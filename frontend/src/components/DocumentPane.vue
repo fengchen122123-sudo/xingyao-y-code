@@ -1,8 +1,4 @@
 <template>
-  <!-- 右侧面板「文档」工作台：纯 DOM 渲染，不叠加任何原生浏览器表面。
-       PDF 由 pdf.js 逐页画进 canvas，工具栏（页码/缩放/适应宽度）全部自绘；
-       .docx 由 docx-preview 直接渲染 OOXML；Excel / PPT / 旧版 doc 仍由后端先转成
-       PDF，再走 pdf.js 这条渲染链。 -->
   <div class="dc-root" data-test="doc-pane-root">
     <div class="dc-toolbar">
       <AppIcon name="file" :size="13" :stroke-width="2" class="dc-fileicon" />
@@ -10,7 +6,6 @@
 
       <span class="dc-spacer"></span>
 
-      <!-- 翻页只对 PDF 有意义：docx 由 docx-preview 排出连续页面，滚动阅读即可 -->
       <template v-if="ready && !docxMode">
         <button
           class="dc-btn"
@@ -75,8 +70,6 @@
       ><AppIcon name="refresh" :size="14" :stroke-width="2" /></button>
     </div>
 
-    <!-- 编辑模式第二行：标注工具 + 页面操作 + 撤销重做 + 保存。
-         编辑只记录操作（PDF point 坐标系），页面重排要等后端保存时才发生。 -->
     <div v-if="editing" class="dc-edit-toolbar" data-test="dc-edit-toolbar">
       <button
         v-for="t in EDIT_TOOLS"
@@ -123,8 +116,6 @@
         <div ref="docxRef" class="dc-docx-host"></div>
       </div>
 
-      <!-- 页面操作（删页/旋转/插页）不会改动当前 pdf.js 预览：真要重排只能由后端
-           保存时执行，所以这里明确提示，避免用户以为按钮没生效 -->
       <div v-if="editing && pendingPageOps.length" class="dc-pageops" data-test="dc-pageops-pending">
         <AppIcon name="info" :size="13" :stroke-width="2" />
         <span>页面操作将在保存时生效，当前预览未重排：共 {{ pageOpsCount }} 项（{{ pageOpsSummary }}）</span>
@@ -170,8 +161,6 @@
         >
           <canvas :ref="(el) => setCanvas(p, el)" class="dc-canvas"></canvas>
 
-          <!-- 编辑覆盖层：viewBox 直接用该页的 PDF point 尺寸，标注坐标可以原样画，
-               不需要任何缩放换算（canvas 那边是像素，这里是一直是 point）。 -->
           <svg
             v-if="editing"
             :ref="(el) => setLayer(p, el)"
@@ -195,7 +184,6 @@
               :transform="itemTransform(item.id)"
               @pointerdown="onAnnotDown(item.id, p, $event)"
             >
-              <!-- 高亮：半透明色块，无描边 -->
               <rect
                 v-if="item.shape === 'fill'"
                 :x="item.rect.x"
@@ -206,7 +194,6 @@
                 :fill-opacity="item.opacity"
                 stroke="none"
               />
-              <!-- 下划线 / 删除线：一条直线画在矩形底边 / 中线 -->
               <line
                 v-else-if="item.shape === 'line'"
                 :x1="item.x1"
@@ -216,7 +203,6 @@
                 :stroke="item.color"
                 :stroke-width="item.width"
               />
-              <!-- 方框 -->
               <rect
                 v-else-if="item.shape === 'stroke'"
                 :x="item.rect.x"
@@ -227,7 +213,6 @@
                 :stroke="item.color"
                 :stroke-width="item.width"
               />
-              <!-- 箭头：直线 + 箭头多边形 -->
               <g v-else-if="item.shape === 'arrow'">
                 <line
                   :x1="item.x1"
@@ -239,7 +224,6 @@
                 />
                 <polygon :points="item.head" :fill="item.color" />
               </g>
-              <!-- 自由笔 -->
               <polyline
                 v-else-if="item.shape === 'ink'"
                 :points="item.points"
@@ -249,7 +233,6 @@
                 stroke-linejoin="round"
                 stroke-linecap="round"
               />
-              <!-- 白块遮盖：白色不透明 + 浅色虚线框（提示这里还能选中/撤销） -->
               <rect
                 v-else-if="item.shape === 'redact'"
                 :x="item.rect.x"
@@ -261,7 +244,6 @@
                 stroke-width="0.8"
                 stroke-dasharray="3 2"
               />
-              <!-- 便签 / 印章：矩形 + 文字（印章用红框大写） -->
               <g v-else-if="item.shape === 'boxed'">
                 <rect
                   :x="item.rect.x"
@@ -288,7 +270,6 @@
                   >{{ line }}</tspan>
                 </text>
               </g>
-              <!-- 文本框：可选底色矩形 + 文字 -->
               <g v-else-if="item.shape === 'bgtext'">
                 <rect
                   v-if="item.bg"
@@ -317,7 +298,6 @@
               </g>
             </g>
 
-            <!-- 拖拽中的实时预览（松手才生成 op） -->
             <g v-if="draft && draft.page === p" data-test="dc-edit-draft" class="dc-edit-draft">
               <polyline
                 v-if="tool === 'ink'"
@@ -352,7 +332,6 @@
             </g>
           </svg>
 
-          <!-- 便签/印章/文本框的内联编辑器：拖完矩形直接就位输入 -->
           <div
             v-if="textEditor && textEditor.page === p"
             class="dc-text-editor"
@@ -403,9 +382,6 @@ function readApi(): any {
   try { return (window as any).pywebview?.api ?? null; } catch { return null; }
 }
 
-// ── pdf.js 惰性加载 ──
-// 主包 + worker 约 1.7MB，只在真正打开文档时才动态 import：不用文档页签的用户
-// 不为它付首屏代价。workerSrc 用 ?url 让 Vite 打成静态资源，WebView2 支持模块 worker。
 type PdfModule = typeof import('pdfjs-dist');
 let pdfjsPromise: Promise<PdfModule> | null = null;
 
@@ -434,7 +410,6 @@ function loadDocx(): Promise<DocxModule> {
 
 const scrollRef = ref<HTMLElement | null>(null);
 const docxRef = ref<HTMLElement | null>(null);
-// 当前文档走哪条渲染链：docx-preview（Word）还是 pdf.js（PDF / 转出来的 Excel、PPT）
 const docxMode = ref(false);
 const currentPath = ref('');
 const loading = ref(false);
@@ -444,34 +419,24 @@ const pageCount = ref(0);
 const pageNo = ref(1);
 // 每页在 scale=1 下的宽高：占位块按它 × 当前缩放渲染，避免图片出来前页面高度跳动
 const pageSizes = ref<{ w: number; h: number }[]>([]);
-// zoomFactor 是相对「适应宽度」的倍数：面板变宽时 fitScale 重算，用户手动放大的
-// 比例仍然保留
 const zoomFactor = ref(1);
 const fitScale = ref(1);
 const scale = computed(() => fitScale.value * zoomFactor.value);
 const zoomPct = computed(() => Math.round(scale.value * 100));
 const displayName = computed(() => store.docPreviewRequest?.name || '文档');
-// 「在文件夹中打开」「用系统默认程序打开」定位的都是源文件：Office 文档显示的
-// 是后端转出的缓存 PDF，但用户点开的是磁盘上那个 .docx，所以要优先用 sourcePath
 const fileTarget = computed(() => (
   store.docPreviewRequest?.sourcePath || store.docPreviewRequest?.path || currentPath.value
 ));
 
-// pdf.js 的文档代理对象（类型来自 pdfjs-dist，运行时才有值）
 let pdfDoc: { numPages: number; getPage: (n: number) => Promise<any>; destroy?: () => Promise<void> } | null = null;
 const canvases = new Map<number, HTMLCanvasElement>();
 // 已渲染的「页 → 缩放」键：缩放变化必须重画，滚回原页不重复画
 const renderedKeys = new Map<number, string>();
 let pageObserver: IntersectionObserver | null = null;
-// 页与页之间的间距 + 两侧留白，只在本组件内部使用
 const PAGE_GAP = 12;
 const PAGE_RING = 12;
 let consumedNonce = 0;
 
-// ── 编辑模式 ──
-// 坐标一律用 PDF point（原点在页面左上角，y 向下），等于 scale=1 的页面尺寸坐标系。
-// 覆盖层 svg 的 viewBox 就是这一尺寸，所以标注坐标可以原样画，不用乘缩放。
-// 真正的页面重排 / 内容擦除都发生在后端保存时，这里只维护操作列表（ops）。
 type EditTool =
   | 'highlight'
   | 'underline'
@@ -509,7 +474,6 @@ const COLOR_HIGHLIGHT = '#ffd400';
 const COLOR_LINE = '#e5484d';
 const COLOR_TEXT = '#111111';
 const COLOR_WHITE = '#ffffff';
-// 拖拽短于这个长度算误触（配合 clampRect 的退化尺寸判断）
 const MIN_DRAG = 1;
 
 interface DraftState {
@@ -530,17 +494,13 @@ const editing = ref(false);
 const tool = ref<EditTool | null>(null);
 const ops = ref<EditOp[]>([]);
 const history = new EditHistory();
-// EditHistory 是普通类实例，push/undo 不会触发视图更新：用计数驱动 canUndo/canRedo 重算
 const historyTick = ref(0);
 const saveBusy = ref(false);
-// 保存流程自己触发的重载不算「用户丢弃改动」：置位期间 confirmDiscardEdits 直接放行
 const suppressDiscardConfirm = ref(false);
 const draft = ref<DraftState | null>(null);
 const textEditor = ref<TextEditorState | null>(null);
 const textareaEl = ref<HTMLTextAreaElement | null>(null);
-// 选中项用 ops.value 的全局下标标识（drawItems 里的 item.id 就是它）
 const selectedIndex = ref<number | null>(null);
-// 拖动中的实时位移（SVG transform 预览用，松手才写进历史）
 const moveDelta = ref<{ dx: number; dy: number } | null>(null);
 let moveState: { index: number; page: number; origin: Point } | null = null;
 
@@ -553,7 +513,6 @@ const canRedo = computed(() => {
   void historyTick.value;
   return history.canRedo;
 });
-// 页面类操作：只记录、不重排预览，需要在界面上显式提示
 const pendingPageOps = computed(() => ops.value.filter((op): op is PageOp => op.kind === 'page'));
 
 function pageOpLabel(op: PageOp): string {
@@ -578,7 +537,6 @@ const pageOpsSummary = computed(() => {
   return Array.from(counts, ([label, n]) => `${label}×${n}`).join('、');
 });
 
-// 提示条上的条数走 summarizeOps，与后端统计口径保持一致
 const pageOpsCount = computed(() => summarizeOps(ops.value).pageOps);
 
 function toggleEdit() {
@@ -592,7 +550,6 @@ function toggleEdit() {
 }
 
 function selectTool(next: EditTool) {
-  // 再点一次同一个工具 = 取消选择（回到「只看不改」的状态，覆盖层不吃鼠标）
   tool.value = tool.value === next ? null : next;
   draft.value = null;
   textEditor.value = null;
@@ -603,17 +560,12 @@ function selectTool(next: EditTool) {
   }
 }
 
-/** 把新快照压进历史并同步到视图 */
 function pushOps(next: EditOp[]) {
   history.push(next);
   ops.value = history.current;
   historyTick.value += 1;
 }
 
-// ── 单条标注：选中 / 拖动 / 删除 ──
-// 坐标取整复用文件下方已有的 roundCoord（函数声明会提升，这里直接用）
-
-/** 拖动预览：只给选中的那一条挂 translate，松手才落盘 */
 function itemTransform(id: number): string | undefined {
   if (selectedIndex.value !== id || !moveDelta.value) return undefined;
   const { dx, dy } = moveDelta.value;
@@ -621,7 +573,6 @@ function itemTransform(id: number): string | undefined {
   return `translate(${dx} ${dy})`;
 }
 
-/** 把一条操作整体平移（页面操作不参与移动） */
 function shiftOp(op: EditOp, dx: number, dy: number): EditOp {
   if (op.kind === 'annot') {
     if (op.rect) {
@@ -686,7 +637,6 @@ function onMovePointerUp() {
   pushOps(ops.value.map((op, i) => (i === st.index ? shiftOp(op, delta.dx, delta.dy) : op)));
 }
 
-/** 只有「选择」工具下点标注才是选中；其它工具要能正常在标注上继续画 */
 function onAnnotDown(index: number, page: number, ev: PointerEvent) {
   if (!editing.value || tool.value !== 'select') return;
   ev.stopPropagation();
@@ -709,7 +659,6 @@ function deleteSelected() {
   pushOps(next);
 }
 
-/** Delete/Backspace 删除选中标注；正在输入文字时不动手 */
 function onEditKeydown(ev: KeyboardEvent) {
   if (!editing.value || selectedIndex.value === null) return;
   const target = ev.target as HTMLElement | null;
@@ -745,7 +694,6 @@ function redoEdit() {
   textEditor.value = null;
 }
 
-// 清空也作为一步入历史：误点「清空」还能撤销回来
 function clearEdits() {
   if (!ops.value.length) return;
   pushOps([]);
@@ -801,7 +749,6 @@ async function saveEdits(mode: 'copy' | 'overwrite') {
     }
     if (!ok) return;
   }
-  // 本地校验先跑一遍：坐标/颜色/页号不合法时连桥都不必打
   const problems = validateOps(ops.value);
   if (problems.length) {
     store.notifyModal('PDF 编辑', `有 ${problems.length} 处问题：${problems[0]}`);
@@ -812,12 +759,10 @@ async function saveEdits(mode: 'copy' | 'overwrite') {
     return;
   }
   saveBusy.value = true;
-  // 保存成功后 store 会把新文件重新开进「文档」页签，nonce 变化会触发 loadDoc；
-  // 此时 ops 已清空、再问一句「会丢弃改动」只会让用户困惑，顺手抑制掉
   suppressDiscardConfirm.value = true;
   try {
     const res = await store.savePdfEdits(ops.value, mode);
-    if (!res) return; // 失败/被拦下：编辑态与历史都不动，用户可以改完再试
+    if (!res) return;
     resetEditState();
     editing.value = false;
   } finally {
@@ -825,8 +770,6 @@ async function saveEdits(mode: 'copy' | 'overwrite') {
     setTimeout(() => { suppressDiscardConfirm.value = false; }, 0);
   }
 }
-
-// ── 覆盖层几何 ──
 
 function layerSize(page: number): { w: number; h: number } {
   return pageSizeOf(pageSizes.value, page) ?? { w: 600, h: 800 };
@@ -837,7 +780,6 @@ function layerViewBox(page: number): string {
   return `0 0 ${size.w} ${size.h}`;
 }
 
-// v-for 里的 svg 用函数 ref 收集（模板 ref 在 v-for 下会变成数组）
 const layerEls = new Map<number, SVGSVGElement>();
 
 function setLayer(page: number, el: unknown) {
@@ -850,7 +792,6 @@ function clampNumber(v: number, min: number, max: number): number {
   return Math.min(Math.max(v, min), max);
 }
 
-/** 指针位置 → 该页 PDF point */
 function eventToPoint(page: number, ev: PointerEvent): Point {
   const size = layerSize(page);
   const svg = layerEls.get(page);
@@ -870,8 +811,6 @@ function clampedRect(a: Point, b: Point, page: number): Rect | null {
   if (rect.w < MIN_DRAG || rect.h < MIN_DRAG) return null;
   return rect;
 }
-
-// ── 绘制交互 ──
 
 function buildOp(
   t: Exclude<EditTool, 'note' | 'stamp' | 'text'>,
@@ -900,9 +839,6 @@ function buildOp(
   return { kind: 'annot', type: 'rect', page, color: COLOR_LINE, width: 1.5, rect };
 }
 
-// 拖拽期间把 move/up 听到 window 上：指针移出页面也能继续画；
-// 元素自身的 pointermove/pointerup 也照样处理（jsdom 里不一定冒泡到 window），
-// 两边都会调，靠 onLayerUp 里先清 draft 做去重。
 let watchingDrag = false;
 
 function startDragWatch() {
@@ -966,8 +902,6 @@ function onLayerCancel() {
   stopDragWatch();
 }
 
-// ── 便签 / 印章 / 文本框的内联编辑器 ──
-
 const textEditorPlaceholder = computed(() => {
   const t = textEditor.value?.tool;
   if (t === 'stamp') return '印章文字（保存为大写）';
@@ -1012,7 +946,7 @@ function confirmText() {
   if (!editor) return;
   const text = editor.text.trim();
   textEditor.value = null;
-  if (!text) return; // 空文本算取消，不进历史
+  if (!text) return;
   pushOps([...ops.value, buildTextOp(editor.tool, editor.page, editor.rect, text)]);
 }
 
@@ -1100,7 +1034,7 @@ function toDrawItem(op: EditOp, id: number): DrawItem {
     lineHeight: 13,
   };
 
-  if (op.kind === 'page') return base; // 页面操作不参与绘制
+  if (op.kind === 'page') return base;
 
   if (op.kind === 'redact') {
     return { ...base, type: 'redact', shape: 'redact', rect: op.rect, color: op.fill || COLOR_WHITE };
@@ -1230,8 +1164,6 @@ function toDrawItem(op: EditOp, id: number): DrawItem {
 
 const drawItems = computed(() => {
   const byPage = new Map<number, DrawItem[]>();
-  // 逐条记住它在 ops.value 里的「全局下标」：选中/拖动/删除都要按这个下标回写，
-  // 用页内序号会在多页都有标注时删错条目
   const entriesByPage = new Map<number, Array<{ op: EditOp; index: number }>>();
   ops.value.forEach((op, index) => {
     if (op.kind === 'page') return;
@@ -1249,7 +1181,6 @@ function drawItemsFor(page: number): DrawItem[] {
   return drawItems.value.get(page) ?? [];
 }
 
-// 拖拽中的实时预览
 const draftRect = computed<Rect>(() => {
   const d = draft.value;
   if (!d) return { x: 0, y: 0, w: 0, h: 0 };
@@ -1260,7 +1191,6 @@ const draftPoints = computed(() =>
   (draft.value ? draft.value.points.map((p) => `${p.x},${p.y}`).join(' ') : ''),
 );
 
-/** 丢弃未保存的编辑前先问一句；没有 confirm（非浏览器宿主）时不拦 */
 function confirmDiscardEdits(): boolean {
   if (suppressDiscardConfirm.value) return true;
   if (!dirty.value) return true;
@@ -1306,8 +1236,6 @@ function messageOf(err: unknown): string {
   return msg ? String(msg) : String(err);
 }
 
-// ── 缩放与适配 ──
-
 function computeFitScale() {
   const el = scrollRef.value;
   const first = pageSizes.value[0];
@@ -1326,7 +1254,6 @@ async function zoomBy(delta: number) {
   const next = Math.min(4, Math.max(0.3, Math.round((zoomFactor.value + delta) * 100) / 100));
   if (next === zoomFactor.value) return;
   zoomFactor.value = next;
-  // docx 没有 canvas 要重画，改一下 CSS zoom 就够
   if (docxMode.value) {
     applyDocxZoom();
     return;
@@ -1348,8 +1275,6 @@ async function resetZoom() {
   renderVisible();
 }
 
-// ── 逐页渲染 ──
-
 // 每页在跑的渲染任务：缩放/滚动会连打招呼，两个 render 往同一块 canvas 上画
 // 会叠成残影，换比例时必须把旧任务 cancel 掉
 const inflightTasks = new Map<number, { key: string; task: { cancel: () => void; promise: Promise<void> } }>();
@@ -1362,8 +1287,8 @@ async function renderPage(page: number) {
   if (renderedKeys.get(page) === key) return;
   const prev = inflightTasks.get(page);
   if (prev) {
-    if (prev.key === key) return; // 同比例正在画，等它
-    try { prev.task.cancel(); } catch { /* 已结束，忽略 */ }
+    if (prev.key === key) return;
+    try { prev.task.cancel(); } catch { }
   }
   renderedKeys.set(page, key);
   // canvas 位图尺寸必须由调用方按 viewport 像素定好：pdf.js v6 传 canvas 参数时
@@ -1380,7 +1305,6 @@ async function renderPage(page: number) {
     canvas.style.width = `${Math.floor(viewport.width / dpr)}px`;
     canvas.style.height = `${Math.floor(viewport.height / dpr)}px`;
   } catch {
-    // 渲染失败/被取消（该页损坏、被中途切走、换比例）：清掉标记，下次进入视口重试
     if (renderedKeys.get(page) === key) renderedKeys.delete(page);
   } finally {
     const current = inflightTasks.get(page);
@@ -1425,8 +1349,6 @@ function renderVisible() {
   });
 }
 
-// ── 页码与滚动 ──
-
 function onScroll() {
   const el = scrollRef.value;
   if (!el || !pageCount.value) return;
@@ -1453,8 +1375,6 @@ function goPage(target: number) {
   pageNo.value = clamped;
 }
 
-// ── 载入与清理 ──
-
 async function destroyDoc() {
   teardownObserver();
   const doc = pdfDoc;
@@ -1464,15 +1384,13 @@ async function destroyDoc() {
   dropDocx();
   // 换文档时把没画完的渲染任务撤掉，避免旧任务往新 canvas 上画
   for (const entry of inflightTasks.values()) {
-    try { entry.task.cancel(); } catch { /* 已结束，忽略 */ }
+    try { entry.task.cancel(); } catch { }
   }
   inflightTasks.clear();
   if (doc && typeof doc.destroy === 'function') {
-    try { await doc.destroy(); } catch { /* 关闭失败不影响后续载入 */ }
+    try { await doc.destroy(); } catch { }
   }
 }
-
-// ── docx 渲染 ──
 
 /** 清掉上一份 Word 渲染结果（换文档/重载时先抹掉，避免闪一下旧内容） */
 function dropDocx() {
@@ -1481,8 +1399,6 @@ function dropDocx() {
   docxMode.value = false;
 }
 
-// data URL → ArrayBuffer：这里不用 fetch(data:)，WebView2 对超大 data URL 的 fetch
-// 行为有实现差异，手动解码最稳（32MB 上限内的文档耗时也是毫秒级）
 function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
   const comma = dataUrl.indexOf(',');
   const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
@@ -1492,9 +1408,7 @@ function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-/** docx 字节 → DOM（docx-preview 自己按分页符切成多张"纸"） */
 async function renderDocx(dataUrl: string) {
-  // 先切到 docx 视图：容器节点要等这一轮 DOM 更新才存在，ref 才有值
   docxMode.value = true;
   await nextTick();
   const host = docxRef.value;
@@ -1514,14 +1428,12 @@ async function renderDocx(dataUrl: string) {
   });
 }
 
-/** 「适应宽度」：docx 页宽由文档页面设置决定（A4 = 21cm），量一次换算比例 */
 function computeDocxFit() {
   const host = docxRef.value;
   const wrapper = host?.querySelector('.docx-wrapper') as HTMLElement | null;
   const page = host?.querySelector('.docx-wrapper > section') as HTMLElement | null;
   const el = scrollRef.value;
   if (!host || !wrapper || !page || !el) return;
-  // CSS zoom 会改变 offsetWidth，量之前先把缩放归零
   wrapper.style.zoom = '1';
   const pageWidth = page.offsetWidth || 0;
   const avail = (el.clientWidth || 0) - PAGE_RING * 2 - 10;
@@ -1529,7 +1441,6 @@ function computeDocxFit() {
   fitScale.value = Math.min(3, Math.max(0.2, avail / pageWidth));
 }
 
-/** 把 scale（fitScale × zoomFactor）落到 docx 上：用 CSS zoom 让布局尺寸跟着变 */
 function applyDocxZoom() {
   const host = docxRef.value;
   const wrapper = host?.querySelector('.docx-wrapper') as HTMLElement | null;
@@ -1540,7 +1451,6 @@ function applyDocxZoom() {
 
 async function loadDoc(path: string) {
   if (!path) return;
-  // 有未保存的编辑时先征询：换文档意味着这些标注会丢
   if (!confirmDiscardEdits()) return;
   currentPath.value = path;
   error.value = '';
@@ -1572,7 +1482,6 @@ async function loadDoc(path: string) {
     error.value = (res && res.msg) || '读取文档失败';
     return;
   }
-  // docx：后端把原始 OOXML 字节 base64 过桥，这里直接渲染，不经过任何 PDF 转换
   if (res.kind === 'docx') {
     if (typeof res.data_url !== 'string' || !res.data_url) {
       loading.value = false;
@@ -1593,7 +1502,6 @@ async function loadDoc(path: string) {
     }
     return;
   }
-  // 其余能进这里的只有 PDF：Excel / PPT / 旧版 doc 已由调用方先转成 PDF
   if (res.kind !== 'pdf' || typeof res.data_url !== 'string') {
     loading.value = false;
     error.value = '该文件不是可渲染的 PDF';
@@ -1634,7 +1542,6 @@ function consumeDocRequest() {
   if (!req || !req.path) return;
   // 页签/面板没激活时等激活（否则量不到容器宽度，缩放会算错）
   if (!props.active) return;
-  // 别的会话的请求不在当前视图消费：切到该会话时由 active 变化再触发
   if (req.session && req.session !== store.currentSessionName) return;
   if (store.docPreviewNonce === consumedNonce) return;
   consumedNonce = store.docPreviewNonce;
@@ -1652,18 +1559,15 @@ function openInSystem() {
   void store.openInSystem(target);
 }
 
-// 在资源管理器里定位到源文件（打开所在目录并选中该文件）
 function revealInExplorer() {
   const target = fileTarget.value;
   if (!target) return;
   void store.revealInExplorer(target);
 }
 
-// nonce 变化 = 新的打开请求（同一文件重复点击也会自增，watch 必触发）
 watch(() => store.docPreviewNonce, consumeDocRequest);
 watch(() => props.active, (active) => { if (active) consumeDocRequest(); });
 
-// 面板宽度变化：重算「适应宽度」比例并重画（缩放因子保留）
 let resizeObserver: ResizeObserver | null = null;
 
 onMounted(() => {
@@ -1672,7 +1576,6 @@ onMounted(() => {
   if (el && typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => {
       if (!ready.value) return;
-      // docx 的内容排版与面板宽度无关：只重算缩放比并重新套上去，不重排
       if (docxMode.value) {
         computeDocxFit();
         applyDocxZoom();
@@ -1690,7 +1593,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (resizeObserver) {
-    try { resizeObserver.disconnect(); } catch { /* 忽略 */ }
+    try { resizeObserver.disconnect(); } catch { }
     resizeObserver = null;
   }
   stopDragWatch();
@@ -1818,12 +1721,9 @@ onBeforeUnmount(() => {
 .dc-canvas {
   display: block;
 }
-/* ── Word（docx-preview）渲染 ── */
 .dc-docx {
   padding: 12px;
 }
-/* docx-preview 自带的 wrapper 是灰底 + 默认内边距，这里跟随面板主题；
-   纸张观感与 PDF 页保持一致，缩放由 wrapper 上的 CSS zoom 控制 */
 .dc-docx :deep(.docx-wrapper) {
   padding: 0;
   background: transparent;
@@ -1871,7 +1771,6 @@ onBeforeUnmount(() => {
   line-height: 1.6;
 }
 
-/* ── 编辑模式 ── */
 .dc-editbtn {
   position: relative;
 }
@@ -1879,7 +1778,6 @@ onBeforeUnmount(() => {
   background: var(--accent-soft);
   color: var(--accent);
 }
-/* 有未保存改动的小圆点 */
 .dc-dirty {
   position: absolute;
   top: 3px;
@@ -1942,8 +1840,6 @@ onBeforeUnmount(() => {
   background: var(--bg2);
   border-bottom: 1px solid var(--border);
 }
-/* 覆盖层铺满该页：viewBox 就是 PDF point，坐标无需换算。
-   没选工具时不吃鼠标（保证能正常滚动），选了工具才接管并换成十字光标 */
 .dc-edit-layer {
   position: absolute;
   inset: 0;
@@ -1960,7 +1856,6 @@ onBeforeUnmount(() => {
 .dc-edit-draft {
   pointer-events: none;
 }
-/* 选中的标注：外发光 + 可拖动光标（选择工具下才有意义） */
 .dc-edit-layer > g.is-selected {
   filter: drop-shadow(0 0 2px var(--accent));
   cursor: move;

@@ -60,7 +60,6 @@ it('running 状态渲染目标文本、轮次与「停止」按钮', async () =>
   expect(wrapper.get('[data-test="goal-round"]').text()).toBe('第 2/5 轮');
   expect(wrapper.get('[data-test="goal-status"]').text()).toBe('进行中');
   expect(wrapper.find('[data-test="goal-stop"]').exists()).toBe(true);
-  // 运行中不给「继续」：后端此时会拒绝重复启动，按钮不该出现
   expect(wrapper.find('[data-test="goal-resume"]').exists()).toBe(false);
 
   wrapper.unmount();
@@ -91,10 +90,8 @@ it('achieved 状态用成功样式并在文案上标出「已完成」', async (
   const { wrapper } = await mountWith(goal({ status: 'achieved', round: 3 }));
 
   const bar = wrapper.get('[data-test="goal-bar"]');
-  // 成功样式由 .gb-achieved 承担（3 秒后自动隐藏，隐藏期间不改 store，故这里只校验样式）
   expect(bar.classes()).toContain('gb-achieved');
   expect(wrapper.get('[data-test="goal-status"]').text()).toBe('已完成');
-  // 达成是终态：停止/继续都不该出现
   expect(wrapper.find('[data-test="goal-stop"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="goal-resume"]').exists()).toBe(false);
 
@@ -107,7 +104,6 @@ it('awaiting_confirm 渲染「确认达成」与「停止」，不给「继续�
   expect(wrapper.get('[data-test="goal-status"]').text()).toBe('待确认');
   // 自评不可信：必须给出确认入口，否则用户看到"待确认"却无处确认
   expect(wrapper.find('[data-test="goal-confirm"]').exists()).toBe(true);
-  // 认为没达成时可以「停止」再「继续」跑剩余轮次，所以停止按钮同时保留
   expect(wrapper.find('[data-test="goal-stop"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="goal-resume"]').exists()).toBe(false);
 

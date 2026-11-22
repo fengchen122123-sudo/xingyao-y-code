@@ -1,5 +1,3 @@
-"""风险分级与两段式确认测试（规格 §13）。"""
-
 import time
 
 import pytest
@@ -13,8 +11,6 @@ from core.git.risk import (
     requires_typed_confirmation,
 )
 
-
-# ---------------------------------------------------------------- 风险分级
 
 def test_risk_classification_table():
     assert classify_risk("stage") is RiskLevel.LOCAL_REVERSIBLE
@@ -40,12 +36,9 @@ def test_confirmation_requirements():
     assert requires_confirmation(RiskLevel.REMOTE_WRITE) is False
     assert requires_confirmation(RiskLevel.HISTORY_REWRITE) is True
     assert requires_confirmation(RiskLevel.UNRECOVERABLE) is True
-    # 不可恢复操作要求输入分支名/短 Hash 二次确认（§13）
     assert requires_typed_confirmation(RiskLevel.UNRECOVERABLE) is True
     assert requires_typed_confirmation(RiskLevel.HISTORY_REWRITE) is False
 
-
-# ---------------------------------------------------------------- 确认令牌
 
 _PARAMS = {"path": ["a.py"], "message": "hi"}
 _VERSIONS = SnapshotVersions(worktree_version="w1", refs_version="r1")
@@ -64,7 +57,7 @@ def test_token_issue_and_verify_roundtrip():
     d = _digests()
     token = svc.issue(versions=_VERSIONS, **d)
     assert token
-    svc.verify_and_consume(token, versions=_VERSIONS, **d)  # 不抛即通过
+    svc.verify_and_consume(token, versions=_VERSIONS, **d)
 
 
 def test_token_one_time_use():
@@ -88,10 +81,8 @@ def test_token_binding_mismatch_rejected():
     svc = ConfirmationService()
     d = _digests()
     token = svc.issue(versions=_VERSIONS, **d)
-    # 换会话
     with pytest.raises(GitError):
         svc.verify_and_consume(token, versions=_VERSIONS, **{**d, "session_id": "other"})
-    # 换参数摘要（前端改参数重放）
     with pytest.raises(GitError):
         svc.verify_and_consume(
             token,
@@ -100,7 +91,6 @@ def test_token_binding_mismatch_rejected():
             repo_digest=d["repo_digest"],
             params_digest="different",
         )
-    # 换快照版本（状态过期后旧令牌立即失效，§13）
     with pytest.raises(GitError):
         svc.verify_and_consume(
             token,

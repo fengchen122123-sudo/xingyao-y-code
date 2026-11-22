@@ -39,7 +39,6 @@ function mountSidebar(groups: any[]) {
   return mount(Sidebar, { global: { plugins: [pinia] } });
 }
 
-/** 指定分组当前渲染出的会话名顺序 */
 function sessionNames(wrapper: any, groupIndex = 0): string[] {
   return wrapper
     .findAll('.session-group')
@@ -47,7 +46,6 @@ function sessionNames(wrapper: any, groupIndex = 0): string[] {
     .map((n: any) => n.attributes('data-session-name'));
 }
 
-/** 按会话名定位条目（不依赖下标，顺序变化后依然可靠） */
 function sessionItem(wrapper: any, groupIndex: number, name: string) {
   const items = wrapper.findAll('.session-group')[groupIndex].findAll('.session-item');
   const names = items.map((n: any) => n.attributes('data-session-name'));
@@ -60,7 +58,6 @@ async function dragSession(wrapper: any, groupIndex: number, name: string) {
   });
 }
 
-/** 落到目标的 y 坐标：上半区（0~10）插到前，下半区（10~20）插到后 */
 async function dropSession(wrapper: any, groupIndex: number, name: string, clientY: number) {
   const el = sessionItem(wrapper, groupIndex, name);
   await el.trigger('dragover', { clientY });
@@ -73,8 +70,6 @@ const HALF_AFTER = 15;
 beforeEach(() => {
   localStorage.clear();
   delete (window as any).pywebview;
-  // jsdom 无布局引擎，getBoundingClientRect 恒为 0，会让"上半区/下半区"判定失效；
-  // 统一桩成 top=0 / height=20 的固定盒，使落点中线逻辑真正被覆盖
   (Element.prototype as any).getBoundingClientRect = () => ({
     top: 0, bottom: 20, height: 20, left: 0, right: 0, width: 0, x: 0, y: 0,
     toJSON: () => ({}),

@@ -7,10 +7,7 @@
     </div>
 
     <div class="sub-body">
-      <!-- 技能页 -->
       <div v-if="subType === 'skills'">
-        <!-- 会话级稳定段落快照：技能的启停会改变 system 头，而进行中的会话已在首请求
-             定型目录字节以保住前缀缓存；因此本页的改动只对新建会话生效。 -->
         <p class="sub-note" data-test="session-snapshot-note">
           已打开的会话将在新会话中生效：进行中的会话沿用其启动时的目录快照，以保证前缀缓存稳定。
         </p>
@@ -36,8 +33,6 @@
             @click="onRefreshSkills"
           >{{ refreshingSkills ? '刷新中…' : '刷新技能' }}</button>
         </div>
-        <!-- 首屏技能改为后端后台扫描 + skills_loaded 事件推送：空列表可能是
-             "还没扫完"而非"真没有技能"，据此区分文案，避免误导用户 -->
         <div v-if="store.skills.length === 0" class="sub-empty">
           {{ store.skillsLoading ? '技能加载中…' : '暂无可用技能' }}
         </div>
@@ -50,7 +45,6 @@
               <div class="row-sub" :title="s.description || ''">{{ s.description || '项目/用户自定义扩展技能' }}</div>
             </div>
             <div class="row-side">
-              <!-- 已偏离内置版本（曾由内置释放但当前 source 非 builtin）才提供恢复入口 -->
               <button
                 v-if="s.from_builtin === true && s.source !== 'builtin'"
                 class="row-text-btn"
@@ -70,7 +64,6 @@
         </div>
       </div>
 
-      <!-- MCP 页 -->
       <div v-else-if="subType === 'mcp'">
          <div class="sub-toolbar">
            <span class="toolbar-spacer"></span>
@@ -125,7 +118,6 @@
         </div>
       </div>
 
-      <!-- 插件页 -->
       <div v-else-if="subType === 'plugins'">
         <div class="sub-toolbar">
           <div class="src-filter" data-test="source-filter">
@@ -141,7 +133,6 @@
             placeholder="搜索插件…"
             title="按名称 / 介绍 / 工具名搜索，多个关键词用空格分隔"
           />
-          <!-- 已移除的内置插件仍在 store.plugins 里（status=removed），用一个开关切换展示 -->
           <button
             v-if="removedPluginCount"
             class="seg-btn"
@@ -185,7 +176,6 @@
         </div>
       </div>
 
-      <!-- 星轨：自动化任务 + 工作流 双标签页（参考 ZCode 的 Automations 页签形态） -->
       <div v-else-if="subType === 'automations' || subType === 'workflows'" class="auto-page">
         <div class="auto-tabs" role="tablist" aria-label="星轨页签" data-test="auto-tabs">
           <button
@@ -209,7 +199,6 @@
         <WorkflowPane v-else />
       </div>
 
-      <!-- 模型管理页 -->
       <div v-else class="models-page">
         <div class="model-section-title">添加供应商</div>
         <div class="model-form">
@@ -336,8 +325,6 @@ const desc = computed(() => {
 
 const refreshingSkills = ref(false);
 
-// 来源筛选：全部 / 内置 / 用户，口径与卡片角标一致——
-// 技能缺 source（旧版后端）按用户算，插件非 'user' 按内置算
 type SourceFilterValue = 'all' | 'builtin' | 'user';
 const sourceFilter = ref<SourceFilterValue>('all');
 
@@ -345,12 +332,9 @@ const sourceFilter = ref<SourceFilterValue>('all');
 // 为 false 时 list 只给在用插件，避免已移除项与在用项混排。
 const showRemoved = ref(false);
 
-// 关键词搜索：技能 / MCP / 插件三页共用同一个输入框，切页时与来源筛选一起重置。
-// MCP 后端只返回服务名，故该页搜索范围仅服务名。
 const searchQuery = ref('');
 watch(() => props.subType, () => { sourceFilter.value = 'all'; searchQuery.value = ''; showRemoved.value = false; });
 
-// 关键词按空格拆成多个词，全部命中才算匹配（忽略大小写）；只传小写后的 kw
 function hitSearch(kw: string, fields: Array<string | undefined | null>): boolean {
   if (!kw) return true;
   const hay = fields.filter(Boolean).join(' ').toLowerCase();
@@ -368,7 +352,6 @@ const removedPluginCount = computed(() => store.plugins.filter(p => p.status ===
 const filteredPlugins = computed(() => {
   const kw = searchQuery.value.trim().toLowerCase();
   return store.plugins.filter(p => {
-    // 先按“在用/已移除”分流：已移除视图只列可恢复项，常规视图隐藏它们
     if ((p.status === 'removed') !== showRemoved.value) return false;
     if (sourceFilter.value !== 'all' && (p.source === 'user' ? 'user' : 'builtin') !== sourceFilter.value) return false;
     return hitSearch(kw, [p.name, p.description, p.tools.join(' ')]);
@@ -404,9 +387,6 @@ async function onDeleteSkill(s: SkillInfo) {
   if (ok) await store.deleteSkill(s.id);
 }
 
-// 恢复内置版本会用内置源覆盖用户改动（破坏性），先复用项目统一的 askConfirm
-// 二次确认（与删除模型/撤销回合同一机制，底层是全局 ConfirmModal），
-// 确认后再调 store action；失败提示由 store.restoreSkill 内部统一处理
 async function onRestoreSkill(s: SkillInfo) {
   const ok = await store.askConfirm(
     '恢复内置版本',
@@ -421,7 +401,6 @@ function onToggleMcp(m: McpInfo, checked: boolean) {
   store.toggleMcpServer(m.name, checked);
 }
 
-// 删除 MCP 服务会改写 mcp.json，属破坏性操作，先二次确认再调 store action
 async function onRemoveMcp(m: McpInfo) {
   const ok = await store.askConfirm(
     '删除 MCP 服务',
@@ -444,7 +423,6 @@ function mcpErrorText(m: McpInfo): string {
   return err.length > MCP_ERR_MAX ? err.slice(0, MCP_ERR_MAX) + '…' : err;
 }
 
-// 添加自定义 MCP 服务的表单状态
 const addForm = reactive({
   show: false,
   name: '',
@@ -462,7 +440,6 @@ function submitAddMcp() {
     return;
   }
   const args = addForm.args.split(/\s+/).filter(Boolean);
-  // 解析每行一个的 KEY=VALUE 环境变量
   const env: Record<string, string> = {};
   for (const line of addForm.env.split('\n')) {
     const t = line.trim();
@@ -532,8 +509,6 @@ async function onDeletePlugin(p: PluginInfo) {
 }
 
 
-// 打开 MCP / 插件 / 自动化页时刷新一次最新状态；星轨/星流双标签共用一个
-// 子页，切换或打开任一标签都同时刷新两侧数据（两侧各自幂等，开销可忽略）
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
@@ -549,12 +524,10 @@ watch(
   }
 );
 
-// 星轨/星流标签切换：换 subType 而不关子页（openSubpage 是幂等置值）
 function switchAutoTab(tab: 'automations' | 'workflows') {
   store.openSubpage(tab);
 }
 
-// ---- 模型管理：添加供应商 ----
 const newProvider = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const addingProvider = ref(false);
 
@@ -565,8 +538,6 @@ async function submitAddProvider() {
   }
   addingProvider.value = true;
   try {
-    // M34 修复：addProvider 失败（返回 null）时不检查返回值仍清空表单，
-    // 用户填写内容丢失且误以为已添加。成功才清空。
     const res = await store.addProvider(newProvider.name.trim(), newProvider.base_url.trim(), newProvider.api_key.trim(), newProvider.protocol);
     if (res && res.ok) {
       newProvider.name = '';
@@ -579,11 +550,9 @@ async function submitAddProvider() {
   }
 }
 
-// ---- 模型管理：添加模型 ----
 const newModel = reactive({ provider_id: '', model_name: '', context_window: 32000, max_tokens: '' as number | '' });
 const addingModel = ref(false);
 
-// ---- 模型管理：获取模型列表一键填充 ----
 const subpageRemoteModels = ref<{ id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[] | null>(null);
 const subpageFetchingModels = ref(false);
 
@@ -613,7 +582,6 @@ function pickSubpageModel(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   if (!value) return;
   newModel.model_name = value;
-  // 厂商元数据 + 本地规格表：能填的都填（未提供的字段保持表单原值）
   const entry = (subpageRemoteModels.value || []).find((m) => m.id === value);
   if (!entry) return;
   if (entry.context_window && entry.context_window > 0) {
@@ -629,7 +597,6 @@ async function submitAddModel() {
   }
   addingModel.value = true;
   try {
-    // M34 修复：同上，addModel 成功才清空表单；最大输出留空 = null（走内置默认）
     const maxTokens = newModel.max_tokens === '' ? null : Number(newModel.max_tokens);
     const res = await store.addModel(newModel.provider_id, newModel.model_name.trim(), Number(newModel.context_window) || 0, false, true, '', maxTokens);
     if (res && res.ok) {
@@ -641,7 +608,6 @@ async function submitAddModel() {
   }
 }
 
-// ---- 模型管理：测试连接 ----
 const testingModelId = ref<string | null>(null);
 const testResults = ref<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
 
@@ -827,7 +793,6 @@ async function testModelRow(m: ModelInfo) {
 .toolbar-spacer {
   flex: 1;
 }
-/* 星轨/星流双标签页签（复用技能页 .seg-btn 分段外观，置于内容区顶部） */
 .auto-page {
   display: flex;
   flex-direction: column;
@@ -865,7 +830,6 @@ async function testModelRow(m: ModelInfo) {
   color: var(--accent);
   font-weight: 600;
 }
-/* 技能 / MCP / 插件三页共用的关键词搜索框（与钩子页 .hook-search 同款外观） */
 .sub-search {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -881,7 +845,6 @@ async function testModelRow(m: ModelInfo) {
 .sub-search:focus {
   border-color: var(--accent);
 }
-/* 来源分段筛选：全部 / 内置 / 用户 */
 .src-filter {
   display: inline-flex;
   align-items: center;
@@ -920,7 +883,6 @@ async function testModelRow(m: ModelInfo) {
   text-align: center;
 }
 
-/* MCP 添加服务表单 */
 .mcp-add-form {
   max-width: 960px;
   margin: 0 auto 12px;
@@ -984,7 +946,6 @@ async function testModelRow(m: ModelInfo) {
   background: var(--accent-soft);
 }
 
-/* 开关 Pill */
 .switch {
   position: relative;
   display: inline-block;
@@ -1095,7 +1056,6 @@ async function testModelRow(m: ModelInfo) {
   to { transform: rotate(360deg); }
 }
 
-/* 模型管理页 */
 .models-page {
   max-width: 760px;
   margin: 0 auto;

@@ -1,4 +1,3 @@
-"""Local latency benchmark. It uses only a loopback page and desktop screenshots."""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +27,21 @@ def stats(values):
     return {"samples": len(values), "p50_ms": statistics.median(values) if values else None,
             "p95_ms": values[max(0, int(len(values) * .95) - 1)] if values else None,
             "min_ms": min(values) if values else None, "max_ms": max(values) if values else None}
+
+
+def measure_stop_and_lease(service, owner, capability, target: str = "browser") -> dict:
+    """测量停止响应与 lease 释放耗时，供 Task 0 门禁基线采数使用。"""
+    run = service.start_run(owner, capability, target=target)
+    started = time.perf_counter()
+    snap = service.stop(run.run_id, "benchmark_stop")
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    return {
+        "run_id": run.run_id,
+        "status": snap.status,
+        "stop_response_ms": elapsed_ms,
+        "lease_release_ms": elapsed_ms,
+        "lease_released": service._run is None,
+    }
 
 
 def measure(fn, count):
@@ -106,18 +120,61 @@ def main():
         try:
             backend.start()
             backend.execute("benchmark", ComputerAction(kind="navigate", target="browser", url=f"http://127.0.0.1:{server.server_port}"))
+            backend.observe("benchmark")
             hot_click = measure(lambda: backend.execute("benchmark", ComputerAction(kind="click", target="browser", x=150, y=75)), args.samples)
             hot_observe = measure(lambda: backend.observe("benchmark"), args.samples)
         finally:
             backend.close(); server.shutdown(); server.server_close()
 
     desktop_start = measure(lambda: (lambda b: (b.start(), b.close()))(WindowsComputerBackend.create_default()), args.samples)
-    desktop = WindowsComputerBackend.create_default(); desktop.start()
+    desktop = WindowsComputerBackend.create_default()
+    desktop_error = ""
     try:
+        desktop.start()
         desktop_observe = measure(lambda: desktop.observe("benchmark"), args.samples)
+    except Exception as exc:
+        desktop_error = f"{getattr(exc, 'code', '') or type(exc).__name__}: {exc}"
+        desktop_observe = {"samples": 0, "p50_ms": None, "p95_ms": None, "min_ms": None, "max_ms": None, "errors": [{"error_code": getattr(exc, "code", ""), "error": str(exc)}]}
     finally:
         desktop.close()
-    output = {"environment": environment(args.browser), "browser": {"cold_start": stats(cold), "hot_click": hot_click, "hot_observe": hot_observe}, "desktop": {"start": desktop_start, "observe": desktop_observe}}
+    from core.computer.controller import ComputerControlService
+    from core.computer.models import ComputerCapability, ComputerOwner, ComputerProtocol
+    import threading
+
+    stop_samples = []
+    with tempfile.TemporaryDirectory(prefix="ycode-bench-stop-") as directory:
+        svc = ComputerControlService(
+            backend_factory=lambda _t, _i: BrowserComputerBackend(
+                args.browser, Path(directory) / "profile", use_process_worker=True
+            ),
+            generation_provider=lambda: 1,
+            abort_streams=lambda _e: None,
+        )
+        cap = ComputerCapability(
+            enabled=True,
+            protocol=ComputerProtocol.GENERIC.value,
+            targets=("browser",),
+            browser=args.browser,
+            settings_generation=1,
+        )
+        for idx in range(min(args.samples, 3)):
+            sample_owner = ComputerOwner(
+                session_id="bench-local",
+                turn_id=f"bench-stop-{idx}",
+                session_label="基准",
+                cancel_event=threading.Event(),
+            )
+            stop_samples.append(measure_stop_and_lease(svc, sample_owner, cap, target="browser")["stop_response_ms"])
+    output = {
+        "environment": environment(args.browser),
+        "browser": {
+            "cold_start": stats(cold),
+            "hot_click": hot_click,
+            "hot_observe": hot_observe,
+            "stop_and_lease": stats(stop_samples),
+        },
+        "desktop": {"start": desktop_start, "observe": desktop_observe, "error": desktop_error},
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(output, ensure_ascii=False, indent=2))

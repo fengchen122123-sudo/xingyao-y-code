@@ -158,7 +158,6 @@ describe('FeishuSettings', () => {
     expect(text).toContain('卡片按钮点了没反应');
     expect(text).toContain('发布版本');
     expect(text).toContain('/whoami');
-    // 排错指引
     expect(text).toContain('收不到消息时依次查');
   });
 
@@ -168,7 +167,6 @@ describe('FeishuSettings', () => {
     await flushPromises();
 
     const guide = () => wrapper.find('[data-test="feishu-guide"]');
-    // 默认展开（用户要求说明直接可见）；点标题折叠
     expect(guide().attributes('style') || '').not.toContain('display: none');
     await wrapper.find('[data-test="feishu-guide-toggle"]').trigger('click');
     expect(guide().attributes('style')).toContain('display: none');
@@ -188,7 +186,6 @@ describe('FeishuSettings', () => {
 
     const items = wrapper.findAll('[data-test="feishu-checklist"] li');
     expect(items).toHaveLength(5);
-    // 前三项已满足（App ID / 密钥 / 已启用），连接异常与白名单未配置
     expect(items[0].classes()).toContain('ok');
     expect(items[1].classes()).toContain('ok');
     expect(items[2].classes()).toContain('ok');

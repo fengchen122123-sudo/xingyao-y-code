@@ -43,7 +43,6 @@ const ALL_PERM_MODES: Array<{ v: PermissionMode; c: string; desc: string }> = [
   { v: 'full', c: 'var(--red)', desc: '沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制' },
 ];
 
-// 仅当决策模型（JEV）开启时才展示「自动决策」选项
 const permModes = computed(() =>
   ALL_PERM_MODES.filter((m) => m.v !== 'auto_decision' || store.decisionEnabled),
 );

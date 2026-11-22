@@ -1,20 +1,3 @@
-"""免费网页搜索后端（无需 API Key、不消耗额度）。
-
-**为什么需要这个模块**：内置的 ddgs（DuckDuckGo）在国内网络下经常空返回或直接
-超时——2026-11-15 实测连续三次查询全部失败，导致 search_news 整体不可用。
-本模块提供两条国内可达的免费通道，作为 search_news 的**主路径**：
-
-1. ``360``：抓 https://www.so.com/s 的结果页，实测约 1 秒出结果，结果条目里的
-   ``data-mdurl`` 属性直接给出真实 URL，不需要解 360 的跳转链接。
-2. ``bing_rss``：抓 https://cn.bing.com/search?format=rss 的结构化 XML，无需解析
-   HTML；但中文查询的相关性明显偏弱（实测「星瑶Code 是什么」返回小米官网），
-   因此只作兜底。
-
-两条通道都是**公开网页**而非官方开放 API：解析规则针对当前页面结构编写，
-页面改版时解析会返回空列表而不是抛“成功”，由调用方回退到 ddgs，
-不会把一次空抓取伪装成搜索结果。
-"""
-
 from __future__ import annotations
 
 import http.cookiejar
@@ -41,7 +24,6 @@ _SO360_ENDPOINT = "https://www.so.com/s"
 _BAIDU_ENDPOINT = "https://www.baidu.com/s"
 _BING_RSS_ENDPOINT = "https://cn.bing.com/search"
 _DEFAULT_TIMEOUT = 12.0
-# 360 一页通常 10 条，其中还混着图片/文库聚合卡片；要多条就翻页
 _MAX_PAGES = 3
 
 # 反爬冷却：百度连续查询约 3 次后会转到「百度安全验证」页，360 超频后只回骨架页。
@@ -66,8 +48,6 @@ class SearchCancelled(RuntimeError):
     """用户取消了本次搜索：不参与后端兜底，直接向上抛。"""
 
 
-# --- 360 结果页解析 ---------------------------------------------------------
-# 单个结果条目：<li class="res-list ..." ...>…</li>
 _360_BLOCK_RE = re.compile(r'(?is)<li\s+class="res-list[^"]*"[^>]*>(.*?)</li>')
 _H3_RE = re.compile(r"(?is)<h3[^>]*>(.*?)</h3>")
 _ANCHOR_RE = re.compile(r"(?is)<a\s([^>]*)>(.*?)</a>")
@@ -87,12 +67,10 @@ _WS_RE = re.compile(r"\s+")
 _COOKIE_JAR = http.cookiejar.CookieJar()
 _OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_COOKIE_JAR))
 
-# 360 反爬拦截页的典型特征，命中时按失败处理而不是“无结果”
 _BLOCKED_MARKERS = ("安全验证", "请输入验证码", "访问过于频繁", "异常流量")
 
 
 def _plain_text(fragment: str) -> str:
-    """把含高亮 <em>、<cite> 等标签的 HTML 片段压成一行纯文本。"""
     return _WS_RE.sub(" ", unescape(_TAG_RE.sub("", fragment or ""))).strip()
 
 
@@ -101,11 +79,6 @@ def _is_http_url(url: str) -> bool:
 
 
 def parse_360_html(html: str, num_results: int = 10) -> list[dict]:
-    """从 360 结果页 HTML 提取 ``[{title, url, snippet}]``。
-
-    公开给测试直接调用：不联网也能验证解析规则。
-    返回空列表意味着「这一页没有可用的网页结果」（改版或被拦截），由调用方决定兜底。
-    """
     results: list[dict] = []
     seen: set[str] = set()
     for block in _360_BLOCK_RE.findall(html or ""):
@@ -150,7 +123,6 @@ def _fetch(
     opener: urllib.request.OpenerDirector | None = None,
     extra_headers: dict | None = None,
 ) -> str:
-    """GET 一个页面并解码为文本；被取消或网络失败时抛异常。"""
     if cancel_check is not None and cancel_check():
         raise SearchCancelled("操作已被用户取消")
     headers = dict(_DEFAULT_HEADERS)
@@ -185,8 +157,6 @@ def search_360(
             _SO360_ENDPOINT + "?" + urllib.parse.urlencode(params), timeout, cancel_check
         )
         if not html.strip() or _looks_blocked(html) or len(html) < 10000:
-            # 限流时 360 只回 ~3KB 的页面骨架（结果靠前端脚本异步填充），
-            # 长度判据比关键词判据更可靠
             _start_cooldown("360")
             raise SearchBackendError("360 返回骨架页或反爬拦截页")
         page_results = parse_360_html(html, num_results)
@@ -203,10 +173,6 @@ def search_360(
     return collected
 
 
-# --- 百度结果页解析 ---------------------------------------------------------
-# 结果块：<div class="result c-container …" mu="真实URL" …>…</div>
-# 百度把真实地址放在块的 mu 属性里，href 则是 /link?url=… 的跳转链接，
-# 所以优先取 mu，拿不到才退用 href（跳转链接浏览器仍可打开）。
 _BAIDU_BLOCK_RE = re.compile(r'(?is)<div[^>]*class="result c-container[^"]*"[^>]*>')
 _BAIDU_MU_RE = re.compile(r'\smu="([^"]*)"')
 _BAIDU_DESC_RE = re.compile(
@@ -218,9 +184,6 @@ _SNIPPET_NOISE_RE = re.compile(
     r"(百度快照|查看全文|查看更多|展开全部|收起|反馈|举报|收藏|分享|\s{2,})"
 )
 
-# 百度会话：独立 cookie 容器 + 首页预热标记。
-# 实测（2026-11-15）：不预热直接搜，连续约 3 次就被转「百度安全验证」页；
-# 先访问一次首页拿到 BAIDUID 等 cookie 并带上 Referer 后，连续 4 次全部正常。
 _BAIDU_OPENER = urllib.request.build_opener(
     urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
 )
@@ -228,7 +191,6 @@ _baidu_ready = {"warmed": False}
 
 
 def _baidu_warm(timeout: float, cancel_check: Callable[[], bool] | None = None) -> None:
-    """访问百度首页预热 cookie（每个进程只做一次）。"""
     if _baidu_ready["warmed"]:
         return
     if cancel_check is not None and cancel_check():
@@ -240,12 +202,6 @@ def _baidu_warm(timeout: float, cancel_check: Callable[[], bool] | None = None) 
 
 
 def _baidu_snippet(block: str) -> str:
-    """取结果块里的摘要文字。
-
-    优先用结构化摘要容器（c-abstract / content-right / c-span-last）；百度现在
-    大量结果块不带这些类名（尤其图文混排卡片），此时回退到「h3 之后的正文」：
-    结果块里 h3 是标题，之后的文本就是摘要区，比返回「无摘要」有用得多。
-    """
     match = _BAIDU_DESC_RE.search(block)
     if match:
         tail = block[match.end():]
@@ -263,11 +219,6 @@ def _baidu_snippet(block: str) -> str:
 
 
 def parse_baidu_html(html: str, num_results: int = 10) -> list[dict]:
-    """从百度结果页 HTML 提取 ``[{title, url, snippet}]``（纯函数，便于测试）。
-
-    块范围用「下一个结果块起点」切分，而不是正则嵌套匹配 —— 百度结果是多层
-    嵌套 div，非贪婪跨块匹配会把摘要切到别的结果里去。
-    """
     starts = list(_BAIDU_BLOCK_RE.finditer(html or ""))
     results: list[dict] = []
     seen: set[str] = set()
@@ -314,10 +265,8 @@ def search_baidu(
     except SearchCancelled:
         raise
     except Exception:
-        # 预热失败/网络异常：下次重新预热，不留在"已预热"的假状态里
         _baidu_ready["warmed"] = False
         raise
-    # 安全验证页只有 1~2KB，正常结果页在 1MB 量级，长度是最稳的判别信号
     if "百度安全验证" in html or len(html) < 20000:
         _baidu_ready["warmed"] = False
         _start_cooldown("baidu")
@@ -373,14 +322,6 @@ def search_web(
     timeout: float = _DEFAULT_TIMEOUT,
     cancel_check: Callable[[], bool] | None = None,
 ) -> list[dict]:
-    """免费通道统一入口：百度 → 360 → 必应 RSS。
-
-    顺序按实测相关性排：百度与 360 的中文命中率明显好于必应（必应对生僻词会
-    对到完全不相关的热门页），但两者都有反爬；必应 RSS 是结构化接口、最稳，
-    专门兜底，因此不参与冷却。
-    返回 ``[{title, url, snippet}]``；全部通道失败时抛 ``SearchBackendError``，
-    异常信息里带上每条通道的失败原因，方便调用方在失败文本里说明。
-    """
     query = str(query or "").strip()
     if not query:
         raise SearchBackendError("查询词为空")
@@ -404,14 +345,12 @@ def search_web(
         except SearchCancelled:
             # 取消是用户意图，不能当故障吞掉去跑下一个后端
             raise
-        except Exception as error:  # 单条通道失败不应中断整轮搜索
+        except Exception as error:
             failures.append(f"{name} {type(error).__name__}: {error}")
             continue
         if not results:
             failures.append(f"{name} 未解析到结果")
             continue
-        # 条数不够就继续用后面的通道补足：泛词在百度常只回 1~2 条网页结果
-        # （其余是 AI 摘要卡片），必应虽相关性弱但条数充足，补上比缺着好。
         for item in results:
             url = (item.get("url") or "").strip()
             if not url or url in seen:
@@ -423,4 +362,3 @@ def search_web(
     if merged:
         return merged
     raise SearchBackendError("；".join(failures) or "所有免费搜索通道均不可用")
-

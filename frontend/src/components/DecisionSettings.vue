@@ -1,5 +1,4 @@
 <template>
-  <!-- 决策模型（JEV）设置分区：总开关默认关；关闭时其余控件全部置灰 -->
   <div class="decision-settings" data-test="decision-settings-page">
     <header class="decision-header">
       <div>
@@ -236,7 +235,6 @@ import type {
   DecisionSettingsSnapshot,
 } from '../types/pywebview';
 
-// 探针状态 → 中文标签（与 core.decision_service.probe_decision 的分类一一对应）
 const PROBE_LABELS: Record<string, string> = {
   available: '可用',
   no_permission: '权限不足',
@@ -282,7 +280,6 @@ const fetchFailed = ref(false);
 const auditSummary = ref<DecisionAuditSummary | null>(null);
 const auditScope = ref<'all' | 'session'>('all');
 
-// 业务场景（三态开关）：每个场景独立保存，改一项立即生效
 const sceneRows = ref<DecisionSceneRow[]>([]);
 // 正在保存的场景名（只禁用该行，避免整页置灰打断连续调整）
 const sceneSaving = ref('');
@@ -291,7 +288,6 @@ const scenesFailed = ref(false);
 
 let savedTipTimer: ReturnType<typeof setTimeout> | null = null;
 
-// 总开关关闭时：除总开关与保存按钮外的控件全部置灰（设计第 6 节）
 const controlsDisabled = computed(() => loading.value || saving.value || !enabledDraft.value);
 
 const availableEntry = computed(
@@ -394,7 +390,6 @@ function applySettings(settings: Partial<DecisionSettingsSnapshot>) {
   const mode = String(settings.key_mode ?? 'auto');
   if (mode.startsWith('index:')) {
     keyModeDraft.value = 'index';
-    // key_mode 的 N 是 0 基，界面按「第 N 把」1 基展示
     keyIndexDraft.value = (parseInt(mode.slice('index:'.length), 10) || 0) + 1;
   } else {
     keyModeDraft.value = 'auto';
@@ -420,7 +415,6 @@ async function loadSettings() {
   try {
     const api = window.pywebview?.api;
     if (!api?.get_decision_settings) {
-      // 后端未就绪（如纯前端预览）：保留默认草稿，不报错
       return;
     }
     const res = await api.get_decision_settings();
@@ -472,7 +466,6 @@ async function saveSettings() {
       savedTip.value = res.msg || '已保存';
       if (savedTipTimer) clearTimeout(savedTipTimer);
       savedTipTimer = setTimeout(() => { savedTip.value = ''; }, 2500);
-      // 全局影子开关会改变各场景的"真实生效三态"：保存后重取场景快照
       loadScenes();
     } else {
       // 保存失败：保留用户草稿不回滚，只回显后端原因
@@ -499,7 +492,7 @@ async function runProbe() {
     probeResults.value = Array.isArray(res?.results) ? res.results.map(normalizeProbe) : [];
     probeModelId.value = String(res?.model_id ?? '');
     if (res?.msg) probeMsg.value = String(res.msg);
-    loadAuditSummary(); // 探针会写一条审计记录：刷一次面板立即可见
+    loadAuditSummary();
   } catch {
     probeMsg.value = '探针执行失败';
   } finally {
@@ -570,7 +563,6 @@ function applyScenes(rows: Partial<DecisionSceneRow>[] | undefined) {
   sceneRows.value = Array.isArray(rows) ? rows.map(normalizeScene).filter((row) => row.scene) : [];
 }
 
-/** 用户选了"正式"但全局影子把场景压成影子：这一行要额外提示 */
 function sceneShadowBlocked(row: DecisionSceneRow): boolean {
   return row.requested_mode === 'live' && row.mode !== 'live';
 }
@@ -593,7 +585,6 @@ async function restoreScenes() {
   if (rows) applyScenes(rows);
 }
 
-/** 场景三态快照（设置页「业务场景」区块）：失败静默，不阻塞其余控件 */
 async function loadScenes() {
   const rows = await fetchSceneRows();
   if (rows) {
@@ -604,7 +595,6 @@ async function loadScenes() {
   scenesMsg.value = '加载业务场景失败';
 }
 
-/** 切换某场景的三态：后端按三态反推两个布尔并立即落盘 */
 async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
   if (sceneSaving.value) return;
   sceneSaving.value = row.scene;
@@ -620,10 +610,8 @@ async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
     }
     const res = await api.set_decision_scene(row.scene, mode);
     if (res?.ok) {
-      // 后端返回最新四场景快照：用它刷新，保证 mode / requested_mode 都是落盘后的真实状态
       if (res.scenes) applyScenes(res.scenes);
       scenesMsg.value = res.hint ? `${res.msg || '已保存'}；${res.hint}` : String(res.msg || '已保存');
-      // 选了「正式」但真实生效不是 live（全局影子压住）：提示改用警示色
       scenesFailed.value = mode === 'live' && res.effective_mode !== undefined && res.effective_mode !== 'live';
     } else {
       scenesFailed.value = true;
@@ -639,7 +627,6 @@ async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
   }
 }
 
-/** 改某场景阈值：钳制到 0~1 后按当前所选三态一起保存（阈值不影响三态） */
 async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
   if (sceneSaving.value) return;
   const input = event.target as HTMLInputElement;
@@ -661,7 +648,6 @@ async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
       scenesMsg.value = '后端接口未就绪，无法保存场景设置';
       return;
     }
-    // 传 requested_mode：保持「用户想要的档位」，不让全局影子的折算值覆盖用户选择
     const res = await api.set_decision_scene(row.scene, row.requested_mode, threshold);
     if (res?.ok) {
       if (res.scenes) applyScenes(res.scenes);
@@ -688,7 +674,6 @@ function setAuditScope(scope: 'all' | 'session') {
   void loadAuditSummary();
 }
 
-/** 审计汇总（决策记录面板）：加载失败静默，不阻塞其余控件 */
 async function loadAuditSummary() {
   const seq = (auditRequestSeq += 1);
   try {
@@ -729,7 +714,6 @@ async function loadAuditSummary() {
       };
     }
   } catch {
-    // 记录面板失败不弹错
   }
 }
 
@@ -757,7 +741,6 @@ function reloadAll() {
   loadAuditSummary();
 }
 
-/** 拉取可选调用通道列表（不含 Key 内容）；失败静默，不阻塞页面其余控件 */
 async function loadProviders() {
   if (channelsLoading.value) return;
   channelsLoading.value = true;
@@ -777,7 +760,6 @@ async function loadProviders() {
         .filter((item) => item.ref);
     }
   } catch {
-    // 通道列表失败不弹错：用户仍可用自动匹配或手动输入 Base URL
   } finally {
     channelsLoading.value = false;
   }

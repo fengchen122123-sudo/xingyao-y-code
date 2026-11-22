@@ -1,5 +1,3 @@
-"""Tool parsing, JSON repair, pipeline context preparation, and vision fallback."""
-
 from __future__ import annotations
 
 import hashlib
@@ -119,7 +117,6 @@ def _tool_call_arguments(tc):
 
 
 def _tool_call_name(tool_call) -> str:
-    """dict / 属性两种 tool_call 形态统一取 function.name。"""
     if isinstance(tool_call, dict):
         return str(((tool_call.get("function") or {}).get("name")) or "")
     function = getattr(tool_call, "function", None)
@@ -127,13 +124,6 @@ def _tool_call_name(tool_call) -> str:
 
 
 def _persisted_tool_calls(tool_calls):
-    """落库 tool_calls 的脱敏副本（设计 22.3/22.4，Task 16 隐私审计）。
-
-    computer 保留名的参数只留 computer_tool_arguments_projection 摘要
-    （输入正文/组合键/URL 只存 code point 数与 SHA-256），其余工具原样。
-    Provider 请求侧的 message_to_append 不经本函数——assistant tool_calls
-    与 tool 结果必须原样配对重发（协议要求），脱敏只作用于持久化副本。
-    """
     projected = []
     for tool_call in tool_calls:
         name = _tool_call_name(tool_call)
@@ -249,7 +239,6 @@ def _tool_finished_event_payload(tool_call, result, duration_ms):
 
 
 def _tool_output_preview(function_name, arguments, result):
-    """Return a stable terminal summary without exposing raw tool output."""
     ok = _tool_result_ok(function_name, result)
     return summarize_tool_finished(function_name, arguments, result, ok)
 
@@ -258,24 +247,11 @@ def _tool_output_preview(function_name, arguments, result):
 # GUI 需要展开查看原始输出，但不能让单条事件把 IPC 通道撑爆。
 TOOL_RESULT_EVENT_MAX_CHARS = 4000
 
-# 模型只输出思考未生成正文时，促升为公开回复的思考预览长度上限（字符数）。
-# 思考原文可能长达数万字，全量展示会把大段内心独白倾倒给用户。
 PROMOTED_REASONING_PREVIEW_CHARS = 600
 
-# 慢步熔断阈值（秒）：单步耗时超过该值且既未产出正文、也未发起工具调用，
-# 判为推理型小模型思考失控/静默空转，先强催促一次、再触发即结束本回合。
-# 阈值取 60s 而非更激进的值：思考型大模型在长上下文中单步思考 30~60s 属正常，
-# 阈值过低会把正常深度思考误判为空转（neohorse-1-9b 实测失控为 46.9s，60s 仍可捕获）。
 SLOW_STEP_ABORT_SECONDS = 60.0
-# 慢步熔断允许的强催促次数上限：达到上限后再次触发直接结束循环、返回已有内容。
 SLOW_STEP_MAX_NUDGES = 1
 
-# ─── D 方案：验证声明检测护栏 ────────────────────────────────────────
-# 触发条件：本回合调用过写入类工具（名称含 write/edit）、却一次命令执行类工具都没
-# 调用（名称含 execute_command/run_command/shell/bash/terminal/exec），而收尾正文却
-# 声称"测试通过/已验证"。此时模型是在口头交付一份从未真实运行过的结论（典型的
-# "谎报验证"），追加一条 user 提醒要求它立刻跑命令并贴出原始输出。
-# 只命中这些强表述：刻意不匹配"已确认/已核对"等弱表述，避免干扰正常收尾。
 VERIFY_CLAIM_MARKERS = (
     "测试通过",
     "运行通过",
@@ -287,8 +263,6 @@ VERIFY_CLAIM_MARKERS = (
     "all tests passed",
     "tests passed",
 )
-# 命中否定过滤（评审建议1）：标记前 4 个字符内出现这些词，视为否定/疑问语境，
-# 不算验证声明（例如"没有全部通过""是否已通过""尚未通过"）。
 CLAIM_NEGATION_PREFIXES = ("未", "没", "无", "尚未", "不能", "是否", "并非", "不算")
 # 验证声明护栏允许的提醒次数上限：达到上限后不再介入（避免与模型反复声明打转）。
 VERIFY_CLAIM_MAX_NUDGES = 1
@@ -297,7 +271,6 @@ VERIFY_CLAIM_NUDGE_TEXT = (
     "你声称已完成验证，但本回合没有执行任何命令。"
     "请立即用工具真实运行验证并贴出原始输出；若未验证，请如实说明未验证。"
 )
-# 命令执行类工具名标记：按工具名粗分类，不做精确白名单（新增同类工具自动覆盖）。
 COMMAND_TOOL_NAME_MARKERS = (
     "execute_command",
     "run_command",
@@ -309,12 +282,6 @@ COMMAND_TOOL_NAME_MARKERS = (
 
 
 def _tool_call_activity_kinds(tool_calls):
-    """按工具名粗分一批工具调用里是否出现写入类/命令执行类工具。
-
-    返回 (used_write_tools, used_command_tools)。纯函数、无副作用：只看名称
-    子串（写入类：write/edit；命令执行类：COMMAND_TOOL_NAME_MARKERS），不解析
-    参数、不看执行结果，因此对既有请求字节与流程零影响。
-    """
     used_write_tools = False
     used_command_tools = False
     for call in tool_calls or ():
@@ -332,18 +299,6 @@ def _tool_call_activity_kinds(tool_calls):
 def _claims_verification_without_evidence(
     final_text, used_write_tools, used_command_tools
 ):
-    """收尾正文是否"口头声称已验证、却没有命令执行证据"。
-
-    当且仅当：本回合用过写入类工具、没用过命令执行类工具、且正文命中
-    VERIFY_CLAIM_MARKERS 任一标记时返回 True。文本为空/空白返回 False；
-    只命中强表述（"测试通过/已验证…"），"已确认/已核对"等弱表述刻意不匹配；
-    否定/疑问语境（标记前 4 字内含 CLAIM_NEGATION_PREFIXES）与"通过率"不算命中。
-
-    已知边界（评审记录，属有意的低成本取舍）：本函数只按工具**名称**分类，
-    不检查命令的执行结果，因此模型跑一条无关或失败的命令即可让护栏失效；
-    父回合把验证委托给 run_subagent 时也不算命令证据。护栏只做一次提醒、
-    不做强拦截，故接受该边界。
-    """
     if not used_write_tools or used_command_tools:
         return False
     text = str(final_text or "")
@@ -360,8 +315,6 @@ def _claims_verification_without_evidence(
                 break
             window = text[max(0, idx - 4):idx]
             following = text[idx + len(marker):idx + len(marker) + 1]
-            # 否定/疑问语境（如"没有全部通过""是否已通过"）与"通过率"这类
-            # 非声明用法不算验证声明。
             if not any(neg in window for neg in CLAIM_NEGATION_PREFIXES) and following != "率":
                 return True
             start = idx + 1
@@ -369,10 +322,6 @@ def _claims_verification_without_evidence(
 
 
 def _tool_result_text(result):
-    """把工具消息正文取出并截断，作为 tool_finished 事件的 result 字段。
-
-    这是附加字段：CLI 只读 summary，多出的 result 对它无副作用。
-    """
     try:
         content = result.get("content", "") if isinstance(result, dict) else result
     except Exception:
@@ -421,7 +370,6 @@ _PLAN_STATE_RESULT_TOOLS = frozenset({
 
 
 def _canonical_arguments_signature(name, tool_call):
-    """读取签名 = tool name + canonical arguments 的 SHA-256（仅存 Turn 内存）。"""
     raw = ""
     if tool_call:
         raw = str((tool_call.get("function") or {}).get("arguments") or "")
@@ -438,12 +386,6 @@ def _canonical_arguments_signature(name, tool_call):
 
 
 def _unplanned_subagent_progress_part(message, tool_call):
-    """返回无计划子任务的稳定进展材料；计划绑定调用返回 None。
-
-    参数签名区分模型实际派发的不同工作。结果只保留稳定的 status/result，
-    明确排除 task_id、耗时与 error 等运行噪声；计划绑定调用则完全交给计划
-    快照指纹判定，不能靠改描述或动态任务 id 重置停滞计数。
-    """
     raw_arguments = ""
     if tool_call:
         raw_arguments = str(
@@ -470,7 +412,6 @@ def _unplanned_subagent_progress_part(message, tool_call):
         if "result" in payload:
             stable_result["result"] = payload.get("result")
     else:
-        # 前台 completed 路径直接返回子代理正文；正文就是实际成果信号。
         stable_result = {"status": "completed", "result": content}
     return [
         "run_subagent",
@@ -480,13 +421,6 @@ def _unplanned_subagent_progress_part(message, tool_call):
 
 
 def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
-    """构造本 Step 的确定性进展观察（供 TurnProgressGuard 判定）。
-
-    只聚合确定性状态：后台任务指纹、计划 canonical 快照指纹、
-    非观察类工具结果哈希、修改类提交标记；不读取模型自然语言。
-    附加本步只读工具签名，供 guard 做有界（MAX_UNIQUE_READS）读取进展
-    判定（所有会话通用，普通只读调查链不再被误判停滞）；签名不写 Journal。
-    """
     from core.harness.progress_guard import ProgressObservation
     from core.harness.tool_pipeline import (
         _PLAN_READ_ONLY_TOOLS,
@@ -502,7 +436,6 @@ def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
         message = getattr(record, "message", None) or {}
         name = str(message.get("name", "") or "")
         content = str(message.get("content", "") or "")
-        # RepeatCallGuard 拦截结果是固定文案，不代表任何业务状态变化
         if content == REPEAT_CALL_BLOCKED_TEXT:
             continue
         ok = _tool_result_ok(name, message)
@@ -564,7 +497,6 @@ def _show_file_diff(
     truncated_note,
     tool_call_id="",
 ):
-    """Compatibility wrapper for the extracted diff adapter."""
     from core.harness.tool_adapters import _show_file_diff as _render_file_diff
 
     return _render_file_diff(
@@ -578,7 +510,6 @@ def _show_file_diff(
     )
 
 def _get_imom_active_publish_root():
-    """Compatibility wrapper for the extracted imom adapter."""
     from core.harness.tool_adapters import _get_imom_active_publish_root as _get_root
 
     return _get_root()
@@ -627,7 +558,6 @@ def _sandbox_outside_guard(
     cancel_event,
     **kwargs,
 ):
-    """Compatibility wrapper for the extracted sandbox adapter."""
     from core.harness.tool_adapters import _sandbox_outside_guard as _guard
 
     return _guard(
@@ -658,6 +588,7 @@ def _build_tool_pipeline_and_context(
     permission_source="主代理",
     computer_lease=None,
     computer_native_selection=None,
+    computer_capability=None,
     journal_event_sink=None,
     harness_step=None,
 ):
@@ -712,11 +643,8 @@ def _build_tool_pipeline_and_context(
         mcp_manager=_adapter("_get_mcp_manager", _get_mcp_manager)(),
         computer_lease=computer_lease,
         computer_native_selection=computer_native_selection,
-        # C6/C7 接线：注入默认 HookRunner（进程内单例）。无 hooks 配置时
-        # runner 各层快速短路，工具链行为与字节保持改造前完全一致（H-T16）。
+        computer_capability=computer_capability,
         hook_runner=get_default_hook_runner(),
-        # 续跑记录（S1-b）：由调用方（core/llm.py 的 turn/step 作用域）注入。
-        # 默认 None 时既不写 journal 也不写 tool_call_count，行为与改造前一致。
         journal_event_sink=journal_event_sink,
         harness_step=harness_step,
     )
@@ -741,7 +669,6 @@ def _execute_single_tool_call(
     permission_owner=None,
     permission_source="主代理",
 ):
-    """Compatibility wrapper around the extracted deterministic pipeline."""
     pipeline, context = _build_tool_pipeline_and_context(
         event_callback,
         parent_session=parent_session,
@@ -760,14 +687,10 @@ _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
 # 固定 Harness 管线中，避免形成第二套重复调用判定逻辑。
 from core.harness.tool_pipeline import RepeatCallGuard as _RepeatCallGuard
 
-# ─── 工具结果入上下文前的截断 ────────────────────────────────────
-# 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
-# 一次 pip install 的 stdout 可以是几 MB。截断只影响送进模型上下文/落库的内容，
-# 不影响工具本身的执行结果与终端展示。
-_TOOL_RESULT_MAX_CHARS = 24000            # 默认上限（约 8K token）
+_TOOL_RESULT_MAX_CHARS = 24000
 _TOOL_RESULT_LIMITS = {
-    "execute_command": 16000,             # 保留头尾：报错信息几乎都在结尾
-    "fetch_url": 16000,                   # 保留头部：正文开头信息密度最高
+    "execute_command": 16000,
+    "fetch_url": 16000,
     "search_news": 8000,
 }
 _TOOL_RESULT_TAIL_TOOLS = {"execute_command"}
@@ -780,7 +703,6 @@ _TOOL_RESULT_EXEMPT = {"read_file"}
 
 
 def _read_file_result_limit():
-    """read_file 结果入上下文的字符上限；0/缺省 = 不限。配置读取失败时静默不限。"""
     try:
         from core.model_manager import load_config
         return int(load_config().get("read_file_result_max_chars", 0) or 0)
@@ -815,7 +737,6 @@ def _truncate_tool_result_for_context(function_name, text):
     )
 
 def _call_vision_model_for_content(secondary, content, cancel_event=None, max_retries=3):
-    """调用支持视觉的副模型，传入完整 content（含图片），返回回复文本；失败返回空字符串。"""
     kwargs = {
         "model": secondary["litellm_model"],
         "messages": [{"role": "user", "content": content}],
@@ -873,7 +794,6 @@ def _call_vision_model_for_content(secondary, content, cancel_event=None, max_re
 
 
 def _vision_fallback_text(user_text=""):
-    """图片分析失败时替换用的提示文本，明确让主模型直接回复用户。"""
     hint = (
         "[当前主模型和副模型均不支持图片输入或图片分析失败，无法处理图片。"
         "请直接回复用户：无法分析图片，不要调用任何工具。]"
@@ -884,11 +804,9 @@ def _vision_fallback_text(user_text=""):
 
 
 def _describe_images_with_secondary(messages, main_model_name, event_callback=None, cancel_event=None):
-    """主模型不识图时，直接用副模型分析本轮最新图片并替换为文字描述/回答。"""
     if _supports_vision_llm_first(main_model_name):
         return
 
-    # 只处理最近一条用户消息中的图片；历史图片即使还在上下文里也不再重复分析
     target_msg = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -928,7 +846,6 @@ def _describe_images_with_secondary(messages, main_model_name, event_callback=No
         "message": f"主模型不支持图片输入，正在使用副模型 {secondary['name']} 分析图片...",
     })
 
-    # 把用户的问题也一起给副模型，让副模型直接作答
     if user_text:
         vision_prompt = f"请基于图片的视觉内容回答以下问题：{user_text}"
     else:
@@ -950,16 +867,6 @@ def _describe_images_with_secondary(messages, main_model_name, event_callback=No
 
 
 def _refill_messages_after_compression(messages, manager, session):
-    """上下文超限强制压缩后，原地用压缩后的 DB 历史重建请求消息列表。
-
-    历史必须走 get_history_for_llm：剔除刚被摘要排除的消息（水位之后才是
-    活跃区）、挂载记忆摘要并修复 tool_call 配对。此前误用全量 get_history
-    ——刚被压缩排除的消息被原样塞回，重试载荷不降反升，兜底路径必然再次
-    超限并报出误导性的「压缩后仍超窗」错误，且记忆摘要挂载整条丢失。
-    首部系统提示词（稳定前缀 + 会话内注入块）每轮现组、不落库，从原
-    列表完整保留并前置；DB 中旧格式遗留的 system 上下文块与
-    prepare_turn_messages 的清理口径一致，重读时整体丢弃。
-    """
     system_blocks = [
         m for m in messages if isinstance(m, dict) and m.get("role") == "system"
     ]
@@ -968,4 +875,3 @@ def _refill_messages_after_compression(messages, manager, session):
         m for m in refreshed if not (isinstance(m, dict) and m.get("role") == "system")
     ]
     messages[:] = system_blocks + refreshed
-

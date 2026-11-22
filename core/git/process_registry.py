@@ -1,10 +1,3 @@
-"""Workspace Process Registry（规格 §9.2）。
-
-登记 execute_command / GUI 内嵌终端 / 后台任务的活动状态，供 Git 操作兼容矩阵
-判断"同 Worktree 存在哪些活动命令"。登记失败绝不影响命令执行本身（调用方
-以 try/except 包裹）。
-"""
-
 from __future__ import annotations
 
 import threading
@@ -14,12 +7,6 @@ from typing import Dict, Optional, Tuple
 
 from core.git.repository import normalize_repo_path
 
-# risk_class 语义：
-#   git       —— 可识别的直接 git 命令（可接入 GitOperationCoordinator）
-#   readonly  —— 可识别的只读查询命令
-#   service   —— 可识别的长期监听服务
-#   mutation  —— 可识别的仓库/文件变更命令
-#   unknown   —— 无法可靠分类（按"未知前台变更命令"从保守处理）
 _RISK_READONLY_COMMANDS = frozenset(
     {"ls", "dir", "cat", "type", "pwd", "whoami", "echo", "find", "grep", "rg", "head", "tail", "wc"}
 )

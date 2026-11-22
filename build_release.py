@@ -1,31 +1,3 @@
-"""
-build_release.py
-Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安装包体系。
-
-产出物（均在 dist/ 下）：
-  dist/ycode/                  onedir 核心程序包，同时包含：
-      Y-code.exe                 GUI 窗口版 (pywebview, console=False)，同时也是
-                                 `--cli` 模式下的 CLI 实现（唯一一份 Python 载荷）
-      ycode.exe                  CLI 启动器（几 KB 的 C# 控制台程序，把参数原样
-                                 透传并追加 --cli 拉起 Y-code.exe；由
-                                 build_cli_launcher 用 csc 编译，不再是 PyInstaller 产物）
-      _internal/                 两者共享的运行时依赖与数据文件
-  dist/ycode_uninstall.exe     独立卸载向导
-  dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（单独分发，补装/纯 CLI 用户）
-  dist/XingYaoCode-{版本}.exe  主安装向导（默认装 GUI，可选附带装 CLI）
-  dist/release_parts/          Gitee Release 附件（超 100MB 的安装包按 ≤95MB
-                               二进制分卷 .part1/.part2/...，附 RELEASE_NOTES.txt
-                               上传指引，内含 SHA256 校验行）
-  （两个安装向导文件名带版本号，便于多渠道分发时区分新旧。）
-
-用法：
-  venv\\Scripts\\python build_release.py                   完整构建
-  venv\\Scripts\\python build_release.py --cli-only         只构建 CLI 相关产物，跳过主安装包
-  venv\\Scripts\\python build_release.py --skip-frontend    跳过前端构建，直接用现有 frontend/dist
-  venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build
-  venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
-  venv\\Scripts\\python build_release.py --no-split-parts   跳过分卷切割（产物不分发到 Gitee 时用）
-"""
 import argparse
 import datetime
 import glob
@@ -41,10 +13,6 @@ import zipfile
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-
-# ============================================================================
-# 通用工具函数
-# ============================================================================
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -98,11 +66,6 @@ def resolve_pyinstaller(project_dir):
 
 
 def _strip_python_comment(line):
-    """剥掉一行 Python 代码里的注释（整行与行尾）：引号外的首个 # 起截断。
-
-    spec 里的 collect_all('x') 写进注释只是文档不是配置，混进解析结果会让
-    硬校验对不存在的包误报缺依赖、白白卡死构建，因此解析前必须剥离。
-    """
     in_str = None
     for i, ch in enumerate(line):
         if in_str:
@@ -135,7 +98,6 @@ def collect_all_targets_from_spec(spec_path):
 
 
 def find_missing_collect_all_targets(targets):
-    """返回 targets 中构建环境 import 不到的包名（find_spec 只定位不执行模块）。"""
     missing = []
     for name in targets:
         try:
@@ -148,16 +110,6 @@ def find_missing_collect_all_targets(targets):
 
 
 def verify_spec_collect_all_targets(project_dir):
-    """主程序构建前的环境硬校验：ycode.spec 每个 collect_all 目标必须可 import。
-
-    背景：PyInstaller 的 collect_all 对构建环境里缺失的包静默返回空三元组
-    （6.21.0 实测只打 WARNING 不报错），Analysis 照常通过，产物直接丢依赖。
-    pywinpty（GUI 内嵌终端）是重灾区——core/gui_terminal.py 被 gui_bridge.py 顶层
-    导入，其 `from winpty import PtyProcess` 虽是函数内 import，但仍是字面 import、
-    字节码扫描可识别，Python 模块本身不漏收；真正需要 collect_all 的是 pywinpty 的
-    原生二进制与 datas（默认收集不全，collect_all 是收全它们的唯一通道）；缺包时
-    打包版终端启动即报 ModuleNotFoundError，且整个构建流程没有任何失败信号。
-    """
     return find_missing_collect_all_targets(
         collect_all_targets_from_spec(os.path.join(project_dir, "ycode.spec"))
     )
@@ -192,17 +144,7 @@ def format_size_mb(path):
     return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-# ============================================================================
-# 步骤 0：前端构建
-# ============================================================================
-
 def read_playwright_version(project_dir):
-    """从 venv 里 playwright 的 _repo_version.py 读版本号；读不到返回 "0.0.0"。
-
-    该文件由 hatch-vcs 生成，实体形如 `__version__ = version = '1.62.0'`；
-    这里只做正则解析，不 import playwright（import 会拉起完整运行时依赖，
-    构建脚本不该为读一个字符串付这个代价）。
-    """
     version_file = os.path.join(
         project_dir, "venv", "Lib", "site-packages", "playwright", "_repo_version.py"
     )
@@ -220,21 +162,10 @@ def read_playwright_version(project_dir):
     return "0.0.0"
 
 
-# ============================================================================
-# 步骤 0b：playwright 组件包（运行时由 core/components.py 下载安装）
-# ============================================================================
-
 PLAYWRIGHT_COMPONENT_SOURCES = ("playwright", "greenlet", "pyee")
 
 
 def step0b_build_playwright_component(project_dir):
-    """把 playwright 运行时（含 driver/node.exe）打成可发布到 Gitee Release 的组件包。
-
-    组件包根目录平铺 COMPONENT.json + playwright/ + greenlet/ + pyee/，正好满足
-    core/components.py 的 _locate_component_root 校验（COMPONENT.json 与
-    playwright/driver/node.exe 必须同时存在）。greenlet 是 cp314 编译扩展，
-    必须从当前 venv 复制，保证 ABI 与打包版 Python 3.14 一致。
-    """
     print("\n[步骤 0b/5] 正在产出 playwright 组件包 (dist/playwright-component-*.zip)...")
     site_packages = os.path.join(project_dir, "venv", "Lib", "site-packages")
     missing = [
@@ -249,9 +180,6 @@ def step0b_build_playwright_component(project_dir):
     dist_dir = os.path.join(project_dir, "dist")
     os.makedirs(dist_dir, exist_ok=True)
     zip_path = os.path.join(dist_dir, f"playwright-component-{version}.zip")
-    # 同版本组件包已存在就复用：LZMA 压缩 107MB（node.exe 占 88MB）单线程要
-    # 十几分钟，每次完整构建都重压一遍纯属浪费。内容由 playwright 版本号决定，
-    # 版本变则文件名变，不存在"旧内容被误用"。需要强制重建时先删掉该 zip。
     if os.path.exists(zip_path):
         print(f"✅ 已存在同版本组件包，跳过压缩: {zip_path} ({format_size_mb(zip_path)})")
         return zip_path
@@ -301,21 +229,10 @@ def step0b_build_playwright_component(project_dir):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# ============================================================================
-# 步骤 0d：ffmpeg 组件包（运行时由 core/components.py 的 FFMPEG_SPEC 下载安装）
-# ============================================================================
-
 FFMPEG_COMPONENT_FILES = ("ffmpeg.exe", "NOTICE.txt")
 
 
 def read_ffmpeg_version(project_dir):
-    """从 vendor/ffmpeg/NOTICE.txt 解析 ffmpeg 版本号，解析不出返回 "bundled"。
-
-    只认 NOTICE.txt 里那行「版本 : ffmpeg version 8.1-essentials_build-www.gyan.dev」
-    的数字版本段（→ "8.1"）：完整构建串里带下载站后缀，塞进 zip 文件名会很难看。
-    刻意**不执行 ffmpeg.exe -version**：那是 96MB 二进制，冷启动要几秒且会把
-    stdout 编码/编码页问题引进构建脚本，而版本事实已在 NOTICE.txt 里由构建者记录。
-    """
     notice_path = os.path.join(project_dir, "vendor", "ffmpeg", "NOTICE.txt")
     try:
         with open(notice_path, "r", encoding="utf-8") as f:
@@ -331,24 +248,11 @@ def read_ffmpeg_version(project_dir):
 
 
 def step0d_build_ffmpeg_component(project_dir):
-    """把仓库里自带的 ffmpeg 打成可发布到 Gitee Release 的组件包。
-
-    与 playwright 组件包（step0b）不同，ffmpeg 是**可选**能力：仓库里没有
-    ffmpeg.exe（.gitignore 排除的大文件，见 vendor/VENDOR_MANIFEST.json 的
-    optional 记录）时只告警并返回 None，绝不能让整个构建失败——否则没装
-    ffmpeg 的构建机就再也打不出安装包了。
-
-    包内布局必须是「根目录直接平铺 COMPONENT.json + ffmpeg.exe」：
-    core/components.py 的 _locate_component_root_impl 用 required_files[0]
-    （即 "ffmpeg.exe"）与 COMPONENT.json 在**同一层**同时存在来判定组件根，
-    多套一层目录虽然它有兜底探测，但会让安装目录里多一层无谓嵌套，不干净。
-    """
     print("\n[步骤 0d/5] 正在产出 ffmpeg 组件包 (dist/ffmpeg-component-*.zip)...")
     ffmpeg_dir = os.path.join(project_dir, "vendor", "ffmpeg")
     sources = [os.path.join(ffmpeg_dir, name) for name in FFMPEG_COMPONENT_FILES]
     missing = [path for path in sources if not os.path.isfile(path)]
     if missing:
-        # 可选组件：告警后跳过，不中断构建（与 playwright 的 sys.exit(1) 不同）。
         print("⚠️ ffmpeg 组件源文件缺失，本次不产出组件包: "
               + ", ".join(os.path.relpath(path, project_dir) for path in missing))
         print("   影响：设置页「下载视频转换组件」会报『未找到组件下载源』，"
@@ -359,9 +263,6 @@ def step0d_build_ffmpeg_component(project_dir):
     dist_dir = os.path.join(project_dir, "dist")
     os.makedirs(dist_dir, exist_ok=True)
     zip_path = os.path.join(dist_dir, f"ffmpeg-component-{version}.zip")
-    # 同版本组件包已存在就复用：ffmpeg.exe 97MB，LZMA 单线程压缩要几分钟，
-    # 每个完整构建都重压一遍纯属浪费。版本号取自 NOTICE.txt，换构建则版本变、
-    # 文件名变，不会误用旧包；需要强制重建时先删掉该 zip。
     if os.path.exists(zip_path):
         print(f"✅ 已存在同版本组件包，跳过压缩: {zip_path} ({format_size_mb(zip_path)})")
         return zip_path
@@ -378,15 +279,12 @@ def step0d_build_ffmpeg_component(project_dir):
     print("📦 正在压缩 ffmpeg 组件包 (LZMA，97MB 需要几分钟)...")
     count = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
-        # 直接以文件名（不带目录）为 arcname 写入 → 压缩包根目录平铺，正好满足
-        # _locate_component_root_impl 的布局要求。
         for src in sources:
             zf.write(src, os.path.basename(src))
             count += 1
         zf.writestr("COMPONENT.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         count += 1
 
-    # SHA256 要把成品 zip 全量读一遍（本机约 97MB 输入 / 数十 MB 输出），几秒正常。
     digest = sha256_file(zip_path)
     print(f"✔ 组件包产出完成: {count} 个文件 -> {format_size_mb(zip_path)}")
     print(f"   - 文件  : {zip_path}")
@@ -394,31 +292,10 @@ def step0d_build_ffmpeg_component(project_dir):
     return zip_path
 
 
-# ============================================================================
-# 步骤 0e：网页搜索组件包（运行时由 core/components.py 的 SEARCH_SPEC 下载安装）
-# ============================================================================
-
-# 只服务网页搜索（ddgs）的顶层包目录：主安装包已不再内置，全部改由本组件携带。
-#   ddgs           —— 搜索聚合库本身
-#   primp          —— ddgs 的 HTTP 客户端，Rust 扩展（.pyd），平台绑定
-#   lxml           —— ddgs 的 HTML 解析依赖，C 扩展（.pyd），平台绑定
-#   fake_useragent —— ddgs 的 UA 伪装依赖（仅 ddgs 使用）
-# 刻意**不含** click / httpx / certifi：ddgs 的 Requires 确实列了 click 与 httpx，
-# 但这两个是主程序自己的依赖（litellm / uvicorn / 各处 HTTP 调用都直接用），
-# ycode.spec 不能排除它们，它们留在主安装包里即可被组件复用（组件目录的包
-# 只是插在 sys.path 前面，同名的仍能从主包导入）。
 SEARCH_COMPONENT_SOURCES = ("ddgs", "primp", "lxml", "fake_useragent")
 
 
 def read_search_version(project_dir):
-    """从 venv 里 ddgs/__init__.py 读 `__version__ = "9.14.4"` 形式的版本号。
-
-    读不到（缺文件 / 格式变化）时回退 "bundled"：组件包文件名会变成
-    dist/search-component-bundled.zip，Core 侧按 asset_hint 只匹配名字片段，
-    不解析版本，所以回退不影响下载安装，只是失去版本区分度。
-    刻意不 import ddgs：import 会拉起 lxml/primp 等二进制扩展，
-    构建脚本不该为读一个字符串付这个代价（同 read_playwright_version 的思路）。
-    """
     init_file = os.path.join(
         project_dir, "venv", "Lib", "site-packages", "ddgs", "__init__.py"
     )
@@ -435,17 +312,6 @@ def read_search_version(project_dir):
 
 
 def step0e_build_search_component(project_dir):
-    """把 ddgs 及其二进制依赖打成可发布到 Gitee Release 的网页搜索组件包。
-
-    包内布局：根目录平铺 COMPONENT.json + ddgs/ + primp/ + lxml/ + fake_useragent/。
-    core/components.py 的 SEARCH_SPEC 用 required_dirs（四个顶层包目录）判定安装完整，
-    _locate_component_root_impl 要求 COMPONENT.json 与这些目录在**同一层**，
-    所以不能再套一层目录。
-
-    与 ffmpeg 组件一样按「可选组件」处理：venv 里缺包时只告警并返回 None，
-    不中断构建——组件包缺失只影响用户能否下载网页搜索能力，不该让整条发布
-    流水线失败（Core 侧会提示「未找到组件下载源」）。
-    """
     print("\n[步骤 0e/5] 正在产出网页搜索组件包 (dist/search-component-*.zip)...")
     site_packages = os.path.join(project_dir, "venv", "Lib", "site-packages")
     missing = [
@@ -463,8 +329,6 @@ def step0e_build_search_component(project_dir):
     dist_dir = os.path.join(project_dir, "dist")
     os.makedirs(dist_dir, exist_ok=True)
     zip_path = os.path.join(dist_dir, f"search-component-{version}.zip")
-    # 同版本已存在就复用：lxml/primp 都是二进制轮子，LZMA 压缩不算便宜，
-    # 每次构建都重压一遍没有意义；需要强制重建时先删掉该 zip。
     if os.path.exists(zip_path):
         print(f"✅ 已存在同版本组件包，跳过压缩: {zip_path} ({format_size_mb(zip_path)})")
         return zip_path
@@ -474,8 +338,6 @@ def step0e_build_search_component(project_dir):
         shutil.rmtree(tmp_dir, ignore_errors=True)
     os.makedirs(tmp_dir, exist_ok=True)
     try:
-        # 剔除 __pycache__/*.pyc/tests：字节码与上游测试都不参与运行，
-        # 留着只会让 zip 变大（二进制扩展同目录常有几十 KB 缓存）。
         ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "tests")
         for name in SEARCH_COMPONENT_SOURCES:
             shutil.copytree(
@@ -500,7 +362,6 @@ def step0e_build_search_component(project_dir):
         print("📦 正在压缩网页搜索组件包 (LZMA)...")
         count = 0
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
-            # 以相对 tmp_dir 的路径为 arcname：包根目录就是各包目录 + COMPONENT.json
             for root, _dirs, files in os.walk(tmp_dir):
                 for name in files:
                     src = os.path.join(root, name)
@@ -562,13 +423,8 @@ def step0_build_frontend(project_dir, args):
         print("   3) frontend/src 下的 TypeScript / Vue 代码存在编译错误")
         sys.exit(1)
 
-    # 首屏包体积守门：GUI 首屏只加载 index-*.js，体积必须受控。
-    # 既有约定是重依赖（语言包、语法高亮语言模式、图表/终端等大库）一律动态 import，
-    # 一旦某个大模块被静态引入，这里就会失败并给出可读告警。
-    # 注：计划原文用 `base_dir`，本函数的对应变量名是 `project_dir`（函数内无 base_dir），
-    # 故这里逐字保留校验逻辑、只把根目录变量名对齐到本函数的作用域。
     dist_assets = os.path.join(project_dir, "frontend", "dist", "assets")
-    MAX_ENTRY_BYTES = 1_800_000  # 首屏 JS 上限 1.8 MB
+    MAX_ENTRY_BYTES = 1_800_000
     if os.path.isdir(dist_assets):
         entry_files = [
             f for f in os.listdir(dist_assets)
@@ -589,7 +445,6 @@ def step0_build_frontend(project_dir, args):
 
     print(f"✅ 前端构建成功: {index_html}")
 
-    # ---- 独立移动端子应用（frontend-mobile/dist，/m/ 托管；缺失仅影响新界面）----
     print("\n[步骤 0.5/5] 构建 / 复用移动端子应用产物 (frontend-mobile/dist)...")
     mobile_dir = os.path.join(project_dir, "frontend-mobile")
     mobile_dist = os.path.join(mobile_dir, "dist")
@@ -632,10 +487,6 @@ def step0_build_frontend(project_dir, args):
     print(f"✅ 移动端构建成功: {mobile_index}")
 
 
-# ============================================================================
-# 步骤 1：核心程序包（Y-code.exe 唯一 Python 载荷 + ycode.exe 控制台启动器）
-# ============================================================================
-
 def find_csc():
     """定位 .NET Framework 自带的 csc.exe（Windows 10/11 默认存在，无需装 VS）。
 
@@ -659,18 +510,6 @@ def find_csc():
 
 
 def build_cli_launcher(project_dir, ycode_dir):
-    """把 ycode.exe 编译成几 KB 的 C# 控制台启动器（转发到 Y-code.exe --cli）。
-
-    背景：原先 Y-code.exe(GUI) 与 ycode.exe(CLI) 各自内嵌一份约 31MB 的
-    PyInstaller 字节码归档（PYZ），实测两份里 30.83MB 的共用模块完全相同、
-    CLI 独有模块只有 0.12MB。现在 ycode.spec 只产出 GUI 那一路，ycode.exe
-    由 packaging/ycode_launcher.cs 编译而来：原样透传参数、继承标准输入输出、
-    等待子进程并返回其退出码。
-
-    找不到 csc 时回退为复制 Y-code.exe（CLI 会以 GUI 模式启动，控制台模式
-    不可用），打印显眼告警但不中断构建——宁可交付一个能用的 GUI 包，也不要
-    因为构建机缺 .NET Framework 而让整条发布流水线失败。
-    """
     print("\n[步骤 1.5/5] 正在编译 CLI 控制台启动器 ycode.exe...")
     source = os.path.join(project_dir, "packaging", "ycode_launcher.cs")
     target = os.path.join(ycode_dir, "ycode.exe")
@@ -718,9 +557,6 @@ def build_cli_launcher(project_dir, ycode_dir):
 
 def step1_build_core(pyinstaller_bin, project_dir):
     print("\n[步骤 1/5] 正在编译核心程序包 (Y-code.exe GUI，CLI 共用同一份载荷)...")
-    # 用 ycode.spec 而不是一堆 CLI flag：spec 里配置了单套 GUI Analysis（CLI 走
-    # --cli 模式共用同一份 PYZ）、collect_all 依赖收集与 upx=False（避免启动时
-    # 内存解压 + Defender 扫描拖慢启动速度），这些精细控制没法完全用 CLI 表达。
     cmd = [pyinstaller_bin, "--clean", "--noconfirm", "ycode.spec"]
     run_checked(cmd, "核心程序包编译")
 
@@ -737,10 +573,6 @@ def step1_build_core(pyinstaller_bin, project_dir):
     print(f"   - CLI 控制台版: {cli_exe}")
     return ycode_dir
 
-
-# ============================================================================
-# 步骤 2：卸载程序
-# ============================================================================
 
 def step2_build_uninstaller(pyinstaller_bin, project_dir):
     """确认卸载向导已由 ycode.spec 产出（与主程序共享 _internal 的 onedir 入口）。
@@ -761,24 +593,7 @@ def step2_build_uninstaller(pyinstaller_bin, project_dir):
     return uninstall_exe
 
 
-# ============================================================================
-# 步骤 3 / 4：安装向导
-# (ycode_setup.py 是同一份源码；靠内嵌的 setup_mode.txt marker 文件区分
-#  'cli' / 'full' 两种运行模式，因此这里构建两次、每次内嵌不同的数据。)
-# ============================================================================
-
 def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_data_pairs):
-    """通用安装向导构建：把 mode（'cli'/'full'）和版本号写入临时 marker 文件，随构建一并打包进 exe。
-
-    这里没有用静态 .spec 文件表达 cli/full 两个变体，是因为它们依赖的内嵌数据
-    ——尤其是 dist/ycode_cli_setup.exe 这种“上一步骤才产出”的文件——在两次
-    调用之间是不同的。用 CLI --add-data 动态拼装，比维护两份高度相似、还要
-    应对“某些源文件此刻可能还不存在”的 spec 文件更清晰，也更不容易出现
-    “spec 文件内容和实际构建命令对不上”的配置漂移。
-    """
-    # 用项目内 build/ 下的临时目录而不是系统 %TEMP%：一是复用已被 .gitignore
-    # 忽略的 build/ 目录，二是避免当用户目录名包含中文等非 ASCII 字符时，
-    # 个别工具链对系统临时目录路径处理不稳的问题。
     tmp_dir = os.path.join(project_dir, "build", f"_setup_tmp_{mode}")
     if os.path.exists(tmp_dir):
         shutil.rmtree(tmp_dir)
@@ -793,16 +608,7 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
             f.write(read_project_version(project_dir))
 
         cmd = [
-            # --windowed：安装向导是 tkinter GUI，不能弹出黑色控制台窗口
             pyinstaller_bin, "--clean", "--noconfirm", "--onefile", "--windowed", "--noupx",
-            # 安装向导除标准库 + tkinter 之外不需要任何第三方运行时：
-            #   - PIL：侧栏 logo 已改为构建期预缩放的 assets/ycode-logo-168.png，
-            #     运行期用 tk.PhotoImage 直接读，不再 import PIL（省 ~15MB）；
-            #   - numpy：安装向导自己从不 import，它只是 PIL 的可选依赖，
-            #     PyInstaller 的 hook 会顺带扫进来（省 ~31MB）。
-            # 这两项只影响本函数拼出来的向导构建命令，不影响 ycode.spec 里
-            # 主程序/卸载器的 Analysis（主程序 core/gui_theme.py 顶层 import PIL，
-            # 绝不能全局排除）。
             "--exclude-module", "numpy",
             "--exclude-module", "PIL",
             "--name", output_name,
@@ -833,21 +639,6 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
 
 
 def make_payload_archive(project_dir, ycode_dir):
-    """把 dist/ycode 整个目录压缩成单个 ycode_pkg.zip 作为安装向导的载荷。
-
-    安装向导是 PyInstaller onefile exe：启动时要先把内嵌数据全部解压到临时
-    目录才能显示界面。内嵌 4000+ 散文件时，解压 + 杀毒软件逐个扫描会让双击后
-    超过一分钟毫无反应（用户以为安装包坏了）。压缩成单文件后，启动解压量从
-    4000+ 个文件降到十几个，界面几秒内出现；真正的文件释放挪到安装步骤里做
-    （有进度条，符合正常安装体验）。
-
-    为什么 ZIP_LZMA 而不是 DEFLATE-6：载荷体积再省 ~15-20%，且载荷在每个
-    安装器里各嵌一份、直接决定安装器体积。释放侧 ycode_setup._copy_payload
-    走 zf.read() 逐成员读，对压缩算法完全透明；安装向导通过模块级
-    `import lzma` 已随包 _lzma 解码器。代价：压缩耗时约 2-4 分钟、安装时
-    解压略慢 1-3 秒（进度条内无感）；且 Explorer 无法直接打开 LZMA zip——
-    本产物仅供安装器内嵌，不是用户可直接解压的分发物。
-    """
     zip_path = os.path.join(project_dir, "build", "ycode_pkg.zip")
     if os.path.exists(zip_path):
         os.remove(zip_path)
@@ -866,18 +657,12 @@ def make_payload_archive(project_dir, ycode_dir):
 
 def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
     print("\n[步骤 3/5] 正在编译 CLI 独立安装向导 ycode_cli_setup.exe...")
-    # 同时内嵌卸载程序：这样即便用户脱离主安装包、单独运行这个 CLI 安装向导
-    # （即"安装目录下还没有 Y-code.exe"的独立安装场景），也能正常复制出
-    # 卸载程序并注册 Y-code-CLI 卸载入口，而不是只能在合并进完整版安装后
-    # 才具备可卸载性。
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="cli", output_name="ycode_cli_setup",
         add_data_pairs=[
             (payload_zip, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
-            # GUI 向导资源：侧栏 logo（构建期已缩放好的 168x168 PNG，
-            # tk.PhotoImage 直接读，因此不需要随包 Pillow）+ 窗口图标
             (os.path.join("assets", "ycode-logo-168.png"), "assets"),
             (os.path.join("assets", "ycode.ico"), "assets"),
         ],
@@ -886,36 +671,19 @@ def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
 
 def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
     print("\n[步骤 4/5] 正在编译主安装向导 ycode_setup.exe...")
-    # 不再内嵌 cli/ycode_cli_setup.exe（-222MB）：主安装器的 full 模式本来就
-    # 用同一份载荷直接释放 ycode.exe（run_install → _copy_payload），内嵌的
-    # CLI 安装器只在"用户勾掉 CLI"的兜底场景被复制到安装目录，却让 169MB
-    # 载荷 + 32MB 卸载器在主安装包里各出现两次。补装路径改为：重跑主安装
-    # 向导勾选「命令行版」。
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="full", output_name="ycode_setup",
         add_data_pairs=[
             (payload_zip, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
-            # GUI 向导资源：侧栏 logo（构建期已缩放好的 168x168 PNG，
-            # tk.PhotoImage 直接读，因此不需要随包 Pillow）+ 窗口图标
             (os.path.join("assets", "ycode-logo-168.png"), "assets"),
             (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
 
 
-# ============================================================================
-# 步骤 4.5：安装包重命名为带版本号的最终分发名
-# ============================================================================
-
 def versioned_setup_name(base, version):
-    """安装包最终分发文件名（不含扩展名）。
-
-    主安装包用 XingYaoCode-{version}（如 XingYaoCode-1.2.28），CLI 独立安装包用
-    Y-code-cli-{version}。注意此处仅决定落到 dist/ 供分发的最终文件名，
-    构建期内部仍用固定名 ycode_setup / ycode_cli_setup。
-    """
     if base == "ycode_setup":
         return f"XingYaoCode-{version}"
     if base == "ycode_cli_setup":
@@ -924,11 +692,6 @@ def versioned_setup_name(base, version):
 
 
 def step4b_rename_setups(project_dir, version, cli_only):
-    """把固定名构建产物重命名为带版本号的分发名，并清理上一版本的同名旧产物。
-
-    构建期仍用固定名（ycode_setup / ycode_cli_setup）：主安装包内嵌的
-    cli/ycode_cli_setup.exe 由安装引擎按固定名查找，不能带版本号；最终落到
-    dist/ 供分发的文件才改成带版本号的名字。"""
     print("\n[步骤 4.5/5] 安装包重命名为带版本号的分发名...")
     bases = ["ycode_cli_setup"] if cli_only else ["ycode_cli_setup", "ycode_setup"]
     renamed = {}
@@ -941,15 +704,11 @@ def step4b_rename_setups(project_dir, version, cli_only):
         for old in glob.glob(os.path.join(project_dir, "dist", f"{base}_v*.exe")):
             os.remove(old)
         if base == "ycode_setup":
-            # 主安装包新命名 XingYaoCode-{版本}.exe 清理旧版本残留；
-            # 同时清理历史遗留的旧命名 Y-code-{版本}.exe（老版本构建残留）。
-            # 用 [0-9] 前缀精确匹配，避免误删 Y-code-cli-*.exe（CLI 安装包）。
             for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-[0-9]*.exe")):
                 os.remove(old)
             for old in glob.glob(os.path.join(project_dir, "dist", "XingYaoCode-[0-9]*.exe")):
                 os.remove(old)
         if base == "ycode_cli_setup":
-            # CLI 安装包新命名 Y-code-cli-*.exe 也清理旧版本残留
             for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-cli-*.exe")):
                 os.remove(old)
         dst = os.path.join(project_dir, "dist", f"{versioned_setup_name(base, version)}.exe")
@@ -959,11 +718,6 @@ def step4b_rename_setups(project_dir, version, cli_only):
     return renamed
 
 
-# ============================================================================
-# 步骤 4.7：Gitee Release 分卷附件（绕过单附件 100MB 上限）
-# ============================================================================
-
-# Gitee Release 单附件上限 100MB；留 5MB 余量切割
 SPLIT_PART_BYTES = 95 * 1024 * 1024
 
 
@@ -993,11 +747,11 @@ def _looks_like_utf16_text(head: bytes) -> bool:
         for i in range(0, min(len(head), 512) - 1, 2):
             unit = int.from_bytes(head[i:i + 2], "little" if little else "big")
             if 0xD800 <= unit <= 0xDFFF:
-                break  # 裸代理项：非合法 UTF-16
+                break
             if unit < 0x20 and unit not in (0x09, 0x0A, 0x0D):
-                break  # C0 控制字符
+                break
             if 0x7F <= unit <= 0x9F:
-                break  # DEL / C1 控制字符
+                break
             run += 1
             if run >= _UTF16_RUN_THRESHOLD:
                 return True
@@ -1005,19 +759,6 @@ def _looks_like_utf16_text(head: bytes) -> bool:
 
 
 def _safe_part_boundary(f, off, file_size):
-    """分卷边界微调：避免分卷起始字节被 CDN 内容嗅探误判为文本。
-
-    v1.2.16 事故：part4 起始字节 FE 91 FF 9D... 前 72 字节可连续按
-    UTF-16LE 解码成 CJK 字符，Gitee/foruda CDN 将其误判为 UTF-16 文本，
-    注入 0xFF 拼成 FF FE BOM（体积 +1 字节）并以
-    text/plain; charset=utf-16le 返回，老版本 core/updater.py 的
-    Content-Type 防线把它当成风控页面拒绝下载（自动更新确定性失败）。
-
-    边界整体向后挪到首个"非 BOM、前 512 字节含 0x00、且看起来不像
-    UTF-16 文本"的位置，只改变切片点，不影响拼接还原结果。
-    注意本规则只是降低命中概率的启发式，真正的兜底是发布侧的
-    上传后回读校验（publish_release.verify_remote_attachment）。
-    """
     while off < file_size:
         f.seek(off)
         head = f.read(512)
@@ -1035,27 +776,15 @@ def _safe_part_boundary(f, off, file_size):
 
 
 def split_file_for_release(src_path, out_dir, part_bytes=SPLIT_PART_BYTES):
-    """把超限文件切成 .partN 二进制分卷并移入 out_dir。
-
-    分卷是纯字节切割（无压缩/加密）：按序号顺序拼接即还原原文件。
-    文件本身 ≤ 100MB 时直接原样拷贝（单片分卷没有拼接意义）。
-    采用均衡切分：先定片数再均摊片长，避免固定片长切出极小的尾卷
-    （曾出现 78KB 尾卷被 core/updater.py 的 >1MB 完整性防线误判为
-    HTML 错误页而拒绝下载，见 v1.2.16 发布事故）。
-    返回 (分卷文件名列表, 原文件 SHA256)。
-    """
     size = os.path.getsize(src_path)
     base = os.path.basename(src_path)
     if size <= part_bytes:
         shutil.copy2(src_path, os.path.join(out_dir, base))
         return [base], sha256_file(src_path)
 
-    # 片数按上限取整，再把总长均摊到各片：每片大小相近且都不超上限
-    part_count = -(-size // part_bytes)  # ceil(size / part_bytes)
-    balanced_part_bytes = -(-size // part_count)  # ceil(size / part_count)
+    part_count = -(-size // part_bytes)
+    balanced_part_bytes = -(-size // part_count)
 
-    # 计算各片边界（首个边界为 0，末边界为文件末尾），并对中间边界做
-    # 内容嗅探安全微调
     names = []
     with open(src_path, "rb") as f:
         boundaries = [0]
@@ -1088,19 +817,12 @@ COMPONENT_DIGEST_LINE = "{name}  SHA256={digest}"
 
 
 def component_digest_line(archive_name, digest):
-    """生成 Release 说明里的组件包校验行（格式固定，客户端据它做下载校验）。"""
     return COMPONENT_DIGEST_LINE.format(name=archive_name, digest=digest)
 
 
-# 随主安装包一起发到同一个 Gitee Release 的按需组件包清单：
-#   (dist/ 里的 glob 前缀, 发布说明里的标题, 组件包体积量级MB)
-# 新增组件只要在这里登记一行，上传指引与校验行就会自动各多一条——避免出现
-# 「运行时加了组件、发布说明忘了写 digest」这种客户端只能告警放行的漏配。
 RELEASE_COMPONENTS = (
     ("playwright-component", "浏览器操控组件包", 25),
     ("ffmpeg-component", "视频转换组件包", 97),
-    # 网页搜索组件：ddgs + primp + lxml + fake_useragent 四个包目录，
-    # 体积量级按 18MB 报（zip 实测约 8-10MB，解压后约 18MB）。
     ("search-component", "网页搜索组件包", 18),
 )
 
@@ -1124,13 +846,6 @@ def find_playwright_component_archive(project_dir):
 
 
 def step4c_make_release_parts(project_dir, version, cli_only):
-    """生成 Gitee Release 上传用的分卷附件目录 dist/release_parts/。
-
-    主安装包（约 290MB）与 CLI 安装包（约 145MB）都超过 Gitee 单附件
-    100MB 上限，统一切成 ≤95MB 分卷；自动更新端（core/updater.py）识别
-    .partN 序列后顺序下载拼接，并用 RELEASE_NOTES.txt 中发布的 SHA256
-    校验拼接结果，校验不过即拒绝安装。
-    """
     print("\n[步骤 4.7/5] 生成 Gitee Release 分卷附件 (dist/release_parts/)...")
     out_dir = os.path.join(project_dir, "dist", "release_parts")
     # 整目录重建：清掉上一版本残留的分卷与指引，避免多版本文件混传
@@ -1148,7 +863,7 @@ def step4c_make_release_parts(project_dir, version, cli_only):
              "主安装包 (GUI + 可选 CLI)")
         )
 
-    entries = []  # (描述, 文件名, 分卷列表, sha256)
+    entries = []
     for rel_path, desc in targets:
         abs_path = os.path.join(project_dir, rel_path)
         if not os.path.exists(abs_path):
@@ -1167,7 +882,7 @@ def step4c_make_release_parts(project_dir, version, cli_only):
     # （core/components.py::_parse_component_digest，按资产名精确匹配），缺失时
     # 客户端只能告警放行。每个组件各占一行，互不影响——多个组件行共存时客户端
     # 靠资产名区分，不会串号（见 tests/test_components.py 的 digest 用例）。
-    component_entries = []  # (glob 前缀, 标题, 文件名, sha256)
+    component_entries = []
     for prefix, title, _size_mb in RELEASE_COMPONENTS:
         archive = find_component_archive(project_dir, prefix)
         if not archive:
@@ -1180,7 +895,6 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         )
         print(f"✔ 组件包 {os.path.basename(archive)}  SHA256: {component_digest}")
 
-    # 生成上传指引 + 发布说明模板（SHA256 行供 updater 解析，勿改动格式）
     main_entry = next((e for e in entries if "主安装包" in e[0]), entries[0])
     lines = []
     lines.append(f"Y-CODE v{version} Gitee Release 附件上传指引")
@@ -1222,8 +936,6 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         parts_desc = f"（{len(names)} 分卷）" if len(names) > 1 else ""
         lines.append(f"{fname:<40} {parts_desc} {digest}")
 
-    # 每个组件一段独立的校验行区块：客户端按资产名精确匹配取 digest，
-    # 多段共存不会互相干扰；某组件本次未产出时给出可执行的补救说明。
     for prefix, title, _size_mb in RELEASE_COMPONENTS:
         found = next((e for e in component_entries if e[0] == prefix), None)
         lines.append("")
@@ -1240,10 +952,6 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         f.write("\n".join(lines) + "\n")
     print(f"✔ 上传指引已生成: {notes_path}")
 
-
-# ============================================================================
-# 步骤 5：汇总校验
-# ============================================================================
 
 def step5_summary(project_dir, cli_only, version):
     print("\n[步骤 5/5] 校验构建产物...")
@@ -1268,8 +976,6 @@ def step5_summary(project_dir, cli_only, version):
         else:
             print(f"  ❌ {rel_path:<34} {'缺失':>9}   {desc}")
             all_ok = False
-    # 组件包由 step0b / step0d 独立产出；--setup-only 复用既有载荷时不会重新生成，
-    # 故这里只列示、不计入"产物缺失即失败"的判定（ffmpeg 还是可选组件）。
     for prefix, title, _size_mb in RELEASE_COMPONENTS:
         found_zips = sorted(
             glob.glob(os.path.join(project_dir, "dist", f"{prefix}-*.zip"))
@@ -1297,15 +1003,9 @@ def step5_summary(project_dir, cli_only, version):
     print("=" * 64)
 
 
-# ============================================================================
-# 主流程
-# ============================================================================
-
 def build():
     args = parse_args()
 
-    # 确保当前目录是工程根目录：后面所有相对路径（ycode.spec、frontend/、
-    # core/version.py、dist/...）都以此为基准。
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
 
@@ -1313,7 +1013,6 @@ def build():
         # 快速通道：只打组件包，不需要 PyInstaller / 前端 / 安装向导环境
         step0b_build_playwright_component(project_dir)
         step0d_build_ffmpeg_component(project_dir)
-        # 网页搜索组件同样随 Release 单独发布（ddgs 链路已从主包剔除）
         step0e_build_search_component(project_dir)
         print("ℹ 已指定 --component-only，跳过其它所有构建步骤。")
         return
@@ -1321,7 +1020,6 @@ def build():
     pyinstaller_bin = resolve_pyinstaller(project_dir)
 
     if args.setup_only:
-        # 快速通道：核心载荷与卸载程序未变，直接复用现有产物，只重新编译安装向导。
         ycode_dir = os.path.join(project_dir, "dist", "ycode")
         uninstall_exe = os.path.join(project_dir, "dist", "ycode", "Y-code-uninstall.exe")
         if not os.path.isdir(ycode_dir):
@@ -1333,8 +1031,6 @@ def build():
         print("ℹ 已指定 --setup-only，跳过前端 / 核心载荷 / 卸载程序构建，直接复用现有产物。")
         payload_zip = make_payload_archive(project_dir, ycode_dir)
     else:
-        # 硬校验放在最前（含前端构建之前）：环境缺包时尽快失败，不浪费时间。
-        # --setup-only 分支复用既有载荷、不重新 Analysis，无需此检查。
         missing_collect_all = verify_spec_collect_all_targets(project_dir)
         if missing_collect_all:
             print("❌ 构建环境缺少 ycode.spec collect_all 依赖的包: "
@@ -1356,7 +1052,6 @@ def build():
         # 一起上传 Gitee Release（ffmpeg 缺失时 step0d 只告警，不阻断构建）
         step0b_build_playwright_component(project_dir)
         step0d_build_ffmpeg_component(project_dir)
-        # 网页搜索组件（ddgs 链路）已从主安装包剔除，漏传则用户无法联网搜索
         step0e_build_search_component(project_dir)
         ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
         payload_zip = make_payload_archive(project_dir, ycode_dir)

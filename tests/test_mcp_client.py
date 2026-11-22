@@ -10,7 +10,6 @@ from core.mcp_client import MCPManager
 
 @pytest.fixture
 def manager(monkeypatch):
-    """独立的 MCPManager 实例；状态输出打桩，测试结束时停掉 event loop。"""
     monkeypatch.setattr(mcp_client, "_emit_status", lambda *a, **k: None)
     mgr = MCPManager()
     yield mgr
@@ -29,12 +28,10 @@ def _write_config(manager, tmp_path, servers):
 
 
 def test_lazy_connect_on_init(manager):
-    """import/构造时绝不连接，首次使用才惰性启动"""
     assert manager._connect_future is None
 
 
 def test_empty_config_never_connects(manager, tmp_path):
-    """空配置走占位 future，绝不发起任何连接，后续访问零开销"""
     _write_config(manager, tmp_path, {})
 
     def _boom(*args, **kwargs):
@@ -48,7 +45,6 @@ def test_empty_config_never_connects(manager, tmp_path):
 
 
 def test_failed_connection_resets_future_for_retry(manager, tmp_path, monkeypatch):
-    """连接失败后 _connect_future 必须重置回 None，允许下次调用重连"""
     _write_config(manager, tmp_path, {"s1": {"command": "nonexistent-cmd"}})
 
     async def _failing():
@@ -70,7 +66,6 @@ def test_failed_connection_resets_future_for_retry(manager, tmp_path, monkeypatc
 
 
 def test_stdio_spawn_is_wrapped_with_timeout(manager, monkeypatch):
-    """stdio_client 进入（spawn 子进程）必须包超时，挂起的 server 不得永久阻塞"""
 
     class _HangingCM:
         async def __aenter__(self):
@@ -88,7 +83,6 @@ def test_stdio_spawn_is_wrapped_with_timeout(manager, monkeypatch):
 
 
 def test_call_unknown_tool_returns_error(manager, tmp_path):
-    """未连接/未知工具返回错误字符串而不是抛异常"""
     _write_config(manager, tmp_path, {})
 
     result = manager.call_tool_sync("srv__tool", {})
@@ -97,15 +91,12 @@ def test_call_unknown_tool_returns_error(manager, tmp_path):
 
 
 def test_close_is_idempotent(manager):
-    """close() 可重复调用不出错"""
     manager.close()
     manager.close()
     assert manager._closed
 
 
 def test_get_schemas_returns_sorted_by_tool_name(manager, tmp_path):
-    """tools 列表必须跨轮次逐字节稳定：get_schemas 按工具名排序返回，
-    与各 server 连接完成的先后顺序无关（DeepSeek/Kimi 前缀缓存命中的前提）。"""
     _write_config(manager, tmp_path, {})
     manager.tool_schemas = [
         {"type": "function", "function": {"name": "srvb__zeta", "description": "", "parameters": {}}},
@@ -242,10 +233,7 @@ def test_closed_manager_cannot_start_new_connections(manager, tmp_path, monkeypa
     assert started == []
 
 
-# ── 连接路径强制校验（手工编辑 mcp.json 绕过 add_server 的场景） ──────
-
 def test_connect_server_rejects_hand_edited_unsafe_command(manager, monkeypatch):
-    """手工写入 mcp.json 的任意命令：_connect_server 必须复核 _validate_mcp_launch 规则"""
     spawned = []
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: spawned.append(params))
 
@@ -257,7 +245,6 @@ def test_connect_server_rejects_hand_edited_unsafe_command(manager, monkeypatch)
 
 
 def test_connect_server_rejects_dangerous_env_from_disk(manager, monkeypatch):
-    """手工写入的危险环境变量（如 PATH 覆盖）：拒绝连接且不 spawn"""
     spawned = []
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: spawned.append(params))
 
@@ -270,7 +257,6 @@ def test_connect_server_rejects_dangerous_env_from_disk(manager, monkeypatch):
 
 
 def test_connect_server_env_merge_strips_inherited_key_overrides(manager, monkeypatch):
-    """通过校验的 env 仍不得覆盖 PATH/COMSPEC/SYSTEMROOT 等继承键（合并时剔除）"""
     captured = {}
 
     def _fake_stdio(params, errlog=None):
@@ -298,8 +284,6 @@ def test_connect_server_rejects_non_dict_env(manager, monkeypatch):
     assert spawned == []
 
 
-# ── env 加密落盘 / 读取解密（与 config.json 加密策略对齐） ────────────
-
 def test_add_server_encrypts_env_values_before_write(manager, tmp_path, monkeypatch):
     _write_config(manager, tmp_path, {})
     monkeypatch.setattr(manager, "reconnect", lambda: (True, "ok"))
@@ -315,7 +299,6 @@ def test_add_server_encrypts_env_values_before_write(manager, tmp_path, monkeypa
 
 
 def test_connect_server_decrypts_prefixed_env_values(manager, monkeypatch):
-    """读取连接时 dpapi:/keyring: 前缀的值必须解密后注入子进程环境"""
     captured = {}
 
     def _fake_stdio(params, errlog=None):
@@ -334,7 +317,6 @@ def test_connect_server_decrypts_prefixed_env_values(manager, monkeypatch):
 
 
 def test_connect_server_treats_unprefixed_env_as_plaintext(manager, monkeypatch):
-    """向后兼容：无前缀旧值按明文处理"""
     captured = {}
 
     def _fake_stdio(params, errlog=None):
@@ -356,10 +338,6 @@ def test_connect_server_treats_unprefixed_env_as_plaintext(manager, monkeypatch)
 
 
 def test_connect_server_passes_real_errlog_when_stderr_is_null_stream(manager, monkeypatch):
-    """打包 GUI（console=False）下 sys.stderr 被运行时钩子替换为无 fileno 的哑流，
-    stdio_client 默认 errlog=sys.stderr，anyio 拉起子进程时取 fileno() 会抛
-    'null stream has no fileno' 导致所有 stdio MCP 连接失败；
-    必须显式传入一个可真实重定向的 errlog。"""
     captured = {}
 
     def _fake_stdio(params, errlog=None):
@@ -390,7 +368,6 @@ def test_connect_server_passes_real_errlog_when_stderr_is_null_stream(manager, m
 
 
 def test_connect_server_passes_real_errlog_when_stderr_is_none(manager, monkeypatch):
-    """sys.stderr 直接是 None（未装运行时钩子的窗口程序）时同样要兜底"""
     captured = {}
 
     def _fake_stdio(params, errlog=None):
@@ -408,7 +385,6 @@ def test_connect_server_passes_real_errlog_when_stderr_is_none(manager, monkeypa
 
 
 def test_encrypt_plaintext_env_on_disk_migrates_after_success(manager, tmp_path, monkeypatch):
-    """连接成功后把明文 env 一次性回写为加密版本"""
     _write_config(manager, tmp_path, {
         "s1": {"command": "node", "args": [], "env": {"API_KEY": "legacy-plain"}}
     })
@@ -421,13 +397,10 @@ def test_encrypt_plaintext_env_on_disk_migrates_after_success(manager, tmp_path,
 
     saved = json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8"))
     assert saved["mcpServers"]["s1"]["env"] == {"API_KEY": "dpapi:enc(legacy-plain)"}
-    # 幂等：已加密的值不会二次加密
     manager._encrypt_plaintext_env_on_disk("s1")
     saved = json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8"))
     assert saved["mcpServers"]["s1"]["env"] == {"API_KEY": "dpapi:enc(legacy-plain)"}
 
-
-# ── 取消竞态 / schema 幂等（M39） ─────────────────────────────────
 
 class _FakeTool:
     def __init__(self, name):
@@ -472,7 +445,6 @@ def _session_cm(session):
 
 
 def test_reconnect_same_server_replaces_schemas_idempotently(manager, monkeypatch):
-    """同 server 重复连接（取消-重试竞态）：不产生双份 server/双份工具 schema"""
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
     monkeypatch.setattr(
         mcp_client, "ClientSession", lambda r, w: _session_cm(_FakeSession(["alpha"]))
@@ -487,7 +459,6 @@ def test_reconnect_same_server_replaces_schemas_idempotently(manager, monkeypatc
 
 
 def test_cancelled_connect_cleans_up_orphan_entry(manager, monkeypatch):
-    """取消晚于 initialize 完成：已入 self.servers 的孤儿连接必须被移除并关闭"""
     closed = []
 
     class _SlowListToolsSession(_FakeSession):
@@ -507,7 +478,7 @@ def test_cancelled_connect_cleans_up_orphan_entry(manager, monkeypatch):
 
     async def _run():
         task = asyncio.ensure_future(manager._connect_server("s1", {"command": "node"}))
-        await asyncio.sleep(0.1)  # 让 initialize 完成、entry 已入 servers
+        await asyncio.sleep(0.1)
         assert "s1" in manager.servers
         task.cancel()
         try:
@@ -521,10 +492,7 @@ def test_cancelled_connect_cleans_up_orphan_entry(manager, monkeypatch):
     assert closed, "取消后必须关闭已建立的 stack"
 
 
-# ── call_tool_sync 超时契约（M40） ────────────────────────────────
-
 def test_call_tool_sync_timeout_returns_friendly_error(manager, tmp_path, monkeypatch):
-    """超时不得抛给调用线程：返回 🚨 开头的友好错误文本并取消底层调用"""
     _write_config(manager, tmp_path, {})
 
     async def _slow(tool_name, arguments):
@@ -541,10 +509,7 @@ def test_call_tool_sync_timeout_returns_friendly_error(manager, tmp_path, monkey
     assert "超时" in result
 
 
-# ── 连接失败原因可读（server_errors / last_error / 增删改如实反馈） ────
-
 class _RaisingStdioCM:
-    """stdio_client 替身：进入即抛错，用于稳定复现连接失败（无网络、无外部依赖）。"""
 
     def __init__(self, message="Connection closed"):
         self._message = message
@@ -557,7 +522,6 @@ class _RaisingStdioCM:
 
 
 def test_connect_failure_records_error_and_exposes_last_error(manager, tmp_path, monkeypatch):
-    """连接抛异常时记录脱敏原因，并通过 list_servers() 的 last_error 暴露给上层"""
     _write_config(manager, tmp_path, {"s1": {"command": "node", "args": ["server.js"]}})
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _RaisingStdioCM())
 
@@ -570,14 +534,12 @@ def test_connect_failure_records_error_and_exposes_last_error(manager, tmp_path,
 
 
 def test_connect_rejected_by_launch_validation_records_reason(manager):
-    """启动校验失败（不存在的命令）同样要留下可读原因"""
     asyncio.run(manager._connect_server("bad", {"command": "nonexistent-cmd"}))
 
     assert "nonexistent-cmd" in manager.server_errors["bad"]
 
 
 def test_successful_connect_clears_server_error(manager, monkeypatch):
-    """连接成功必须清除该服务的历史失败原因"""
     manager.server_errors["s1"] = "Connection closed"
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
     monkeypatch.setattr(
@@ -591,7 +553,6 @@ def test_successful_connect_clears_server_error(manager, monkeypatch):
 
 
 def test_disabled_server_skip_is_not_a_connection_error(manager, tmp_path):
-    """enabled=false 主动跳过的服务不算连接失败，不记录错误"""
     _write_config(manager, tmp_path, {
         "s1": {"command": "node", "args": [], "enabled": False}
     })
@@ -604,7 +565,6 @@ def test_disabled_server_skip_is_not_a_connection_error(manager, tmp_path):
 
 
 def test_list_servers_last_error_is_null_without_error(manager, tmp_path):
-    """无失败记录时 last_error 为 null"""
     _write_config(manager, tmp_path, {"s1": {"command": "node", "args": []}})
 
     item = json.loads(manager.list_servers())[0]
@@ -613,7 +573,6 @@ def test_list_servers_last_error_is_null_without_error(manager, tmp_path):
 
 
 def test_reconnect_clears_server_errors(manager, tmp_path):
-    """reconnect() 重置状态时必须一并清空 server_errors"""
     _write_config(manager, tmp_path, {})
     manager.server_errors["s1"] = "Connection closed"
 
@@ -624,7 +583,6 @@ def test_reconnect_clears_server_errors(manager, tmp_path):
 
 
 def test_add_server_reports_connection_failure_reason(manager, tmp_path, monkeypatch):
-    """目标服务连不上时，add_server 不得再说“已新增服务”，必须给出失败原因"""
     _write_config(manager, tmp_path, {})
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _RaisingStdioCM())
 
@@ -639,7 +597,6 @@ def test_add_server_reports_connection_failure_reason(manager, tmp_path, monkeyp
 
 
 def test_add_server_reports_tool_count_when_connected(manager, tmp_path, monkeypatch):
-    """连接成功时 add_server 返回该 server 已就绪的工具数"""
     _write_config(manager, tmp_path, {})
     monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
     monkeypatch.setattr(
@@ -653,7 +610,6 @@ def test_add_server_reports_tool_count_when_connected(manager, tmp_path, monkeyp
 
 
 def test_set_enabled_and_remove_do_not_claim_connection_success(manager, tmp_path, monkeypatch):
-    """禁用/删除后的消息不得暗示连接成功"""
     _write_config(manager, tmp_path, {"s1": {"command": "node", "args": []}})
 
     ok, message = manager.set_server_enabled("s1", False)

@@ -114,7 +114,6 @@ it('执行条只显示当前会话发起的任务，其他会话/无归属任务
   ];
   const wrapper = mount(BackgroundTasksBar);
 
-  // 只计本会话的 t1；当前会话为空（草稿）时不显示任何任务
   expect(wrapper.find('[data-test="bg-bar"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="bg-bar-details"]').text()).toContain('后台');
   expect(wrapper.find('[data-test="bg-bar-count"]').text()).toBe('1');
@@ -146,14 +145,12 @@ it('有后台任务时显示数量角标，默认收起卡片，点头部胶囊�
   expect(cardText).toContain('npm run build');
   expect(wrapper.find('[data-test="bg-kill-t1"]').exists()).toBe(true);
 
-  // 再点一次胶囊收起
   await wrapper.find('[data-test="bg-bar-details"]').trigger('click');
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
   wrapper.unmount();
 });
 
 it('终止任务调用 kill_task 并立即刷新快照', async () => {
-  // 组件挂载不拉快照，只有终止后的刷新会调用一次 get_background_tasks
   const getStatus = vi.fn().mockResolvedValue([]);
   const kill = vi.fn().mockResolvedValue({ ok: true, msg: '已终止后台任务' });
   (window as any).pywebview = { api: { get_background_tasks: getStatus, kill_task: kill } };
@@ -180,7 +177,6 @@ it('任务详情按钮保持卡片展开并打开右侧后台任务工作台', a
   await wrapper.find('[data-test="bg-bar-details"]').trigger('click');
   await wrapper.find('[data-test="bg-detail-t1"]').trigger('click');
 
-  // 详情不收起卡片：侧栏查看执行过程时卡片保持可见
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
   expect(store.bgTaskDetailId).toBe('t1');
   expect(store.bgTaskOpenNonce).toBe(1);

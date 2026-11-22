@@ -1,7 +1,3 @@
-"""
-core/model_manager.py
-多厂商模型管理器：读写 config.json，提供 get/set 激活模型的接口。
-"""
 import json
 import os
 import uuid
@@ -16,8 +12,6 @@ from core.model_catalog import (
 from core.reasoning_capabilities import get_reasoning_capability
 _CONFIG_FILE = config._CONFIG_FILE
 
-# 电脑操控能力元数据（设计 9.1）：只接受严格 bool 与固定协议集合；
-# generic 组合缺视觉或工具能力时保存即拒绝，不允许落盘半有效配置。
 COMPUTER_PROTOCOLS = ("none", "generic", "native_openai")
 
 
@@ -31,7 +25,6 @@ def _normalize_capability_bool(name: str, value):
 
 
 def _normalize_computer_protocol(value):
-    """None = 调用方不触碰（保留既有值）；"" = 自动（缺省协议，由能力元数据判定）。"""
     if value is None or value == "":
         return value
     if type(value) is not str or value not in COMPUTER_PROTOCOLS:
@@ -64,7 +57,6 @@ def load_config() -> dict:
     read_failed = not isinstance(raw, dict) and os.path.exists(_CONFIG_FILE)
     data = raw if isinstance(raw, dict) else {}
 
-    # 检测旧格式（只有 model/api_key/base_url 的扁平结构），自动迁移
     if "model" in data and "providers" not in data:
         try:
             old_model = data.get("model", "openai/agnes-3.0-flash")
@@ -76,7 +68,6 @@ def load_config() -> dict:
             model_name = old_model.split("/")[-1]
             mid = str(uuid.uuid4())[:8]
             pid = str(uuid.uuid4())[:8]
-            # 保留旧格式中的其他字段（theme / permission_mode 等），只替换模型相关字段
             base_url = data.pop("base_url", "")
             api_key = data.pop("api_key", "")
             data.pop("model", None)
@@ -150,7 +141,6 @@ def load_config() -> dict:
                     "为避免把用户模型配置覆盖成默认值，本次不会写回磁盘"
                 )
             else:
-                # 仅「首次运行（配置文件确实不存在）」才落盘默认结构
                 _write_config(data)
         else:
             data["providers"] = []
@@ -165,18 +155,6 @@ def _write_config(data: dict):
 
 
 def effective_provider_api_key(provider: dict) -> str:
-    """请求读取路径使用的单 Key：多 Key provider 返回 Key 池「当前该用」的 Key。
-
-    设计见 docs/superpowers/specs/2026-10-12-provider-multi-key-failover-design.md
-    第 4 节：所有「取 Key 去发请求 / 返回给调用方」的路径都必须与 Key 池一致，
-    绝不把多行 Key 串整体当作一个 Key 使用。
-
-    - 多 Key（换行/逗号/分号分隔）→ Key 池 initial_key()（粘性 + 冷却后轮换）；
-    - 单 Key → 原样返回 provider["api_key"]；
-    - Key 池不可用 / 任何异常 → 原值回退，行为与现状一致。
-
-    注意：add/update/delete 等写入路径不得调用本函数——多行原文必须原样保存。
-    """
     raw = (provider or {}).get("api_key")
     try:
         from core.provider_keys import get_key_pool
@@ -192,14 +170,6 @@ def effective_provider_api_key(provider: dict) -> str:
 
 
 def get_active_model(session_name: str | None = None) -> dict | None:
-    """
-    返回当前激活模型的完整信息字典，包含：
-      litellm_model, api_key, base_url, context_window, name
-    如果没有配置任何模型，返回 None。
-
-    当传入 session_name 时，优先取该会话在 sessions 表中绑定的 active_model_id；
-    未绑定则回退到全局 active_model_id。CLI/无会话调用方传 None，始终读全局配置。
-    """
     active_id = None
     if session_name:
         try:
@@ -225,8 +195,6 @@ def get_active_model(session_name: str | None = None) -> dict | None:
         return None
     return {
         "litellm_model":   model["litellm_model"],
-        # 多 Key provider 只返回「当前该用的单 Key」（Key 池选择结果），
-        # 多行原文仍完整保存在配置里，由请求层按需切 Key
         "api_key":         effective_provider_api_key(provider),
         "base_url":         provider["base_url"],
         "context_window":  model.get("context_window", 128000),
@@ -374,10 +342,6 @@ def set_model_reasoning_effort(model_id: str, level: str | None) -> tuple[bool, 
 
 
 def get_model_config_by_litellm_model(litellm_model: str, base_url: str | None = None) -> dict | None:
-    """根据 litellm_model 字符串（以及可选的 base_url）查找对应的模型配置条目。
-
-    返回的 dict 是 provider 下 model 条目的引用（浅拷贝），调用方不应修改。
-    """
     data = load_config()
     litellm_model = str(litellm_model or "").strip()
     base_url = str(base_url or "").rstrip("/").lower()
@@ -439,7 +403,6 @@ def get_secondary_model() -> dict | None:
 
 
 def set_secondary_model(model_id: str | None):
-    """设置/清除 secondary（便宜）模型 ID，用于子 Agent / 摘要 / 压缩等后台任务。"""
     def _mutate(data):
         if model_id:
             data["secondary_model_id"] = model_id
@@ -501,13 +464,6 @@ def add_model_to_provider(
     max_tokens: int | None = None,
     system_prompt_extra: str | None = None,
 ) -> str:
-    """
-    给指定厂商追加一个模型，litellm_model 格式为 {protocol}/{name}。
-    返回新模型的 model_id。若当前无激活模型，自动激活该模型。
-
-    system_prompt_extra：模型级系统提示扩展（可选）。None=不落键；""=清除该键；
-    非空=写入，该模型请求时会自动追加这段指令，其他模型完全不受影响。
-    """
     name = str(name or "").strip()
     context_window = int(context_window)
     if not name:
@@ -518,7 +474,6 @@ def add_model_to_provider(
         "supports_function_calling", supports_function_calling
     )
     computer_protocol = _normalize_computer_protocol(computer_protocol)
-    # 模型级系统提示扩展：None=保持现状，""=清除键，非空=写入（沿用既有字段风格）
     normalized_prompt_extra = (
         None if system_prompt_extra is None else str(system_prompt_extra).strip()
     )
@@ -548,7 +503,6 @@ def add_model_to_provider(
                     model_entry["supports_vision"] = bool(supports_vision)
                 if supports_function_calling is not None:
                     model_entry["supports_function_calling"] = supports_function_calling
-                # ""（自动）不落键：缺省协议由 capability 按视觉+工具调用元数据判定
                 if computer_protocol:
                     model_entry["computer_protocol"] = computer_protocol
                 if normalized_prompt_extra:
@@ -557,7 +511,6 @@ def add_model_to_provider(
                     model_entry.pop("system_prompt_extra", None)
                 provider["models"].append(model_entry)
                 break
-        # 若当前尚未选择激活任何模型，自动激活新添加的模型
         if not data.get("active_model_id"):
             data["active_model_id"] = mid
     config.update_config(_mutate)
@@ -573,10 +526,8 @@ def delete_model(model_id: str):
             for model in provider["models"][:]:
                 if model["id"] == model_id:
                     provider["models"].remove(model)
-        # 如果删掉的是 secondary 模型，一并清除
         if data.get("secondary_model_id") == model_id:
             data.pop("secondary_model_id", None)
-        # 如果删掉的是激活模型，自动将激活模型切到第一个剩余模型
         if data.get("active_model_id") == model_id:
             first_remaining = None
             for p in data.get("providers", []):
@@ -588,11 +539,6 @@ def delete_model(model_id: str):
 
 
 def delete_provider(provider_id: str):
-    """显式删除厂商及其模型，并修复活动/副模型选择。
-
-    删除最后一个厂商同样属于用户明确意图，因此显式传 allow_provider_wipe=True
-    放行写入保护（其余写入路径仍会拒绝把 providers 写空）。
-    """
     def _mutate(data):
         providers = data.get("providers", [])
         target = next((provider for provider in providers if provider.get("id") == provider_id), None)
@@ -655,11 +601,6 @@ def update_model(
     system_prompt_extra: str | None = None,
     max_tokens: int | None = None,
 ):
-    """更新单个模型的公开配置字段；新能力字段传 None 表示保留既有值。
-
-    system_prompt_extra：None=保留既有值，""=清除该键，非空=写入。
-    max_tokens（最大输出）：None=保留既有值，0=清除该键（回到内置默认），正整数=写入。
-    """
     name = str(name or "").strip()
     context_window = int(context_window)
     if not name:
@@ -717,16 +658,13 @@ def update_model(
         if supports_function_calling is not None:
             model["supports_function_calling"] = supports_function_calling
         if computer_protocol == "":
-            # ""（自动）：删除已存显式协议，回到缺省判定（视觉+工具调用）
             model.pop("computer_protocol", None)
         elif computer_protocol is not None:
             model["computer_protocol"] = computer_protocol
-        # 模型级系统提示扩展：None=保留既有值，""=清除键，非空=写入
         if normalized_prompt_extra:
             model["system_prompt_extra"] = normalized_prompt_extra
         elif normalized_prompt_extra == "":
             model.pop("system_prompt_extra", None)
-        # 最大输出：None=保留既有值，0=清除键（回到内置默认），正整数=写入
         if normalized_max_tokens is not None:
             model["max_tokens"] = normalized_max_tokens
         elif clear_max_tokens:
@@ -843,11 +781,6 @@ def add_preset_provider_with_models(
 
 
 def add_preset_provider(preset_id: str, api_key: str) -> str:
-    """仅接收预置 ID 和 API Key，其余字段从共享目录读取。
-
-    预置目录只含厂商信息（名称/Base URL/协议），不携带模型——用户添加后
-    通过「获取模型列表」按需拉取并自动填充。
-    """
     preset = get_preset_provider(preset_id)
     return add_preset_provider_with_models(
         preset["name"],
@@ -860,7 +793,6 @@ def add_preset_provider(preset_id: str, api_key: str) -> str:
 
 
 def _apply_preset_capability_fields(entry: dict, catalog_model: dict) -> None:
-    """把目录条目的可选能力字段落进新建模型条目。"""
     if "max_tokens" in catalog_model:
         entry["max_tokens"] = int(catalog_model["max_tokens"])
     if "supports_vision" in catalog_model:
@@ -873,10 +805,8 @@ def _apply_preset_capability_fields(entry: dict, catalog_model: dict) -> None:
         entry["computer_protocol"] = _normalize_computer_protocol(
             catalog_model["computer_protocol"]
         )
-    # 模型级系统提示扩展（预置护栏）：目录声明了才落键，未声明的模型不受影响。
     if "system_prompt_extra" in catalog_model:
         prompt_extra = str(catalog_model["system_prompt_extra"]).strip()
         if prompt_extra:
             entry["system_prompt_extra"] = prompt_extra
-
 

@@ -11,7 +11,6 @@ function mountModal() {
     attachTo: document.body,
     global: {
       stubs: {
-        // 停用 Transition 动画包裹延迟，确保 show 切换同步反映在 DOM 上
         Transition: false,
       },
     },
@@ -70,7 +69,6 @@ describe('ConfirmModal', () => {
     const store = useAppStore();
     const wrapper = mountModal();
 
-    // 1. Esc 取消
     const p1 = store.askConfirm('删除模型', 'sub', '确定删除？');
     await nextTick();
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -78,21 +76,18 @@ describe('ConfirmModal', () => {
     await nextTick();
     expect(wrapper.find('[data-test="confirm-modal"]').exists()).toBe(false);
 
-    // 2. 右上角关闭钮取消
     const p2 = store.askConfirm('删除模型', 'sub', '确定删除？');
     await nextTick();
     await wrapper.get('[data-test="confirm-modal-close"]').trigger('click');
     expect(await p2).toBe(false);
     await nextTick();
 
-    // 3. 弹窗内按住拖出到遮罩松手（仅有 click 没有 mousedown on mask）不应关闭
     const p3 = store.askConfirm('删除模型', 'sub', '确定删除？');
     await nextTick();
     await wrapper.get('[data-test="confirm-modal"]').trigger('mousedown');
     await wrapper.get('[data-test="confirm-modal-mask"]').trigger('click');
     expect(store.confirmModal.show).toBe(true);
 
-    // 4. 在遮罩上完整 mousedown + click 才会取消
     await wrapper.get('[data-test="confirm-modal-mask"]').trigger('mousedown');
     await wrapper.get('[data-test="confirm-modal-mask"]').trigger('click');
     expect(await p3).toBe(false);
@@ -134,23 +129,19 @@ describe('ConfirmModal', () => {
     expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('error');
     expect(wrapper.get('[data-test="confirm-modal-ok"]').classes()).toContain('tone-primary');
 
-    // 点遮罩不关闭通知弹窗
     await wrapper.get('[data-test="confirm-modal-mask"]').trigger('mousedown');
     await wrapper.get('[data-test="confirm-modal-mask"]').trigger('click');
     expect(store.confirmModal.show).toBe(true);
 
-    // 成功提示归入 success 语义
     store.notifyModal('导出成功', '主题已导出到桌面');
     await nextTick();
     expect(wrapper.get('.cm-icon').classes()).toContain('tone-success');
     expect(wrapper.get('.cm-icon').attributes('data-icon')).toBe('success');
 
-    // Esc 可关闭通知弹窗
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await nextTick();
     expect(store.confirmModal.show).toBe(false);
 
-    // 非删除类危险操作（如撤销/覆盖）走柔和警示图标，不显示垃圾桶
     const pNonDelete = store.askConfirm('撤销本轮修改', '', '确定撤销？', '撤销本轮修改');
     await nextTick();
     expect(wrapper.get('.cm-icon').classes()).toContain('tone-danger');

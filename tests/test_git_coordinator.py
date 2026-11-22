@@ -1,5 +1,3 @@
-"""coordinator 测试：双级锁、快照版本、操作兼容矩阵（规格 §9）。"""
-
 import threading
 
 
@@ -20,16 +18,13 @@ def setup_function():
     clear_registry()
 
 
-# ---------------------------------------------------------------- 双级锁
-
 def test_locks_are_reentrant_and_scoped():
     with worktree_lock("E:/proj"):
-        with worktree_lock("E:/proj"):  # 同线程可重入
+        with worktree_lock("E:/proj"):
             pass
 
 
 def test_repository_locks_acquire_common_first():
-    # 功能性验证：common 锁互斥同一 common dir；不同 worktree 的 worktree 锁可并行
     import time
 
     with repository_locks("E:/proj/.git", "E:/proj"):
@@ -63,8 +58,6 @@ def test_common_lock_serializes_same_key():
     assert counter["n"] == 5
 
 
-# ---------------------------------------------------------------- 快照版本
-
 def _identity_like(common="E:/p/.git", worktree="E:/p"):
     from core.git.models import RepositoryIdentity
 
@@ -94,7 +87,6 @@ def test_worktree_version_deterministic_and_sensitive():
     assert v1 == v2 and len(v1) == 64
     changed = compute_worktree_version(**{**kwargs, "status_bytes": b"changed"})
     assert changed != v1
-    # 工作区文件正文不参与（材料清单只含规格 §7.2 列项）
     assert "file-content" not in str(kwargs)
 
 
@@ -107,7 +99,6 @@ def test_refs_version_scope_and_determinism():
     assert compute_refs_version(**kwargs) == compute_refs_version(**kwargs)
     moved = compute_refs_version(**{**kwargs, "ref_oids": {"refs/heads/dev": "ccc"}})
     assert moved != compute_refs_version(**kwargs)
-    # refs 版本只覆盖共享作用域：同 repo 不同 worktree 的本地 index 不影响
     assert compute_refs_version(**kwargs) != compute_worktree_version(
         identity=_identity_like(), head_oid="a", index_material="", status_bytes=b"",
         operation_markers="", conflict_material="",
@@ -120,8 +111,6 @@ def test_versions_match_handles_none():
     assert versions_match("a", "b") is False
     assert versions_match(None, "a") is False
 
-
-# ---------------------------------------------------------------- 兼容矩阵（§9.2）
 
 def _rec(handle, risk, foreground=True, long_running=False):
     return ProcessRecord(
@@ -148,7 +137,6 @@ def test_matrix_index_and_ref_allow_safe_reject_unknown_mutation():
         assert not allowed and blockers
         allowed, blockers = check_compatible(category, (_rec("h2", "mutation"),))
         assert not allowed and blockers
-        # 长期 unknown 后台服务同样按未知处理（拒绝）
         allowed, _ = check_compatible(category, (_rec("h3", "unknown", foreground=False, long_running=True),))
         assert not allowed
 

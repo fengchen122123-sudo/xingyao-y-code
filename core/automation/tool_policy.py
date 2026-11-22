@@ -1,24 +1,3 @@
-"""星轨自动化回合的工具策略（G3：防任务自我繁殖的唯一事实源）。
-
-星轨自动化派发的回合（automation turn）本身也在跑 Agent，如果不加门控，模型
-可以创建/修改/删除自动化任务、或立即执行其他任务，形成"任务自己生任务"的
-自我繁殖链（费用与副作用都会指数放大）。本模块集中定义该策略：
-
-- schema 层（core.llm.get_tools_schema）用 ``hidden_tool_names_for_current_turn``
-  把写类自动化工具从工具列表里剔除（模型不看到就不会调用）；
-- 执行层（core.harness.tool_pipeline）用 ``is_automation_turn_tool_blocked``
-  兜底拒绝（MCP / 插件 / 保留名等不经过注册表 schema 的调用同样被拦下）；
-- 工具 wrapper（core.tool_registry）用 ``automation_write_denied`` 做最后一道
-  拦截，保证直接调用也不落库。
-
-两侧共用同一份策略是本仓库既有范式（参见 core.secretary）：策略只写一处，
-避免 schema 与执行层判定漂移。
-
-依赖纪律：只读 core.app_context 的线程本地标记，禁止 import gui_bridge /
-sqlite3——工具 schema 构造在模型请求热路径上，任何 GUI / 存储依赖都会把启动
-顺序与 IO 风险带进来。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -73,8 +52,4 @@ def is_automation_turn_tool_blocked(tool_name: str) -> bool:
 
 
 def automation_write_denied() -> bool:
-    """写类工具 wrapper 的一行判定：自动化回合里一律拒绝。
-
-    被包装的函数本身就是写类工具，因此只需判定回合标记。
-    """
     return is_automation_turn()

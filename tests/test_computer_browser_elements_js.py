@@ -1,12 +1,3 @@
-"""E1 元素收集脚本的真实浏览器行为测试（设计 9：T-E1-1~6）。
-
-用 Playwright 直连系统 Edge（headless）执行 ELEMENT_COLLECT_SCRIPT 的真实
-JS 语义：kind/name 推导、可见性与视口过滤、500/80 上限、data-ycode-ref
-打标、确定性、inline 链接的视觉可点击区域。环境不可用（无 playwright 或无
-可用 Edge）时整组 skip——不伪造通过；fake 层集成语义由
-test_computer_browser_elements.py 覆盖。
-"""
-
 from __future__ import annotations
 
 import json
@@ -18,7 +9,6 @@ from core.computer.browser_backend import ELEMENT_COLLECT_SCRIPT
 
 @pytest.fixture(scope="module")
 def edge_page():
-    """module 级 headless Edge 页面；启动失败则整组 skip（环境问题，不算通过）。"""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as error:  # pragma: no cover - 环境分支
@@ -42,9 +32,6 @@ def _collect(page, html: str):
     return page.evaluate(ELEMENT_COLLECT_SCRIPT)
 
 
-# ---------------- 基本收集与 kind 推导 ----------------
-
-
 def test_collects_common_html_with_kinds(edge_page):
     result = _collect(
         edge_page,
@@ -64,7 +51,6 @@ def test_collects_common_html_with_kinds(edge_page):
         "link", "button", "textbox", "checkbox", "button",
         "combobox", "textbox", "searchbox",
     ]
-    # ref 按文档顺序从 el-1 递增
     assert [item["ref"] for item in result] == [f"el-{i}" for i in range(1, 9)]
     assert result[0]["name"] == "链接一"
     assert result[1]["name"] == "按钮一"
@@ -83,9 +69,6 @@ def test_disabled_state_is_reported(edge_page):
         """,
     )
     assert [item["enabled"] for item in result] == [False, False, True]
-
-
-# ---------------- 可见性与视口过滤 ----------------
 
 
 def test_visibility_filters_hidden_elements(edge_page):
@@ -112,9 +95,6 @@ def test_viewport_filter_excludes_far_elements(edge_page):
     assert [item["name"] for item in result] == ["在视口内"]
 
 
-# ---------------- name 推导优先级 ----------------
-
-
 def test_name_derivation_priority(edge_page):
     result = _collect(
         edge_page,
@@ -131,27 +111,73 @@ def test_name_derivation_priority(edge_page):
     ]
 
 
-# ---------------- 确定性 + 打标 ----------------
-
-
-def test_collect_is_deterministic_and_marks_elements(edge_page):
+def test_collect_is_deterministic_without_dom_mutation(edge_page):
     html = '<button id="b1">按我</button><input placeholder="输入">'
     edge_page.set_content(html)
     first = edge_page.evaluate(ELEMENT_COLLECT_SCRIPT)
     second = edge_page.evaluate(ELEMENT_COLLECT_SCRIPT)
     assert json.dumps(first, ensure_ascii=False) == json.dumps(second, ensure_ascii=False)
-    # 打标：E2 的 Playwright locator 依赖 data-ycode-ref 属性
-    marked = edge_page.query_selector('[data-ycode-ref="el-1"]')
-    assert marked is not None
-    assert marked.inner_text() == "按我"
+    assert edge_page.query_selector('[data-ycode-ref]') is None
 
 
-# ---------------- 上限与截断 ----------------
+def test_collect_does_not_renumber_after_element_out_of_viewport(edge_page):
+    edge_page.set_content(
+        '<button id="b1">第一个</button><button id="b2">第二个</button>'
+    )
+    first = edge_page.evaluate(ELEMENT_COLLECT_SCRIPT)
+    assert [(item["ref"], item["name"]) for item in first] == [
+        ("el-1", "第一个"),
+        ("el-2", "第二个"),
+    ]
+    edge_page.eval_on_selector(
+        "#b1",
+        "el => { el.style.position = 'absolute'; el.style.top = '9000px'; }",
+    )
+    second = edge_page.evaluate(ELEMENT_COLLECT_SCRIPT)
+    assert [(item["ref"], item["name"]) for item in second] == [("el-2", "第二个")]
+    assert edge_page.query_selector('[data-ycode-ref]') is None
+
+
+def test_collect_pierces_open_shadow_dom(edge_page):
+    edge_page.set_content('<div id="host"></div>')
+    edge_page.evaluate(
+        """() => {
+            const root = document.getElementById('host').attachShadow({ mode: 'open' });
+            root.innerHTML = '<label for="si">影子输入</label>'
+                + '<input id="si" type="text">'
+                + '<button id="sb">影子按钮</button>';
+        }"""
+    )
+    result = edge_page.evaluate(ELEMENT_COLLECT_SCRIPT)
+    assert [(item["kind"], item["name"]) for item in result] == [
+        ("textbox", "影子输入"),
+        ("button", "影子按钮"),
+    ]
+    assert all(
+        item["bounds"][2] > item["bounds"][0] and item["bounds"][3] > item["bounds"][1]
+        for item in result
+    )
+
+
+def test_collect_cursor_pointer_supplements_without_duplicating_children(edge_page):
+    result = _collect(
+        edge_page,
+        """
+        <div id="card" style="cursor:pointer;width:160px;height:40px">
+          <span>卡片标题</span>
+          <span>副标题</span>
+        </div>
+        <button id="real-btn">真实按钮</button>
+        """,
+    )
+    names = [item["name"] for item in result]
+    assert "真实按钮" in names
+    assert result[0]["name"] == "真实按钮"
+    assert any("卡片标题" in name for name in names)
+    assert names.count("副标题") == 0
 
 
 def test_max_elements_and_name_truncation(edge_page):
-    # E3：上限从 200 提到 500（网格型页面一盘就有 256~480 个可点单元）。
-    # 200 个元素不再被截断，超出 500 才截断。
     buttons = "".join(f"<button>{i}</button>" for i in range(210))
     result = _collect(edge_page, buttons)
     assert len(result) == 210
@@ -167,8 +193,6 @@ def test_max_elements_and_name_truncation(edge_page):
 
 
 def test_inline_anchor_bounds_cover_wrapped_icon(edge_page):
-    """E3 回归：line-height:0 的 inline <a> 自身盒退化成 1px 高且不覆盖图片，
-    bounds 必须取其与图标后代的并集（用户实际看到、鼠标能命中的区域）。"""
     result = _collect(
         edge_page,
         """
@@ -185,14 +209,10 @@ def test_inline_anchor_bounds_cover_wrapped_icon(edge_page):
 
 
 def test_name_truncation_counts_code_points_not_utf16_units(edge_page):
-    """E1 评审修复：非 BMP 字符（emoji）按码点截断，不被 UTF-16 代理对切半。"""
     truncated = _collect(edge_page, f"<button>{'😀' * 100}</button>")
     assert truncated[0]["name"] == "😀" * 80
     mixed = _collect(edge_page, f"<button>{'a' + '😀' * 100}</button>")
     assert mixed[0]["name"] == "a" + "😀" * 79
-
-
-# ---------------- 隐私 ----------------
 
 
 def test_collect_never_reads_form_values(edge_page):

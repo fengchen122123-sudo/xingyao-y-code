@@ -1,13 +1,3 @@
-/**
- * 星瑶 bridge 数据层：复用 lan_server 注入的 mobile-shim 协议。
- *
- * - 桌面（pywebview）与手机（shim）都暴露 window.pywebview.api（RPC Proxy）；
- *   RPC 约定 {"method","args","id"} → {"id","result"}，见 core/lan_server.py。
- * - 事件经 window.onBridgeEvent({type, data}) 派发（广播模型，各端独立收）。
- * - shim 每次连接成功会重新注入 api 并 dispatch 'pywebviewready'：
- *   以此作为"连接恢复"信号；RPC 失败/超时则视为离线（shim 无主动断线回调，
- *   由 store 心跳 RPC 兜底探测）。
- */
 
 type BridgeEvent = { type: string; data?: Record<string, any>; seq?: number };
 type Listener = (e: BridgeEvent) => void;
@@ -34,7 +24,6 @@ function waitForApi(timeoutMs = 15000): Promise<void> {
   });
 }
 
-/** 调用 bridge RPC（位置参数数组，与 shim/lan_server ALLOWED_METHODS 约定一致） */
 export async function rpc<T = any>(method: string, ...args: any[]): Promise<T> {
   await waitForApi();
   const api = window.pywebview?.api as any;
@@ -44,7 +33,6 @@ export async function rpc<T = any>(method: string, ...args: any[]): Promise<T> {
   return (api[method](...args) as Promise<T>);
 }
 
-/** 带 RPC 结果回写的连接状态探测：成功即在线 */
 export async function probeOnline(): Promise<boolean> {
   try {
     await rpc('get_token_usage');
@@ -53,8 +41,6 @@ export async function probeOnline(): Promise<boolean> {
     return false;
   }
 }
-
-// ---- 事件分发：单一 window.onBridgeEvent 扇出到多个 listener ----
 
 function dispatch(e: BridgeEvent) {
   for (const l of [...listeners]) {
@@ -70,27 +56,22 @@ function dispatch(e: BridgeEvent) {
 if (window.onBridgeEvent) {
   const prev = window.onBridgeEvent;
   window.onBridgeEvent = (msg: any) => {
-    try { prev(msg); } catch { /* 前一个 handler 的错误不阻断后注册的 */ }
+    try { prev(msg); } catch { }
     dispatch(msg);
   };
 } else {
   window.onBridgeEvent = dispatch as any;
 }
 
-/** 订阅 bridge 事件，返回取消函数 */
 export function onEvent(listener: Listener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
 
-// 配对失效：shim 在 WS 收到 4401（token 过期/被轮换）后派发。
-// 扇出为普通 bridge 事件，复用 onEvent 通道交给 store 处理。
 window.addEventListener('yc-pair-invalid', () => {
   dispatch({ type: 'pair_invalid', data: {} });
 });
 
-// 补发整态自愈：shim 在收到 resync_required / device_reset / seq_reset 后拉取
-// get_initial_state 并派发此事件，通知 store 直接应用快照。
 window.addEventListener('yc-initial-state', (event: Event) => {
   const detail = (event as CustomEvent).detail;
   if (detail && typeof detail === 'object') {

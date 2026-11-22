@@ -1,9 +1,3 @@
-"""gu`i_browser_mixin.BrowserBridgeMixin 的 headless 测试。
-
-用 Dummy(Mixin) 组合类 + stub 控制器，覆盖：非 win32 拒绝、rect 校验、
-navigate 透传、控制器抛异常兜底、on_state→emit_event 接线。
-"""
-
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,7 +73,6 @@ def test_non_windows_reports_unsupported(monkeypatch):
         "ok": False,
         "error": "unsupported_platform",
     }
-    # S5：set_bounds 的平台守卫与其余桥方法一致（此前返回 not_open）
     assert d.browser_pane_set_bounds(VALID_RECT) == {
         "ok": False,
         "error": "unsupported_platform",
@@ -113,7 +106,6 @@ def test_open_passes_rect_and_url_to_controller(monkeypatch):
 
 
 def test_open_and_set_bounds_pass_zoom_through(monkeypatch):
-    """自由尺寸「适应窗口」：前端计算好的缩放随 open/set_bounds 一并透传。"""
     monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
     d = Dummy()
     stub = StubController()
@@ -153,8 +145,6 @@ def test_controller_exception_is_swallowed(monkeypatch):
     assert d.browser_pane_navigate("https://x.com") == {"ok": False, "error": "boom"}
 
 
-# ---------------- 基元律动会话 cookie 注入（内嵌浏览器免二次登录）----------------
-
 TOKENRHYTHM_URL = "https://tokenrhythm.studio/account"
 FAKE_COOKIES = [
     {"name": "sid", "value": "secret-value", "domain": "tokenrhythm.studio", "path": "/"}
@@ -162,7 +152,6 @@ FAKE_COOKIES = [
 
 
 def _patch_export_session_cookies(monkeypatch, result):
-    """把 core.tokenrhythm_auth.export_session_cookies 换成固定返回值/异常。"""
     import core.tokenrhythm_auth as ta
 
     calls = []
@@ -188,7 +177,6 @@ def test_navigate_injects_tokenrhythm_session_cookies(monkeypatch):
 
     assert result["ok"] is True
     assert export_calls == [True]
-    # 注入在 navigate 之前，且带上官方域名
     assert stub.calls == [
         ("set_session_cookies", FAKE_COOKIES, "tokenrhythm.studio"),
         ("navigate", TOKENRHYTHM_URL),
@@ -232,7 +220,7 @@ def test_non_tokenrhythm_url_skips_injection(monkeypatch):
 
     assert d.browser_pane_navigate("https://example.com")["ok"] is True
 
-    assert export_calls == []  # 非官方站点连导出都不做
+    assert export_calls == []
     assert stub.calls == [("navigate", "https://example.com")]
 
 
@@ -246,7 +234,7 @@ def test_export_failure_does_not_break_navigation(monkeypatch):
     result = d.browser_pane_navigate(TOKENRHYTHM_URL)
 
     assert result["ok"] is True
-    assert stub.calls == [("navigate", TOKENRHYTHM_URL)]  # 未注入，导航照常
+    assert stub.calls == [("navigate", TOKENRHYTHM_URL)]
 
 
 def test_empty_cookie_list_skips_injection(monkeypatch):
@@ -268,9 +256,7 @@ def test_controller_lazy_singleton_wires_on_state(monkeypatch):
     ctrl = d._browser_controller()
 
     assert ctrl is not None
-    assert d._browser_controller() is ctrl  # 单例
-    # on_state → emit_event('embedded_browser', ...)
-    # 状态事件必须带归属会话（未占用控件时为空串，前端按当前查看会话处理）
+    assert d._browser_controller() is ctrl
     ctrl._on_state({"url": "https://x.com"})
     assert d.events == [
         ("embedded_browser", {"url": "https://x.com", "session_name": ""})
@@ -302,8 +288,6 @@ def test_hide_and_get_state_without_controller_are_safe():
 
 
 def test_automation_endpoint_emits_session_name(monkeypatch):
-    """自动化事件携带发起会话名：前端据此把浏览器页签开进发起会话的右面板，
-    A 会话的浏览器自动化不再出现在当前查看的 B 会话里。"""
     from core.computer.models import ComputerControlError
 
     monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
@@ -336,7 +320,6 @@ def test_automation_endpoint_emits_session_name(monkeypatch):
         )
     ]
 
-    # 控制器缺失：明确抛错（无降级），不发面板事件
     d2 = Dummy()
     try:
         d2.embedded_browser_automation_endpoint("sess-B")
@@ -345,9 +328,6 @@ def test_automation_endpoint_emits_session_name(monkeypatch):
     else:
         raise AssertionError("expected ComputerControlError")
     assert d2.events == []
-
-
-# ---------------- 预览页落盘（md 在右栏浏览器渲染用）----------------
 
 
 def test_write_preview_page_writes_file(tmp_path, monkeypatch):
@@ -365,8 +345,89 @@ def test_write_preview_page_writes_file(tmp_path, monkeypatch):
 def test_write_preview_page_error_is_structured():
     d = Dummy()
 
-    # 空内容：不抛穿 js_api，返回结构化错误
     result = d.write_preview_page("   ")
 
     assert result["ok"] is False
     assert result["error"]
+
+
+def test_browser_pane_forwards_surface_generation_when_provided(monkeypatch):
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+
+    class GenController(StubController):
+        def open(self, rect, url="", zoom=1.0, surface_generation=None):
+            self.calls.append(("open", rect, url, zoom, surface_generation))
+            return {"ok": True, "ack": True, "surface_generation": surface_generation}
+
+        def set_bounds(self, rect, zoom=1.0, surface_generation=None):
+            self.calls.append(("set_bounds", rect, zoom, surface_generation))
+            return {"ok": True, "ack": True, "surface_generation": surface_generation}
+
+        def hide(self, surface_generation=None):
+            self.calls.append(("hide", surface_generation))
+            return {"ok": True, "ack": True, "surface_generation": surface_generation}
+
+    d = Dummy()
+    ctrl = GenController()
+    d._embedded_browser = ctrl
+
+    r1 = d.browser_pane_open(VALID_RECT, "https://example.com", 1.0, "", surface_generation=7)
+    r2 = d.browser_pane_set_bounds(VALID_RECT, 1.0, "", surface_generation=7)
+    r3 = d.browser_pane_hide("", surface_generation=8)
+
+    assert r1["surface_generation"] == 7
+    assert r2["surface_generation"] == 7
+    assert r3["surface_generation"] == 8
+    assert ctrl.calls == [
+        ("open", VALID_RECT, "https://example.com", 1.0, 7),
+        ("set_bounds", VALID_RECT, 1.0, 7),
+        ("hide", 8),
+    ]
+
+
+def test_automation_endpoint_prompts_confirmation_via_permission_broker_for_non_cdp(monkeypatch):
+    from core.computer.models import ComputerControlError
+    from core.permission_broker import PermissionBroker
+
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    monkeypatch.setattr("core.computer.settings.get_project_browser_viewport", lambda _w: (1280, 800))
+    monkeypatch.setattr("core.workspace_context.get_workdir", lambda: "D:/proj")
+
+    class NonCdpController:
+        def __init__(self):
+            self.confirmed = []
+
+        def prepare_automation(self, *, confirm_recreate=None):
+            ok = bool(confirm_recreate and confirm_recreate("https://example.com/user-page"))
+            self.confirmed.append(ok)
+            if not ok:
+                return {"ok": False, "error": "recreate_confirmation_required", "msg": "需要用户确认刷新接管"}
+            return {"ok": True, "endpoint": "http://127.0.0.1:9444", "recreated": True}
+
+    prompts = []
+    broker = PermissionBroker(
+        activate_prompt=lambda req: (prompts.append(req), broker.resolve_by_key(req.request_id, "deny")),
+        dismiss_prompt=lambda: None,
+    )
+    monkeypatch.setattr("core.permission_broker.permission_broker", broker)
+
+    d = Dummy()
+    d._embedded_browser = NonCdpController()
+    try:
+        d.embedded_browser_automation_endpoint("sess-A")
+    except ComputerControlError as exc:
+        assert exc.code == "computer_embedded_recreate_required"
+    else:
+        raise AssertionError("expected ComputerControlError when recreate declined")
+    assert len(prompts) == 1
+    assert prompts[0].function_name == "embedded_browser_recreate"
+    assert d._embedded_browser.confirmed == [False]
+
+    broker2 = PermissionBroker(
+        activate_prompt=lambda req: broker2.resolve_by_key(req.request_id, "allow_once"),
+        dismiss_prompt=lambda: None,
+    )
+    monkeypatch.setattr("core.permission_broker.permission_broker", broker2)
+    endpoint = d.embedded_browser_automation_endpoint("sess-A")
+    assert endpoint == "http://127.0.0.1:9444"
+    assert d._embedded_browser.confirmed == [False, True]

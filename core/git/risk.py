@@ -1,12 +1,3 @@
-"""风险分级与两段式确认（规格 §13）。
-
-- 用户手动操作不经模型权限 Broker，但必须过服务端 GitRiskPolicy；
-- 高风险操作（历史改写 / 不可恢复）使用两段式协议：preview 发放短时一次性
-  confirmation_token，执行时服务端验证会话、仓库、参数摘要、快照版本、
-  有效期与未使用状态，全部一致才执行；前端弹窗只是交互层；
-- 令牌由进程内随机密钥 HMAC 生成，前端无法构造或复用。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -30,7 +21,6 @@ class RiskLevel(str, Enum):
     UNRECOVERABLE = "unrecoverable"
 
 
-# 白名单操作 → 风险等级（§13 分级表；未列出的操作 = 白名单外，显式拒绝）
 _OPERATION_RISK: Dict[str, RiskLevel] = {
     # 只读
     "status": RiskLevel.READ_ONLY,
@@ -39,21 +29,20 @@ _OPERATION_RISK: Dict[str, RiskLevel] = {
     "blame": RiskLevel.READ_ONLY,
     "reflog": RiskLevel.READ_ONLY,
     "fetch": RiskLevel.READ_ONLY,
-    # 可逆本地
     "stage": RiskLevel.LOCAL_REVERSIBLE,
     "unstage": RiskLevel.LOCAL_REVERSIBLE,
-    "discard_hunk": RiskLevel.UNRECOVERABLE,  # Restore 未提交内容在 §13 高风险清单
+    "discard_hunk": RiskLevel.UNRECOVERABLE,
     "commit": RiskLevel.LOCAL_REVERSIBLE,
     "undo_last_commit": RiskLevel.LOCAL_REVERSIBLE,
     "branch_create": RiskLevel.LOCAL_REVERSIBLE,
     "branch_rename": RiskLevel.LOCAL_REVERSIBLE,
-    "branch_delete_safe": RiskLevel.LOCAL_REVERSIBLE,  # Reflog 可恢复
-    "branch_delete_force": RiskLevel.UNRECOVERABLE,    # 强制删除未合并分支：高风险清单
+    "branch_delete_safe": RiskLevel.LOCAL_REVERSIBLE,
+    "branch_delete_force": RiskLevel.UNRECOVERABLE,
     "switch": RiskLevel.LOCAL_REVERSIBLE,
     "set_upstream": RiskLevel.LOCAL_REVERSIBLE,
     "remote_add": RiskLevel.LOCAL_REVERSIBLE,
     "remote_set_url": RiskLevel.LOCAL_REVERSIBLE,
-    "pull": RiskLevel.LOCAL_REVERSIBLE,  # 仅 fast-forward；冲突即显式停止
+    "pull": RiskLevel.LOCAL_REVERSIBLE,
     "stash_create": RiskLevel.LOCAL_REVERSIBLE,
     "stash_apply": RiskLevel.LOCAL_REVERSIBLE,
     "stash_pop": RiskLevel.LOCAL_REVERSIBLE,
@@ -69,16 +58,14 @@ _OPERATION_RISK: Dict[str, RiskLevel] = {
     "worktree_remove": RiskLevel.LOCAL_REVERSIBLE,
     "worktree_prune": RiskLevel.LOCAL_REVERSIBLE,
     "ignore_add": RiskLevel.LOCAL_REVERSIBLE,
-    "apply_patch": RiskLevel.LOCAL_REVERSIBLE,  # --check 预检 + 失败显式
+    "apply_patch": RiskLevel.LOCAL_REVERSIBLE,
     "export_patch": RiskLevel.READ_ONLY,
-    "rebase_plan_write": RiskLevel.HISTORY_REWRITE,  # interactive rebase 计划改写
-    # 远程写（preview，不强制令牌）
+    "rebase_plan_write": RiskLevel.HISTORY_REWRITE,
     "push": RiskLevel.REMOTE_WRITE,
     "tag_push": RiskLevel.REMOTE_WRITE,
-    "tag_delete_remote": RiskLevel.UNRECOVERABLE,  # §13 高风险清单
+    "tag_delete_remote": RiskLevel.UNRECOVERABLE,
     "branch_delete_remote": RiskLevel.UNRECOVERABLE,
-    # 历史改写（高风险确认）
-    "push_force_with_lease": RiskLevel.HISTORY_REWRITE,  # 唯一允许的强推形态
+    "push_force_with_lease": RiskLevel.HISTORY_REWRITE,
     "rebase": RiskLevel.HISTORY_REWRITE,
     "amend_published": RiskLevel.HISTORY_REWRITE,
     # 不可恢复（高风险确认 + 输入目标分支名/短 Hash）
@@ -106,7 +93,6 @@ def requires_confirmation(level: RiskLevel) -> bool:
 
 
 def requires_typed_confirmation(level: RiskLevel) -> bool:
-    """不可恢复操作还要求用户输入分支名或短 Hash 二次确认（§13）。"""
     return level is RiskLevel.UNRECOVERABLE
 
 
@@ -127,10 +113,9 @@ class _Binding:
 
 
 class ConfirmationService:
-    """一次性确认令牌：preview 发放，执行时验证并消费（§13 两段式协议）。"""
 
     def __init__(self, ttl_seconds: float = 60.0):
-        self._secret = secrets.token_bytes(32)  # 进程内随机密钥
+        self._secret = secrets.token_bytes(32)
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
         self._bindings: Dict[str, _Binding] = {}

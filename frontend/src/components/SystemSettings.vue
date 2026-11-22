@@ -197,7 +197,7 @@
         <div class="setting-row">
           <div class="setting-copy">
             <h2>浏览器操控</h2>
-            <p>在专用 Edge/Chrome 页面中观察、点击、输入、滚动和导航。</p>
+            <p>在系统设置选定的默认浏览器（星瑶内置浏览器 / Edge / Chrome）中观察、点击、输入、滚动和导航。</p>
           </div>
           <button
             v-if="!isMobile"
@@ -213,8 +213,6 @@
           </button>
         </div>
 
-        <!-- Playwright 按需组件（core/components.py）：安装包不再内置 Playwright，
-             未安装时在这里按需下载；下载进度走 playwright_component_progress 桥事件 -->
         <div class="setting-row playwright-component-card" data-test="playwright-component-card">
           <div class="setting-copy">
             <h2>浏览器操控组件</h2>
@@ -360,9 +358,6 @@
       >{{ computerModelCapabilityHint }}</p>
     </section>
 
-    <!-- 网页搜索按需组件（core/components.py 的 SEARCH_SPEC）：ddgs 及其
-         primp/lxml/fake_useragent 二进制依赖已从主安装包剔除，未安装时在这里
-         按需下载；下载进度走 search_component_progress 桥事件 -->
     <section class="setting-group search-component-settings" data-test="search-component-section">
       <div class="group-title"><AppIcon name="search" :size="14" /> 网页搜索</div>
       <div class="setting-card">
@@ -433,28 +428,19 @@ import AppIcon from './AppIcon.vue';
 const store = useAppStore();
 const saving = ref(false);
 
-// 手机 viewport 不显示可点击启用控件（呈现层约束；后端边界由 Task 15 实施）
 const isMobile = useIsMobile();
 
-// 每次进入设置页重拉一次：电脑操控资格提示依赖「当前会话生效模型」，
-// 会话级模型随时可能被切换，沿用启动时的快照会显示成别的模型
 onMounted(() => {
   void store.refreshSystemSettings({ silent: true });
-  // Playwright 组件状态来自磁盘探测（安装包已不再内置），进页必拉一次；
-  // 下载中的进度由 playwright_component_progress 桥事件持续合并
   void store.refreshPlaywrightComponentStatus();
-  // 网页搜索组件同样是磁盘探测得来的（安装包已不含 ddgs），进页也要拉一次
   void store.refreshSearchComponentStatus();
 });
 
-// ── Playwright 按需组件（设置页「浏览器操控组件」卡片）──
-// 展示状态一律读 Store 快照，不在组件内单独维护副本（桥事件只更新 Store）
 const playwrightComponent = computed(() => store.playwrightComponent);
 const playwrightPercent = computed(() => {
   const value = Number(store.playwrightComponent.percent) || 0;
   return Math.min(100, Math.max(0, Math.round(value)));
 });
-// 已下载/总字节按 MB 展示（后端 total 未知时为 0，此时只显示已下载量）
 const playwrightSizeText = computed(() => {
   const format = (bytes: number) => `${(Math.max(0, Number(bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
   const total = Number(store.playwrightComponent.total_bytes) || 0;
@@ -491,7 +477,6 @@ const searchPercent = computed(() => {
   const value = Number(store.searchComponent.percent) || 0;
   return Math.min(100, Math.max(0, Math.round(value)));
 });
-// 已下载/总字节按 MB 展示（后端 total 未知时为 0，此时只显示已下载量）
 const searchSizeText = computed(() => {
   const format = (bytes: number) => `${(Math.max(0, Number(bytes) || 0) / (1024 * 1024)).toFixed(1)} MB`;
   const total = Number(store.searchComponent.total_bytes) || 0;
@@ -552,7 +537,6 @@ const turnStepLimitError = computed(() => {
   const value = parsedTurnStepLimit.value;
   const min = store.systemSettings.agent_turn_step_limit_min;
   const max = store.systemSettings.agent_turn_step_limit_max;
-  // type="number" 的 v-model 会自动把草稿转为 number，这里统一按字符串校验
   if (!String(turnStepLimitDraft.value).trim() || !Number.isInteger(value)) {
     return '请输入整数';
   }
@@ -579,12 +563,9 @@ async function saveTurnStepLimit() {
   }
 }
 
-// 上下文水位基准：草稿为字符串，空串表示不设基准（按 0 提交）；
-// 快照为 null（未设置）时同样回显为空串
 const contextWatermarkBaseDraft = ref(
   store.systemSettings.context_watermark_base === null ? '' : String(store.systemSettings.context_watermark_base),
 );
-// 保存失败的行内提示：与校验错误共用同一行提示位
 const contextWatermarkBaseSaveError = ref('');
 
 watch(
@@ -592,7 +573,6 @@ watch(
   value => { contextWatermarkBaseDraft.value = value === null ? '' : String(value); },
 );
 
-// 空串按 0 处理（表示不设基准）；type="number" 的 v-model 会把草稿转为 number
 const parsedContextWatermarkBase = computed(
   () => (String(contextWatermarkBaseDraft.value).trim() ? Number(contextWatermarkBaseDraft.value) : 0),
 );
@@ -601,11 +581,9 @@ const contextWatermarkBaseValidationError = computed(() => {
   const value = parsedContextWatermarkBase.value;
   const min = store.systemSettings.context_watermark_base_min;
   const max = store.systemSettings.context_watermark_base_max;
-  // type="number" 的 v-model 会自动把草稿转为 number，这里统一按字符串校验
   if (!Number.isInteger(value)) {
     return '请输入整数';
   }
-  // 0 是「不设基准」的合法值，只有非 0 值才受 min/max 约束
   if (value !== 0 && (value < min || value > max)) {
     return `请输入 0（不设基准）或 ${min}–${max} 之间的整数`;
   }
@@ -636,8 +614,6 @@ async function saveContextWatermarkBase() {
   }
 }
 
-// AI 生成内容目录（Task 5）：草稿保存的是原始配置值（未配置为空串），
-// 生效路径与默认目录都由后端快照给出，前端不自行拼路径
 const aiOutputDirDraft = ref(store.systemSettings.ai_output_dir_setting || '');
 const aiOutputDirError = ref('');
 
@@ -696,8 +672,6 @@ async function selectTokenTtl(value: string) {
   }
 }
 
-// ── 电脑操控区（Task 12）：开关状态一律以后端快照渲染，失败自动回滚 ──
-
 // 活动 run：浏览器选择在活动会话中不可修改（设计 8.1）
 const activeComputerRun = computed(() => {
   const run = store.systemSettings.computer_run;
@@ -705,7 +679,6 @@ const activeComputerRun = computed(() => {
   return !['idle', 'completed', 'stopped', 'failed'].includes(run.status);
 });
 
-// 平台/浏览器/热键 preflight 结果（mini-list 摘要，不塞整表）
 const preflightItems = computed(() => {
   const items = [
     {
@@ -804,7 +777,6 @@ async function selectComputerBrowser(browser: string) {
 .setting-save:disabled { cursor: not-allowed; opacity: .6; }
 .setting-error { margin: 8px 0 0; color: var(--red); font-size: 12px; }
 
-/* ── 电脑操控区（Task 12）── */
 .setting-switch { position: relative; flex: 0 0 auto; width: 44px; height: 24px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg3); cursor: pointer; transition: background .15s ease, border-color .15s ease; }
 .setting-switch[aria-checked='true'] { background: var(--accent); border-color: var(--accent); }
 .setting-switch .switch-knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 999px; background: var(--text-bright); transition: transform .15s ease; }
@@ -814,7 +786,6 @@ async function selectComputerBrowser(browser: string) {
 /* 专用配置目录是长路径：右侧只读展示，不占整行 */
 .setting-path { flex: 0 0 auto; max-width: 50%; color: var(--text-dim); font-size: 12px; text-align: right; word-break: break-all; }
 
-/* ── Playwright 按需组件卡片（安装包不再内置 Playwright）── */
 .playwright-component-card { align-items: flex-start; }
 .playwright-component-state { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .playwright-component-missing { color: var(--text-faint); font-size: 12px; }
@@ -851,7 +822,6 @@ async function selectComputerBrowser(browser: string) {
 .search-component-size { flex: 0 0 auto; color: var(--text-faint); font-size: 12px; white-space: nowrap; }
 .search-component-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
 
-/* 环境检测/安全提示折叠在卡片末行，保持主视图清爽 */
 .setting-details { border-top: 0; }
 .setting-details > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; color: var(--text-dim); font-size: 13px; cursor: pointer; list-style: none; user-select: none; }
 .setting-details > summary::-webkit-details-marker { display: none; }
@@ -882,7 +852,6 @@ async function selectComputerBrowser(browser: string) {
 @media (max-width: 620px) {
   .setting-row { align-items: stretch; flex-direction: column; gap: 12px; padding: 14px 16px; }
   .setting-select { flex-basis: auto; max-width: none; width: 100%; }
-  /* 窄屏下目录输入框与两个按钮换行铺满，不横向溢出 */
   .setting-number-group { flex-wrap: wrap; width: 100%; }
   .setting-number[data-test="ai-output-dir-input"] { flex: 1 1 160px; width: auto; min-width: 0; }
 }

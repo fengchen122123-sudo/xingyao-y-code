@@ -241,7 +241,6 @@ const STATUS_LABELS: Record<string, string> = {
 const statusLabel = computed(() => STATUS_LABELS[settings.value.status.state] || settings.value.status.state);
 const statusClass = computed(() => `is-${settings.value.status.state || 'disabled'}`);
 
-/** 配置检查清单：让用户一眼看出「我配到哪一步了」 */
 const checklist = computed(() => {
   const current = settings.value;
   const approvers = current.approvers || [];
@@ -347,9 +346,6 @@ onMounted(load);
 </script>
 
 <style scoped>
-/* 颜色一律走 style.css 里真实存在的语义别名：--text / --text-dim / --text-faint /
-   --green / --yellow / --red / --mono。--text-1/--text-2/--text-3、--ok、--warn、
-   --danger、--font-mono 在本项目没有定义，写进去等于取值透明。 */
 .feishu-settings { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
 .feishu-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 6px; }
 .feishu-header h1 { margin: 0 0 6px; font-size: 25px; }

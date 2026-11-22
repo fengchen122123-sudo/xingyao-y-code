@@ -12,24 +12,19 @@ const turnStepLimitFields = {
   agent_turn_step_limit_max: 1000,
 };
 
-// 上下文水位基准设置：null 表示未设置（跟随模型真实窗口），取值范围由 min/max 给出
 const contextWatermarkFields = {
   context_watermark_base: null as number | null,
   context_watermark_base_min: 50000,
   context_watermark_base_max: 2000000,
 };
 
-// AI 生成内容目录设置（Task 5）：setting 为原始配置值（未配置为空串），
-// default 为默认目录（占位符与说明文案展示用）
 const aiOutputDirFields = {
   ai_output_dir: 'C:\\ycode-data\\tmp',
   ai_output_dir_setting: '',
   ai_output_dir_default: 'C:\\ycode-data\\tmp',
 };
 
-// 电脑操控设置快照（Task 12）：两个开关默认关闭，浏览器选项独立探测
 const computerSettings = {
-  // 子代理开关（缺省开启）：不补该字段会让 SystemSettingsSnapshot 类型不完整
   subagent_enabled: true,
   browser_control_enabled: false,
   computer_control_enabled: false,
@@ -197,8 +192,6 @@ describe('SystemSettings', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
-  // ── 上下文水位基准 ──
-
   function mountWithContextWatermark(overrides: Record<string, unknown> = {}) {
     const store = useAppStore();
     store.systemSettings = {
@@ -262,7 +255,6 @@ describe('SystemSettings', () => {
 
     await wrapper.get('[data-test="context-watermark-base-input"]').setValue('0');
 
-    // 0 是「不设基准」（跟随模型真实窗口），不受 min/max 约束
     expect(wrapper.find('[data-test="context-watermark-base-error"]').exists()).toBe(false);
     const button = wrapper.get('[data-test="save-context-watermark-base"]');
     expect(button.attributes('disabled')).toBeUndefined();
@@ -338,8 +330,6 @@ describe('SystemSettings', () => {
     }
   });
 
-  // ── AI 生成内容目录（Task 5）──
-
   it('saves the AI output directory through the store', async () => {
     const store = useAppStore();
     store.systemSettings = {
@@ -356,7 +346,6 @@ describe('SystemSettings', () => {
     const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
     const wrapper = mount(SystemSettings);
 
-    // 占位符显示后端给出的默认目录，用户不填即恢复默认
     const input = wrapper.get('[data-test="ai-output-dir-input"]');
     expect(input.attributes('placeholder')).toBe('C:\\ycode-data\\tmp');
 
@@ -404,7 +393,6 @@ describe('SystemSettings', () => {
       command_shell_options: [],
     };
     const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
-    // 选择目录走 store.pickFolderPlain（桌面原生对话框 / 触屏内置浏览器统一入口）
     const pick = vi.spyOn(store, 'pickFolderPlain').mockImplementation(async (cb: (path: string) => void) => {
       cb('D:\\ai_out');
     });
@@ -432,7 +420,6 @@ describe('SystemSettings', () => {
       command_shell_options: [],
     };
     const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
-    // 用户取消：pickFolderPlain 的回调不触发
     vi.spyOn(store, 'pickFolderPlain').mockImplementation(async () => {});
     const wrapper = mount(SystemSettings);
 
@@ -442,8 +429,6 @@ describe('SystemSettings', () => {
     expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('');
     expect(save).not.toHaveBeenCalled();
   });
-
-  // ── 电脑操控区（Task 12）──
 
   function mountWithComputerSettings(overrides: Record<string, unknown> = {}) {
     const store = useAppStore();
@@ -551,7 +536,6 @@ describe('SystemSettings', () => {
     try {
       const { wrapper } = mountWithComputerSettings();
 
-      // 手机端不显示可点击启用控件（后端边界由 Task 15 实施）
       expect(wrapper.find('[data-test="browser-control-switch"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="computer-control-switch"]').exists()).toBe(false);
       expect(wrapper.find('[data-test="computer-browser-select"]').exists()).toBe(false);
@@ -600,11 +584,9 @@ describe('computer active model capability hint', () => {
 
   it('shows eligible summary when switches on and model qualifies', () => {
     const wrapper = mountWith({ browser_control_enabled: true });
-    // 合格提示是说明性内容，收在「环境检测与安全提示」折叠区里，不占主视图行
     const hint = wrapper.get('[data-test="computer-diagnostics-capability-hint"]');
     expect(hint.text()).toContain('已具备电脑操控资格');
     expect(hint.classes()).not.toContain('blocked');
-    // 不合格时才是需要立刻看到的问题，仍然放在折叠区外
     expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
   });
 
@@ -613,8 +595,6 @@ describe('computer active model capability hint', () => {
     expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
   });
 });
-
-// ── 子代理开关 ──
 
 describe('subagent switch', () => {
   const subagentApi = { set_subagent_enabled: vi.fn() };

@@ -112,7 +112,6 @@ async function applyResult() {
 }
 
 async function aiAdvice() {
-  // §5.15：AI 只发可见对话消息给建议；不直接改文件
   await apiSafe('git_ai_assist', store.workdir, 'conflict_advice');
 }
 

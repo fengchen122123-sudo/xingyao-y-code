@@ -49,7 +49,7 @@ def test_elide_upgrades_snipped_but_never_touches_elided():
     snipped = snip_tool_result("read_file", text)
     upgraded = elide_tool_result("read_file", snipped)
     assert upgraded is not None and upgraded.startswith(ELIDED_PREFIX)
-    assert elide_tool_result("read_file", upgraded) is None  # 单调：升级后永久冻结
+    assert elide_tool_result("read_file", upgraded) is None
 
 
 def test_marker_helpers():
@@ -61,6 +61,5 @@ def test_marker_helpers():
 
 def test_estimate_text_tokens_cjk_aware():
     assert estimate_text_tokens("") == 0
-    # CJK：字符数主导；ASCII：bytes/4 主导
     assert estimate_text_tokens("汉" * 100) >= 100
     assert estimate_text_tokens("a" * 400) == 100

@@ -1,16 +1,3 @@
-"""core/tools_admin_model.py
-Agent 工具 model_manage：模型与提供商管理。
-
-覆盖能力：提供商增删改查、预置提供商添加、模型增删改查、激活模型切换、
-思考档位设置、连通性测试（真实最小请求）、拉取提供商模型列表。
-
-设计约束：
-- 配置读写一律走 core.model_manager 的公开函数，不直接改 config.json；
-- 绝不 import gui_bridge / main / pywebview；
-- 输出统一为 JSON 字符串（ensure_ascii=False）：成功 {"ok": true, ...}，
-  失败 {"ok": false, "error": "中文原因"}；API Key 永不落进任何输出（仅报是否已配置）；
-- 连通性测试与 fetch_models 都发真实网络请求，失败返回真实错误，不伪造成功。
-"""
 from __future__ import annotations
 
 import json
@@ -47,13 +34,9 @@ _ACTIONS = (
 _PROTOCOLS = ("openai", "anthropic", "responses")
 _COMPUTER_PROTOCOLS = ("none", "generic", "native_openai")
 
-# 连通性测试与模型列表拉取的超时（秒）
 _NETWORK_TIMEOUT_SECONDS = 20.0
 
 
-# ---------------------------------------------------------------------------
-# 统一 JSON 输出
-# ---------------------------------------------------------------------------
 def _ok(**payload: Any) -> str:
     result = {"ok": True}
     result.update(payload)
@@ -75,7 +58,6 @@ def _api_key_configured(provider: dict) -> bool:
 
 
 def _resolve_provider(config: dict, identifier: str) -> dict | None:
-    """按 provider id 精确匹配，其次按名称精确匹配。"""
     target = str(identifier or "").strip()
     if not target:
         return None
@@ -90,7 +72,6 @@ def _resolve_provider(config: dict, identifier: str) -> dict | None:
 
 
 def _find_model(config: dict, model_id: str) -> tuple[dict | None, dict | None]:
-    """返回 (provider, model)；未找到返回 (None, None)。"""
     target = str(model_id or "").strip()
     if not target:
         return None, None
@@ -145,9 +126,6 @@ def _build_models_url(base_url: str) -> str:
     return base + "/v1/models"
 
 
-# ---------------------------------------------------------------------------
-# 各 action 实现
-# ---------------------------------------------------------------------------
 def _action_list_providers() -> str:
     config = model_manager.load_config()
     providers = [_provider_summary(p) for p in (config.get("providers") or [])]
@@ -231,7 +209,7 @@ def _action_update_provider(provider: str, name: str, base_url: str,
         str(target.get("id")),
         name=new_name,
         base_url=new_base_url,
-        api_key=str(api_key or ""),  # 空串 = 保留原 Key
+        api_key=str(api_key or ""),
         protocol=new_protocol,
     )
     return _ok(
@@ -274,7 +252,7 @@ def _action_add_model(provider: str, model_name: str, name: str,
         return _fail(f"未找到提供商: {provider}")
     window = int(context_window or 0)
     if window <= 0:
-        window = 128000  # 未指定时按通用默认，避免 model_manager 直接拒绝
+        window = 128000
     proto = str(computer_protocol or "").strip() or None
     model_id = model_manager.add_model_to_provider(
         str(target.get("id")),
@@ -350,7 +328,6 @@ def _action_set_active(model_id: str) -> str:
         active_model_id=model.get("id"),
         name=model.get("name"),
         route=model.get("litellm_model"),
-        # 只回传非敏感字段，get_active_model 的 api_key 一律不输出
         provider_name=(active or {}).get("provider_name"),
         protocol=(active or {}).get("protocol"),
         context_window=(active or {}).get("context_window"),
@@ -372,7 +349,6 @@ def _action_set_reasoning(model_id: str, reasoning: str) -> str:
 
 
 def _action_test(model_id: str) -> str:
-    """发一次最小真实 chat 请求验证连通性；失败回传真实错误，不伪装成功。"""
     if not str(model_id or "").strip():
         return _fail("test 需要 model_id")
     config = model_manager.load_config()
@@ -389,7 +365,6 @@ def _action_test(model_id: str) -> str:
     if not str(api_key or "").strip():
         return _fail(f"提供商 {provider.get('name')} 未配置 API Key，无法测试连通性")
 
-    # 复用项目原生 HTTP 传输（core.llm_native_transport）：非流式、最小载荷、20 秒超时。
     from core.llm_native_transport import native_completion
 
     started = time.perf_counter()
@@ -438,7 +413,6 @@ def _action_test(model_id: str) -> str:
 
 
 def _action_fetch_models(provider: str) -> str:
-    """GET {base_url}/models（或 /v1/models）拉取可用模型 id 列表。"""
     if not str(provider or "").strip():
         return _fail("fetch_models 需要 provider（厂商 id 或名称）")
     config = model_manager.load_config()
@@ -482,7 +456,6 @@ def _action_fetch_models(provider: str) -> str:
             identifier = item.get("id") or item.get("name") or item.get("model")
             if identifier:
                 model_ids.append(str(identifier))
-    # 去重保序
     seen: set[str] = set()
     unique_ids = [mid for mid in model_ids if not (mid in seen or seen.add(mid))]
     return _ok(
@@ -494,9 +467,6 @@ def _action_fetch_models(provider: str) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# 对外工具函数
-# ---------------------------------------------------------------------------
 def model_manage(action: str, provider: str = "", model_id: str = "", name: str = "",
                  base_url: str = "", api_key: str = "", protocol: str = "",
                  model_name: str = "", preset: str = "", reasoning: str = "",
@@ -548,7 +518,6 @@ def model_manage(action: str, provider: str = "", model_id: str = "", name: str 
 
 
 def _execute(**arguments: Any) -> str:
-    """ToolSpec 执行入口：过滤调度层注入的内部键后转调 model_manage。"""
     clean = {key: value for key, value in arguments.items() if key in _KNOWN_ARGUMENTS}
     return model_manage(**clean)
 
@@ -587,7 +556,6 @@ _INPUT_SCHEMA: dict[str, Any] = {
 
 
 def build_specs() -> list[ToolSpec]:
-    """返回 model_manage 的工具规格（单条）。"""
     return [
         ToolSpec(
             name="model_manage",

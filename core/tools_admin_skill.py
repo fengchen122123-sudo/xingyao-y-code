@@ -1,47 +1,20 @@
-"""管理类 Agent 工具：技能 / 插件 / Hook。
-
-设计约束（务必保持）：
-- **只做"能力复用"**：本模块不实现任何业务逻辑，全部转调既有 core 服务
-  （``core.skills`` / ``core.plugin_loader`` / ``core.hooks.trust`` /
-  ``core.hooks.config_mutation``），避免 GUI、CLI 与本工具三份实现分叉。
-- **不暴露信任/授权动作**：插件信任（``plugin_loader.trust_plugin``）与 hook
-  信任（``hooks.trust.apply_hook_trust_action``）是"人类确认"语义的操作，模型
-  无权代劳，因此本模块既没有也不允许新增 trust/grant/deny/revoke 类 action。
-- **统一返回 JSON 字符串**（``ensure_ascii=False``）：成功 ``{"ok": true, ...}``，
-  失败 ``{"ok": false, "error": "中文原因"}``；所有异常在 execute 内兜底捕获，
-  绝不让异常穿透到调度层。
-- 依赖边界：禁止 import ``gui_bridge`` / ``main`` / ``pywebview``（GUI 层在
-  GUI 进程里不可用，且会把工具注册拖进 UI 依赖）。core 模块一律函数内惰性
-  导入：本模块被工具注册表 import 时不应触发插件扫描、hook 读盘等副作用。
-"""
-
 import json
 import os
 
 from core.tool_protocol import ToolSpec
 
 
-# ── 统一返回与参数校验小工具 ──────────────────────────────────
-
-
 def _ok(**payload):
-    """成功结果：``{"ok": true, ...}``。"""
     data = {"ok": True}
     data.update(payload)
     return json.dumps(data, ensure_ascii=False)
 
 
 def _err(message):
-    """失败结果：``{"ok": false, "error": <中文原因>}``。"""
     return json.dumps({"ok": False, "error": str(message or "未知错误")}, ensure_ascii=False)
 
 
 def _workspace_root():
-    """当前线程绑定的工作目录（项目级 hook 配置的定位基准）。
-
-    用 ``workspace_context`` 而不是 ``os.getcwd()``：多会话并行时各会话工作目录
-    可能不同，项目级 hooks.json 必须落在发起调用的那个工作区。
-    """
     try:
         from core.workspace_context import get_workdir
 
@@ -51,23 +24,13 @@ def _workspace_root():
 
 
 def _require_str(value, field_name):
-    """返回 ``(文本, "")`` 或 ``(None, 中文原因)``。"""
     if not isinstance(value, str) or not value.strip():
         return None, f"缺少必填参数 {field_name}"
     return value.strip(), ""
 
 
-# ── 技能管理 ────────────────────────────────────────────────
-
-
 def _skill_view(skill, active_ids, released_builtin):
-    """把 ``scan_all_skills`` 的原始记录压成工具输出用的精简视图。
-
-    ``scan_all_skills`` 的每项含完整正文（content/body），直接回传会白烧上下文，
-    模型只需要 id / 名称 / 描述 / 启停状态 / 来源。
-    """
     skill_id = str(skill.get("id") or "")
-    # 技能以 SKILL.md 绝对路径为 id（见 parse_skill_md），目录名才是"短名"
     short_id = os.path.basename(os.path.dirname(skill_id)) if skill_id else ""
     return {
         "id": skill_id,
@@ -76,13 +39,11 @@ def _skill_view(skill, active_ids, released_builtin):
         "description": str(skill.get("description") or ""),
         "enabled": skill_id in active_ids,
         "source": str(skill.get("source") or "user"),
-        # 是否曾由内置技能释放过（True 表示可用 restore 恢复内置版本）
         "from_builtin": bool(short_id and short_id in released_builtin),
     }
 
 
 def _skill_snapshot():
-    """扫描技能并拼装 ``{skills, active_ids}`` 快照（供各 action 复用）。"""
     from core.skills import (
         get_active_skill_ids,
         get_released_builtin_names,
@@ -100,12 +61,6 @@ def _skill_snapshot():
 
 
 def skill_manage(action, skill_id="", reload_only=False):
-    """技能管理：list / enable / disable / refresh / restore。
-
-    - ``refresh`` 与 ``reload_only=True`` 都是"重新扫描"，不做任何写操作；
-      ``reload_only=True`` 时 enable/disable 降级为只读预演（只回传当前状态），
-      便于模型先确认目标技能再落盘。
-    """
     try:
         from core.skills import (
             get_active_skill_ids,
@@ -170,7 +125,6 @@ def skill_manage(action, skill_id="", reload_only=False):
             target_id, error = _require_str(skill_id, "skill_id")
             if target_id is None:
                 return _err(error)
-            # restore_builtin_skill 以"技能目录名"为唯一标识，需从 SKILL.md 路径反推
             name = os.path.basename(os.path.dirname(target_id))
             if not name:
                 return _err("技能标识无效，无法定位技能目录")
@@ -187,18 +141,13 @@ def skill_manage(action, skill_id="", reload_only=False):
         return _err(f"技能管理失败：{exc}")
 
 
-# ── 插件管理 ────────────────────────────────────────────────
-
-
 def _plugin_view(info):
-    """插件信息精简视图（``get_plugin_infos`` 已返回 dict 副本，可直接挑字段）。"""
     return {
         "name": str(info.get("name") or ""),
         "version": str(info.get("version") or ""),
         "description": str(info.get("description") or ""),
         "path": str(info.get("path") or ""),
         "source": str(info.get("source") or ""),
-        # loaded / disabled / failed / overridden / untrusted
         "status": str(info.get("status") or ""),
         "enabled": str(info.get("status") or "") in ("loaded", "failed"),
         "has_settings": bool(info.get("has_settings")),
@@ -208,15 +157,6 @@ def _plugin_view(info):
 
 
 def plugin_manage(action, name="", setting="", value=None):
-    """插件管理：list / enable / disable / settings_get / settings_action。
-
-    设置读写沿用既有插件钩子约定 ``plugin_settings``（见 gui_bridge 同款调用）：
-    - 读取快照：``call_plugin_hook(name, "plugin_settings", {"action": "render"})``
-    - 执行动作：``call_plugin_hook(name, "plugin_settings",
-      {"action": <setting>, "params": <value>})``
-    两种调用都只对"已加载（= 已信任 + 已启用）"的插件生效，未加载时 core 返回
-    ``needs``（trust / enable）指引，本工具原样透出——但不提供代替用户信任的动作。
-    """
     try:
         from core.plugin_loader import (
             call_plugin_hook,
@@ -228,8 +168,6 @@ def plugin_manage(action, name="", setting="", value=None):
         action = str(action or "").strip().lower()
 
         if action == "list":
-            # 增量刷新：发现运行期新装/已删除的插件。未信任的插件不会被加载执行
-            # （refresh_plugins 内部先做信任确认），因此这一步不会执行陌生插件代码。
             refresh_plugins()
             plugins = [_plugin_view(i) for i in (get_plugin_infos() or [])]
             return _ok(action="list", plugins=plugins, count=len(plugins),
@@ -309,9 +247,6 @@ def plugin_manage(action, name="", setting="", value=None):
         return _err(f"插件管理失败：{exc}")
 
 
-# ── Hook 管理 ───────────────────────────────────────────────
-
-
 def _hook_snapshot(workspace_root):
     """读取两级 hook 配置 + 信任状态（只读视图，不执行任何 hook）。"""
     from core.hooks.trust import list_hooks_with_status
@@ -320,11 +255,6 @@ def _hook_snapshot(workspace_root):
 
 
 def hook_manage(action, source_path="", digest="", payload=None, disabled=False):
-    """Hook 管理：list / save / delete / set_disabled。
-
-    信任/授权（grant / deny / revoke / reset / trust）**故意不实现**：hook 信任是
-    用户对本机命令执行的授权，必须由人在 CLI/GUI 里确认。
-    """
     try:
         action = str(action or "").strip().lower()
         workspace_root = _workspace_root()
@@ -380,7 +310,6 @@ def hook_manage(action, source_path="", digest="", payload=None, disabled=False)
             digest_text, error = _require_str(digest, "digest")
             if digest_text is None:
                 return _err(error)
-            # 拒绝 "true"/1 这类非布尔值：把"想启用"误判成停用是危险方向
             if not isinstance(disabled, bool):
                 return _err("disabled 必须是布尔值（true 停用 / false 启用）")
             ok, message = set_hook_disabled(
@@ -405,11 +334,7 @@ def hook_manage(action, source_path="", digest="", payload=None, disabled=False)
         return _err(f"Hook 管理失败：{exc}")
 
 
-# ── 工具规格 ────────────────────────────────────────────────
-
-
 def _spec(name, description, properties, execute, activity_description):
-    """构造 ToolSpec：管理类工具都会落盘/改系统状态，故统一非只读 + 需授权 + system 范围。"""
     return ToolSpec(
         name=name,
         description=description,

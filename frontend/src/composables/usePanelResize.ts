@@ -1,6 +1,5 @@
 import { ref, type Ref } from 'vue';
 
-// 持久化键：与 appStore 的 'ycode-*' 前缀约定一致（同 useComposerResize）
 export const SIDEBAR_WIDTH_KEY = 'ycode-sidebar-width';
 export const RIGHT_PANEL_WIDTH_KEY = 'ycode-rightpanel-width';
 
@@ -9,7 +8,6 @@ export const RIGHT_PANEL_WIDTH_KEY = 'ycode-rightpanel-width';
 export const SIDEBAR_DEFAULT_WIDTH = 240;
 export const SIDEBAR_MIN_WIDTH = 240;
 export const SIDEBAR_MAX_WIDTH = 480;
-// 右面板默认 330px，可在 260~1280 之间拖拽（实际上限随视口收窄，见 MAX_VIEWPORT_RATIO）
 export const RIGHT_PANEL_DEFAULT_WIDTH = 330;
 export const RIGHT_PANEL_MIN_WIDTH = 260;
 export const RIGHT_PANEL_MAX_WIDTH = 1280;
@@ -18,23 +16,16 @@ export const RIGHT_PANEL_MAX_WIDTH = 1280;
 // 固定上限只兜底超宽窗口，比例守卫才是真正的挤压保护
 export const MAX_VIEWPORT_RATIO = 0.5;
 
-/** 限制在 [min, max] 区间内并取整（min > max 时按交换后的区间夹取） */
 export function clampPanelWidth(width: number, min: number, max: number): number {
   const lo = Math.min(min, max);
   const hi = Math.max(min, max);
   return Math.min(Math.max(Math.round(width), lo), hi);
 }
 
-/** 视口感知上限：min(配置上限, 视口宽度 * 50%) */
 export function panelMaxWidth(max: number, viewportWidth = window.innerWidth): number {
   return Math.min(max, Math.round(viewportWidth * MAX_VIEWPORT_RATIO));
 }
 
-/**
- * 由拖拽起止点算出目标宽度：
- * - direction='left'（手柄在左侧面板右缘）：向右拖（clientX 变大）面板变宽
- * - direction='right'（手柄在右侧面板左缘）：向左拖（clientX 变小）面板变宽
- */
 export function dragTargetWidth(
   direction: 'left' | 'right',
   startClientX: number,
@@ -63,10 +54,6 @@ export function computeRestoredWidth(stored: string | null, min: number, max: nu
 // 宽度按“占视口宽度的比例”记忆：窗口放大/缩小时等比跟随，拖到 50% 就一直保持 50%。
 // 存储值 <= 1 视为比例；> 1 视为旧版像素值（按当前视口换算成比例，兼容老记忆）。
 
-/**
- * 解析持久化的视口比例：非法/非正数返回 null（视为未自定义）；
- * 超过 50% 的比例收敛到 MAX_VIEWPORT_RATIO（与 panelMaxWidth 同口径）。
- */
 export function parseStoredRatio(stored: string | null, viewportWidth = window.innerWidth): number | null {
   if (stored == null) return null;
   const value = Number(stored);
@@ -75,12 +62,10 @@ export function parseStoredRatio(stored: string | null, viewportWidth = window.i
   return Math.min(ratio, MAX_VIEWPORT_RATIO);
 }
 
-/** 视口比例 → 像素宽度：夹取到 [min, min(配置上限, 视口 50%)] */
 export function ratioToWidth(ratio: number, min: number, max: number, viewportWidth = window.innerWidth): number {
   return clampPanelWidth(ratio * viewportWidth, min, panelMaxWidth(max, viewportWidth));
 }
 
-/** 恢复比例记忆的宽度：未自定义返回 null，其余按当前视口换算像素宽度 */
 export function computeRestoredRatioWidth(
   stored: string | null,
   min: number,
@@ -92,45 +77,24 @@ export function computeRestoredRatioWidth(
 }
 
 export interface PanelResizeOptions {
-  /** 手柄在面板的哪一侧：'left' 手柄于左栏右缘，'right' 手柄于右栏左缘 */
   direction: 'left' | 'right';
-  /** localStorage 持久化键 */
   storageKey: string;
   minWidth: number;
   maxWidth: number;
-  /** 双击手柄恢复的默认宽度；拖回该值时清除记忆 */
   defaultWidth: number;
-  /** 读取当前宽度（通常取自 appStore） */
   getWidth: () => number;
-  /** 拖拽中实时回写宽度（通常写入 appStore） */
   setWidth: (w: number) => void;
-  /**
-   * 宽度按视口比例记忆并在窗口缩放时等比跟随（右面板专用）。
-   * 开启后持久化的是比例而非像素，且 window resize 时按比例重算像素宽度；
-   * 侧栏上限固定 480px、语义是固定像素宽度，故不开启。
-   */
   viewportRatio?: boolean;
 }
 
 export interface PanelResizeApi {
-  /** 拖拽进行中（手柄据此高亮，宿主据此给根容器加 user-select 保护） */
   isResizing: Ref<boolean>;
-  /** 绑定到手柄的 pointerdown */
   onHandlePointerdown: (e: PointerEvent) => void;
-  /** 绑定到手柄的 dblclick：恢复默认宽度并清除记忆 */
   resetWidth: () => void;
 }
 
-/**
- * 面板宽度拖拽调节（桌面端左右分栏手柄）：
- * - 拖拽中实时跟随，松手后写入 localStorage，下次启动自动恢复
- * - 上限随视口动态夹取（不超过窗口 50%）
- * - 拖回默认宽度视为未自定义，清除记忆；双击手柄直接复位
- */
 export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
   const isResizing = ref(false);
-  // 当前自定义比例（null = 未自定义，窗口缩放不联动）。内存持有而非每次读存储：
-  // 拖拽中尚未持久化也要能联动；被小视口夹窄时也不丢用户意图，窗口回弹即按原比例恢复
   let ratio: number | null = null;
   if (opts.viewportRatio) {
     try { ratio = parseStoredRatio(localStorage.getItem(opts.storageKey)); } catch { ratio = null; }
@@ -143,7 +107,6 @@ export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
       if (!customized) {
         localStorage.removeItem(opts.storageKey);
       } else if (opts.viewportRatio) {
-        // 存比例而非像素：窗口缩放后按同一比例还原
         localStorage.setItem(opts.storageKey, String(Number((width / window.innerWidth).toFixed(4))));
       } else {
         localStorage.setItem(opts.storageKey, String(width));
@@ -154,7 +117,7 @@ export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
   function resetWidth() {
     opts.setWidth(opts.defaultWidth);
     if (opts.viewportRatio) ratio = null;
-    try { localStorage.removeItem(opts.storageKey); } catch { /* 忽略 */ }
+    try { localStorage.removeItem(opts.storageKey); } catch { }
   }
 
   // 视口比例联动：窗口缩放时按记忆比例重算像素宽度（拖到 50% 就一直是 50%）；
@@ -172,15 +135,14 @@ export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
     // 上限在按下时按当时视口锁定一次，避免拖拽中窗口变化导致忽宽忽窄
     const max = panelMaxWidth(opts.maxWidth);
     const handle = e.currentTarget as HTMLElement;
-    // pointer capture 让指针移出手柄/窗口后仍持续收到 move（jsdom 无此实现）
-    try { handle.setPointerCapture?.(e.pointerId); } catch { /* 忽略 */ }
+    try { handle.setPointerCapture?.(e.pointerId); } catch { }
     isResizing.value = true;
 
     const onMove = (ev: PointerEvent) => {
       opts.setWidth(dragTargetWidth(opts.direction, startX, ev.clientX, startWidth, opts.minWidth, max));
     };
     const onUp = (ev: PointerEvent) => {
-      try { handle.releasePointerCapture?.(ev.pointerId); } catch { /* 忽略 */ }
+      try { handle.releasePointerCapture?.(ev.pointerId); } catch { }
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
@@ -190,7 +152,6 @@ export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
-    // 阻止手柄上的拖拽演变为文本选择
     e.preventDefault();
   }
 

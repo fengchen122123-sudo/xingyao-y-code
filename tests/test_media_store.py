@@ -1,5 +1,3 @@
-"""tests/test_media_store.py —— 永久媒体仓库层测试。"""
-
 import os
 
 import pytest
@@ -60,7 +58,6 @@ def test_archive_dedupes_by_content(tmp_path):
     assert item1["digest"] == item2["digest"]
     blob = os.path.join(MEDIA_BLOBS_DIR, item1["digest"] + ".png")
     assert os.path.isfile(blob)
-    # 同内容两个源文件归档后仓库里只有一个 Blob
     blobs = [f for f in os.listdir(MEDIA_BLOBS_DIR) if f == item1["digest"] + ".png"]
     assert blobs == [item1["digest"] + ".png"]
     assert item1["kind"] == "image"
@@ -86,7 +83,6 @@ def test_archive_errors(tmp_path):
         archive_media_file(svg)
     assert exc.value.error_code == "unsupported_type"
 
-    # 扩展名伪装：.png 后缀但内容是文本 → 嗅探拒绝
     fake = _write(tmp_path, "fake.png", b"just text")
     with pytest.raises(MediaStoreError) as exc:
         archive_media_file(fake)
@@ -127,11 +123,8 @@ def test_supported_mime_whitelist_has_no_svg():
 
 
 def test_archive_failure_cleans_part_residue(tmp_path, monkeypatch):
-    """B8-01：归档中途失败（os.replace 异常）不得残留 .part 临时文件。"""
     import core.media_store as ms
 
-    # 内容唯一（尾部随机）：避开其它用例已归档同内容触发的去重命中，
-    # 确保走 os.replace 落盘分支，才能命中注入的失败点。
     src = _write(tmp_path, "a.png", PNG_BYTES + os.urandom(16))
 
     def boom(*args, **kwargs):
@@ -146,7 +139,6 @@ def test_archive_failure_cleans_part_residue(tmp_path, monkeypatch):
 
 
 def test_prune_orphan_blobs_reclaims_expired_orphans(tmp_path, monkeypatch):
-    """B8-01：过期且无引用的孤儿 Blob 被回收。"""
     import time as _time
 
     import core.media_store as ms
@@ -164,7 +156,6 @@ def test_prune_orphan_blobs_reclaims_expired_orphans(tmp_path, monkeypatch):
 
 
 def test_prune_orphan_blobs_protects_referenced_and_recent(tmp_path, monkeypatch):
-    """B8-01：有引用或仍在宽限期内的 Blob 一律保留。"""
     import time as _time
 
     import core.media_store as ms
@@ -178,8 +169,8 @@ def test_prune_orphan_blobs_protects_referenced_and_recent(tmp_path, monkeypatch
         with open(path, "wb") as f:
             f.write(b"x")
     old = _time.time() - (3 * 24 * 3600)
-    os.utime(referenced, (old, old))  # 老但被引用 → 保留
+    os.utime(referenced, (old, old))
 
     assert ms.prune_orphan_blobs({digest}) == 0
     assert os.path.exists(referenced)
-    assert os.path.exists(fresh)  # 无引用但崭新（宽限期内）→ 保留
+    assert os.path.exists(fresh)

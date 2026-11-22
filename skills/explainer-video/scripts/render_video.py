@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""竖屏讲解视频画面渲染器。
-
-用法: python render_video.py <工作目录> [full|bench]
-  读 <工作目录>/script.json 与 timeline.json，逐帧渲染并直接管道给 ffmpeg 编码，
-  不落盘中间 PNG。bench = 只渲染前 60 帧测速；full = 全量渲染出 video_silent.mp4。
-  版式由每个分镜的 visual.type 决定（见 reference/script-schema.md）。
-  字体为 Windows 系统字体，换平台需改 FBD/FRG/FMO 三个常量。
-"""
 import sys, os, json, time, math, subprocess
 from bisect import bisect_right
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -32,9 +24,8 @@ FG = (255, 255, 255, 255)
 ACC = {'blue': (0x38, 0xBD, 0xF8), 'purple': (0xA8, 0x55, 0xF7),
        'teal': (0x2D, 0xD4, 0xBF), 'amber': (0xFB, 0xBF, 0x24)}
 
-# 卡片内边距区
 CX0, CY0, CX1, CY1 = MX, 340, W - MX, 1000
-IX, IY, IW, IH = MX + 40, 380, W - 2 * (MX + 40), 580  # 96,380,528,580
+IX, IY, IW, IH = MX + 40, 380, W - 2 * (MX + 40), 580
 
 _fc = {}
 
@@ -98,7 +89,7 @@ def make_bg():
     top = np.array([0x0B, 0x10, 0x20], np.float32)
     bot = np.array([0x12, 0x18, 0x2E], np.float32)
     ramp = (np.arange(H, dtype=np.float32) / (H - 1))[:, None]
-    col = top[None, :] * (1 - ramp) + bot[None, :] * ramp          # (H,3)
+    col = top[None, :] * (1 - ramp) + bot[None, :] * ramp
     arr = np.repeat(col[:, None, :], W, axis=1)
     rng = np.random.default_rng(7)
     arr = np.clip(arr + rng.normal(0, 2.2, (H, W, 1)), 0, 255).astype(np.uint8)
@@ -135,7 +126,6 @@ def build_scene(sc):
     card = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     d = ImageDraw.Draw(card)
 
-    # ---- 标题区（heading + accent 下划线）----
     hs, hl = 52, None
     while True:
         f = fnt(FBD, hs)
@@ -151,11 +141,10 @@ def build_scene(sc):
         y += int(hs * 1.24)
     d.rounded_rectangle((MX, y + 20, MX + 72, y + 26), 3, fill=acc + (255,))
 
-    # ---- 卡片底板 ----
     d.rounded_rectangle((CX0, CY0, CX1, CY1), 24, fill=(255, 255, 255, 15),
                         outline=(255, 255, 255, 26), width=1)
 
-    blocks = []  # (sprite, x, y)
+    blocks = []
 
     def sqrow(text, font, fill, hh=64, sq=10):
         img = Image.new('RGBA', (IW, hh), (0, 0, 0, 0))
@@ -174,7 +163,6 @@ def build_scene(sc):
     def centered(sprite, y):
         blocks.append((sprite, IX + (IW - sprite.width) // 2, y))
 
-    # ---- 各 type ----
     if typ == 'title':
         centered(ti(lines[0], fnt(FBD, 64), FG), IY + 130)
         centered(ti(lines[1], fnt(FRG, 30), (255, 255, 255, 225)), IY + 252)
@@ -227,7 +215,6 @@ def build_scene(sc):
             else:
                 blocks.append((ti(ttl, tf, acc + (255,)), IX, ymid + 34))
                 blocks.append((ti(desc, df, (255, 255, 255, 210)), IX + 28, ymid + 82))
-        # 中间虚线分隔
         y = ymid + 4
         x = IX
         while x < IX + IW:
@@ -293,7 +280,6 @@ def build_scene(sc):
         for i, ln in enumerate(lines[:3]):
             centered(ti(ln, fnt(FRG, 28), (255, 255, 255, 215)), IY + 230 + i * 68)
 
-    # ---- 字幕（静态，预渲染进底图）----
     sub_font = fnt(FRG, 28)
     sw = W - 2 * MX
     sl = wrap(sc['narration'], sub_font, sw)
@@ -306,7 +292,6 @@ def build_scene(sc):
         t = ti(ln, sub_font, (255, 255, 255, 224))
         card.alpha_composite(t, (MX + (sw - t.width) // 2, y0 + i * lh))
 
-    # ---- 缓存：card(裁剪) + blocks 打包 ----
     bbox = card.getbbox()
     card_c = card.crop(bbox)
     card_p = pack(card_c)
@@ -319,7 +304,6 @@ def build_scene(sc):
         fades.append((st, st + 0.25))
     settle = max([0.6] + [e for _, e in fades])
 
-    # settled 静止帧（不含移动光斑/进度条）
     settled = bg.copy()
     settled.paste(card_p[0], (bbox[0], bbox[1]), card_p[1])
     for (rgb, mk), x, y in blk:
@@ -384,7 +368,6 @@ def render_frame(f, cache, starts, blobcache):
     return img, sc['sc']['id']
 
 
-# ---------------- 主流程 ----------------
 if __name__ == '__main__':
     mode = MODE
     script = json.load(open(SCRIPT, encoding='utf-8'))

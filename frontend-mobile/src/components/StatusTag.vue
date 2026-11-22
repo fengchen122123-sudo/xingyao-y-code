@@ -1,5 +1,4 @@
 <script setup lang="ts">
-/** 统一状态标签（移植自 co-team mobile）：语义色映射，双主题经 token 自适应。 */
 import { computed } from 'vue';
 
 const props = withDefaults(defineProps<{ status: string; label?: string }>(), { label: '' });
@@ -23,7 +22,6 @@ const text = computed(() => props.label || props.status);
 </template>
 
 <style scoped>
-/* 方角 mono 小标签（4px 圆角 + 发丝线 + 语义 tint），保留状态点 */
 .st-tag {
   display: inline-flex;
   align-items: center;

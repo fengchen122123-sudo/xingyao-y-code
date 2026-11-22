@@ -1,5 +1,3 @@
-"""Default command-interpreter discovery, persistence, and invocation."""
-
 from __future__ import annotations
 
 import os
@@ -139,20 +137,9 @@ def get_selected_command_shell() -> str:
 
 
 def _computer_active_model_capability(computer, active_model_id: str | None = None) -> dict[str, Any]:
-    """当前活动模型的电脑操控资格摘要（设置面板展示用，只读）。
-
-    与 Turn 起点走同一个判定函数（resolve_computer_capability，local 来源），
-    保证设置页提示与真实执行门槛一致；模型未配置/读取失败时不影响设置页。
-
-    active_model_id 由调用方传入「真正会执行任务的模型」（GUI 按会话绑定模型，
-    全局 active_model_id 只在会话未绑定时才生效）；缺省时退回全局值。
-    """
     try:
         from core.computer.capability import resolve_computer_capability
 
-        # 经 config._load() 读取（与设置读取同一路径，可被测试隔离）；
-        # 不走 model_manager.load_config（其模块级 _CONFIG_FILE 快照与设置
-        # 路径可能不一致）。
         data = config._load()
         active_id = str(active_model_id or data.get("active_model_id") or "")
         model = None
@@ -213,8 +200,6 @@ def get_system_settings(
         )
     except (TypeError, ValueError):
         remote_token_ttl = config.REMOTE_TOKEN_TTL_DEFAULT
-    # 电脑操控静态设置（core.computer.settings，无运行时依赖）；
-    # hotkey 运行态键（Task 5）与 controller run 键（Task 8）经函数内惰性导入接入。
     computer = load_computer_settings(platform=platform)
     from core.computer.hotkey import get_emergency_hotkey_snapshot
     from core.computer.controller import get_computer_control_service
@@ -228,15 +213,11 @@ def get_system_settings(
         get_ai_output_dir_setting as _get_ai_output_dir_setting,
         resolve_ai_output_dir as _resolve_ai_output_dir,
     )
-    # 上下文水位基准（memory_compression.watermark_base_tokens）：同样走函数内惰性导入，
-    # None 表示不设基准、按真实模型窗口的比例线计算。
     from core.context_watermark import (
         MAX_WATERMARK_BASE,
         MIN_WATERMARK_BASE,
         load_watermark_base,
     )
-    # 全局子代理开关（设置项 subagent_enabled）：同样走函数内惰性导入，
-    # 读路径不抛异常，缺省视为开启。
     from core.subagent_settings import subagent_enabled as _get_subagent_enabled
 
     return {
@@ -248,7 +229,6 @@ def get_system_settings(
         "agent_turn_step_limit": load_turn_step_limit(),
         "agent_turn_step_limit_min": MIN_TURN_STEP_LIMIT,
         "agent_turn_step_limit_max": MAX_TURN_STEP_LIMIT,
-        # 上下文水位基准：生效值（None = 不设基准、跟随真实窗口）/ 合法区间（设置页校验用）
         "context_watermark_base": load_watermark_base(),
         "context_watermark_base_min": MIN_WATERMARK_BASE,
         "context_watermark_base_max": MAX_WATERMARK_BASE,
@@ -264,11 +244,9 @@ def get_system_settings(
         "computer_active_model_capability": _computer_active_model_capability(
             computer, active_model_id
         ),
-        # AI 生成内容目录：生效绝对路径 / 原始配置值（设置页回显）/ 默认目录
         "ai_output_dir": str(_resolve_ai_output_dir()),
         "ai_output_dir_setting": _get_ai_output_dir_setting(),
         "ai_output_dir_default": str(_default_ai_output_dir()),
-        # 全局子代理开关：关闭后不派发子代理、也不启用计划编排
         "subagent_enabled": _get_subagent_enabled(),
     }
 
@@ -332,9 +310,6 @@ def build_command_invocation(
 
     executable = str(selected["executable"])
     if shell_id == "cmd":
-        # Windows 的 list2cmdline 采用 C 运行时转义规则，而 cmd.exe 不把 \"
-        # 视为引号转义。交给 Popen 的 shell 路径承载原始命令，避免破坏路径
-        # 和嵌套引号。
         return CommandInvocation(command, True, shell_id, executable)
     elif shell_id in {"powershell", "pwsh"}:
         argv = [

@@ -1,9 +1,3 @@
-"""把 markdown 里的容器本地图片路径内联成 data URI。
-
-web 端浏览器访问不到 `/data/...` 这类容器内路径，原样渲染就是坏图。
-这里在服务端出口统一改写：只处理白名单目录 + 图片扩展名 + 体积上限，
-读不到或超限一律原样返回，绝不因为一张图让整条消息失败。
-"""
 from __future__ import annotations
 
 import base64
@@ -34,7 +28,6 @@ def inline_local_images_in_text(text: str) -> str:
 
     def _replace(match: "re.Match[str]") -> str:
         raw = match.group("path")
-        # file:///C:/x 三斜杠去掉后只剩 C:/x；file://host/path 这类非常规形态原样保留
         if raw.startswith("file:///"):
             path = raw[len("file:///"):]
         elif raw.startswith("file://"):

@@ -1,7 +1,3 @@
-/**
- * 工具执行行的分类/分组/状态归约（对齐桌面 frontend/src/utils/toolTrace.ts 精简版）。
- * 输入 ToolCallUi[]（含 display），输出可直接渲染的行。
- */
 import type { ToolCallUi, ToolDisplay } from '../stores/app';
 
 export type ToolRowKind = 'read-group' | 'search-group' | 'command' | 'mutation' | 'skill' | 'tool';

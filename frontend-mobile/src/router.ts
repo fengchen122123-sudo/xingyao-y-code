@@ -28,8 +28,6 @@ export const router = createRouter({
   ],
 });
 
-// stale-shell self-heal：懒路由 chunk 加载失败（构建更新后命中旧缓存 index）时
-// 做一次整页刷新取新资源；按路径防刷新死循环，导航成功即清除。
 const RELOAD_FLAG = 'yc-route-reload';
 router.onError((error, to) => {
   const msg = String((error as any)?.message || error);

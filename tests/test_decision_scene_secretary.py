@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""secretary 场景接入测试：JEV 决定「这条任务派发到哪个会话」。
-
-被测函数：``core/tools.py::dispatch_task``（秘书派发工具）。
-
-隔离策略：
-- ``tests/conftest.py`` 收集阶段已把 ``YCODE_DATA_DIR`` 指向临时目录；本文件再把
-  ``config.YCODE_DIR`` monkeypatch 到每个用例的 tmp_path，绝不触碰真实 ``~/.ycode``；
-- 秘书调度服务用 ``_FakeDispatchService`` 打桩并经 ``secretary_dispatch.register``
-  注册——不建 DB、不起回合线程、不做任何真实 I/O；
-- 决策请求打桩 ``decision_service._post``，网关真链路用例也零真实网络。
-
-覆盖点：
-JEV 关闭 → 派发目标 / 调用次数 / 返回文本与接入前逐字节一致；
-决策返回候选 session_name → 目标变成它（并带可读说明）；
-返回 "new" / 候选之外的名字 / decide 抛异常 / 候选为空 → 走原逻辑；
-target 非空 → 完全不发决策；
-state 只含任务描述截断 + 会话名 + workdir，不含历史与文件文本。
-"""
 import json
 import os
 import sys
@@ -38,7 +20,6 @@ PROVIDER = {
     "api_key": "sk_key_one",
 }
 
-# 调度服务返回的固定派发结果：用于断言「返回文本逐字节一致」
 DISPATCH_RESULT = {
     "ok": True,
     "target_session": "session_abc123",
@@ -48,12 +29,7 @@ DISPATCH_RESULT = {
 }
 
 
-# ---------------------------------------------------------------------------
-# 测试基础设施
-# ---------------------------------------------------------------------------
-
 class _FakeDispatchService:
-    """秘书调度服务打桩：记录两类调用，返回预设候选与派发结果。"""
 
     def __init__(self, candidates=None, *, search_error=None):
         self.candidates = list(candidates or [])
@@ -91,7 +67,6 @@ class _FakeDispatchService:
 
 
 def _candidate(name, display=None, updated_at="2026-10-18 10:00:00"):
-    """构造一条 search_conversations 返回行（字段与协议声明一致）。"""
     return {
         "session_name": name,
         "display_name": display or name,
@@ -104,7 +79,6 @@ def _candidate(name, display=None, updated_at="2026-10-18 10:00:00"):
 
 
 def _mock_decide(monkeypatch, value):
-    """打桩网关 decide；记录调用参数，返回指定答案（Exception 实例则抛出）。"""
     calls = []
 
     def fake(scene, state, question, **kwargs):
@@ -126,7 +100,6 @@ def _write_user_config(data_dir, providers):
 
 
 def _enable_secretary_scene(*, shadow=False):
-    """写决策配置：全局 enabled + secretary 场景 enabled。"""
     return svc.save_decision_config(
         {
             "enabled": True,
@@ -137,7 +110,6 @@ def _enable_secretary_scene(*, shadow=False):
 
 
 def _mock_no_network(monkeypatch):
-    """护栏：JEV 关闭时任何真实决策请求都应让用例失败。"""
     calls = []
 
     def fake(url, headers, payload, timeout_seconds):  # pragma: no cover - 不应被调用
@@ -149,7 +121,6 @@ def _mock_no_network(monkeypatch):
 
 
 def _mock_post(monkeypatch, handler):
-    """打桩 decision_service._post（网关链路真正发请求的唯一出口）。"""
     calls = []
 
     def fake(url, headers, payload, timeout_seconds):
@@ -177,7 +148,6 @@ def _audit_records(data_dir):
 
 
 def _expected_output(result=None):
-    """接入前的返回文本：payload = dict(result) + setdefault("ok", True)。"""
     payload = dict(result or DISPATCH_RESULT)
     payload.setdefault("ok", True)
     return json.dumps(payload, ensure_ascii=False)
@@ -185,7 +155,6 @@ def _expected_output(result=None):
 
 @pytest.fixture()
 def data_dir(tmp_path, monkeypatch):
-    """把 config.YCODE_DIR 重定向到 tmp_path，保证不读写真实 ~/.ycode。"""
     import config
 
     directory = tmp_path / "ycode"
@@ -198,7 +167,6 @@ def data_dir(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def service(monkeypatch):
-    """注册打桩调度服务；用例可替换 ``service.candidates``。"""
     fake = _FakeDispatchService(
         [
             _candidate("会话甲", updated_at="2026-10-18 12:00:00"),
@@ -210,15 +178,9 @@ def service(monkeypatch):
     secretary_dispatch.unregister()
 
 
-# ---------------------------------------------------------------------------
-# 1. JEV 全关：与接入前逐字节一致（返回文本 / 派发目标 / 调用次数）
-# ---------------------------------------------------------------------------
-
 def test_jev_disabled_matches_pre_integration(data_dir, service, monkeypatch):
-    """JEV 全关：零决策请求、零会话检索，派发目标与返回文本完全不变。"""
-    # 不写 decision.json = DEFAULT_CONFIG（enabled=false，scenes 全未启用）
     _write_user_config(data_dir, [PROVIDER])
-    post_calls = _mock_no_network(monkeypatch)  # 任何决策请求都会 AssertionError
+    post_calls = _mock_no_network(monkeypatch)
 
     out = tools_mod.dispatch_task(prompt="把 README 补一版")
 
@@ -234,7 +196,6 @@ def test_jev_disabled_matches_pre_integration(data_dir, service, monkeypatch):
 def test_scene_disabled_but_global_enabled_matches_pre_integration(
     data_dir, service, monkeypatch
 ):
-    """全局开、secretary 场景关：等同 JEV 关闭（场景闸门先判，零额外调用）。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({"enabled": True, "shadow_mode": False})
     post_calls = _mock_no_network(monkeypatch)
@@ -248,7 +209,6 @@ def test_scene_disabled_but_global_enabled_matches_pre_integration(
 
 
 def test_jev_disabled_keeps_explicit_target(data_dir, service, monkeypatch):
-    """JEV 全关 + 显式 target：target 原样透传（回归：不改动原逻辑）。"""
     _write_user_config(data_dir, [PROVIDER])
     _mock_no_network(monkeypatch)
 
@@ -260,7 +220,6 @@ def test_jev_disabled_keeps_explicit_target(data_dir, service, monkeypatch):
 
 
 def test_jev_disabled_empty_prompt_message_unchanged(data_dir, service, monkeypatch):
-    """JEV 全关 + 空 prompt：仍是原来的报错文本，且不触发任何调度调用。"""
     _write_user_config(data_dir, [PROVIDER])
     _mock_no_network(monkeypatch)
 
@@ -271,12 +230,7 @@ def test_jev_disabled_empty_prompt_message_unchanged(data_dir, service, monkeypa
     assert service.dispatch_calls == []
 
 
-# ---------------------------------------------------------------------------
-# 2. 决策被采纳 → 目标换成候选会话
-# ---------------------------------------------------------------------------
-
 def test_decision_candidate_name_becomes_target(data_dir, service, monkeypatch):
-    """决策返回候选里的 session_name：派发目标换成它，并留下可读说明。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     calls = _mock_decide(monkeypatch, "会话乙")
@@ -295,10 +249,8 @@ def test_decision_candidate_name_becomes_target(data_dir, service, monkeypatch):
 
 
 def test_candidate_list_is_capped_and_recent_first(data_dir, service, monkeypatch):
-    """候选上限 10 个、按 updated_at 倒序：options = ["new"] + 最近 10 个名字。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
-    # 故意打乱顺序，让 updated_at 决定顺序（12 个 → 只取最近 10 个）
     service.candidates = [
         _candidate(f"会话{i:02d}", updated_at=f"2026-10-{(i % 28) + 1:02d} 09:00:00")
         for i in range(12)
@@ -316,12 +268,7 @@ def test_candidate_list_is_capped_and_recent_first(data_dir, service, monkeypatc
     assert len(set(names)) == len(names) == 10
 
 
-# ---------------------------------------------------------------------------
-# 3. 各种回退：走原逻辑（target 保持空串 = 新建会话）
-# ---------------------------------------------------------------------------
-
 def test_decision_new_falls_back(data_dir, service, monkeypatch):
-    """决策选 "new"（新建会话）：target 保持空串，返回文本不带说明。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     calls = _mock_decide(monkeypatch, "new")
@@ -338,7 +285,6 @@ def test_decision_new_falls_back(data_dir, service, monkeypatch):
     ids=["unknown", "empty", "blank", "new_with_space", "renamed"],
 )
 def test_decision_outside_candidates_falls_back(data_dir, service, monkeypatch, dirty):
-    """决策答案不在候选内（脏数据 / 改名 / 空）：一律走原逻辑。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     _mock_decide(monkeypatch, dirty)
@@ -350,7 +296,6 @@ def test_decision_outside_candidates_falls_back(data_dir, service, monkeypatch, 
 
 
 def test_empty_candidates_skips_decision(data_dir, service, monkeypatch):
-    """候选为空：根本不发决策（没有选择余地），走原逻辑。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     service.candidates = []
@@ -365,7 +310,6 @@ def test_empty_candidates_skips_decision(data_dir, service, monkeypatch):
 
 
 def test_search_failure_skips_decision(data_dir, service, monkeypatch):
-    """候选检索抛错（如服务拒绝参数）：吞掉异常，不发决策，走原逻辑。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     service.search_error = secretary_dispatch.SecretaryDispatchError("请至少给出关键词")
@@ -379,7 +323,6 @@ def test_search_failure_skips_decision(data_dir, service, monkeypatch):
 
 
 def test_decision_exception_falls_back(data_dir, service, monkeypatch):
-    """decide 抛异常：静默回退，派活照常成功。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     _mock_decide(monkeypatch, RuntimeError("决策服务炸了"))
@@ -391,7 +334,6 @@ def test_decision_exception_falls_back(data_dir, service, monkeypatch):
 
 
 def test_explicit_target_never_consults_decision(data_dir, service, monkeypatch):
-    """target 非空：完全不发决策，连候选检索都不做。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     calls = _mock_decide(monkeypatch, "会话乙")
@@ -404,14 +346,9 @@ def test_explicit_target_never_consults_decision(data_dir, service, monkeypatch)
     assert out == _expected_output()
 
 
-# ---------------------------------------------------------------------------
-# 4. 隐私约束：state 只含任务描述截断 + 会话名 + workdir
-# ---------------------------------------------------------------------------
-
 def test_state_contains_only_prompt_head_names_and_workdir(
     data_dir, service, monkeypatch
 ):
-    """state 只放任务描述前 300 字符与会话名；不含历史、片段、文件内容。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     calls = _mock_decide(monkeypatch, None)
@@ -423,18 +360,14 @@ def test_state_contains_only_prompt_head_names_and_workdir(
     state = calls[0]["state"]
     assert state.startswith("任务描述：" + head)
     assert "甲" * 10 in state
-    # 任务描述被截到 300 字符：第 300 个字符之后的内容一律不得出现在 state
     assert "会话历史机密标记" not in state
     assert "sk-" + "a" * 24 not in state
     assert len(state.split("任务描述：", 1)[1].split("\n", 1)[0]) == 300
-    # 候选会话名（session_name + display_name）与 workdir 必须在场
-    # （显示名与会话名相同时不重复渲染括号）
     assert "- 会话甲\n" in state
     assert "- 会话乙\n" in state
     assert state.endswith("工作目录：/tmp/project-x")
     # 检索片段（snippets 里的会话正文）绝不能进入 state
     assert "会话历史正文不应进入 state" not in state
-    # 题目形状符合规范：上游要求 criteria 是「选项名 → 描述」的对象，不是数组
     question = calls[0]["question"]
     assert question["type"] == "choice"
     assert isinstance(question["criteria"], dict)
@@ -444,7 +377,6 @@ def test_state_contains_only_prompt_head_names_and_workdir(
 
 
 def test_state_shows_display_name_when_different(data_dir, service, monkeypatch):
-    """会话名与显示名不同时，state 里两者都给出（模型好判断语义）。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     service.candidates = [_candidate("s_2026abc", display="项目甲")]
@@ -457,7 +389,6 @@ def test_state_shows_display_name_when_different(data_dir, service, monkeypatch)
 
 
 def test_state_workdir_falls_back_to_global(data_dir, service, monkeypatch):
-    """未指定 workdir：state 里写 GLOBAL（自由对话），不写空串。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene()
     calls = _mock_decide(monkeypatch, None)
@@ -467,12 +398,7 @@ def test_state_workdir_falls_back_to_global(data_dir, service, monkeypatch):
     assert calls[0]["state"].endswith("工作目录：GLOBAL")
 
 
-# ---------------------------------------------------------------------------
-# 5. 端到端（真实网关链路 + 打桩 HTTP）：live 模式采纳目标并回填审计
-# ---------------------------------------------------------------------------
-
 def test_live_mode_end_to_end_uses_decided_target(data_dir, service, monkeypatch):
-    """live 模式走完「网关 → 服务 → 审计」全链路：目标变成 会话乙，审计 adopted。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene(shadow=False)
     post_calls = _mock_post(
@@ -493,7 +419,6 @@ def test_live_mode_end_to_end_uses_decided_target(data_dir, service, monkeypatch
 
 
 def test_live_mode_illegal_answer_from_upstream_falls_back(data_dir, service, monkeypatch):
-    """上游给出候选之外的答案：网关判非法 → 走原逻辑（不误派到脏目标）。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene(shadow=False)
     _mock_post(
@@ -509,7 +434,6 @@ def test_live_mode_illegal_answer_from_upstream_falls_back(data_dir, service, mo
 
 
 def test_shadow_mode_observes_but_keeps_target(data_dir, service, monkeypatch):
-    """影子模式：真实发请求并写审计，但结果丢弃，target 保持空串。"""
     _write_user_config(data_dir, [PROVIDER])
     _enable_secretary_scene(shadow=True)
     post_calls = _mock_post(

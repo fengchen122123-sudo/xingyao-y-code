@@ -1,10 +1,3 @@
-"""统一的终端标记、主题 ANSI 颜色与排版辅助（所有渲染路径共用）。
-
-单一事实来源：turn_renderer（实时渲染）、history_renderer（历史回放）、
-tool_progress（工具轨迹）、main.py（首页/计划面板/命令输出）共用本模块，
-禁止在各渲染点本地硬编码杂乱颜色或重复实现宽字符测量。
-"""
-
 from __future__ import annotations
 
 import re
@@ -22,7 +15,6 @@ ANSI_CYAN = "\x1b[36m"
 ANSI_MAGENTA = "\x1b[35m"
 ANSI_GRAY = "\x1b[90m"
 
-# 计划/工具状态标记（六态）
 MARK_DONE = "✓"
 MARK_ACTIVE = "■"
 MARK_FAILED = "✗"
@@ -30,7 +22,6 @@ MARK_BLOCKED = "!"
 MARK_CANCELLED = "-"
 MARK_PENDING = "□"
 
-# 统一克制几何微符号（全等宽单格，告别 emoji 宽度抖动）
 ICON_SPARK = "✦"
 ICON_SUBAGENT = "◈"
 ICON_PLAN = "❖"
@@ -97,8 +88,6 @@ def plan_color(status: str, theme_name: str | None = None) -> str:
     return theme_ansi(token, theme_name=theme_name)
 
 
-# 状态 → prompt_toolkit HTML() 标签名，供 main.py 中用 HTML(...) 渲染的命令输出使用；
-# 与 PLAN_COLORS 语义一一对应，只是 token 形式不同（HTML 标签名 vs 原始转义码）。
 PLAN_HTML_COLORS = {
     "completed": "ansigreen",
     "done": "ansigreen",

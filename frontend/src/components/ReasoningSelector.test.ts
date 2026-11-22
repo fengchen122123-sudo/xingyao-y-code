@@ -18,7 +18,6 @@ describe('ReasoningSelector', () => {
       disabled_reason: '该模型始终开启思考', choice: 'on', options: [],
     };
 
-    // hero 变体带文字标签；compact 也显示文字标签（等级）
     const wrapper = mount(ReasoningSelector, { props: { variant: 'hero' } });
     const button = wrapper.get('[data-test="reasoning-button"]');
 

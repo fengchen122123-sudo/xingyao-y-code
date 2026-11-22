@@ -283,3 +283,8 @@ app/android/**/*.hprof
 app/android/app/src/main/assets/public/
 # Node 依赖：根规则已有一个 node_modules/，此处显式声明 app/node_modules 不作为源码入库
 app/node_modules/
+
+# 历史设计文档归档（2026-11-21 从 docs/superpowers、docs 顶层报告与「待开发」迁入）
+# 归档属内部资料而非源码，整体不入库；上面的 docs/superpowers/ 与 /待开发/ 规则
+# 保留作防回归，避免同名目录被重新创建时误入版本库。
+docs/archive/

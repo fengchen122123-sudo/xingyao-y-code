@@ -119,7 +119,6 @@ it('pdf 进「文档」页签由 pdf.js 渲染，不写浏览器导航请求', a
   expect(store.rightPanelTabs).toContain('doc');
   expect(store.rightPanelActiveTab).toBe('doc');
   expect(store.rightPanelCollapsed).toBe(false);
-  // 不再经过内嵌浏览器
   expect(store.browserNavRequest).toBeNull();
   expect(store.browserNavNonce).toBe(0);
   expect(store.rightPanelTabs).not.toContain('browser');

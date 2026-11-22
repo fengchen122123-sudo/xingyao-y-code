@@ -1,29 +1,7 @@
-/**
- * 免责条款正文 —— 设置页「法律 → 免责条款」与首次使用确认弹窗共用的唯一事实源。
- *
- * 修改条款正文后必须同步两处，否则已同意旧版本的用户不会重新看到确认弹窗：
- * 1) 递增本文件 DISCLAIMER_VERSION 与 DISCLAIMER_UPDATED_AT；
- * 2) 同步递增后端 core/disclaimer_consent.py 的 DISCLAIMER_VERSION。
- *
- * 合规红线（勿突破）：
- * 1) 《民法典》第 496–497 条：格式条款不得「不合理地免除或减轻自身责任、
- *    加重对方责任、限制对方主要权利」，否则该条款无效；
- * 2) 《民法典》第 506 条：免除「故意或重大过失造成对方财产损失」责任的
- *    条款无效，故免责表述必须限定在「法律允许的最大范围内」；
- * 3) 本软件为本地工具软件、不提供生成式 AI 服务，模型由使用者自行配置。
- *    该定性决定了数据外发与内容责任的分界（《生成式人工智能服务管理
- *    暂行办法》第 2 条第 3 款），表述不得含糊。
- */
 
 export const DISCLAIMER_VERSION = 'v1.0';
 export const DISCLAIMER_UPDATED_AT = '2026-09-11';
 
-/**
- * 校验已同意的版本是否满足当前条款版本要求。
- *
- * 只有已同意版本有效且不低于当前要求版本时返回 true。
- * 一旦条款版本升级（或已同意版本落后），返回 false 触发再次确认。
- */
 export function isDisclaimerVersionAccepted(
   acceptedVersion: string | null | undefined,
   requiredVersion: string = DISCLAIMER_VERSION

@@ -1,5 +1,3 @@
-"""桌面侧配对 URL 与二维码。"""
-
 from __future__ import annotations
 
 import time
@@ -100,7 +98,6 @@ def test_pair_url_returns_none_when_exchange_fails(relay_config, monkeypatch):
 
 
 def test_bind_qr_prefers_public_url_when_relay_connected(monkeypatch):
-    """云中转连上时二维码给公网地址，且自带二维码图，前端无需区分来源。"""
     import gui_bridge
 
     bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
@@ -121,7 +118,6 @@ def test_bind_qr_prefers_public_url_when_relay_connected(monkeypatch):
 
 
 def test_bind_qr_falls_back_to_lan_when_relay_unavailable(monkeypatch):
-    """公网入口拿不到时不能报错，要退回原来的局域网逻辑。"""
     import gui_bridge
 
     bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
@@ -132,4 +128,3 @@ def test_bind_qr_falls_back_to_lan_when_relay_unavailable(monkeypatch):
     result = bridge.get_remote_bind_qr(mobile=True)
     assert result["ok"] is False
     assert "启动失败" in result["msg"]
-

@@ -1,5 +1,3 @@
-"""星轨自动化任务：常量、任务字段校验与 UI 摘要。"""
-
 from __future__ import annotations
 
 import os
@@ -11,19 +9,14 @@ from core.automation.scheduling import TRIGGER_TYPES, validate_trigger
 # 依然按无人值守语义立即自动拒绝（_activate_permission_request）。
 PERMISSION_MODES = ("confirm", "accept_edits", "auto_decision", "plan", "full")
 
-# 错过触发（应用未运行）的处理策略。
 MISSED_RUN_POLICIES = ("skip", "run_once")
 
-# 运行会话落点模式：per_run=每次运行新建 {YYYY-MM-DD} {任务名} 会话（默认，
-# 见 core/automation/session_naming.py）；fixed=沿用 target_session 固定会话。
 SESSION_MODES = ("per_run", "fixed")
 
 # 任务生命周期状态：active=可触发；completed=执行次数耗尽（自然终态，不可逆——
 # 不允许 set_enabled 复活、不允许编辑改回 active，只能复制新建）。
 TASK_STATUSES = ("active", "completed")
 
-# 运行状态机：queued → running → completed | cancelled | error；
-# skipped（单飞/错过）与 interrupted（启动恢复）为旁路终态。
 RUN_STATUSES = (
     "queued",
     "running",
@@ -36,10 +29,8 @@ RUN_STATUSES = (
 ACTIVE_RUN_STATUSES = ("queued", "running")
 FINISH_RUN_STATUSES = ("completed", "cancelled", "error")
 
-# 触发种类。
 TRIGGER_KINDS = ("scheduled", "startup", "manual", "catchup")
 
-# 任务规模上限（设计规格 5.1）。
 MAX_TASKS = 64
 MAX_NAME_CHARS = 50
 MAX_PROMPT_CHARS = 6000
@@ -77,8 +68,6 @@ def validate_task(task: dict) -> list[str]:
     if session_mode not in SESSION_MODES:
         errors.append(f"运行会话模式必须是 {'/'.join(SESSION_MODES)} 之一")
 
-    # 目标会话：仅 fixed 模式必填（旧行为）；per_run 允许空串（运行时按生成的
-    # 会话名落点），但长度上限对两种模式都生效。
     target_session = task.get("target_session")
     target_text = target_session.strip() if isinstance(target_session, str) else ""
     if session_mode == "fixed" and not target_text:
@@ -113,7 +102,6 @@ def validate_task(task: dict) -> list[str]:
         if isinstance(max_runs, bool) or not isinstance(max_runs, int) or max_runs < 1:
             errors.append("最多执行次数必须是 ≥1 的整数（留空表示不限次）")
 
-    # status 是读侧字段（由存储层按认领次数维护），入参只接受 active
     status = task.get("status")
     if status not in (None, "") and status != "active":
         errors.append(

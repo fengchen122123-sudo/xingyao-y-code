@@ -1,18 +1,3 @@
-"""管理运维类 Agent 工具：用量统计 / 会话导出 / 自动更新 / 系统设置 / 图表 / 自检。
-
-设计约束：
-- 只复用 core 层公开模块，禁止 import gui_bridge / main / pywebview；
-- 所有工具统一返回 JSON 字符串（ensure_ascii=False）：
-  成功 ``{"ok": true, ...}``，失败 ``{"ok": false, "error": "中文原因"}``；
-- 所有异常在工具入口处兜底，任何情况下都不向调度层抛出；
-- 不触碰安全项：permission_mode / allow_outside_workspace（沙箱）/ whitelist
-  在本模块中显式拒绝，只暴露非安全的设置项。
-
-工具清单（build_specs() 返回 6 个 ToolSpec）：
-usage_stats / session_export / update_manage / system_settings /
-diagram_manage / doctor_run
-"""
-
 from __future__ import annotations
 
 import datetime
@@ -26,11 +11,6 @@ from typing import Any
 from core.tool_protocol import ToolSpec
 
 
-# ---------------------------------------------------------------------------
-# 通用返回与容错
-# ---------------------------------------------------------------------------
-
-# 统计范围（与 CLI /usage、GUI get_token_usage_statistics 口径一致）
 USAGE_ALLOWED_DAYS = (1, 7, 30, 365)
 
 # 严禁通过工具修改的安全项（命中即明确拒绝，不静默忽略）
@@ -43,7 +23,6 @@ FORBIDDEN_SETTING_KEYS = {
     "command_whitelist": "命令白名单",
 }
 
-# 支持的设置项 -> 中文标签
 SUPPORTED_SETTING_KEYS = {
     "command_shell": "默认命令解释器",
     "turn_step_limit": "单任务最大轮次",
@@ -102,20 +81,11 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
-# ---------------------------------------------------------------------------
-# MemoryManager 获取（统计 / 导出共用）
-# ---------------------------------------------------------------------------
-
 _MANAGER_LOCK = threading.Lock()
 _FALLBACK_MANAGER: Any = None
 
 
 def _resolve_manager():
-    """优先用运行时注册的 MemoryManager；headless 场景就地创建一个只读用途实例。
-
-    运行时上下文（core.app_context）由 CLI / GUI 启动时注册，这里不依赖
-    任何入口模块，拿不到时按当前 UI 形态回落到对应的会话库。
-    """
     global _FALLBACK_MANAGER
     try:
         from core import app_context
@@ -138,10 +108,6 @@ def _resolve_manager():
         return _FALLBACK_MANAGER
 
 
-# ---------------------------------------------------------------------------
-# 1) usage_stats
-# ---------------------------------------------------------------------------
-
 _USAGE_METRICS = ("prompt", "completion", "cached", "cache_prompt", "total", "requests")
 
 
@@ -155,7 +121,6 @@ def _add_metrics(target: dict[str, Any], source: dict[str, Any]) -> None:
 
 
 def _with_cache_rate(metrics: dict[str, Any]) -> dict[str, Any]:
-    """补缓存命中率：命中率分母只统计已报告缓存明细的 prompt（与 GUI 口径一致）。"""
     result = dict(metrics)
     cache_prompt = _as_int(result.get("cache_prompt", 0), 0)
     result["cache_hit_rate"] = (
@@ -207,7 +172,6 @@ def usage_stats(days: int = 30) -> str:
 
         day_item = day_lookup.get(str(row.get("date") or ""))
         if day_item is None:
-            # 超出请求区间的脏数据不进日明细（SQL 已过滤，这里只是防御）
             continue
         _add_metrics(day_item, row)
         day_item["models"].append(
@@ -241,10 +205,6 @@ def usage_stats(days: int = 30) -> str:
         days=day_items,
     )
 
-
-# ---------------------------------------------------------------------------
-# 2) session_export
-# ---------------------------------------------------------------------------
 
 _EXPORT_FORMATS = {
     "md": "md",
@@ -310,7 +270,6 @@ def session_export(session: str = "", fmt: str = "md", output_path: str = "") ->
 
 
 def _current_session_name() -> str:
-    """当前会话名：优先本线程回合绑定的会话，其次 UI 当前查看的会话。"""
     try:
         from core import app_context
 
@@ -319,13 +278,9 @@ def _current_session_name() -> str:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# 3) update_manage
-# ---------------------------------------------------------------------------
-
 _DOWNLOAD_LOCK = threading.Lock()
 _DOWNLOAD_STATE: dict[str, Any] = {
-    "status": "idle",  # idle / downloading / done / error
+    "status": "idle",
     "version": "",
     "percent": 0,
     "downloaded": 0,
@@ -532,12 +487,7 @@ def _update_cleanup() -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# 4) system_settings
-# ---------------------------------------------------------------------------
-
 def _settings_snapshot() -> dict[str, Any]:
-    """当前非安全设置项快照。"""
     return {key: _get_one_setting(key) for key in SUPPORTED_SETTING_KEYS}
 
 
@@ -604,7 +554,6 @@ def _get_one_setting(key: str) -> dict[str, Any]:
             "description": "关闭后不派发子代理，计划编排工具一并不可用；所有子任务由主 Agent 直接完成",
         }
 
-    # ai_output_dir
     from core.ai_output_paths import (
         default_ai_output_dir,
         get_ai_output_dir_setting,
@@ -621,7 +570,6 @@ def _get_one_setting(key: str) -> dict[str, Any]:
 
 @_guard
 def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
-    """读取 / 修改非安全设置项（命令解释器、单任务最大轮次、搜索排除目录、AI 输出目录、子代理开关）。"""
     act = str(action or "get").strip().lower()
     setting_key = str(key or "").strip()
 
@@ -661,7 +609,7 @@ def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
             return _fail("command_shell 需要提供解释器 id（如 auto / cmd / powershell / bash）")
         try:
             set_selected_command_shell(text)
-        except Exception as exc:  # CommandShellError / 未安装 / 保存失败
+        except Exception as exc:
             return _fail(str(exc) or "设置默认命令解释器失败")
         return _ok(action="set", key=setting_key, setting=_get_one_setting(setting_key))
 
@@ -673,7 +621,7 @@ def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
 
         try:
             save_turn_step_limit(number)
-        except Exception as exc:  # TurnStepLimitError（越界 / 保存失败）
+        except Exception as exc:
             return _fail(str(exc) or "保存单任务最大轮次失败")
         return _ok(action="set", key=setting_key, setting=_get_one_setting(setting_key))
 
@@ -705,12 +653,11 @@ def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
             return _fail(str(exc) or "子代理开关保存失败")
         return _ok(action="set", key=setting_key, setting=_get_one_setting(setting_key))
 
-    # ai_output_dir
     from core.ai_output_paths import set_ai_output_dir_setting
 
     try:
         resolved = set_ai_output_dir_setting(text)
-    except Exception as exc:  # AiOutputDirError
+    except Exception as exc:
         return _fail(str(exc) or "设置 AI 输出目录失败")
     return _ok(
         action="set",
@@ -719,10 +666,6 @@ def system_settings(action: str = "get", key: str = "", value: str = "") -> str:
         setting=_get_one_setting(setting_key),
     )
 
-
-# ---------------------------------------------------------------------------
-# 5) diagram_manage
-# ---------------------------------------------------------------------------
 
 @_guard
 def diagram_manage(action: str = "export", text: str = "", index: int = 0) -> str:
@@ -765,7 +708,6 @@ def diagram_manage(action: str = "export", text: str = "", index: int = 0) -> st
     if not items:
         return _fail("还没有生成过图表：先用 action=export 导出 Mermaid 图表")
 
-    # index 采用 1 起序号；0（或负数）表示最近一张
     position = _as_int(index, 0)
     if position <= 0:
         position = 1
@@ -778,10 +720,6 @@ def diagram_manage(action: str = "export", text: str = "", index: int = 0) -> st
         return _fail(f"打开图表失败（无法唤起默认浏览器）：{target}")
     return _ok(action="open", path=str(target), index=position)
 
-
-# ---------------------------------------------------------------------------
-# 6) doctor_run
-# ---------------------------------------------------------------------------
 
 @_guard
 def doctor_run(json_output: bool = False) -> str:
@@ -826,10 +764,6 @@ def doctor_run(json_output: bool = False) -> str:
     return _ok(**payload)
 
 
-# ---------------------------------------------------------------------------
-# ToolSpec 注册
-# ---------------------------------------------------------------------------
-
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     schema: dict[str, Any] = {
         "type": "object",
@@ -842,7 +776,6 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
 
 
 def build_specs() -> list[ToolSpec]:
-    """返回 6 个管理运维工具契约（供工具注册表装配）。"""
     return [
         ToolSpec(
             name="usage_stats",
@@ -890,8 +823,6 @@ def build_specs() -> list[ToolSpec]:
             ),
             execute=session_export,
             read_only=False,
-            # 只写会话导出文件（返回值即真实产物路径），不属于受控源码编辑，
-            # 因此不声明 mutates_files、不纳入按回合撤销记录器。
             mutates_files=False,
             requires_permission=True,
             cancellable=True,
@@ -921,8 +852,6 @@ def build_specs() -> list[ToolSpec]:
             ),
             execute=update_manage,
             read_only=False,
-            # 只写更新安装包/缓存目录（installer_path 语义），不属于受控源码编辑，
-            # 因此不声明 mutates_files、不纳入按回合撤销记录器。
             mutates_files=False,
             requires_permission=True,
             cancellable=False,
@@ -975,8 +904,6 @@ def build_specs() -> list[ToolSpec]:
             ),
             execute=diagram_manage,
             read_only=False,
-            # 只写导出的图表产物（路径由 export 返回值给出），不属于受控源码编辑，
-            # 因此不声明 mutates_files、不纳入按回合撤销记录器。
             mutates_files=False,
             requires_permission=True,
             cancellable=True,

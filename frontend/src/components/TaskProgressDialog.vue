@@ -1,7 +1,4 @@
 <template>
-  <!-- 会话头部「星链」入口的悬浮面板：锚定在按钮下方（.plan-entry-wrap 内
-       absolute 定位），无全屏遮罩；计划数据由 plan_updated 事件流实时驱动，
-       点外部或按 Esc 收起。 -->
   <div class="plan-pop" data-test="task-dialog" @click.stop>
     <div class="pop-head">
       <div class="ph-ico"><AppIcon name="layers" :size="14" :stroke-width="2" /></div>
@@ -214,7 +211,6 @@
       </div>
     </div>
 
-    <!-- 单行省略时悬停展示完整内容的气泡（Teleport 到 body，避免被滚动区裁切） -->
     <Teleport to="body">
       <div
         v-if="tipState.visible"
@@ -265,9 +261,6 @@ import type { PlanTaskItem, PlanTaskStatus } from '../types/pywebview';
 import type { IconName } from './iconPaths';
 import AppIcon from './AppIcon.vue';
 
-// 会话头部“计划”入口的悬浮面板：锚定在按钮下方（.plan-entry-wrap 内
-// absolute 定位），无全屏遮罩；计划数据由 plan_updated 事件流实时驱动，
-// 这里纯展示、不拉取后端。点外部或按 Esc 收起。
 const emit = defineEmits<{ close: [] }>();
 
 const store = useAppStore();
@@ -396,7 +389,6 @@ async function toggleItem(item: PlanTaskItem, event?: MouseEvent) {
   }
 }
 
-// ── 悬停完整内容气泡（单行被省略时触发） ──
 const tipState = ref<{
   visible: boolean;
   idLabel: string;
@@ -687,7 +679,6 @@ onUnmounted(() => {
   color: var(--xy-text, var(--text));
 }
 
-/* 顶部固定概览区：计划标题 + 进度条 + 紧凑状态计数/筛选 */
 .pop-overview {
   padding: 9px 13px;
   border-bottom: 1px solid var(--xy-border, var(--border));
@@ -844,7 +835,6 @@ onUnmounted(() => {
   color: var(--xy-rose, var(--red));
 }
 
-/* 紧凑单行感条目列表：高度接近原版，信息不截断、详情按需展开 */
 .pop-body {
   padding: 8px 13px;
   overflow-y: auto;
@@ -1095,7 +1085,6 @@ onUnmounted(() => {
   color: var(--xy-rose, var(--red));
 }
 
-/* 展开后的详情区 */
 .p-detail {
   margin-top: 7px;
   padding-top: 7px;
@@ -1228,7 +1217,6 @@ onUnmounted(() => {
   color: var(--xy-text-3, var(--text-faint));
 }
 
-/* 底部操作栏与独立样式按钮 */
 .pop-foot {
   display: flex;
   align-items: center;
@@ -1282,7 +1270,6 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--xy-accent, var(--accent)) 16%, transparent);
 }
 
-/* 悬停全文气泡：Teleport 到 body + fixed，不被面板裁剪 */
 .plan-item-tip {
   position: fixed;
   z-index: 1500;

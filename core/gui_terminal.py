@@ -1,24 +1,3 @@
-"""GUI 内嵌交互式终端（底部面板）的常驻 shell 会话。
-
-承载用户在终端面板里手动敲入的持久 shell（Windows 走 pywinpty/ConPTY，
-POSIX 走标准库 pty），模型/工具链路不经过这里——模型执行命令仍走
-execute_command 工具的权限确认流程。旧版右侧面板单命令终端
-（run_terminal_command）已随该功能上线一并下线删除。
-
-为什么用 pywinpty 而不是手写 ctypes ConPTY：实测 Windows 11 24H2/25H2 上
-自实现的 CreatePseudoConsole + PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 组合
-（含官方文档与 EchoCon 两种写法）子进程均无法挂上伪终端（属性被静默忽略，
-microsoft/terminal 也有同类 24H2 回归报告），而 pywinpty（Rust 封装）在同
-环境验证可用，故 Windows 侧直接复用该库。
-
-线程模型（会话最多 3 个守护线程）：
-- 读线程阻塞读 PTY 输出，进批量缓冲（50ms / 8KB 双阈值），节拍线程负责
-  静默期冲刷；事件回调里只调 emit_event（内部 put_nowait 进 _js_queue），
-  绝不直接触碰 WebView（gui_bridge 的 JS 桥铁律）。
-- 监视线程等子进程退出后取回退出码并触发收尾，保证「最终输出冲刷完才发
-  退出事件」的顺序。
-"""
-
 from __future__ import annotations
 
 import codecs
@@ -33,12 +12,9 @@ from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 单次冲刷的批量阈值：过密的 evaluate_js 会拖垮 WebView，与流式 token
-# 批量推送同一思路（gui_bridge 的 JS 事件派发队列）
 _FLUSH_INTERVAL = 0.05
 _FLUSH_BYTES = 8 * 1024
 
-# 终端尺寸夹取范围：ConPTY 对 0/负值与超大列宽都会报错
 MIN_COLS, MAX_COLS = 2, 500
 MIN_ROWS, MAX_ROWS = 2, 300
 
@@ -60,7 +36,6 @@ def clamp_terminal_size(cols: object, rows: object) -> Tuple[int, int]:
 
 
 def resolve_shell_command() -> Tuple[str, str]:
-    """返回 (可执行文件, 参数列表)：优先系统自带 PowerShell。"""
     if os.name == "nt":
         for exe in ("powershell.exe", "pwsh.exe"):
             path = shutil.which(exe)
@@ -74,11 +49,6 @@ def resolve_shell_command() -> Tuple[str, str]:
 
 
 class PtyTerminalSession:
-    """一个常驻 shell 的伪终端会话；回调均在后台线程触发。
-
-    on_output(text) 携带已解码文本（批量冲刷）；on_exit(code) 在最终输出
-    冲刷之后触发一次。回调内部异常只记日志，不影响会话收尾。
-    """
 
     def __init__(
         self,
@@ -93,11 +63,8 @@ class PtyTerminalSession:
         self._on_output = on_output
         self._on_exit = on_exit
 
-        # 全部实例属性先于线程启动初始化完毕（读线程/监视线程都依赖）
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._out_lock = threading.Lock()
-        # on_output 派发顺序锁：reader 与 ticker 可能并发冲刷，锁内取残留并回调，
-        # 保证两次 on_output 的调用次序与取出次序一致（前端拼接不会倒序）
         self._emit_lock = threading.Lock()
         self._pending: list[str] = []
         self._pending_bytes = 0
@@ -106,14 +73,12 @@ class PtyTerminalSession:
         self._closed = False
         self._exit_code: Optional[int] = None
         self._exit_event = threading.Event()
-        # 读线程收尾完成标记：读线程不再产出新数据时 set()；
-        # _finish 与它汇合并把残留冲刷完，之后才派发退出事件
         self._reader_done = threading.Event()
 
-        self._proc = None  # pywinpty.PtyProcess（Windows）
-        self._popen: Optional[subprocess.Popen] = None  # POSIX 路径使用
+        self._proc = None
+        self._popen: Optional[subprocess.Popen] = None
         self._proc_pid: Optional[int] = None
-        self._master_fd: Optional[int] = None  # POSIX 路径使用
+        self._master_fd: Optional[int] = None
 
         if os.name == "nt":
             self._spawn_windows()
@@ -133,9 +98,6 @@ class PtyTerminalSession:
         self._ticker.start()
         self._monitor.start()
 
-    # ------------------------------------------------------------------
-    # 平台 spawn
-    # ------------------------------------------------------------------
     def _spawn_windows(self) -> None:
         from winpty import PtyProcess
 
@@ -151,7 +113,6 @@ class PtyTerminalSession:
         self._proc_pid = self._proc.pid
 
     def _spawn_posix(self) -> None:
-        """GUI 面向 Windows，此路径仅供 POSIX 开发环境使用。"""
         import fcntl
         import pty
         import struct
@@ -196,9 +157,6 @@ class PtyTerminalSession:
                 logger.debug("清理 POSIX 终端子进程失败（忽略）", exc_info=True)
             raise PtyTerminalError(f"启动 shell 失败: {e}")
 
-    # ------------------------------------------------------------------
-    # 对外操作
-    # ------------------------------------------------------------------
     @property
     def pid(self) -> Optional[int]:
         return self._proc_pid
@@ -229,7 +187,7 @@ class PtyTerminalSession:
         if self._closed:
             return False
         if not data:
-            return True  # 空输入无需写入，不算失败
+            return True
         try:
             if os.name == "nt":
                 self._proc.write(data)
@@ -267,7 +225,6 @@ class PtyTerminalSession:
     def kill(self) -> None:
         """终止 shell 并释放资源（幂等，可从任意线程调用）。"""
         self._terminate_and_close()
-        # 给读线程机会把退出事件发出去
         self._exit_event.wait(3.0)
 
     def _terminate_and_close(self) -> None:
@@ -294,14 +251,10 @@ class PtyTerminalSession:
         except Exception:
             logger.debug("终端资源释放异常（忽略）", exc_info=True)
 
-    # ------------------------------------------------------------------
-    # 读线程 / 批量冲刷 / 监视与收尾
-    # ------------------------------------------------------------------
     def _reader_loop(self) -> None:
         try:
             if os.name == "nt":
                 while True:
-                    # pywinpty 阻塞读，返回 str；PTY 关闭时抛异常结束循环
                     text = self._proc.read(4096)
                     if not text:
                         continue
@@ -326,14 +279,11 @@ class PtyTerminalSession:
                 except Exception:
                     pass
             finally:
-                # 读线程到此不再产出新数据：先置位再等退出事件，
-                # _finish 汇合该标记并把残留冲刷完，才发 pty_exit
                 self._reader_done.set()
             # monitor 负责发退出事件；这里兜底等待，防止极端时序下先于退出码返回
             self._exit_event.wait(2.0)
 
     def _monitor_loop(self) -> None:
-        """等子进程退出 → 取退出码 → 关流（读线程随之退出）→ 收尾。"""
         try:
             if os.name == "nt":
                 self._proc.wait()
@@ -354,7 +304,6 @@ class PtyTerminalSession:
             self._finish()
 
     def _ticker_loop(self) -> None:
-        """静默期冲刷：小批量输出不依赖下一个数据块到达。"""
         while not self._exit_event.wait(_FLUSH_INTERVAL):
             self._flush()
 
@@ -398,7 +347,6 @@ class PtyTerminalSession:
                 logger.debug("终端输出回调异常", exc_info=True)
 
     def _finish(self) -> None:
-        """monitor 专属收尾：等读线程汇合 → 冲刷残留输出 → 发退出事件。"""
         # 有界等待读线程收尾：读线程可能仍阻塞在 PTY 读取上，
         # 超时兜底继续收尾，避免退出事件被无限期拖延
         self._reader_done.wait(1.0)

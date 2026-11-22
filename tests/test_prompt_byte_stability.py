@@ -1,5 +1,3 @@
-"""Byte-level golden guards for provider prompt-cache inputs."""
-
 import hashlib
 import json
 

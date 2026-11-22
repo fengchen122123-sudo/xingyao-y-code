@@ -1,5 +1,3 @@
-"""云中转服务。公开方法不向外抛异常。未开启时不建线程。"""
-
 from __future__ import annotations
 
 import json
@@ -14,7 +12,6 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# 与 LanServer._serve 对齐，支持手机端 ≤50MB 附件（base64 约 67MB）及大状态快照。
 MAX_WS_FRAME_BYTES = 70 * 1024 * 1024
 _STATUS_FILENAME = "cloud_relay_status.json"
 
@@ -118,7 +115,6 @@ def read_runtime_status() -> dict[str, Any]:
 
 
 def _background_factory(url: str, token: str, bridge, on_state=None):
-    """桌面开启云中转后在后台拨号。断线后退避重连，公开方法不把异常抛给界面。"""
     import time
 
     from core.cloud_relay.client import CloudRelayClient
@@ -154,15 +150,9 @@ def _background_factory(url: str, token: str, bridge, on_state=None):
             try:
                 from websockets.sync.client import connect
 
-                # websockets 17 起 connect() 默认 proxy=True，会读系统代理（Windows
-                # 注册表 Internet Settings）。用户开关代理软件时，代理端口未监听就
-                # 连不上，表现为 WinError 10061，二维码随之静默回落局域网。网关是
-                # 自建域名、直连可达，这里显式禁用代理避免被本地代理状态拖累。
-                # 同时显式放大 max_size（默认仅 1 MiB），防止大附件/大快照直接把连接打断。
                 try:
                     connection = connect(url, proxy=None, max_size=MAX_WS_FRAME_BYTES)
                 except TypeError:
-                    # proxy 参数 15.0 才引入；更老的版本只能沿用默认行为（读系统代理）
                     logger.warning("websockets 版本过低，无法禁用代理，建议升级到 15.0+")
                     connection = connect(url, max_size=MAX_WS_FRAME_BYTES)
                 with connection as socket:

@@ -1,21 +1,3 @@
-"""秘书身份解析：当前会话生效的显示名 / 自称 / 专属人设的唯一事实源。
-
-背景：侧栏「秘书」分组下的会话是独立身份实体——每个会话各自起名（落库
-`sessions.secretary_name`），此后该会话的显示与系统提示词身份全程使用这个名字，
-且不复用设置页的人设名。
-
-专属人设（2026-10-20）：每个秘书都是用户自己创建的独立 agent，可另存一份
-`sessions.secretary_persona` 覆盖内置默认秘书人设；留空即用默认，且与设置页
-「星瑶人设」互不影响（永远不回落到 persona_settings）。
-
-设计约束：
-- 本模块只做"读 + 解析"，写入仍由 MemoryManager 承担；
-- 容错优先：任何异常都回落 persona 名（或空串），绝不抛错——身份解析处在每轮
-  请求与工具提示的高频路径上，不能因一次解析失败拖垮整轮；
-- 会话名 → (来源, 名字, 人设) 做进程内缓存，避免高频路径每轮打 DB；创建 /
-  改名 / 改人设 / 删除会话的调用方负责调用 `invalidate_secretary_cache` 失效。
-"""
-
 from __future__ import annotations
 
 import os
@@ -25,24 +7,16 @@ SECRETARY_SOURCE = "SECRETARY"
 # 历史遗留的未命名秘书会话兜底名（本次改动之前创建的秘书会话没有名字）
 FALLBACK_SECRETARY_NAME = "秘书"
 
-# 名字长度约束：strip 后 1..20 字符；非法值拒绝而非静默截断
 _MAX_NAME_LEN = 20
 # 人设长度上限：与设置页人设（persona_settings.MAX_PERSONA_LEN）同口径，
 # 避免两套"人设"对同一类文本给出不同长度限制
 MAX_PERSONA_LEN = 20000
 
-# 进程内缓存：键 = 会话名，值 = (source, name, persona)。会话名是稳定标识，
-# 缓存值随创建 / 改名 / 改人设 / 删除失效，不设 TTL。
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict[str, tuple[str, str, str]] = {}
 
 
 def validate_secretary_name(name) -> str:
-    """校验并返回去首尾空白后的秘书名；非法值抛 ValueError。
-
-    空 / 纯空白、超长一律拒绝，不做静默截断——名字要落库并写进提示词，静默截断
-    会让用户看到的与系统认到的不一致。
-    """
     if not isinstance(name, str):
         raise ValueError("秘书名字必须是文本")
     cleaned = name.strip()
@@ -54,11 +28,6 @@ def validate_secretary_name(name) -> str:
 
 
 def validate_secretary_persona(persona) -> str:
-    """校验并返回去首尾空白后的秘书人设；空值合法（= 使用内置默认人设）。
-
-    只有非空且超长才抛错——人设是可选项，留空必须能建秘书，不能把"没写人设"
-    当成非法输入拒掉。
-    """
     if persona is None:
         return ""
     if not isinstance(persona, str):
@@ -70,18 +39,6 @@ def validate_secretary_persona(persona) -> str:
 
 
 def _resolve_session_name(session_name):
-    """统一会话名入口：显式传入 > 本回合线程所属会话 > UI 当前会话。
-
-    为什么线程会话必须优先（2026-11-12 修复）：``get_current_session`` 的语义是
-    "UI 当前查看的会话"，会随用户在侧栏切换而变化。后台回合（秘书派活、星轨
-    自动化、忙时会话补发）跑在独立线程里，若只看 UI 当前会话，用户在秘书会话
-    里派活的那一刻，被派的目标会话就会被判成秘书会话：工具面被裁成秘书只读集
-    （实测 harness_steps.tools_bytes=25206，与秘书会话逐字节相同），系统提示词
-    也换成秘书契约，模型于是回答"本会话是秘书会话，不能执行命令、不能写文件"。
-    回合线程在 ``app_context.set_thread_session`` 里绑定了真实会话，它才是本回合
-    的身份事实源；没有线程绑定的交互路径仍回落到 UI 当前会话，行为与改动前一致。
-    （对应 app_context.py 对两者的区分：current=UI 视角，thread=回合视角）
-    """
     if session_name:
         return str(session_name)
     try:
@@ -101,7 +58,6 @@ def _resolve_session_name(session_name):
 
 
 def _load_identity(session_name):
-    """读取 (source, name, persona)；无管理器 / 查询异常回落 ("", "", "")。"""
     try:
         from core import app_context
 
@@ -112,8 +68,6 @@ def _load_identity(session_name):
         name = manager.get_session_secretary_name(session_name) or ""
     except Exception:
         return ("", "", "")
-    # 人设单独读取：测试替身 / 老实现可能没有该方法，缺它只应损失人设，
-    # 不该连来源与名字一起丢掉
     persona = ""
     try:
         persona = manager.get_session_secretary_persona(session_name) or ""
@@ -123,7 +77,6 @@ def _load_identity(session_name):
 
 
 def _cached_identity(session_name):
-    """按会话名取 (source, name, persona)，命中缓存则不打 DB。"""
     with _CACHE_LOCK:
         cached = _CACHE.get(session_name)
     if cached is not None:
@@ -206,7 +159,6 @@ def get_active_agent_name() -> str:
 # 单一事实源。两侧必须共用本策略，避免"模型看得见却执行不了"或反之。
 # ---------------------------------------------------------------------------
 
-# 仅秘书会话可见的调度工具：普通会话工具集零变化（设计第 2/7 节）
 SECRETARY_ONLY_TOOLS = frozenset({
     "search_conversations",
     "dispatch_task",
@@ -275,7 +227,6 @@ SECRETARY_ALLOWED_TOOLS = SECRETARY_ONLY_TOOLS | SECRETARY_ALLOWED_PLUGIN_TOOLS 
     # 项目画像写入：作用域 system（只写 ~/.ycode/memory/projects/，跨项目），
     # 必须按名字显式放行；普通会话同样可见（特性 1）。
     "remember_decision",
-    # 定时提醒与自动化任务调度：属于秘书管家的日程安排能力
     "automation_create",
     "automation_update",
     "automation_delete",
@@ -284,11 +235,6 @@ SECRETARY_ALLOWED_TOOLS = SECRETARY_ONLY_TOOLS | SECRETARY_ALLOWED_PLUGIN_TOOLS 
 
 
 def _plugin_tool_names() -> frozenset:
-    """已加载插件提供的工具名集合；取不到时返回空集（不抛错）。
-
-    插件工具的 side_effect_scope 常依赖默认值（none），仅凭作用域会把插件
-    工具误放行；秘书会话只认内置工具与显式白名单插件（``SECRETARY_ALLOWED_PLUGIN_TOOLS``）。
-    """
     try:
         from core import plugin_loader
 
@@ -304,12 +250,6 @@ def _plugin_tool_names() -> frozenset:
 
 
 def secretary_allows_tool(tool_name: str, side_effect_scope: str = "") -> bool:
-    """秘书会话是否允许该工具（策略单一事实源）。
-
-    允许 = ``side_effect_scope == "none"``（只读类，排除编码/内部黑名单与未放行插件）
-    或名字在 ``SECRETARY_ALLOWED_TOOLS`` 里；其余（写文件 / 执行命令 / 电脑操控 /
-    子代理 / 计划写 / 生图 / MCP / 未白名单插件）一律拒绝。空名字拒绝。
-    """
     name = str(tool_name or "").strip()
     if not name:
         return False
@@ -408,12 +348,6 @@ def is_secretary_registered_workspace_read(
 def is_secretary_tool_blocked(
     tool_name: str, side_effect_scope: str = "", session_name=None
 ) -> bool:
-    """秘书会话里该工具是否被只读门控拒绝（工具执行前的统一判定）。
-
-    ``session_name`` 缺省用当前会话解析；显式传入时以传入值为准（回合执行
-    线程用 parent_session，避免用户切换视图导致误判）。身份解析异常按普通
-    会话处理（False）——门控组件故障不得阻断正常会话。
-    """
     try:
         if not is_secretary_session(session_name):
             return False
@@ -442,13 +376,6 @@ def build_secretary_name_block(name) -> str:
 
 
 def build_secretary_persona_block(persona) -> str:
-    """构建注入秘书系统提示词的"专属人设"块；人设为空返回空串（不注入）。
-
-    为什么单独成块并显式声明"取代"：秘书提示词随包分发、开头就写着默认定位
-    （可靠干练、结论先行、不寒暄…）。用户自定义人设若只是追加在后面，模型会
-    同时看到两套性格描述而互相打架，所以必须写明覆盖范围；但绝对红线、调度
-    硬约束、工具与安全规则不属于"人设"，一律保留。
-    """
     try:
         cleaned = validate_secretary_persona(persona)
     except ValueError:

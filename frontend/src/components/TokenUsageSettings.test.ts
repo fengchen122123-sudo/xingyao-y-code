@@ -38,7 +38,6 @@ function makeDay(date: string, total: number, requests = 1, models: unknown[] = 
   return { date, models, ...metrics(total, requests) };
 }
 
-// 7 天范围快照：2 个模型，只有 2 天有真实用量。
 const sevenDayDates = dateKeysEndingAt(RANGE_END, 7);
 const statistics7 = {
   ok: true as const,
@@ -52,7 +51,6 @@ const statistics7 = {
   }),
 };
 
-// 365 天 lifetime 快照：3 个活跃日，最后两天连续。
 const lifetimeDates = dateKeysEndingAt(RANGE_END, 365);
 const lifetime = {
   ok: true as const,
@@ -98,7 +96,6 @@ describe('TokenUsageSettings', () => {
     const { load, loadLifetime, wrapper } = mountPage();
     await flushPromises();
 
-    // 累计摘要条：5 格，含 lifetime 汇总值。
     const strip = wrapper.get('[data-test="token-summary-strip"]');
     expect(wrapper.findAll('[data-test="token-summary-item"]')).toHaveLength(5);
     expect(strip.text()).toContain('总 Token');
@@ -108,7 +105,6 @@ describe('TokenUsageSettings', () => {
     expect(strip.text()).toContain('当前连续');
     expect(strip.text()).toContain('最长连续');
 
-    // 热力图：52 列 × 7 格 = 364 格。
     expect(wrapper.findAll('[data-test="heatmap-column"]')).toHaveLength(52);
     expect(wrapper.findAll('[data-test="heatmap-cell"]')).toHaveLength(364);
     expect(wrapper.findAll('[data-test="heatmap-cell"].has-usage')).toHaveLength(3);
@@ -119,14 +115,12 @@ describe('TokenUsageSettings', () => {
     expect(wrapper.findAll('[data-test="heatmap-cell"]')).toHaveLength(364);
     expect(wrapper.get('[data-test="heatmap-column"]').attributes('title')).toContain('Token');
 
-    // 范围 tabs：选中态来自 store，点击强制刷新对应范围；UI 不再提供「今日」入口。
     expect(wrapper.find('[data-test="range-1"]').exists()).toBe(false);
     expect(wrapper.get('[data-test="range-7"]').attributes('aria-pressed')).toBe('true');
     expect(wrapper.get('[data-test="range-30"]').attributes('aria-pressed')).toBe('false');
     await wrapper.get('[data-test="range-7"]').trigger('click');
     expect(load).toHaveBeenLastCalledWith(7, true);
 
-    // 趋势图：前 2 个模型各一条折线，7 天各一个 hover 列。
     expect(wrapper.findAll('[data-test="trend-legend-item"]')).toHaveLength(2);
     expect(wrapper.findAll('[data-test="trend-line"]')).toHaveLength(2);
     expect(wrapper.findAll('[data-test="trend-col"]')).toHaveLength(7);
@@ -134,7 +128,6 @@ describe('TokenUsageSettings', () => {
     expect(wrapper.text()).toContain('kimi-k2');
     expect(wrapper.get('[data-test="trend-col"]').find('title').text()).toContain('总计');
 
-    // 环图列表：每行含占比与「总量 · 输入 · 输出 · 缓存 · 请求」副行。
     const rows = wrapper.findAll('[data-test="model-usage-row"]');
     expect(rows).toHaveLength(2);
     expect(rows[0].text()).toContain('deepseek-v4');
@@ -146,7 +139,6 @@ describe('TokenUsageSettings', () => {
     expect(rows[0].text()).toContain('次请求');
     expect(rows[1].text()).toContain('300');
 
-    // 刷新按钮：同时强制刷新范围与 lifetime 两份数据。
     await wrapper.get('[data-test="token-refresh"]').trigger('click');
     expect(load).toHaveBeenLastCalledWith(7, true);
     expect(loadLifetime).toHaveBeenLastCalledWith(true);
@@ -217,7 +209,6 @@ describe('TokenUsageSettings', () => {
     const { wrapper } = mountPage();
     await flushPromises();
 
-    // lifetime 最后一天（RANGE_END）有 200 Token、1 个模型。
     const used = wrapper.findAll('[data-test="heatmap-cell"].has-usage');
     const target = used[used.length - 1];
     await target.trigger('click');
@@ -229,7 +220,6 @@ describe('TokenUsageSettings', () => {
     expect(target.attributes('aria-pressed')).toBe('true');
     expect(target.classes()).toContain('is-selected');
 
-    // 折线：总量 / 输入 / 输出三条，单模型只留数据点；环图给占比。
     expect(detail.findAll('[data-test="day-detail-legend"] span')).toHaveLength(3);
     expect(detail.findAll('[data-test="day-detail-ranking"] circle')).toHaveLength(3);
     expect(detail.findAll('[data-test="day-detail-band"]')).toHaveLength(1);
@@ -237,7 +227,6 @@ describe('TokenUsageSettings', () => {
     expect(detail.findAll('[data-test="day-detail-model-row"]')).toHaveLength(1);
     expect(detail.text()).toContain('deepseek-v4');
 
-    // 再点同一格收起。
     await target.trigger('click');
     expect(wrapper.find('[data-test="token-day-detail"]').exists()).toBe(false);
   });
@@ -250,7 +239,6 @@ describe('TokenUsageSettings', () => {
     await used[used.length - 1].trigger('click');
     expect(wrapper.get('[data-test="token-day-detail"]').text()).toContain('8月9日');
 
-    // 换到更早的一个活跃日（lifetime 的 index 10）。
     await used[0].trigger('click');
     const detail = wrapper.get('[data-test="token-day-detail"]');
     expect(detail.text()).not.toContain('8月9日');
@@ -266,15 +254,12 @@ describe('TokenUsageSettings', () => {
     const { wrapper } = mountPage();
     await flushPromises();
 
-    // 第一个格子是 364 天前的 0 用量日。
     await wrapper.get('[data-test="heatmap-cell"]').trigger('click');
     expect(wrapper.get('[data-test="token-day-detail"]').text()).toContain('这一天没有用量记录');
 
-    // 模式切换后旧选中态失效，明细收起。
     await wrapper.get('[data-test="heatmap-mode-weekly"]').trigger('click');
     expect(wrapper.find('[data-test="token-day-detail"]').exists()).toBe(false);
 
-    // 每周模式点最后一列的格子 = 整周（含 RANGE_END 那天）。
     const lastColumn = wrapper.findAll('[data-test="heatmap-column"]');
     const cells = lastColumn[lastColumn.length - 1].findAll('[data-test="heatmap-cell"]');
     await cells[0].trigger('click');

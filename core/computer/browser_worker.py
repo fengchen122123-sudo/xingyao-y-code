@@ -51,7 +51,6 @@ def main(argv: list[str] | None = None) -> int:
     from core.computer.models import ComputerAction, ComputerControlError
     from core.computer.platforms import get_platform_adapter
 
-    # R5 受控页裁决的系统侧窗口提示由平台层提供（与生产父进程接线一致）。
     hint_provider = getattr(get_platform_adapter(), "browser_window_hints", None)
     if hint_provider is not None and not callable(hint_provider):
         hint_provider = None
@@ -66,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         backend.start()
     except ComputerControlError as error:
         return _boot_failed(error.code, error.message)
-    except Exception as error:  # 防御：启动异常统一归一为稳定错误码
+    except Exception as error:
         return _boot_failed(
             "computer_backend_start_failed", f"浏览器 backend 启动失败：{type(error).__name__}"
         )
@@ -86,8 +85,6 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 request = decode_request(line)
             except (ValueError, json.JSONDecodeError) as error:
-                # 会话期协议错误用独立事件名：父进程把 boot_failed 记进
-                # _boot_error（启动后无人再读），语义误导且难排查
                 _emit(
                     {
                         "event": "worker_protocol_error",
@@ -114,10 +111,21 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     backend.execute(str(request.get("run_id") or ""), action)
                     _emit({"id": command_id, "ok": True})
+                elif op == "sync_frame":
+                    from core.computer.browser_worker_protocol import (
+                        normalize_frame_payload,
+                    )
+                    from core.computer.models import ObservationFrame
+
+                    frame = ObservationFrame(
+                        **normalize_frame_payload(request["frame"])
+                    )
+                    backend.sync_observation_frame(frame)
+                    _emit({"id": command_id, "ok": True})
                 elif op == "release":
                     backend.release_inputs()
                     _emit({"id": command_id, "ok": True})
-                else:  # close（白名单内最后一个）
+                else:
                     backend.close()
                     _emit({"id": command_id, "ok": True})
                     return 0

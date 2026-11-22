@@ -6,7 +6,6 @@ import ContextUsagePanel from './ContextUsagePanel.vue';
 import { normalizeTokenUsage, useAppStore } from '../stores/appStore';
 import type { ContextBreakdownItem, TokenUsage } from '../types/pywebview';
 
-// 直接覆写 store.tokenUsage（绕过逐字段归一化），以覆盖面板自身的容错路径
 function setUsage(usage: Partial<TokenUsage>) {
   useAppStore().tokenUsage = { ...normalizeTokenUsage({}), ...usage };
 }
@@ -61,7 +60,6 @@ describe('ContextUsagePanel', () => {
     const summary = wrapper.get('[data-test="ctx-usage-summary"]').text();
     expect(summary).toBe('500 / 0（0.0%）');
     expect(summary).not.toContain('NaN');
-    // CSS 数值归一化：0.00% 会被样式表规范为 0%
     expect(wrapper.get('[data-test="ctx-usage-bar-fill"]').attributes('style'))
       .toContain('width: 0%');
     wrapper.unmount();
@@ -89,7 +87,6 @@ describe('ContextUsagePanel', () => {
     expect(rows[2].find('.cxp-row-name').text()).toBe('技能');
     expect(rows[2].find('.cxp-row-pct').text()).toBe('10.9%');
 
-    // 有 breakdown：进度条按来源分段着色（色块与分段的颜色派生自主题变量）
     const segments = wrapper.findAll('.cxp-bar-seg');
     expect(segments).toHaveLength(3);
     expect(segments[0].attributes('style')).toContain('color-mix');
@@ -122,13 +119,11 @@ describe('ContextUsagePanel', () => {
         { source: 'bogus' as ContextBreakdownItem['source'], chars: 50 },
         { source: 'messages', chars: 0 },
         { source: 'system_tools', chars: -3 },
-        // 旧来源 tools 已从白名单移除，须被静默过滤
         { source: 'tools' as ContextBreakdownItem['source'], chars: 42 },
       ],
     });
     const wrapper = mountPanel();
     expect(wrapper.find('[data-test="ctx-usage-breakdown"]').exists()).toBe(false);
-    // 无有效来源：进度条为单色（无分段），且不出现 NaN
     expect(wrapper.findAll('.cxp-bar-seg')).toHaveLength(0);
     expect(wrapper.text()).not.toContain('NaN');
     wrapper.unmount();
@@ -147,12 +142,10 @@ describe('ContextUsagePanel', () => {
     expect(cacheRow.text()).toContain('缓存命中率');
     expect(cacheRow.text()).toContain('91.3%');
 
-    // cache_available=false 时隐藏（即使有数值）
     setUsage({ cache_available: false, cache_session_pct: 91.25 });
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="ctx-usage-cache"]').exists()).toBe(false);
 
-    // 有 available 但无值（null）时同样隐藏
     setUsage({ cache_available: true, cache_session_pct: null });
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="ctx-usage-cache"]').exists()).toBe(false);
@@ -160,7 +153,6 @@ describe('ContextUsagePanel', () => {
   });
 
   it('向上弹出、水平对齐锚点并在视口内夹取', () => {
-    // jsdom 视口 1024x768：锚点靠右 → left 夹到 1024-12-320=692；bottom=768-700+8=76
     const wrapper = mountPanel({ anchorEl: makeAnchor({ left: 900, right: 930 }) });
 
     const style = wrapper.get('.ctx-usage-panel').attributes('style');
@@ -182,7 +174,6 @@ describe('ContextUsagePanel', () => {
 
     expect(wrapper.get('[data-test="ctx-usage-cache"]').text()).toContain('缓存命中率');
     expect(wrapper.get('[data-test="ctx-usage-cache"]').text()).toContain('90.8%');
-    // 车道身份行（模型 @ 接口）与保活命中率行均已下线：数据字段仍在，界面不再渲染
     expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="ctx-usage-cache-keepalive"]').exists()).toBe(false);
     expect(wrapper.text()).not.toContain('保活');
@@ -199,7 +190,6 @@ describe('ContextUsagePanel', () => {
     });
     const wrapper = mountPanel();
     expect(wrapper.find('[data-test="ctx-usage-cache-keepalive"]').exists()).toBe(false);
-    // 车道行已下线：无论后端有没有车道字段，界面都不渲染它
     expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
 
     setUsage({ cache_lane_model: '', cache_lane_api_base: '', cache_keepalive_session_pct: 31 });

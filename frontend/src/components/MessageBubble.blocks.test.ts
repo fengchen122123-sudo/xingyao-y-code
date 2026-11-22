@@ -19,7 +19,6 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 
 beforeEach(() => {
   setActivePinia(createPinia());
-  // 文件链接后置校验会请求后端，测试里短路掉
   vi.spyOn(useAppStore(), 'checkPathsKind').mockResolvedValue([]);
 });
 
@@ -30,7 +29,7 @@ describe('MessageBubble 块级渲染', () => {
     });
     await flushPromises();
     const blocks = wrapper.findAll('.md-block');
-    expect(blocks).toHaveLength(2); // 1 个稳定块 + 1 个尾部块
+    expect(blocks).toHaveLength(2);
     expect(wrapper.html()).toContain('a');
     expect(wrapper.html()).toContain('b');
     expect(wrapper.html()).toContain('c');
@@ -54,7 +53,7 @@ describe('MessageBubble 块级渲染', () => {
     await flushPromises();
 
     const after = wrapper.findAll('.md-block');
-    expect(after[0].element).toBe(firstBlock); // 同一个 DOM 节点，未重建
+    expect(after[0].element).toBe(firstBlock);
     expect(wrapper.html()).toContain('d');
   });
 
@@ -67,15 +66,13 @@ describe('MessageBubble 块级渲染', () => {
   });
 
   it('回合收尾补挂媒体清单时，已完成块里的图片要重渲染为 <img>', async () => {
-    // 流式期间清单还没下发（它在 message_final 才挂上），此时图片语法只能
-    // 退化成文件链接，并被写进已完成块的渲染缓存
     const msg = assistantMessage({
       content: '![图](D:/tmp/shot.png)\n\n第一段\n\n第二段',
       execution_state: 'running',
     });
     const wrapper = mount(MessageBubble, { props: { msg } });
     await flushPromises();
-    expect(wrapper.findAll('.md-block')).toHaveLength(2); // 图片段落在稳定块里
+    expect(wrapper.findAll('.md-block')).toHaveLength(2);
     expect(wrapper.find('img.md-img').exists()).toBe(false);
     expect(wrapper.html()).toContain('data-file-link="D:/tmp/shot.png"');
 

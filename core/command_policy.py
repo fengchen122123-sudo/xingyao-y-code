@@ -1,5 +1,3 @@
-"""Pure policy helpers for session-scoped command authorization."""
-
 import fnmatch
 import os
 import re
@@ -183,7 +181,6 @@ _CATASTROPHIC_COMMAND_PATTERNS = (
         r"\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|ksh)\b",
         re.IGNORECASE,
     ),
-    # 下载后交给脚本解释器执行（sh 家族之外的变体）
     re.compile(
         r"\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:python\d*(?:\.exe)?|perl|ruby)\b",
         re.IGNORECASE,
@@ -194,7 +191,6 @@ _CATASTROPHIC_COMMAND_PATTERNS = (
         r"(?:sh|bash|zsh|ksh|python\d*(?:\.exe)?|perl)\b",
         re.IGNORECASE,
     ),
-    # PowerShell -EncodedCommand：base64 载荷无法静态审查，一律视为危险
     re.compile(
         r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:enc|ec|encodedcommand)\b",
         re.IGNORECASE,
@@ -354,11 +350,6 @@ def _dangerous_powershell_delete(segment, *, workdir=None, home=None):
 
 
 def is_dangerous_command(command: str, *, workdir=None, home=None) -> bool:
-    """Identify unambiguously catastrophic shell operations.
-
-    This is defense in depth, not a complete shell sandbox. Permission
-    confirmation remains required for mutating commands that are not matched.
-    """
     text = str(command or "").strip()
     if not text:
         return False
@@ -411,6 +402,8 @@ def _has_inline_exec_flag(tokens: tuple[str, ...]) -> bool:
             return True
         if flag == "-p" and executable in {"perl", "ruby"}:
             return True
+        if flag in {"-p", "--print"} and executable in {"node", "nodejs"}:
+            return True
         if flag == "-m" and is_python:
             module_name = tokens[i + 1].lower() if i + 1 < len(tokens) else ""
             if module_name not in _SAFE_PYTHON_MODULES:
@@ -462,7 +455,6 @@ def _classify_git_command(arguments: tuple[str, ...]) -> PermissionRisk:
         return PermissionRisk.SENSITIVE_MUTATION
     if sub == "config":
         if rest and any(arg in {"--get", "--get-all", "--list", "-l", "--show-origin"} for arg in rest):
-            # 仅允许读取查询标志（无写赋值参数时最多 3 个参数）
             positional = [arg for arg in rest if not arg.startswith("-")]
             if "--list" in rest or "-l" in rest or len(positional) <= 1:
                 return PermissionRisk.QUERY
@@ -524,11 +516,6 @@ def _classify_single_command_tokens(
 
 
 def _split_safe_compound_segments(command: str) -> list[tuple[str, ...]] | None:
-    """将无重定向/变量展开/换行的安全复合命令拆解为各段 token 元组。
-
-    任何包含 < > ` \\r \\n $( ${ 或裸后台符号 & 的命令都返回 None，交给调用方按高敏处理。
-    不改变 session_rule_for_command 对组合命令返回 None 的既有安全合约。
-    """
     if not isinstance(command, str) or not command.strip():
         return None
 
@@ -635,7 +622,6 @@ def classify_command_risk(command: str, *, workdir=None, home=None) -> Permissio
 
 
 def parse_manual_command_rule(command: str) -> tuple[str, ...]:
-    """Parse a complete, persistable token prefix entered by the user."""
     if is_dangerous_command(command):
         raise ValueError("灾难性命令不能加入白名单")
 
@@ -648,7 +634,6 @@ def parse_manual_command_rule(command: str) -> tuple[str, ...]:
 
 
 def session_rule_for_command(command: str) -> tuple[str, ...] | None:
-    """Return the narrow session rule for a safe, non-composed command."""
     tokens = _safe_tokens(command)
     if tokens is None:
         return None
@@ -690,19 +675,12 @@ def _session_rule_is_exact(rule: tuple[str, ...]) -> bool:
     )
 
 
-# ---------------------------------------------------------------------------
-# T1 子进程环境变量策略：默认不把主进程的敏感环境变量（API Key / Token 等）
-# 透传给 execute_command 与后台任务拉起的子进程，堵住「模型执行命令时把
-# 凭据带给子进程」的泄漏面。这是唯一默认偏离旧行为的配置项（安全默认）；
-# 逃生门：config.json 设 "shell_env_policy": {"exclude_sensitive": false}。
-# ---------------------------------------------------------------------------
 SHELL_ENV_POLICY_CONFIG_KEY = "shell_env_policy"
 DEFAULT_SHELL_ENV_POLICY = {"inherit": "all", "exclude_sensitive": True}
 DEFAULT_SENSITIVE_ENV_PATTERNS = ("*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*")
 
 
 def _env_pattern_list(value) -> list[str]:
-    """归一化模式列表：字符串视为单模式，非法项静默忽略。"""
     if isinstance(value, str):
         return [value] if value else []
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -711,7 +689,6 @@ def _env_pattern_list(value) -> list[str]:
 
 
 def _env_name_matches(name: str, patterns: list[str]) -> bool:
-    """环境变量名按 fnmatch 匹配，大小写不敏感（Windows 语义跨平台统一）。"""
     upper = str(name).upper()
     return any(fnmatch.fnmatchcase(upper, pattern.upper()) for pattern in patterns)
 
@@ -719,16 +696,6 @@ def _env_name_matches(name: str, patterns: list[str]) -> bool:
 def build_child_env(
     base_env: Mapping[str, str], *, policy: dict | None = None
 ) -> dict[str, str]:
-    """构造子进程环境变量表（默认安全：排除敏感变量）。
-
-    策略字段（均为可选，非法值回退默认）：
-    - ``inherit``: ``all``（默认）继承 base_env；``none`` 从空表开始
-    - ``exclude_sensitive``: 默认 True，按 ``DEFAULT_SENSITIVE_ENV_PATTERNS``
-      排除敏感变量；显式 False 为逃生门（恢复旧行为）
-    - ``exclude``: 追加自定义排除模式（fnmatch，大小写不敏感）
-    - ``include_only``: 非空白名单，仅保留匹配变量
-    - ``set``: 固定注入，最终生效（显式覆盖同名的继承值）
-    """
     options = policy if isinstance(policy, dict) else {}
     base = dict(base_env) if isinstance(base_env, Mapping) else {}
 
@@ -761,7 +728,6 @@ def build_child_env(
 
 
 def load_shell_env_policy() -> dict:
-    """读取 config.json 的 shell_env_policy；缺省/非法值回退安全默认。"""
     resolved = dict(DEFAULT_SHELL_ENV_POLICY)
     try:
         import config

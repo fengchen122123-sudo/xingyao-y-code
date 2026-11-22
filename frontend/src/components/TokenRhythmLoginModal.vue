@@ -6,13 +6,11 @@
     @mousedown.self="close()"
   >
     <div class="tr-card" data-test="tr-login-modal" role="dialog" aria-modal="true" aria-labelledby="tr-login-title">
-      <!-- 顶部品牌区：官方 logo（图形 + tokenrhythm.ai + 基元律动）+ 关闭按钮 -->
       <div class="tr-top">
         <img class="tr-brand" :src="brandLogo" alt="基元律动 TokenRhythm">
         <button class="tr-close" data-test="tr-login-close" title="关闭" @click="close()">✕</button>
       </div>
 
-      <!-- 已登录态：不展示表单，只展示账号与 Key 配置情况 -->
       <template v-if="loggedIn">
         <h2 id="tr-login-title" class="tr-title" data-test="tr-login-title">已登录</h2>
         <p class="tr-sub">当前账号已连接基元律动</p>
@@ -35,7 +33,6 @@
           {{ tab === 'sms' ? '未注册手机号将自动创建账号，已注册手机号直接登录。' : '使用账号或手机号与密码登录，登录后自动配置 API Key。' }}
         </p>
 
-        <!-- 登录说明与责任划分：默认折叠成一行，点了才展开，避免把登录表单挤下去 -->
         <div class="tr-disclaimer">
           <button
             type="button"
@@ -55,7 +52,6 @@
           </ul>
         </div>
 
-        <!-- 短信登录 -->
         <form v-if="tab === 'sms'" class="tr-form" data-test="tr-sms-form" @submit.prevent="submitSms()">
           <label class="tr-field">
             <span class="tr-label">手机号<i class="tr-req">*</i></span>
@@ -86,7 +82,6 @@
                 :disabled="submitting"
                 @input="onCodeInput($event)"
               >
-              <!-- id 是阿里云验证码 SDK 的 button 选择器（#tr-send-code-btn），改结构时别删 -->
               <button
                 id="tr-send-code-btn"
                 type="button"
@@ -140,7 +135,6 @@
           </button>
         </form>
 
-        <!-- 密码登录（账号支持手机号 / 邮箱） -->
         <form v-else class="tr-form" data-test="tr-password-form" @submit.prevent="submitPassword()">
           <label class="tr-field">
             <span class="tr-label">账号<i class="tr-req">*</i></span>
@@ -195,7 +189,6 @@
           </button>
         </form>
 
-        <!-- 底部切换：与官方登录页一致，用文字链接而不是胶囊 tab -->
         <div class="tr-switch">
           <button
             v-if="tab === 'sms'"
@@ -225,8 +218,6 @@
     </div>
   </div>
 
-  <!-- 阿里云人机验证挂载点：常驻在 v-if 之外（弹窗关闭会重建 DOM，只有常驻节点才能让
-       初始化过一次的 SDK 实例在关窗再打开后继续有效）；本身不需要可见尺寸，弹窗由 SDK 自己定位 -->
   <div id="tr-aliyun-captcha" class="tr-captcha-slot"></div>
 </template>
 
@@ -268,35 +259,28 @@ type NoticeKind = 'error' | 'warn' | 'success';
 
 /** 后端没回 interval_seconds 时的发送间隔兜底（秒） */
 const DEFAULT_SMS_INTERVAL = 60;
-/** 登录成功后自动关窗的延时（毫秒） */
 const AUTO_CLOSE_DELAY = 1200;
 /** 人机验证脚本加载 + 实例初始化的超时（毫秒）：超时即降级直接发码，不卡住用户 */
 const CAPTCHA_INIT_TIMEOUT = 10000;
 
-// 阿里云验证码参数只写在这里（与基元律动官方登录页同款），别在别处再硬编码一遍
 const CAPTCHA_SDK_SRC = 'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
 const CAPTCHA_SCRIPT_ID = 'tr-aliyun-captcha-sdk';
 const CAPTCHA_SCENE_ID = '6mwyro6e';
 const CAPTCHA_PREFIX = 'rw34fd';
 const CAPTCHA_REGION = 'cn';
-/** 与模板里的挂载点 / 发送按钮 id 对应，改模板时同步这里 */
 const CAPTCHA_ELEMENT = '#tr-aliyun-captcha';
 const CAPTCHA_BUTTON = '#tr-send-code-btn';
 
-/** 邀请码默认预填值：仅是表单初始值，用户可自行修改或清空，不在登录逻辑里做任何强制 */
 const DEFAULT_INVITE_CODE = 'rf_tr_WXK47U';
 
 const tab = ref<LoginTab>('sms');
 
-// 短信登录
 const phone = ref('');
 const code = ref('');
-/** 邀请码选填：默认预填推荐邀请码，用户可修改或清空；空串由后端归一成 None（不上送 inviteCode） */
 const inviteCode = ref(DEFAULT_INVITE_CODE);
 const maskedTip = ref('');
 const countdown = ref(0);
 const sendingCode = ref(false);
-/** 本次发码的目标手机号：验证码弹窗是异步完成的，回调用点击那一刻的号码更可靠 */
 const pendingPhone = ref('');
 
 // 人机验证内部状态：只用于本组件决定走认证码还是降级，不直接展示给用户
@@ -305,14 +289,11 @@ const captchaFailed = ref(false);
 let captchaInstance: AliyunCaptchaInstance | null = null;
 let captchaInitTask: Promise<boolean> | null = null;
 
-// 密码登录
 const account = ref('');
 const password = ref('');
 
-// 提交态与结果提示
 const submitting = ref(false);
 const notice = ref<{ kind: NoticeKind; text: string } | null>(null);
-/** 协议勾选：与官方登录页一致，未勾选不允许提交（后端 login-or-register 需要 termsAccepted） */
 const agreed = ref(false);
 /** 登录说明默认收起：只在需要时展开，避免把登录表单挤到折叠线以下 */
 const showDisclaimer = ref(false);
@@ -338,7 +319,6 @@ const sendButtonText = computed(() => {
   return '发送验证码';
 });
 
-// 结果提示的 data-test 随类型变化：失败 / 绑定失败 / 成功可分别断言
 const noticeTestId = computed(() => {
   if (!notice.value) return 'tr-login-notice';
   if (notice.value.kind === 'error') return 'tr-login-error';
@@ -406,7 +386,6 @@ function close() {
   store.closeTrLoginModal();
 }
 
-/** 协议正文由基元律动提供（站内没有对应页面）：交给系统浏览器打开官网登录页查看全文 */
 function openLegal(_kind: 'terms' | 'privacy') {
   void store.openExternalUrl('https://tokenrhythm.studio/login');
 }
@@ -417,7 +396,6 @@ function switchTab(next: LoginTab) {
   notice.value = null;
 }
 
-/** 验证码只留数字且最多 6 位：粘贴带空格/短横线的短信内容时也能直接用 */
 function onCodeInput(e: Event) {
   const el = e.target as HTMLInputElement;
   const digits = el.value.replace(/\D/g, '').slice(0, 6);
@@ -447,7 +425,6 @@ function withTimeout<T>(task: Promise<T>, timeout: number): Promise<T> {
   });
 }
 
-/** 运行时注入 SDK；全局已有 initAliyunCaptcha（脚本已在页面里）时直接跳过 */
 function loadCaptchaScript(): Promise<void> {
   if (typeof window.initAliyunCaptcha === 'function') return Promise.resolve();
   return new Promise<void>((resolve, reject) => {
@@ -463,7 +440,6 @@ function loadCaptchaScript(): Promise<void> {
   });
 }
 
-/** SDK 内部渲染是异步的，getInstance 会稍后才回调，这里轮询等待实例真正交出来 */
 function waitCaptchaReady(timeout: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     if (captchaInstance) {
@@ -486,7 +462,6 @@ function waitCaptchaReady(timeout: number): Promise<boolean> {
 function initCaptcha(): void {
   const init = window.initAliyunCaptcha;
   if (typeof init !== 'function') throw new Error('验证码 SDK 未就绪');
-  // 官方要求：initAliyunCaptcha 之前先写好 region / prefix
   window.AliyunCaptchaConfig = { region: CAPTCHA_REGION, prefix: CAPTCHA_PREFIX };
   init({
     SceneId: CAPTCHA_SCENE_ID,
@@ -497,7 +472,6 @@ function initCaptcha(): void {
       void onCaptchaSuccess(captchaVerifyParam);
     },
     fail: () => {
-      // 用户关掉弹窗或校验没通过：放开按钮即可，不额外弹错（可重试或改用密码登录）
       sendingCode.value = false;
       pendingPhone.value = '';
     },
@@ -541,7 +515,6 @@ async function requestSms(phoneValue: string, captchaParam?: string) {
   try {
     const res = await store.trSendSms(phoneValue, captchaParam);
     if (!res || !res.ok) {
-      // 后端文案（如"安全验证未通过，请改用密码登录"）原样展示，别自己改写
       notice.value = { kind: 'error', text: (res && res.msg) || '验证码发送失败，请稍后重试' };
       return;
     }
@@ -584,7 +557,6 @@ async function sendCode() {
     return;
   }
   try {
-    // 只唤起验证码、不发请求：真正发码在 success 回调里
     instance.show();
   } catch (err) {
     console.warn('[tr-login] 唤起人机验证失败，降级直接发送验证码：', err);
@@ -595,7 +567,6 @@ async function sendCode() {
   }
 }
 
-/** 登录结果统一处理：失败原样展示 msg，绑定失败明确提示，成功按 created 区分文案 */
 function applyLoginResult(res: any) {
   if (!res || !res.ok) {
     notice.value = { kind: 'error', text: (res && res.msg) || '登录没有成功，请稍后再试' };
@@ -613,7 +584,6 @@ function applyLoginResult(res: any) {
     kind: 'success',
     text: created ? '登录成功，已自动创建并绑定 API Key' : '登录成功，本地已有可用 API Key',
   };
-  // 全局账号状态以 store 为准，这里再拉一次权威快照（后端已写入登录态）
   void store.refreshTrAuth();
   scheduleAutoClose();
 }
@@ -709,7 +679,6 @@ watch(
   },
 );
 
-// Esc 关闭：与项目内其他弹窗保持一致的交互习惯（遮罩点击 / 右上角 × 也都能关）
 function onWindowKeydown(e: KeyboardEvent) {
   if (e.key !== 'Escape' || !store.trLoginModal.show) return;
   close();
@@ -718,7 +687,6 @@ function onWindowKeydown(e: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onWindowKeydown));
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKeydown);
-  // 只清本组件自己的定时器：SDK 与实例是页面级单例，这里不销毁，下次打开直接复用
   stopCountdown();
   stopAutoClose();
 });
@@ -738,7 +706,6 @@ onBeforeUnmount(() => {
   justify-content: center;
   padding: 16px;
 }
-/* 人机验证挂载点：常驻的 0 尺寸节点，SDK 弹窗自己是 fixed 定位，层级要压过登录遮罩 */
 .tr-captcha-slot {
   position: fixed;
   top: 0;
@@ -769,7 +736,6 @@ onBeforeUnmount(() => {
     opacity: 1;
   }
 }
-/* 顶部：官方 logo 靠左、关闭按钮靠右 */
 .tr-top {
   display: flex;
   align-items: flex-start;
@@ -823,7 +789,6 @@ onBeforeUnmount(() => {
   font-weight: 600;
   color: #222;
 }
-/* 必填星号：与官方一致用红色 */
 .tr-req {
   margin-left: 3px;
   color: #e5484d;
@@ -936,7 +901,6 @@ onBeforeUnmount(() => {
 .tr-disclaimer-list li + li {
   margin-top: 4px;
 }
-/* 协议勾选行 */
 .tr-terms {
   display: flex;
   align-items: flex-start;
@@ -962,7 +926,6 @@ onBeforeUnmount(() => {
 .tr-link-inline:hover {
   color: #000;
 }
-/* 登录按钮：黑底白字 + 右侧箭头，对齐官方样式 */
 .tr-submit {
   display: flex;
   align-items: center;
@@ -995,7 +958,6 @@ onBeforeUnmount(() => {
   font-size: 17px;
   font-weight: 400;
 }
-/* 底部登录方式切换：文字链接（不是胶囊 tab） */
 .tr-switch {
   margin-top: 22px;
   text-align: center;
@@ -1012,7 +974,6 @@ onBeforeUnmount(() => {
 .tr-switch-link:hover {
   color: #111;
 }
-/* 结果提示 */
 .tr-notice-wrap {
   margin-top: 16px;
 }
@@ -1035,7 +996,6 @@ onBeforeUnmount(() => {
   background: #e9f7ec;
   color: #1a7f37;
 }
-/* 已登录态 */
 .tr-account {
   display: flex;
   align-items: center;

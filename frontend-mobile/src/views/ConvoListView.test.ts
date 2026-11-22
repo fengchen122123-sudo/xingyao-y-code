@@ -16,7 +16,6 @@ function makeRouter() {
   });
 }
 
-/** 两个会话的「自由对话」分组，供搜索/滚动用例复用 */
 function twoSessions(): SessionGroup[] {
   return [
     {
@@ -49,7 +48,6 @@ const api = {
 beforeEach(() => {
   (window as any).pywebview = { api };
   api.switch_session.mockClear();
-  // onActivated 会重拉会话列表，默认返回空，需要列表数据的用例自行 mockImplementation
   api.get_sessions.mockReset();
   api.get_sessions.mockImplementation(async () => []);
 });
@@ -138,14 +136,12 @@ describe('ConvoListView', () => {
     const store = useAppStore();
     const groups = twoSessions();
     store.sessionGroups = groups;
-    // 返回列表会触发 onActivated → refreshSessions，这里让后端返回同一份列表
     api.get_sessions.mockImplementation(async () => groups);
 
     const router = makeRouter();
     await router.push('/convo');
     await router.isReady();
 
-    // onActivated/onDeactivated 只在被 keep-alive 缓存时触发，故用宿主组件包一层
     const show = ref(true);
     const Host = defineComponent({
       setup: () => () => h(KeepAlive, null, { default: () => (show.value ? h(ConvoListView) : null) }),
@@ -159,9 +155,9 @@ describe('ConvoListView', () => {
     await nextTick();
     expect(wrapper.findAll('.conv-card')).toHaveLength(1);
 
-    show.value = false; // 去详情页（列表被缓存，触发 onDeactivated）
+    show.value = false;
     await nextTick();
-    show.value = true; // 返回列表
+    show.value = true;
     await nextTick();
     await nextTick();
 

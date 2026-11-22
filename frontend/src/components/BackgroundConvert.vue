@@ -13,7 +13,6 @@
     <section class="setting-group">
       <div class="group-title">基础配置</div>
       <div class="setting-card">
-        <!-- 视频转换组件（ffmpeg）：状态一律读 Store 快照 -->
         <div class="setting-row" data-test="ffmpeg-component">
           <div class="setting-copy">
             <h2>视频转换组件</h2>
@@ -72,7 +71,6 @@
           </div>
         </div>
 
-        <!-- 源视频 -->
         <div class="setting-row setting-row--stackable">
           <div class="setting-copy">
             <h2>源视频</h2>
@@ -107,7 +105,6 @@
           </div>
         </div>
 
-        <!-- 输出目录 -->
         <div class="setting-row">
           <div class="setting-copy">
             <h2>输出目录</h2>
@@ -278,7 +275,6 @@ import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
 
-// 上限用后端返回的真实值（与 core/gui_theme.py 同源），拿不到时退回 10 MiB。
 const limitMiB = computed(() => {
   const bytes = store.bgConvert.video?.max_bytes;
   return bytes ? Math.round(bytes / 1048576) : 10;
@@ -303,7 +299,6 @@ const canStart = computed(() => {
 const isLightPreset = computed(() => store.bgConvert.fps === 8 && store.bgConvert.quality === 65);
 const isQualityPreset = computed(() => store.bgConvert.fps === 15 && store.bgConvert.quality === 85);
 
-// 阶段文案：压缩动画阶段 ffmpeg 拿不到细分进度，进度会停在 88% 一小会儿，简明提示仍在处理。
 const STAGE_LABELS: Record<string, string> = {
   starting: '正在启动…',
   extracting: '正在提取画面…',
@@ -340,8 +335,6 @@ function fmtBytes(bytes: number) {
   return `${(bytes / 1048576).toFixed(2)} MiB`;
 }
 
-// ── 视频转换组件（ffmpeg）──
-// 展示状态一律读 Store 快照，桥事件只更新 Store；组件内不维护副本
 const ffmpegComponent = computed(() => store.ffmpegComponent);
 const ffmpegPercent = computed(() => {
   const value = Number(store.ffmpegComponent.percent) || 0;

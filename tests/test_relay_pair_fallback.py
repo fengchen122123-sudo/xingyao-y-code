@@ -1,5 +1,3 @@
-"""云中转回落局域网时的原因回传：二维码不再静默换地址。"""
-
 from __future__ import annotations
 
 import time
@@ -48,7 +46,6 @@ def relay_config(monkeypatch):
 
 
 def test_offline_relay_reports_reason(relay_config):
-    """连接掉线是最常见的回落原因：界面靠这行提示说明「不是开关没生效」。"""
     reason: dict = {}
     result = portal.build_pair_url(
         _FakeBridge(_FakeService(False)), mobile=True, reason=reason
@@ -114,7 +111,6 @@ def _bridge_with_offline_relay():
 
 
 def test_bind_qr_surfaces_notice_when_relay_enabled(monkeypatch):
-    """开关开着却回落局域网：payload 带 relay_notice，前端据此显示黄色提示。"""
     bridge = _bridge_with_offline_relay()
     monkeypatch.setattr(config, "_load", lambda: {config.CLOUD_RELAY_ENABLED_KEY: True})
     result = bridge.get_remote_bind_qr(mobile=False)
@@ -124,7 +120,6 @@ def test_bind_qr_surfaces_notice_when_relay_enabled(monkeypatch):
 
 
 def test_bind_qr_has_no_notice_when_relay_disabled(monkeypatch):
-    """开关关着就是纯局域网模式，不该弹提示打扰。"""
     bridge = _bridge_with_offline_relay()
     monkeypatch.setattr(config, "_load", lambda: {config.CLOUD_RELAY_ENABLED_KEY: False})
     result = bridge.get_remote_bind_qr(mobile=False)

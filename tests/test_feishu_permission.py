@@ -1,5 +1,3 @@
-"""T5：飞书审批卡与提问卡单测（按钮回传链路、白名单、失效处理）。不触网。"""
-
 import json
 
 
@@ -81,7 +79,7 @@ def _perm_action(allow=True, always=False, request_id="req-1", open_id="ou_allow
 def _ask_action(index=None, answer=None, request_id="req-1", open_id="ou_allowed", message_id=""):
     action: dict = {"form_value": {}}
     if index is None:
-        action["name"] = "ask"                      # 表单提交形态：只有 name
+        action["name"] = "ask"
         action["form_value"] = {"answer": answer or ""}
     else:
         action["value"] = {"kind": "ask", "request_id": request_id, "index": index}
@@ -112,15 +110,13 @@ def _flow_buttons(card):
     return out
 
 
-# ---------------------------------------------------------------- 卡片推送
-
 def test_permission_request_pushes_card_with_three_buttons(tmp_path):
     br, _, api = _setup(tmp_path, approvers=["ou_allowed"], notify_chat_id="oc_notify")
 
     br.on_agent_event("permission_request", _permission_event())
 
     assert len(api.cards) == 1
-    assert api.cards[0]["chat_id"] == "oc_notify"        # 优先固定落点
+    assert api.cards[0]["chat_id"] == "oc_notify"
     card = api.cards[0]["card"]
     assert card["header"]["title"]["content"] == "⛔ 需要授权 · 执行命令"
     assert card["header"]["template"] == "red"
@@ -135,7 +131,6 @@ def test_permission_request_pushes_card_with_three_buttons(tmp_path):
         {"kind": "perm", "request_id": "req-1", "allow": True, "always": True},
         {"kind": "perm", "request_id": "req-1", "allow": False},
     ]
-    # 按钮必须走 callback 行为（红线 2）
     for button in _flow_buttons(card):
         assert button["behaviors"][0]["type"] == "callback"
 
@@ -151,7 +146,6 @@ def test_permission_card_omits_always_button_when_not_allowed(tmp_path):
 
 
 def test_permission_card_fails_closed_without_approvers(tmp_path):
-    """未配置审批白名单：不渲染按钮，并给出明确提示（fail-closed）。"""
     br, _, api = _setup(tmp_path, approvers=[])
 
     br.on_agent_event("permission_request", _permission_event())
@@ -195,7 +189,6 @@ def test_ask_user_pushes_question_card(tmp_path):
 
 
 def test_permission_card_pushed_for_desktop_turn_too(tmp_path):
-    """桌面回合的审批也要推到飞书（人在外面时靠它拍板），不依赖 _pending。"""
     br, _, api = _setup(tmp_path, approvers=["ou_allowed"])
     assert br._pending == {}
 
@@ -203,8 +196,6 @@ def test_permission_card_pushed_for_desktop_turn_too(tmp_path):
 
     assert len(api.cards) == 1
 
-
-# ---------------------------------------------------------------- 审批回传
 
 def test_approve_once_calls_respond_permission(tmp_path):
     br, star, _ = _setup(tmp_path, approvers=["ou_allowed"])
@@ -265,8 +256,6 @@ def test_stale_permission_reports_expired(tmp_path):
     assert "已处理或已失效" in response["card"]["data"]["header"]["title"]["content"]
 
 
-# ---------------------------------------------------------------- 提问回传
-
 def test_ask_option_click_sends_choice_index(tmp_path):
     br, star, _ = _setup(tmp_path, approvers=["ou_allowed"])
 
@@ -277,11 +266,6 @@ def test_ask_option_click_sends_choice_index(tmp_path):
 
 
 def test_ask_free_text_uses_minus_one_index(tmp_path):
-    """自由文本：桌面/移动端统一用 -1 表示自定义回答。
-
-    表单提交按钮没有 value，请求 id 只能靠 context.open_message_id 反查
-    （与 opencode-mobile 的 messageId 方案一致），所以先推卡再提交。
-    """
     br, star, api = _setup(tmp_path, approvers=["ou_allowed"])
     br.on_agent_event("permission_request", _permission_event(
         function_name="ask_user", summary="选择数据库", options=["SQLite", "PostgreSQL"]))
@@ -294,7 +278,6 @@ def test_ask_free_text_uses_minus_one_index(tmp_path):
 
 
 def test_ask_free_text_without_message_mapping_is_rejected(tmp_path):
-    """拿不到请求 id（卡片映射缺失）时不得瞎猜，直接回执提示。"""
     br, star, _ = _setup(tmp_path, approvers=["ou_allowed"])
 
     response = br.on_feishu_event(_ask_action(answer="随便答", message_id="om_unknown"))
@@ -323,8 +306,6 @@ def test_ask_non_approver_rejected(tmp_path):
     assert star.choice_calls == []
     assert "无权操作" in response["card"]["data"]["header"]["title"]["content"]
 
-
-# ---------------------------------------------------------------- 纯函数
 
 def test_action_label_maps_known_and_unknown():
     assert action_label("run_command") == "执行命令"

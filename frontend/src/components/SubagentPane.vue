@@ -1,6 +1,5 @@
 <template>
   <div class="suba-wrap" data-test="subagent-detail">
-    <!-- 任务切换条：会话内有多个子代理时快速切换查看对象 -->
     <div v-if="sessionTasks.length > 1" class="suba-switch" data-test="subagent-switcher">
       <button
         v-for="t in sessionTasks"
@@ -40,8 +39,6 @@
         </div>
       </div>
 
-      <!-- 任务描述气泡：标题默认收 5 行，hover 时在浮层里展示全文。
-           原生 title 会把长段落拉成不换行的超长提示，故自绘 -->
       <Teleport to="body">
         <div
           v-if="tipVisible"
@@ -75,7 +72,6 @@
         </div>
       </div>
 
-      <!-- 终态补充：失败原因 / 执行结论 / 超时现场产出 -->
       <div v-if="detail.error" class="suba-sec">
         <div class="suba-sec-title">失败原因</div>
         <pre class="suba-sec-body err">{{ detail.error }}</pre>
@@ -104,7 +100,6 @@ import { useAppStore } from '../stores/appStore';
 import { buildSubagentFlatView, type SubagentFlatRow } from '../utils/toolTrace';
 import type { SubagentTaskDetail, SubagentTaskListItem } from '../types/pywebview.d';
 
-// 激活态由 RightPanel 传入（页签可见、面板展开且停在本工作台），控制轮询开关
 const props = defineProps<{ active: boolean }>();
 
 const store = useAppStore();
@@ -148,7 +143,6 @@ function statusClass(status: string) {
 function rowClass(row: SubagentFlatRow, index: number) {
   const classes: string[] = [row.kind];
   if (row.kind === 'stage') {
-    // 模板阶段（调用模型/思考中/生成回复）弱化显示；等待授权单独提亮
     if (row.name === 'waiting_approval') classes.push('wait');
     else classes.push('dim');
   }
@@ -174,7 +168,6 @@ function formatElapsed(seconds: number) {
   if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
   return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
 }
-// 运行中工具行的实时耗时：轮询每秒刷新 detail 间接触发重算
 function runningSeconds(at: number) {
   return Math.max(0, Math.floor(Date.now() / 1000 - at));
 }
@@ -186,7 +179,6 @@ const timeRangeText = computed(() => {
   return `${start} 开始`;
 });
 
-// ── 任务描述气泡：标题默认收 5 行，hover 时浮层展示全文 ──
 const tipVisible = ref(false);
 const tipStyle = ref<Record<string, string>>({});
 let tipTimer: ReturnType<typeof setTimeout> | undefined;
@@ -197,7 +189,6 @@ function cancelHideTip() {
     tipTimer = undefined;
   }
 }
-// 延时收起：鼠标从标题移向浮层的过程中不闪烁
 function hideTip() {
   cancelHideTip();
   tipTimer = setTimeout(() => { tipVisible.value = false; }, 120);
@@ -225,7 +216,6 @@ function showTip(el: HTMLElement) {
 }
 function onTitleEnter(e: MouseEvent) {
   const el = e.currentTarget as HTMLElement | null;
-  // 未被截断（内容不足 5 行）不弹气泡
   if (!el || el.scrollHeight <= el.clientHeight + 1) return;
   showTip(el);
 }
@@ -245,7 +235,6 @@ async function copyResult() {
   setTimeout(() => { copyHint.value = ''; }, 1500);
 }
 
-// ── 详情轮询：1 秒拉取目标任务 + 会话任务清单（后台任务/终态回看都走这里） ──
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 
@@ -260,11 +249,10 @@ async function fetchDetail() {
       detail.value = res.task;
       missingText.value = '';
     } else {
-      // 任务可能已被容量清理：无缓存时给出提示；有缓存继续展示最后已知状态
       missingText.value = String(res?.msg || '未找到该子代理任务');
     }
     if (Array.isArray(res?.tasks)) sessionTasks.value = res.tasks;
-  } catch { /* 桥未就绪/单次失败：保留下次轮询 */ }
+  } catch { }
   finally { inFlight = false; }
 }
 
@@ -305,7 +293,6 @@ onUnmounted(() => {
   gap: 10px;
 }
 
-/* 任务切换条 */
 .suba-switch {
   display: flex;
   flex-wrap: wrap;
@@ -355,7 +342,6 @@ onUnmounted(() => {
   background: var(--red);
 }
 
-/* 任务头部 */
 .suba-head {
   display: flex;
   flex-direction: column;
@@ -379,7 +365,6 @@ onUnmounted(() => {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
 }
-/* 任务描述默认只露 5 行，超出以省略号收尾；全文由 hover 气泡展示 */
 .suba-title {
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -393,7 +378,6 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
-/* 任务描述气泡：Teleport 到 body + fixed，不被右栏滚动容器裁切 */
 .suba-title-tip {
   position: fixed;
   z-index: 1500;
@@ -452,7 +436,6 @@ onUnmounted(() => {
   color: var(--red);
 }
 
-/* 执行过程：扁平行，模板行弱化、当前行左侧色条 */
 .suba-flow {
   display: flex;
   flex-direction: column;
@@ -528,7 +511,6 @@ onUnmounted(() => {
   color: var(--accent);
 }
 
-/* 终态补充信息 */
 .suba-sec {
   display: flex;
   flex-direction: column;

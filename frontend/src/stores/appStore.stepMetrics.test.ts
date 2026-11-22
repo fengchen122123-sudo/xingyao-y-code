@@ -65,7 +65,6 @@ describe('appStore step_metrics and streaming speed', () => {
     store.handleBridgeEvent(event('turn_cancelled', { session_name: 's1' }));
     expect(store.streamingSpeed).toBe(0);
 
-    // 再次开始流式，并在 turn_error 时重置
     store.handleBridgeEvent(event('turn_start', { session_name: 's1', user_text: '测试错误' }));
     store.handleBridgeEvent(event('token_delta', { session_name: 's1', text: '即将出错的文本1' }));
     vi.advanceTimersByTime(200);

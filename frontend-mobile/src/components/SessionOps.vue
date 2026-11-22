@@ -1,5 +1,4 @@
 <template>
-  <!-- 会话操作（对齐 preview：模型+思考强度/权限/更多操作/重命名/清空/导出/删除，列表长按与详情 ⋯ 共用） -->
   <div>
     <van-popup :show="show" position="bottom" round @update:show="v => !v && emit('close')">
       <div class="sheet">
@@ -15,7 +14,6 @@
       </div>
     </van-popup>
 
-    <!-- 切换模型（含思考强度，对齐客户端） -->
     <van-popup v-model:show="modelDlg" position="bottom" round :style="{ maxHeight: '72%' }">
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMain">‹</span><span>切换模型</span><span class="x" @click="modelDlg = false">✕</span></div>
@@ -37,7 +35,6 @@
       </div>
     </van-popup>
 
-    <!-- 思考强度 -->
     <van-popup v-model:show="reasonDlg" position="bottom" round>
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToModel">‹</span><span>思考强度</span><span class="x" @click="reasonDlg = false">✕</span></div>
@@ -48,7 +45,6 @@
       </div>
     </van-popup>
 
-    <!-- 权限档位（对齐客户端五档） -->
     <van-popup v-model:show="permDlg" position="bottom" round>
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMain">‹</span><span>权限档位</span><span class="x" @click="permDlg = false">✕</span></div>
@@ -59,7 +55,6 @@
       </div>
     </van-popup>
 
-    <!-- 更多操作 -->
     <van-popup v-model:show="moreDlg" position="bottom" round>
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMain">‹</span><span>更多操作</span><span class="x" @click="moreDlg = false">✕</span></div>
@@ -70,7 +65,6 @@
       </div>
     </van-popup>
 
-    <!-- 调用技能 -->
     <van-popup v-model:show="skillDlg" position="bottom" round :style="{ maxHeight: '70%' }">
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMore">‹</span><span>调用技能</span><span class="x" @click="skillDlg = false">✕</span></div>
@@ -81,7 +75,6 @@
       </div>
     </van-popup>
 
-    <!-- 调用 MCP -->
     <van-popup v-model:show="mcpDlg" position="bottom" round :style="{ maxHeight: '70%' }">
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMore">‹</span><span>调用 MCP</span><span class="x" @click="mcpDlg = false">✕</span></div>
@@ -92,7 +85,6 @@
       </div>
     </van-popup>
 
-    <!-- 引用文件 -->
     <van-popup v-model:show="fileDlg" position="bottom" round :style="{ maxHeight: '70%' }">
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMore">‹</span><span>引用文件</span><span class="x" @click="fileDlg = false">✕</span></div>
@@ -102,7 +94,6 @@
       </div>
     </van-popup>
 
-    <!-- 重命名 -->
     <van-popup v-model:show="renDlg" position="bottom" round>
       <div class="sheet">
         <div class="sh-h"><span class="bk" @click="backToMain">‹</span><span>重命名会话</span><span class="x" @click="renDlg = false">✕</span></div>
@@ -177,7 +168,6 @@ function closeSubs() {
   renDlg.value = false;
 }
 
-/** 打开子弹层：收起主弹层，返回时再 emit('reopen') 复原 */
 function openChild(target: Ref<boolean>) {
   closeSubs();
   target.value = true;
@@ -203,7 +193,6 @@ function backToModel() {
   modelDlg.value = true;
 }
 
-// 菜单每次打开时同步最新会话列表；主弹层被用户关闭（无子弹层）时收起子弹层
 watch(() => props.show, (v) => {
   if (v) { void store.refreshSessions(); return; }
   const anySub = modelDlg.value || reasonDlg.value || permDlg.value || moreDlg.value
@@ -212,7 +201,6 @@ watch(() => props.show, (v) => {
 });
 
 async function pickModel(id: string) {
-  // 保持弹层打开：下方「思考强度」行随新模型刷新
   try {
     await store.setModel(id);
     showToast('模型已切换');
@@ -246,7 +234,6 @@ async function pickPerm(mode: string) {
   }
 }
 
-// ---- 更多操作 ----
 function openFiles() {
   openChild(fileDlg);
   fileQuery.value = '';
@@ -270,7 +257,6 @@ async function runFileSearch(q: string) {
   }
 }
 
-/** 选中技能 / MCP / 文件：插入输入框并收起整个会话操作 */
 function insertText(text: string) {
   emit('insert', text);
   closeSubs();

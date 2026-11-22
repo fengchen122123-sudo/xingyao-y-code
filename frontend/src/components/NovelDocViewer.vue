@@ -26,22 +26,16 @@ import AppIcon from './AppIcon.vue';
 import type { NovelDocReadDto } from '../types/pywebview.d';
 
 const props = defineProps<{
-  /** 浮层标题：父组件传文档名（通常是相对路径或表名） */
   title: string;
-  /** read_novel_doc 返回结果：null 表示还没读（内容区为空文本） */
   doc: NovelDocReadDto | null;
-  /** 是否正在读取：为真时显示 loader 提示 */
   loading: boolean;
-  /** 读取失败文本，非空时按 --red 显示（优先级高于正文） */
   error: string;
 }>();
 
 const emit = defineEmits<{
-  /** 关闭浮层：父组件把当前文档状态清空 */
   (e: 'close'): void;
 }>();
 
-// 字数与 novel_status 同口径，由后端给出；缺失时按 0 显示不猜测
 const charsText = computed(() => {
   const n = Number(props.doc?.chars);
   return `${Number.isFinite(n) && n > 0 ? Math.floor(n) : 0} 字`;
@@ -49,7 +43,6 @@ const charsText = computed(() => {
 </script>
 
 <style scoped>
-/* 颜色/字号只用全局 CSS 变量，跟随主题切换 */
 .novel-doc-viewer {
   display: flex;
   flex-direction: column;

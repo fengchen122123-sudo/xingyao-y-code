@@ -71,7 +71,6 @@ describe('ModelCascader', () => {
     const wrapper = mount(ModelCascader, { props: { visible: false, anchorEl: anchor }, global: { stubs: { teleport: true } } });
     await wrapper.setProps({ visible: true });
 
-    // teleport 桩后组件根是 stub，样式断言查真实根元素
     const root = wrapper.get('#model-cascader');
     expect(root.classes()).toContain('opens-up');
     expect(root.attributes('style')).toContain('--cascader-max-height: 680px');
@@ -110,17 +109,13 @@ describe('ModelCascader', () => {
       });
       await wrapper.setProps({ visible: true });
 
-      // teleport 桩在逐帧重渲染时会重建子元素，断言一律重新实时查询
       const mainPanel = () => wrapper.get('.cascader-main-panel');
-      // 390 视口：subW = min(200, 175) = 175，mainW = min(220, 189) = 189，主面板靠右
       expect(mainPanel().attributes('style')).toContain('width: 189px');
 
-      // 当前供应商（厂商一）模型内联在主面板顶部，带供应商标题
       expect(mainPanel().get('.cascader-provider-header').text()).toBe('厂商一');
       expect(mainPanel().text()).toContain('model-one');
       expect(mainPanel().text()).toContain('vision-two');
 
-      // 点其他供应商 → 方盒出现在主面板左侧（left 10 / 宽 175 / 随主面板顶对齐）
       mainPanel().element.getBoundingClientRect = () => ({
         x: 191, y: 80, top: 80, right: 380, bottom: 480, left: 191,
         width: 189, height: 400, toJSON: () => ({}),
@@ -137,7 +132,6 @@ describe('ModelCascader', () => {
       expect(style).toContain('width: 175px');
       expect(style).toContain('top: 80px');
       expect(style).toContain('max-height: 400px');
-      // 方盒内是该供应商的模型，且不再有返回行（供应商列表始终可见）
       expect(subPanel().text()).toContain('very-long-model-name-from-vendor-two');
       expect(subPanel().findAll('.cascader-back').length).toBe(0);
     } finally {

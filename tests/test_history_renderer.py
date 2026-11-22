@@ -8,8 +8,6 @@ def plain(text: str) -> str:
 
 
 def test_structured_history_replays_markdown_and_never_shows_reasoning():
-    """回放历史时正文按 Markdown 渲染；reasoning_content 与实时路径一致，
-    永不显示（实时路径里思考过程只消费不展示，回放必须保持一致）。"""
     history = [
         {"role": "user", "content": "检查项目"},
         {
@@ -28,8 +26,6 @@ def test_structured_history_replays_markdown_and_never_shows_reasoning():
 
 
 def test_legacy_tagged_history_remains_compatible():
-    """旧版用内联 <think> 标签存储推理内容：标签本身和标签内的推理都不应
-    出现在回放输出里，只保留标签之外的公开正文。"""
     history = [{
         "role": "assistant",
         "content": "<think>旧思考</think>旧回答",
@@ -43,8 +39,6 @@ def test_legacy_tagged_history_remains_compatible():
 
 
 def test_history_replays_tool_call_without_raw_file_content():
-    """详细模式回放：每个工具只有一条结果行（不再有单独的"请求"行），
-    且绝不泄漏工具返回内容的原文。"""
     history = [
         {
             "role": "assistant",
@@ -73,8 +67,6 @@ def test_history_replays_tool_call_without_raw_file_content():
 
 
 def test_history_concise_mode_hides_all_tool_lines():
-    """简短模式回放：成功和失败的工具调用都不刷屏；
-    与实时路径一致，失败数量由收尾统计行汇总。"""
     history = [
         {
             "role": "assistant",
@@ -134,7 +126,6 @@ def test_history_verbose_mode_shows_both_successful_and_failed_tool_lines():
 
 
 def test_user_content_ansi_escape_is_stripped():
-    """用户内容中的 ANSI 转义序列必须被剥离，防止注入劫持终端"""
     history = [{"role": "user", "content": "正常文字\x1b[2J\x1b[31m红色"}]
 
     rendered = render_session_history(history, width=60)
@@ -146,7 +137,6 @@ def test_user_content_ansi_escape_is_stripped():
 
 
 def test_user_multimodal_list_content_extracts_text_blocks():
-    """多模态 list 内容提取 text 块，而不是输出 Python repr"""
     history = [{
         "role": "user",
         "content": [
@@ -163,7 +153,6 @@ def test_user_multimodal_list_content_extracts_text_blocks():
 
 
 def test_narrow_terminal_width_is_clamped():
-    """width < 20 的窄终端恢复会话不应崩溃"""
     history = [{"role": "assistant", "content": "# 标题"}]
 
     rendered = render_session_history(history, width=5)
@@ -172,8 +161,6 @@ def test_narrow_terminal_width_is_clamped():
 
 
 def test_assistant_ansi_escape_is_stripped_and_reasoning_never_leaks():
-    """assistant 内容中的 ANSI 注入必须被剥离，防止回放劫持终端；
-    reasoning_content 永不回放，即使其中包含注入尝试也不会以任何形式泄漏。"""
     history = [{
         "role": "assistant",
         "content": "回答\x1b[2J\x1b[1;1H被清屏",
@@ -189,7 +176,6 @@ def test_assistant_ansi_escape_is_stripped_and_reasoning_never_leaks():
 
 
 def test_tool_target_ansi_escape_is_stripped():
-    """工具参数（模型生成）里的 ANSI 注入不得进入 tool summary"""
     history = [
         {
             "role": "assistant",
@@ -218,8 +204,6 @@ def test_tool_target_ansi_escape_is_stripped():
 
 
 def test_separator_between_turns_but_not_before_first_message():
-    """多轮对话回放：相邻轮次（user 消息）之间出现一条灰色细分隔线，
-    首条消息前不打印分隔线。"""
     history = [
         {"role": "user", "content": "第一个问题"},
         {"role": "assistant", "content": "第一个回答"},
@@ -230,7 +214,6 @@ def test_separator_between_turns_but_not_before_first_message():
     rendered = render_session_history(history, width=60)
     text = plain(rendered)
 
-    # 分隔线只出现一次（第二轮提问前），首条消息前没有
     assert text.count("─" * 60) == 1
     first_q = text.index("第一个问题")
     second_q = text.index("第二个问题")
@@ -239,7 +222,6 @@ def test_separator_between_turns_but_not_before_first_message():
 
 
 def test_blank_line_between_assistant_blocks_in_replay():
-    """回放时 assistant 正文块与上一块之间有一个空行，不再全部汇集在一起。"""
     history = [
         {"role": "user", "content": "问题"},
         {"role": "assistant", "content": "回答一"},
@@ -250,14 +232,11 @@ def test_blank_line_between_assistant_blocks_in_replay():
     plain_text = plain(rendered)
 
     assert "\n  ✦" in plain_text
-    # 第二个 assistant 块头部前必须有空行
     assert plain_text.count("✦ 星瑶") == 2
     assert "\n\n  ✦ 星瑶" in plain_text or "回答一\n\n  ✦ 星瑶" in plain_text
 
 
 def test_history_replay_skips_system_injected_user_messages():
-    """后台任务回报/护栏催促/hook 上下文等系统注入 user 消息：
-    CLI 历史回放一律跳过，不冒充用户发言（与 GUI 气泡、红点导航同一裁决）。"""
     history = [
         {"role": "user", "content": "真正的问题"},
         {

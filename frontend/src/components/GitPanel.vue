@@ -1,6 +1,5 @@
 <template>
   <div id="git-panel" data-test="git-panel">
-    <!-- 未连接 / 非仓库状态 -->
     <div v-if="!store.snapshot" class="git-note" data-test="git-empty">
       <div class="git-note-badge">
         <AppIcon name="git-branch" :size="20" :stroke-width="1.6" class="git-note-icon" />
@@ -16,7 +15,6 @@
     </div>
 
     <template v-else>
-      <!-- 信任提示（§4.5：未信任仓库只允许硬化元数据查询） -->
       <div v-if="store.trustLevel !== 'trusted'" class="git-trust" data-test="git-trust-banner">
         <div class="git-trust-text">
           <AppIcon name="triangle-alert" :size="14" :stroke-width="2" class="git-trust-icon" />
@@ -28,14 +26,12 @@
         </div>
       </div>
 
-      <!-- 错误横幅 -->
       <div v-if="store.error" class="git-error" data-test="git-error-banner">
         <AppIcon name="triangle-alert" :size="14" :stroke-width="2" class="git-error-icon" />
         <span class="git-error-text">{{ store.error.message }}</span>
         <button v-if="store.error.retryable" class="git-pill ghost-red" @click="store.refresh()">重试</button>
       </div>
 
-      <!-- 1. 仓库与同步卡：分支切换 / 上游状态 / Fetch·Pull·Push（§11.2） -->
       <div ref="repoCardRef" class="git-repo-card">
         <div class="git-head">
           <button
@@ -108,7 +104,6 @@
           </div>
         </div>
 
-        <!-- 分支切换与新建下拉浮层 -->
         <div v-if="branchMenuOpen" class="git-branch-menu" @click.stop>
           <div v-if="store.branches.length > 6" class="git-branch-search-wrap">
             <AppIcon name="search" :size="12" :stroke-width="2" class="git-branch-search-ico" />
@@ -180,7 +175,6 @@
         </div>
       </div>
 
-      <!-- 2. 提交编排卡 -->
       <div class="git-commit-box">
         <div class="git-commit-head">
           <input
@@ -238,7 +232,6 @@
         </div>
       </div>
 
-      <!-- 3. 视图分段切换 -->
       <div class="git-toolbar">
         <div class="git-view-switch">
           <button
@@ -271,13 +264,11 @@
         >全部暂存</button>
       </div>
 
-      <!-- 4. 历史视图 -->
       <GitHistory
         v-if="viewMode === 'history' && store.snapshot"
         @open-commit="openCommitDiff"
       />
 
-      <!-- 5. 状态变更视图 -->
       <template v-else-if="store.snapshot && viewMode === 'status'">
         <div v-if="totalChanges === 0" class="git-clean-card">
           <AppIcon name="check-circle" :size="22" :stroke-width="1.6" class="git-clean-icon" />
@@ -286,7 +277,6 @@
         </div>
 
         <div v-else class="git-groups">
-          <!-- 冲突组 -->
           <div v-if="store.snapshot!.conflicts.length" class="git-group git-group-conflict">
             <div class="git-group-head" :class="{ collapsed: collapsedGroups.conflicts }">
               <button type="button" class="git-group-toggle conflict-title" @click="toggleGroup('conflicts')">
@@ -314,7 +304,6 @@
             </div>
           </div>
 
-          <!-- 已暂存组 -->
           <div v-if="store.snapshot!.staged.length" class="git-group" data-test="git-group-staged">
             <div class="git-group-head" :class="{ collapsed: collapsedGroups.staged }">
               <button type="button" class="git-group-toggle" @click="toggleGroup('staged')">
@@ -350,7 +339,6 @@
             </div>
           </div>
 
-          <!-- 变更组（未暂存） -->
           <div v-if="store.snapshot!.unstaged.length" class="git-group" data-test="git-group-changes">
             <div class="git-group-head" :class="{ collapsed: collapsedGroups.unstaged }">
               <button type="button" class="git-group-toggle" @click="toggleGroup('unstaged')">
@@ -391,7 +379,6 @@
             </div>
           </div>
 
-          <!-- 未跟踪组 -->
           <div v-if="store.snapshot!.untracked.length" class="git-group" data-test="git-group-untracked">
             <div class="git-group-head" :class="{ collapsed: collapsedGroups.untracked }">
               <button type="button" class="git-group-toggle" @click="toggleGroup('untracked')">
@@ -424,7 +411,6 @@
         </div>
       </template>
 
-      <!-- Diff 审查弹窗（文件变更与历史提交共用）：Teleport 到 body 逃出右面板层叠上下文 -->
       <Teleport to="body">
         <div v-if="diffModal" class="git-diff-mask" data-test="git-diff-modal" @click.self="closeDiffModal">
           <div class="git-diff-modal">
@@ -472,7 +458,6 @@
         </div>
       </Teleport>
 
-      <!-- 三方冲突解决器弹窗（独立挂载，避免状态切换重复实例化） -->
       <Teleport to="body">
         <div
           v-if="store.conflictResolverPath"
@@ -486,7 +471,6 @@
         </div>
       </Teleport>
 
-      <!-- 高风险确认对话框（§13 两段式：服务端 preview + 一次性令牌） -->
       <Teleport to="body">
         <div v-if="store.pendingConfirm" class="git-confirm-mask" data-test="git-confirm-modal">
           <div class="git-confirm">
@@ -656,7 +640,6 @@ function onDocumentPointerDown(event: MouseEvent) {
 }
 
 async function aiAssist(kind: string) {
-  // §5.15：先展示用途，用户确认后发送可见模板消息（不注入隐藏提示）
   if (!window.confirm('将发送一条可见对话消息，请 AI 基于已暂存 Diff 生成提交说明建议。继续？')) return;
   await store.aiAssist(kind);
 }
@@ -675,7 +658,6 @@ const operationLabel = computed(() => {
   return `${kindLabel[kind] || kind} ${phaseLabel[phase] || ''}`.trim();
 });
 
-// 文件状态字母 → 语义色组（A 新增绿 / D 删除红 / M·R·C 修改橙 / 其余灰）
 function statusKind(letter: string): string {
   if (letter === 'A') return 'added';
   if (letter === 'D') return 'deleted';
@@ -729,7 +711,6 @@ onMounted(() => {
   const workdir = appStore.workdir || '';
   if (workdir) {
     void store.ensureLoaded(workdir);
-    // 信任态只在面板打开时拉取：角标/状态栏刷新路径不再每次多付信任探测的 git 进程
     void store.loadTrust();
   }
   window.addEventListener('keydown', onGlobalKeydown);
@@ -741,7 +722,6 @@ onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocumentPointerDown);
 });
 
-// 会话切换 → 跟随工作区重新加载（§17.3 会话切换不串仓库状态）
 watch(
   () => appStore.workdir,
   (wd) => {
@@ -767,7 +747,6 @@ watch(
   color: var(--xy-text, var(--text));
 }
 
-/* ---------- 空态 ---------- */
 .git-note {
   display: flex;
   flex-direction: column;
@@ -796,7 +775,6 @@ watch(
   line-height: 1.5;
 }
 
-/* ---------- 通用小件 ---------- */
 .git-flex { flex: 1; }
 .git-icon-btn {
   display: inline-flex;
@@ -896,7 +874,6 @@ watch(
   background: var(--xy-accent-soft, var(--accent-soft));
 }
 
-/* ---------- 1. 仓库与同步卡 ---------- */
 .git-repo-card {
   position: relative;
   background: var(--xy-card, var(--bg2));
@@ -1024,7 +1001,6 @@ watch(
   cursor: default;
 }
 
-/* 分支切换下拉浮层 */
 .git-branch-menu {
   position: absolute;
   top: 44px;
@@ -1163,7 +1139,6 @@ watch(
   cursor: default;
 }
 
-/* ---------- 2. 提交编排卡 ---------- */
 .git-commit-box {
   display: flex;
   flex-direction: column;
@@ -1256,7 +1231,6 @@ watch(
   white-space: nowrap;
 }
 
-/* ---------- 3. 分段切换条 ---------- */
 .git-toolbar {
   display: flex;
   gap: 8px;
@@ -1302,7 +1276,6 @@ watch(
   color: var(--xy-text-2, var(--text-dim));
 }
 
-/* ---------- 4. 干净工作区 & 文件分组 ---------- */
 .git-clean-card {
   background: var(--xy-card, var(--bg1));
   border: 1px dashed var(--xy-border-strong, var(--border));
@@ -1557,7 +1530,6 @@ watch(
   border-color: var(--xy-rose, var(--red));
 }
 
-/* ---------- 信任 / 错误横幅 ---------- */
 .git-trust {
   border: 1px solid color-mix(in srgb, var(--xy-amber, var(--orange)) 38%, var(--xy-border, var(--border)));
   background: var(--xy-amber-soft, color-mix(in srgb, var(--orange) 10%, transparent));
@@ -1604,7 +1576,6 @@ watch(
   line-height: 1.5;
 }
 
-/* ---------- 高风险确认弹窗 ---------- */
 .git-confirm-mask {
   position: fixed;
   inset: 0;
@@ -1615,7 +1586,6 @@ watch(
   display: flex;
   align-items: center;
   justify-content: center;
-  /* 已 Teleport 到 body：压过应用层全部面板/抽屉（最高 3000），低于顶层引导 5000 */
   z-index: 4000;
 }
 .git-confirm {
@@ -1671,7 +1641,6 @@ watch(
   margin-top: 6px;
 }
 
-/* ---------- Diff 审查与冲突解决弹窗 ---------- */
 .git-diff-mask {
   position: fixed;
   inset: 0;
@@ -1682,7 +1651,6 @@ watch(
   display: flex;
   align-items: center;
   justify-content: center;
-  /* 已 Teleport 到 body：压过应用层全部面板/抽屉（最高 3000），低于顶层引导 5000 */
   z-index: 4000;
 }
 .git-diff-modal,

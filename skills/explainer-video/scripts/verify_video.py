@@ -54,7 +54,6 @@ def probe(path):
 def volume_at(path, t, dur=3.0):
     rc, out = run(["ffmpeg", "-hide_banner", "-ss", "%.3f" % t, "-t", "%.3f" % dur,
                    "-i", path, "-af", "volumedetect", "-f", "null", "NUL"])
-    # ffmpeg 会先打印一次 n_samples: 0 的空统计，取最后一次出现的数值
     mean = re.findall(r"mean_volume:\s*(-?\d+\.?\d*)\s*dB", out)
     mx = re.findall(r"max_volume:\s*(-?\d+\.?\d*)\s*dB", out)
     return (float(mean[-1]) if mean else None), (float(mx[-1]) if mx else None)
@@ -106,7 +105,6 @@ def main():
         with open(sc_path, encoding="utf-8") as f:
             sc = json.load(f)
 
-    # 1. container
     info = probe(video)
     if not info:
         fail("ffprobe failed on %s" % video)
@@ -128,12 +126,10 @@ def main():
         fail("missing audio stream")
     print("       duration=%.3fs  size=%.2f MiB" % (dur, size / 1048576.0))
 
-    # 2. duration vs timeline
     delta = abs(dur - float(tl["total_duration"]))
     (ok if delta < 0.5 else fail)("duration %.3f vs timeline %.3f (delta %.3f)"
                                   % (dur, tl["total_duration"], delta))
 
-    # 3. audio placement
     scenes = tl["scenes"]
     for s in (scenes[0], scenes[len(scenes) // 2], scenes[-1]):
         mean, mx = volume_at(video, s["start"])
@@ -150,7 +146,6 @@ def main():
         else:
             fail("gap after scene %d t=%.3f not silent (mean=%s max=%s)" % (g["id"], gt, mean, mx))
 
-    # 4. frame content
     pdir = os.path.join(base, "verify_frames")
     os.makedirs(pdir, exist_ok=True)
     for tag, s in (("head", scenes[0]), ("tail", scenes[-1])):
@@ -161,7 +156,6 @@ def main():
         else:
             fail("frame at %.3f (scene %d) looks empty (busy=%s)" % (mid, s["id"], busy))
 
-    # 5. consistency
     if sc is not None:
         if len(sc["scenes"]) == len(scenes):
             ok("scene count %d matches script and timeline" % len(scenes))

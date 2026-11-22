@@ -1,9 +1,3 @@
-"""秘书调度台：调度服务骨架 + 检索 / 派活 / 跳转后端实现的单元测试。
-
-风格对齐 tests/test_gui_automation_dispatch.py：ApiBridge.__new__ 裸实例 + 桩函数，
-重点验证「派活等价于用户在目标会话亲手发一条消息」这一语义（spawn 入参里绝不出现
-display_text / internal_kind），避免在单测里真起回合线程。
-"""
 import json
 import os
 import sys
@@ -24,7 +18,6 @@ from gui_bridge import ApiBridge
 
 @pytest.fixture(autouse=True)
 def _clean_singleton():
-    """每个用例前后清理模块级单例，避免用例互相污染。"""
     secretary_dispatch.unregister()
     yield
     secretary_dispatch.unregister()
@@ -32,11 +25,6 @@ def _clean_singleton():
 
 @pytest.fixture()
 def manager(tmp_path):
-    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。
-
-    同 test_secretary_identity：`import main` 注册的 CLI ctx 以只读视图
-    影子化 set_manager fallback，需先注销 ctx 才能让本管理器生效。
-    """
     m = MemoryManager(str(tmp_path / "ycode.db"))
     prev_ctx = app_context.get()
     prev_manager = app_context.get_manager()
@@ -55,10 +43,8 @@ def manager(tmp_path):
 
 
 def _make_bridge(manager, *, is_turn_active=False):
-    """构造仅含调度所需内部状态的裸桥实例，并注册调度服务句柄。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
-    # 秘书会话是派发的发起方：完成通知按它路由
     bridge._current_session = "s_secretary"
     bridge._turn_start_lock = threading.Lock()
     bridge._message_queues = {}
@@ -66,7 +52,6 @@ def _make_bridge(manager, *, is_turn_active=False):
     bridge._cancel_events = {}
     bridge._is_turn_active = (lambda s: True) if is_turn_active else (lambda s: False)
     bridge._memory = manager
-    # 真回合（_run_turn_worker）用例会触达的身份/快照/汇总结构
     bridge._active_turn_ids = {}
     bridge._active_turn_lock = threading.Lock()
     bridge._active_turn_snapshots = {}
@@ -91,12 +76,7 @@ def _make_bridge(manager, *, is_turn_active=False):
     return bridge, spawned, events
 
 
-# ---------------------------------------------------------------------------
-# 服务骨架：注册 / 注销 / 未注册
-# ---------------------------------------------------------------------------
-
 def test_register_unregister_and_get(manager):
-    """未注册 → get() 为 None；注册后可取回；注销后回到 None 且幂等。"""
     assert secretary_dispatch.get() is None
 
     _make_bridge(manager)
@@ -105,13 +85,11 @@ def test_register_unregister_and_get(manager):
 
     secretary_dispatch.unregister()
     assert secretary_dispatch.get() is None
-    # 未注册时再次注销不抛异常
     secretary_dispatch.unregister()
     assert secretary_dispatch.get() is None
 
 
 def test_protocol_class_is_declaration_only():
-    """协议类只作文档说明：直接实例化调用必须抛 NotImplementedError。"""
     proto = secretary_dispatch.SecretaryDispatchService()
     with pytest.raises(NotImplementedError):
         proto.search_conversations(keyword="x")
@@ -121,12 +99,7 @@ def test_protocol_class_is_declaration_only():
         proto.open_session(target="x")
 
 
-# ---------------------------------------------------------------------------
-# 能力一：会话检索 search_conversations
-# ---------------------------------------------------------------------------
-
 def test_search_returns_only_hits_with_expected_fields(manager, tmp_path):
-    """构造一个含关键词的会话与一个不含的：只返回命中项，字段齐全。"""
     manager.create_session_explicit("会话甲", workdir=str(tmp_path), source="GUI")
     manager.add_messages("会话甲", [("user", "帮我看看登录报错的问题"), ("assistant", "收到")])
     manager.create_session_explicit("会话乙", workdir="GLOBAL", source="GUI")
@@ -149,7 +122,6 @@ def test_search_returns_only_hits_with_expected_fields(manager, tmp_path):
 
 
 def test_search_secretary_session_uses_secretary_name(manager):
-    """秘书会话的 display_name 走 secretary.get_secretary_name，并标记 is_secretary。"""
     manager.create_session_explicit(
         "s_sec", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
     )
@@ -165,7 +137,6 @@ def test_search_secretary_session_uses_secretary_name(manager):
 
 
 def test_search_filters_by_workdir(manager, tmp_path):
-    """workdir 过滤：只返回该项目目录下的会话。"""
     project = tmp_path / "proj-a"
     project.mkdir()
     manager.create_session_explicit("项目会话", workdir=str(project), source="GUI")
@@ -179,14 +150,12 @@ def test_search_filters_by_workdir(manager, tmp_path):
 
 
 def test_search_rejects_empty_keyword_and_dates(manager):
-    """关键词为空且无日期 → 拒绝（避免把全部会话倾倒出来）。"""
     _make_bridge(manager)
     with pytest.raises(secretary_dispatch.SecretaryDispatchError):
         secretary_dispatch.get().search_conversations()
 
 
 def test_search_no_hit_returns_empty_list(manager):
-    """无命中返回空列表（不抛错，由调用方给友好提示）。"""
     manager.create_session_explicit("会话甲", workdir="GLOBAL", source="GUI")
     manager.add_messages("会话甲", [("user", "无关内容")])
 
@@ -195,27 +164,18 @@ def test_search_no_hit_returns_empty_list(manager):
 
 
 def test_search_supports_date_only_query(manager):
-    """只给日期（无关键词）也要能检索：按会话 updated_at 过滤。"""
     manager.create_session_explicit("会话甲", workdir="GLOBAL", source="GUI")
     manager.add_messages("会话甲", [("user", "内容")])
 
     _make_bridge(manager)
     service = secretary_dispatch.get()
-    # 未来区间必然为空
     assert service.search_conversations(date_from="2999-01-01") == []
-    # 覆盖全部历史：能拿到该会话
     assert [r["session_name"] for r in service.search_conversations(date_from="1970-01-01")] == ["会话甲"]
-    # 非法日期格式直接拒绝
     with pytest.raises(secretary_dispatch.SecretaryDispatchError):
         service.search_conversations(date_from="2026/01/01")
 
 
-# ---------------------------------------------------------------------------
-# 能力二：派活 dispatch_task
-# ---------------------------------------------------------------------------
-
 def test_dispatch_existing_session_spawns_plain_user_turn(manager):
-    """已有会话：spawn 入参与「用户亲手发消息」逐项一致，无 display_text/internal_kind。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager)
 
@@ -233,13 +193,11 @@ def test_dispatch_existing_session_spawns_plain_user_turn(manager):
     # 硬要求：等同用户亲手发消息，绝不带显示标记与内部回合标记
     assert "display_text" not in kwargs
     assert "internal_kind" not in kwargs
-    # 完成通知标记：按发起会话（秘书会话）路由
     assert kwargs["secretary_dispatch_context"]["display_name"] == "项目甲"
     assert kwargs["secretary_dispatch_context"]["notify_session"] == "s_secretary"
 
 
 def test_dispatch_existing_session_returns_own_workdir(manager, tmp_path):
-    """已有会话沿用自身 workdir / 权限档位，派活不改写会话归属。"""
     project = tmp_path / "proj"
     project.mkdir()
     manager.create_session_explicit("项目甲", workdir=str(project), source="GUI")
@@ -252,7 +210,6 @@ def test_dispatch_existing_session_returns_own_workdir(manager, tmp_path):
 
 
 def test_dispatch_busy_target_enqueues_like_user_message(manager):
-    """目标会话忙 → 走既有 _message_queues 入队（与自动化同一口径）。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, events = _make_bridge(manager, is_turn_active=True)
 
@@ -263,14 +220,12 @@ def test_dispatch_busy_target_enqueues_like_user_message(manager):
     entry = bridge._message_queues["项目甲"][0]
     assert entry["text"] == "跑一下测试"
     assert entry["turn_source"] == "local"
-    # 排队条目同样不得带显示标记：补发后仍是普通用户消息
     assert not entry.get("display_text")
     assert entry["secretary_dispatch_notify_session"] == "s_secretary"
     assert [e[0] for e in events][-1] == "message_queue"
 
 
 def test_dispatch_new_session_passes_pending_workdir(manager, tmp_path):
-    """新建会话：workdir 透传为 pending_workdir（懒创建语义）。"""
     project = tmp_path / "proj-new"
     project.mkdir()
     bridge, spawned, _ = _make_bridge(manager)
@@ -291,7 +246,6 @@ def test_dispatch_new_session_passes_pending_workdir(manager, tmp_path):
 
 
 def test_dispatch_new_session_rejects_bad_workdir(manager, tmp_path):
-    """workdir 不存在（或不是目录）→ 拒绝，并给出相近目录候选。"""
     (tmp_path / "proj-like").mkdir()
     bridge, spawned, _ = _make_bridge(manager)
 
@@ -303,7 +257,6 @@ def test_dispatch_new_session_rejects_bad_workdir(manager, tmp_path):
     assert "proj-lik" in message
     assert spawned == []
 
-    # 传文件路径同样拒绝（必须是目录）
     a_file = tmp_path / "not-a-dir.txt"
     a_file.write_text("x", encoding="utf-8")
     with pytest.raises(secretary_dispatch.SecretaryDispatchError):
@@ -311,7 +264,6 @@ def test_dispatch_new_session_rejects_bad_workdir(manager, tmp_path):
 
 
 def test_dispatch_rejects_empty_prompt_and_unknown_target(manager):
-    """空 prompt 与不存在的目标都要给出可读拒绝，且不启动回合。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager)
     service = secretary_dispatch.get()
@@ -324,7 +276,6 @@ def test_dispatch_rejects_empty_prompt_and_unknown_target(manager):
 
 
 def test_dispatch_ambiguous_target_returns_candidates(manager):
-    """target 命中多条 → 返回候选列表让上层追问，不擅自挑一个。"""
     manager.create_session_explicit("项目甲-前端", workdir="GLOBAL", source="GUI")
     manager.create_session_explicit("项目甲-后端", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager)
@@ -336,12 +287,7 @@ def test_dispatch_ambiguous_target_returns_candidates(manager):
     assert spawned == []
 
 
-# ---------------------------------------------------------------------------
-# 能力三：跳转 open_session
-# ---------------------------------------------------------------------------
-
 def test_open_session_switches_current_and_emits_event(manager):
-    """跳转 = 系统层切换：调 _set_current_session + 推 open_session 事件。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, _, events = _make_bridge(manager)
     switched = []
@@ -360,7 +306,6 @@ def test_open_session_switches_current_and_emits_event(manager):
 
 
 def test_open_session_unarchives_then_switches(manager):
-    """目标已归档 → 先取消归档，再切换并推事件。"""
     manager.create_session_explicit("旧会话", workdir="GLOBAL", source="GUI")
     manager.add_messages("旧会话", [("user", "老内容")])
     assert manager.archive_session("旧会话") is True
@@ -389,12 +334,7 @@ def test_open_session_unknown_target_raises(manager):
     assert [e for e in events if e[0] == "open_session"] == []
 
 
-# ---------------------------------------------------------------------------
-# 真实回合：角色落库为普通 user 消息 + 收尾通知（真 worker + 桩模型入口）
-# ---------------------------------------------------------------------------
-
 class _WorkerHarness:
-    """为 _run_turn_worker 桩掉模型入口与事件出口（照 test_gui_automation_dispatch）。"""
 
     def __init__(self, bridge, manager, tmp_path, consume_return=False):
         self.bridge = bridge
@@ -446,7 +386,6 @@ class _WorkerHarness:
 
 
 def test_real_turn_persists_plain_user_message_and_completion_notice(manager, tmp_path):
-    """真回合：prompt 以 role=user 落库（无显示标记），收尾推「执行完成」通知。"""
     from core.agent_service import strip_context_suffix
 
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
@@ -464,12 +403,10 @@ def test_real_turn_persists_plain_user_message_and_completion_notice(manager, tm
     assert strip_context_suffix(str(user_msgs[-1]["content"])).strip() == "把 README 补一版"
     notices = [e for e in events if e[0] == "notice"]
     assert any("任务已在「项目甲」会话执行完成" in e[1]["message"] for e in notices)
-    # 通知按发起会话路由，避免串到用户正在查看的会话
     assert all(e[1]["session_name"] == "s_secretary" for e in notices)
 
 
 def test_drain_message_queue_forwards_secretary_dispatch_marker(manager, tmp_path):
-    """忙时入队的派活条目：补发时仍透传懒创建 workdir 与完成通知标记。"""
     project = tmp_path / "proj-q"
     project.mkdir()
     bridge, spawned, _ = _make_bridge(manager, is_turn_active=True)
@@ -487,13 +424,11 @@ def test_drain_message_queue_forwards_secretary_dispatch_marker(manager, tmp_pat
     assert args == ("排队跑一下", res["target_session"])
     assert kwargs["pending_workdir"] == str(project)
     assert kwargs["secretary_dispatch_context"]["notify_session"] == "s_secretary"
-    # 补发的仍是普通用户消息：显示标记与内部回合标记都为空
     assert kwargs.get("display_text", "") == ""
     assert kwargs.get("internal_kind", "") == ""
 
 
 def test_real_turn_without_dispatch_context_emits_no_notice(manager, tmp_path):
-    """普通回合（无派发上下文）：零附加通知，用户亲手发消息不受影响。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     manager.add_messages("项目甲", [("user", "预热")])
     bridge, _, events = _make_bridge(manager)
@@ -504,12 +439,7 @@ def test_real_turn_without_dispatch_context_emits_no_notice(manager, tmp_path):
     assert [e for e in events if e[0] == "notice"] == []
 
 
-# ---------------------------------------------------------------------------
-# 能力四：新建项目文件夹并引入工作区
-# ---------------------------------------------------------------------------
-
 def test_create_project_creates_nested_dir_and_registers_workspace(manager, tmp_path):
-    """不存在的多级路径：逐级创建，并登记为工作区（排在会话之上）。"""
     _make_bridge(manager)
     target = tmp_path / "work" / "demo"
 
@@ -519,12 +449,10 @@ def test_create_project_creates_nested_dir_and_registers_workspace(manager, tmp_
     assert res["created"] is True
     assert res["display_name"] == "demo"
     assert os.path.isdir(target)
-    # 登记进工作区后，侧栏分组数据源（get_all_workspaces）能读到它
     assert str(target.resolve()) in [str(p) for p in manager.get_all_workspaces()]
 
 
 def test_create_project_reuses_existing_dir(manager, tmp_path):
-    """目录已存在：直接复用，created=False，不报错。"""
     _make_bridge(manager)
     target = tmp_path / "已有项目"
     target.mkdir()
@@ -537,7 +465,6 @@ def test_create_project_reuses_existing_dir(manager, tmp_path):
 
 
 def test_create_project_rejects_relative_path(manager):
-    """相对路径拒绝：否则按进程 cwd（安装目录）建目录，位置完全不可预期。"""
     _make_bridge(manager)
 
     with pytest.raises(secretary_dispatch.SecretaryDispatchError) as exc:
@@ -547,7 +474,6 @@ def test_create_project_rejects_relative_path(manager):
 
 
 def test_create_project_rejects_reserved_marker(manager):
-    """GLOBAL / SECRETARY 是虚拟分组标识，不能当磁盘目录创建。"""
     _make_bridge(manager)
 
     for marker in ("GLOBAL", "SECRETARY"):
@@ -557,7 +483,6 @@ def test_create_project_rejects_reserved_marker(manager):
 
 
 def test_create_project_rejects_existing_file(manager, tmp_path):
-    """同名文件已存在：拒绝，不覆盖文件。"""
     _make_bridge(manager)
     target = tmp_path / "占位.txt"
     target.write_text("x", encoding="utf-8")
@@ -569,17 +494,10 @@ def test_create_project_rejects_existing_file(manager, tmp_path):
     assert target.read_text(encoding="utf-8") == "x"
 
 
-# ---------------------------------------------------------------------------
-# 能力五 / 六：派活台账查询 list_dispatches / get_dispatch_result
-# （升级设计 2026-11-04 第 3.4 节）
-# ---------------------------------------------------------------------------
-
-# 500 字结论：远超列表的 200 字截断线，用来区分「列表截断 / 详情不截断」
 _LONG_EXCERPT = "结论" * 250
 
 
 def _seed_ledger(manager, **overrides):
-    """直接往台账塞一条记录（绕过派活链路，专测查询工具的过滤与截断）。"""
     params = dict(
         secretary_session="s_secretary",
         target_session="proj_a",
@@ -594,14 +512,12 @@ def _seed_ledger(manager, **overrides):
 
 
 def test_ledger_tools_visible_in_secretary_schema_only(manager, monkeypatch):
-    """可见性：秘书会话 schema 含两个台账工具，普通会话 schema 一个都不含。"""
     import core.llm as llm
 
     class _NoMcp:
         def get_schemas(self):
             return []
 
-    # 屏蔽 MCP schema 合并：本用例只比较内置工具集，且不能真去连 MCP
     monkeypatch.setattr(llm, "_get_mcp_manager", lambda: _NoMcp())
 
     secretary_names = {s["function"]["name"] for s in llm._secretary_tools_schema()}
@@ -615,12 +531,10 @@ def test_ledger_tools_visible_in_secretary_schema_only(manager, monkeypatch):
     }
     assert "list_dispatches" not in ordinary_names
     assert "get_dispatch_result" not in ordinary_names
-    # 普通会话工具集 = 注册表全量剔除秘书专属项（与改动前逐项一致）
     assert ordinary_names == registry_names - set(secretary.SECRETARY_ONLY_TOOLS)
 
 
 def test_ledger_tools_pass_secretary_gate(manager):
-    """门控：秘书会话里两个台账工具都被放行（不是只读门控的漏网之鱼）。"""
     manager.create_session_explicit(
         "s_sec", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
     )
@@ -635,7 +549,6 @@ def test_ledger_tools_pass_secretary_gate(manager):
 
 
 def test_list_dispatches_filters_and_truncates_excerpt(manager):
-    """列表：status / workdir / target 过滤生效，result_excerpt 截到 200 字。"""
     done_id = _seed_ledger(manager, status=STATUS_DONE)
     failed_id = _seed_ledger(
         manager,
@@ -653,7 +566,6 @@ def test_list_dispatches_filters_and_truncates_excerpt(manager):
 
     all_rows = json.loads(tools.list_dispatches())
     assert all_rows["count"] == 2
-    # 按 id 倒序：最新的失败任务在前
     assert [row["id"] for row in all_rows["dispatches"]] == [failed_id, done_id]
     for field in ("id", "title", "target_display", "workdir", "status",
                   "started_at", "finished_at", "result_excerpt"):
@@ -668,16 +580,13 @@ def test_list_dispatches_filters_and_truncates_excerpt(manager):
     assert len(excerpt) == 200
     assert excerpt == _LONG_EXCERPT[:200]
 
-    # target 同时匹配会话名与显示名的子串
     assert [row["id"] for row in json.loads(tools.list_dispatches(target="项目乙"))["dispatches"]] == [failed_id]
     assert [row["id"] for row in json.loads(tools.list_dispatches(target="proj_a"))["dispatches"]] == [done_id]
 
-    # 无命中：纯文本提示，不是空 JSON
     assert tools.list_dispatches(status="running") == "没有符合条件的派活记录"
 
 
 def test_get_dispatch_result_returns_full_fields(manager):
-    """详情：prompt / result_excerpt 都不截断，error / depends_on / batch_id 齐全。"""
     dispatch_id = _seed_ledger(
         manager,
         prompt="把 README 补一版并跑测试",
@@ -694,7 +603,6 @@ def test_get_dispatch_result_returns_full_fields(manager):
     assert payload["id"] == dispatch_id
     assert payload["status"] == STATUS_DONE
     assert payload["prompt"] == "把 README 补一版并跑测试"
-    # 完整摘要：500 字原样返回（列表口径只有 200 字）
     assert payload["result_excerpt"] == _LONG_EXCERPT
     assert len(payload["result_excerpt"]) == 500
     assert payload["depends_on"] == [7]
@@ -709,7 +617,6 @@ def test_get_dispatch_result_returns_full_fields(manager):
 
 
 def test_get_dispatch_result_reports_missing_and_bad_id(manager):
-    """编号不存在 / 缺失 / 非整数：给可读文本，绝不抛异常。"""
     _make_bridge(manager)
 
     missing = tools.get_dispatch_result(999)
@@ -720,14 +627,12 @@ def test_get_dispatch_result_reports_missing_and_bad_id(manager):
     bad = tools.get_dispatch_result("abc")
     assert "需要是整数" in bad
     assert "abc" in bad
-    # 台账不可用（服务已注册但 store 为 None）也不能抛异常
     secretary_dispatch.get()._store = None
     assert "派活台账不可用" in tools.list_dispatches()
     assert "派活台账不可用" in tools.get_dispatch_result(1)
 
 
 def test_list_dispatches_clamps_limit(manager):
-    """limit：超上限夹到 50，非法值回落默认 20。"""
     for index in range(55):
         _seed_ledger(manager, title=f"任务{index}")
     _make_bridge(manager)
@@ -741,18 +646,11 @@ def test_list_dispatches_clamps_limit(manager):
 
 
 def test_ledger_tools_report_unavailable_without_service(manager):
-    """句柄未注册（CLI / headless）：返回可读提示，不是异常。"""
     assert "秘书调度能力当前不可用" in tools.list_dispatches()
     assert "秘书调度能力当前不可用" in tools.get_dispatch_result(1)
 
 
 def test_dispatch_rejects_secretary_target(manager):
-    """派活目标命中秘书会话：派发前拒绝，绝不投进只读会话。
-
-    秘书会话受 core.secretary.secretary_allows_tool 只读门控约束，没有
-    execute_command / write_file。修复前这种派活会真的启动一个回合，目标只能回
-    "我没有命令执行和写文件工具"，用户看到的就是"秘书派出去的活干不了"。
-    """
     manager.create_session_explicit(
         "s_secretary", workdir="GLOBAL", source="SECRETARY", secretary_name="星河"
     )
@@ -765,10 +663,8 @@ def test_dispatch_rejects_secretary_target(manager):
     with pytest.raises(secretary_dispatch.SecretaryDispatchError) as excinfo:
         service.dispatch_task(target="s_secretary", prompt="跑一下测试")
     assert "秘书会话" in str(excinfo.value)
-    # 拒绝发生在派发之前：没有任何回合被启动，不留一个注定失败的空回合
     assert spawned == []
 
-    # 对照：普通项目会话照常派发
     result = service.dispatch_task(target="s_work", prompt="跑一下测试")
     assert result["ok"] is True
     assert len(spawned) == 1

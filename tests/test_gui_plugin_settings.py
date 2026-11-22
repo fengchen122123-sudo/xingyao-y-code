@@ -1,6 +1,3 @@
-"""gui_bridge 插件设置接口的单元测试（ApiBridge.__new__ 裸实例 + patch 模块属性）。"""
-
-
 import core.plugin_loader as plugin_loader
 from gui_bridge import ApiBridge
 

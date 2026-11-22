@@ -1,7 +1,4 @@
 <template>
-  <!-- 图片大图查看：点击遮罩或 Esc 关闭，多图支持左右切换；
-       滚轮缩放（0.5x–6x）、放大后拖动平移、双击复位。mermaid 图经
-       data URL 进 <img> 后按矢量渲染，任意倍率缩放依旧清晰 -->
   <div
     v-if="store.lightbox.show"
     class="lightbox-mask"
@@ -17,9 +14,6 @@
       title="上一张 (←)"
       @click.stop="store.lightboxNav(-1)"
     ><AppIcon name="chevron-left" :size="22" :stroke-width="2" /></button>
-    <!-- mermaid 图放大：SVG 字符串直接 v-html 注入（与气泡内 injectSvg 同一条
-         渲染路径，字符串已过 sanitizeSvg 净化）；普通图片仍走 img src。
-         此前绕道 data URL 经 img 二次解析 SVG，真实环境会因序列化差异裂图 -->
     <div
       v-if="isCurrentSvg"
       class="lb-svg"
@@ -65,12 +59,9 @@ import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
 
-// 当前展示项：普通图片是媒体服务 URL；mermaid 图点击放大时传的是
-// 净化后的 SVG 字符串（trim 后以 <svg 开头），走 v-html 直注分支
 const currentImage = computed(() => store.lightbox.images[store.lightbox.index] ?? '');
 const isCurrentSvg = computed(() => currentImage.value.trimStart().startsWith('<svg'));
 
-// 缩放/平移是组件本地视图状态：不进 store，换图或重新打开即复位
 const zoom = ref(1);
 const panX = ref(0);
 const panY = ref(0);
@@ -91,8 +82,6 @@ function resetView() {
   dragging.value = false;
 }
 
-// 乘除 1.2 的浮点误差会让 zoom 回不到精确的 1（角标残留 100%）：
-// 四位小数取齐后再 clamp，保证缩放序列可逆、边界值精确
 function clampZoom(v: number): number {
   return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(v * 10000) / 10000));
 }
@@ -101,8 +90,6 @@ function onWheel(e: WheelEvent) {
   zoom.value = clampZoom(zoom.value * (e.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP));
 }
 
-// 只有放大后才允许拖动（zoom=1 时图片居中展示，拖动无意义）；
-// 指针捕获保证移出图片仍能继续平移
 function onPointerDown(e: PointerEvent) {
   if (zoom.value <= 1) return;
   dragging.value = true;
@@ -112,7 +99,7 @@ function onPointerDown(e: PointerEvent) {
   dragBaseY = panY.value;
   const el = e.currentTarget as HTMLElement;
   if (el.setPointerCapture) {
-    try { el.setPointerCapture(e.pointerId); } catch { /* jsdom 等无活动指针环境忽略 */ }
+    try { el.setPointerCapture(e.pointerId); } catch { }
   }
 }
 
@@ -133,7 +120,6 @@ const imgStyle = computed(() => ({
   cursor: zoom.value > 1 ? (dragging.value ? 'grabbing' : 'grab') : 'default',
 }));
 
-// 打开灯箱或左右切换图片时复位视图
 watch(() => [store.lightbox.show, store.lightbox.index], resetView);
 
 function onKeydown(e: KeyboardEvent) {
@@ -164,12 +150,9 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown));
   object-fit: contain;
   border-radius: 8px;
   box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
-  /* 放大后允许溢出视口，配合拖动查看局部 */
   user-select: none;
   -webkit-user-drag: none;
 }
-/* mermaid SVG 直注分支：与 .lb-img 同一缩放/拖动行为；
-   v-html 内容不受 scoped 属性选择器约束，需 :deep 穿透 */
 .lb-svg {
   max-width: 90vw;
   max-height: 88vh;
@@ -177,10 +160,6 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown));
   align-items: center;
   justify-content: center;
   user-select: none;
-  /* 底板修复：mermaid 渲染主题跟随界面主题（见 mermaidRenderer 的
-     isDarkTheme），浅色主题下边线等元素是深色描边且 SVG 背景透明，
-     直接贴纯黑遮罩会隐形（节点有浅色填充所以仍可见）。垫主题卡片
-     底色 + 细边框恢复对比度；暗色主题下为近黑卡片，视觉无突兀 */
   background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -188,8 +167,6 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown));
   box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
 }
 .lb-svg :deep(svg) {
-  /* 底板自带 24px 内边距（box-sizing: border-box 已含在 90vw/88vh 内），
-     SVG 自身不再超视口；阴影上移到 .lb-svg，卡片成为完整视觉单元 */
   max-width: 100%;
   max-height: calc(88vh - 48px);
 }

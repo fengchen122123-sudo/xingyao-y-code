@@ -1,21 +1,3 @@
-"""飞书长连接客户端（搬运自 lark-oapi 1.7.3，MIT，见同目录 LICENSE 与 README.md）。
-
-上游：lark_oapi/ws/client.py（v2_main / 1.7.3）。本文件保留上游的连接建立、
-心跳、收发、合包、重连与 ACK 逻辑，仅做以下改造（均以 `# [星瑶改造]` 标注）：
-
-1. 事件回调：上游用 `EventDispatcherHandler._do_without_validation(payload)`；
-   本层改成注入回调 `on_event(payload: bytes) -> Any | None`，语义一致（返回对象
-   会被 JSON 序列化后回给服务端作为 ACK，返回 None 表示无内容）。
-2. 去掉 client_assertion 分支：星瑶固定用 app_id + app_secret 鉴权。
-3. HTTP 客户端 `requests` → 标准库 `urllib.request`，避免依赖未在
-   requirements.txt 声明的包。
-4. `JSON` / 日志 / 过期缓存 / User-Agent 改为本地内联实现（上游来自
-   lark_oapi.core.*，本层不引入上游包）。
-5. 帧编解码由本地 `frame.py` 提供（替代上游 protobuf 生成代码 + 夹带的
-   protobuf 运行时副本，原因见 frame.py 顶部说明）。
-6. 新增 `stop()`：上游没有停止入口，星瑶需要在应用退出时优雅关闭长连接。
-"""
-
 import asyncio
 import base64
 import copy
@@ -75,7 +57,6 @@ _SDK_VERSION = "1.7.3"
 
 
 def _build_user_agent(source: Optional[str] = None) -> str:
-    """UA 格式对齐上游：<project>/v<version>[ source/<sanitized>]"""
     ua = f"{_SDK_PROJECT}/v{_SDK_VERSION}"
     if source:
         sanitized = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in source)[:64]
@@ -85,10 +66,6 @@ def _build_user_agent(source: Optional[str] = None) -> str:
 
 
 class _ExpiringCache:
-    """带过期时间的键值缓存（替代上游 lark_oapi.core.cache.ExpiringCache）。
-
-    上游的 clear_interval 语义是惰性清理，这里按需清理，行为等价。
-    """
 
     def __init__(self, clear_interval: int = 30):
         self._clear_interval = max(1, int(clear_interval))
@@ -114,7 +91,6 @@ class _ExpiringCache:
 
 
 def _filter_null(d: Dict) -> Dict:
-    """与上游 JSON.filter_null 一致：递归删除值为 None 的键。"""
     if isinstance(d, dict):
         for k, v in list(d.items()):
             if isinstance(v, dict):
@@ -125,7 +101,6 @@ def _filter_null(d: Dict) -> Dict:
 
 
 def _json_default(o: Any) -> Any:
-    """与上游 JSON.Encoder.default 一致的对象/字节处理。"""
     if hasattr(o, "__dict__"):
         return _filter_null(copy.deepcopy(vars(o)))
     if isinstance(o, bytes):
@@ -183,7 +158,6 @@ def _ordinal(n: int) -> str:
 def _ws_connect_kwargs() -> Dict[str, Any]:
     params = inspect.signature(websockets.connect).parameters
     if "proxy" in params:
-        # websockets 15 起默认走环境代理发现；上游历史上是直连，这里保持直连。
         return {"proxy": None}
     return {}
 
@@ -235,7 +209,7 @@ class Client(object):
                  headers: Optional[Mapping[str, str]] = None) -> None:
         self._app_id: str = app_id
         self._app_secret: str = app_secret
-        self._on_event = on_event  # [星瑶改造] 替代上游 EventDispatcherHandler
+        self._on_event = on_event
         self._log_level: LogLevel = log_level
         self._auto_reconnect: bool = auto_reconnect
         self._domain: str = domain
@@ -245,32 +219,21 @@ class Client(object):
         self._conn_url: str = ""
         self._service_id: str = ""
         self._conn_id: str = ""
-        # 本地默认值；飞书接入点会在每次握手时用 _configure() 覆盖（也可能
-        # 通过 CONTROL 帧在会话中途下发更新）。
         self._reconnect_nonce: int = 30
         self._reconnect_count: int = -1
         self._reconnect_interval: int = 120
         self._ping_interval: int = 120
         self._cache: _ExpiringCache = _ExpiringCache(clear_interval=30)
         self._lock: Optional[asyncio.Lock] = None
-        # [星瑶改造] 后台任务集中托管：关闭时统一 cancel + 等待，避免 loop
-        # 停止后残留协程在 GC 阶段被 close，再次执行 await 逻辑时拿不到运行
-        # 中的 loop（表现为 "Exception ignored while closing generator
-        # <coroutine object Client._receive_message_loop> ... 'NoneType'
-        # object has no attribute 'create_future'"）。
         self._tasks: set = set()
-        # [星瑶改造] 供外部观察重连生命周期
         self.on_reconnecting: Callable[[], None] = lambda: None
         self.on_reconnected: Callable[[], None] = lambda: None
         self.on_connected: Callable[[], None] = lambda: None
-        # [星瑶改造] 停止支持：start() 阻塞在专用线程，stop() 从其它线程请求退出
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_waiter: Optional[asyncio.Event] = None
         self._stopping = False
         self._stop_lock = threading.Lock()
         logger.setLevel(log_level.value)
-
-    # ---- 生命周期 ----
 
     def start(self) -> None:
         """阻塞：建立长连接并维持（调用方负责放进专用线程）。"""
@@ -280,16 +243,9 @@ class Client(object):
         try:
             self._serve()
         finally:
-            # [星瑶改造] 无论正常停止还是异常退出，都必须把 loop 收干净。
-            # 上游只让 run_until_complete 返回、从不关 loop，残留的协程会
-            # 在解释器 GC 时才被 close：finalize 会重新驱动协程，继续执行
-            # await 表达式（如 asyncio.Lock.acquire），而此时线程里已没有
-            # 运行中的事件循环，于是打出
-            # "Exception ignored while closing generator ..." 这类噪音。
             self._teardown_loop()
 
     def _serve(self) -> None:
-        """start() 的主体：建连并维持，直到 stop() 唤醒 _select()。"""
         try:
             self._loop.run_until_complete(self._connect())
         except ClientException as e:
@@ -325,8 +281,6 @@ class Client(object):
             logger.debug(self._fmt_log("投递停止信号失败"), exc_info=True)
 
     def _signal_stop(self) -> None:
-        # [星瑶改造] 先断开连接，断完再叫醒 _select()：保证 stop() 返回时
-        # 连接真的关了，而不是把 _shutdown() 丢进 loop 就撒手。
         self._spawn(self._shutdown())
 
     async def _shutdown(self) -> None:
@@ -345,16 +299,10 @@ class Client(object):
                 waiter.set()
 
     async def _select(self) -> None:
-        """[星瑶改造] 上游是 `while True: sleep(3600)`；这里改成可被 stop() 唤醒。"""
         self._stop_waiter = asyncio.Event()
         await self._stop_waiter.wait()
 
     def _spawn(self, coro) -> Optional[asyncio.Task]:
-        """[星瑶改造] 托管后台任务：保留引用，结束/取消后自动摘除。
-
-        上游直接 `loop.create_task(...)` 丢引用，关闭阶段 cancel 不到也等不到，
-        任务只能在 loop 停止后被 GC，从而在 finalize 阶段触发上面说的噪音。
-        """
         loop = self._loop
         if loop is None or loop.is_closed():  # pragma: no cover - loop 已收尾
             coro.close()
@@ -374,7 +322,6 @@ class Client(object):
             logger.debug(self._fmt_log("后台任务异常退出: {}", exc), exc_info=exc)
 
     def _teardown_loop(self) -> None:
-        """[星瑶改造] 关闭 loop 前收尾：取消残留任务并等它们真正结束。"""
         loop = self._loop
         if loop is None or loop.is_closed():
             return
@@ -398,8 +345,6 @@ class Client(object):
                 asyncio.set_event_loop(None)
             except Exception:  # pragma: no cover
                 pass
-
-    # ---- 连接 ----
 
     async def _ping_loop(self) -> None:
         while not self._stopping:
@@ -450,9 +395,6 @@ class Client(object):
                 self._spawn(self._handle_message(msg))
         except Exception as e:
             if self._stopping:
-                # [星瑶改造] 停止过程中连接被 _shutdown 关掉属预期：不再二次
-                # 断开，避免关闭路径上再去抢 asyncio.Lock（此前正是这里在
-                # loop 停止后被 GC 重新驱动，才打出 NoneType.create_future）。
                 logger.debug(self._fmt_log("receive message loop exit on stop, err: {}", e))
                 return
             logger.error(self._fmt_log("receive message loop exit, err: {}", e))
@@ -556,7 +498,6 @@ class Client(object):
 
         pl = frame.payload
         if int(sum_) > 1:
-            # 合包
             pl = self._combine(msg_id, int(sum_), int(seq), pl)
             if pl is None:
                 return
@@ -569,7 +510,6 @@ class Client(object):
         try:
             start = int(round(time.time() * 1000))
             if message_type == MessageType.EVENT:
-                # [星瑶改造] 上游调 EventDispatcherHandler._do_without_validation
                 result = self._on_event(pl) if self._on_event is not None else None
             elif message_type == MessageType.CARD:
                 return
@@ -596,7 +536,6 @@ class Client(object):
         except Exception as e:  # pragma: no cover - 防御性
             logger.warning(self._fmt_log("on_reconnecting callback raised: {}", e))
 
-        # 首次重连随机抖动
         if self._reconnect_nonce > 0:
             nonce = random.random() * self._reconnect_nonce
             await asyncio.sleep(nonce)

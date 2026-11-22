@@ -1,5 +1,3 @@
-"""Pure state machine for compact CLI tool-progress output."""
-
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -112,7 +110,6 @@ class _PendingGroup:
 
 
 def _format_compact_diff_preview(diff_text: str, *, max_lines: int = 6) -> list[str]:
-    """把小改动的 unified diff 压缩为克制的内联预览行（仅变更行，上限 max_lines 行）。"""
     if not diff_text:
         return []
     muted = theme_ansi("text_muted")
@@ -168,7 +165,6 @@ class ToolProgressAggregator:
         event = ToolDisplayEvent.from_payload(payload)
         if not event.tool_id:
             return
-        # Moving a replacement to the end preserves the latest active action.
         self._active.pop(event.tool_id, None)
         self._finished_tool_ids.discard(event.tool_id)
         self._diff_tool_ids.discard(event.tool_id)
@@ -253,7 +249,6 @@ class ToolProgressAggregator:
             f" {muted}·{ANSI_RESET} {ok_c}+{added}{ANSI_RESET} / {err_c}-{removed}{ANSI_RESET} 行"
             f"{stat_suffix}\n"
         )
-        # 小改动（总变更行 <= 10）附带精简内联 Diff 预览，大改动保持单行统计不刷屏
         if diff_text and 1 <= (added + removed) <= 10:
             lines.extend(_format_compact_diff_preview(diff_text, max_lines=6))
         return lines

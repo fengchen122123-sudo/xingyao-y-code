@@ -15,8 +15,6 @@ function mountSubpage(api: Record<string, unknown> = {}) {
   });
 }
 
-// 运行会话落点默认是 per_run（目标会话控件隐藏，target_session 提交空串）。
-// 验证「绑定到已有会话/新建会话」的用例仍按原语义走固定会话模式。
 async function useFixedSession(wrapper: ReturnType<typeof mountSubpage>) {
   await wrapper.find('[data-test="automation-run-session-mode"]').setValue('fixed');
 }
@@ -79,7 +77,6 @@ describe('Subpage - 星轨自动化任务', () => {
     store.refreshAutomations = refreshSpy as any;
     store.automationTasks = [_task];
 
-    // watch 在 visible 从 false 翻转为 true 时触发（与 MCP/插件页一致）
     (window as any).pywebview = { api: {} };
     const wrapper = mount(Subpage, { props: { visible: false, subType: 'automations' as const } });
     await wrapper.setProps({ visible: true });
@@ -140,9 +137,7 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(payload.trigger_type).toBe('daily');
     expect(payload.trigger_config).toEqual({ time: '09:30' });
     expect(payload.permission_mode).toBe('confirm');
-    // 新建会话默认自由对话归属，不再落到应用启动目录
     expect(payload.workdir).toBe('GLOBAL');
-    // 未选择模型时跟随会话绑定/全局默认
     expect(payload.model_id).toBe('');
   });
 
@@ -286,7 +281,6 @@ describe('Subpage - 星轨自动化任务', () => {
 
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
-    // 默认选中第一个既有会话（per_run 下目标会话控件隐藏，先切固定会话模式）
     await useFixedSession(wrapper);
     await wrapper.find('[data-test="automation-name"]').setValue('测试任务');
     await wrapper.find('[data-test="automation-prompt"]').setValue('干点活');
@@ -315,7 +309,6 @@ describe('Subpage - 星轨自动化任务', () => {
 
     expect(wrapper.text()).toContain('自由对话');
     expect(wrapper.text()).toContain('📁 proj');
-    // 指定模型的任务卡展示模型名（供应商）
     expect(wrapper.text()).toContain('🧠 GLM-5.3（智谱）');
   });
 
@@ -329,7 +322,6 @@ describe('Subpage - 星轨自动化任务', () => {
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
     await wrapper.find('[data-test="automation-trigger-type"]').setValue('once');
 
-    // 默认形态是「N 分钟后」；绝对时刻输入此时不渲染（二选一）
     expect(wrapper.find('[data-test="automation-delay-minutes"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="automation-run-at"]').exists()).toBe(false);
 
@@ -343,7 +335,6 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(saveSpy).toHaveBeenCalledTimes(1);
     const payload = saveSpy.mock.calls[0][0];
     expect(payload.trigger_type).toBe('once');
-    // 只传其中一个键：延迟形态不带 run_at
     expect(payload.trigger_config).toEqual({ delay_minutes: 15 });
   });
 
@@ -371,7 +362,6 @@ describe('Subpage - 星轨自动化任务', () => {
     expect(saveSpy).toHaveBeenCalledTimes(1);
     const payload = saveSpy.mock.calls[0][0];
     expect(payload.trigger_type).toBe('once');
-    // 绝对时刻形态不带 delay_minutes，且 datetime-local 的 T 换成后端认的空格
     expect(payload.trigger_config).toEqual({ run_at: '2030-01-02 08:15' });
   });
 
@@ -397,7 +387,6 @@ describe('Subpage - 星轨自动化任务', () => {
       return saveSpy.mock.calls[saveSpy.mock.calls.length - 1][0];
     };
 
-    // 留空 = 不限次
     expect((await fillAndSave()).max_runs).toBeNull();
     expect((await fillAndSave('3')).max_runs).toBe(3);
   });
@@ -428,7 +417,6 @@ describe('Subpage - 星轨自动化任务', () => {
     const toggle = card.find('[data-test="automation-toggle-跑完的任务"]').element as HTMLInputElement;
     expect(toggle.disabled).toBe(true);
 
-    // 置灰后点击不会真正派发
     await runBtn.trigger('click');
     expect(runSpy).not.toHaveBeenCalled();
   });
@@ -448,7 +436,6 @@ describe('Subpage - 星轨自动化任务', () => {
     const card = wrapper.find('[data-test="automation-card-限次任务"]');
     expect(card.exists()).toBe(true);
     expect(card.text()).toContain('已执行 1/3 次');
-    // 未达上限不展示生命周期徽标
     expect(card.find('[data-test="automation-task-status"]').exists()).toBe(false);
   });
 
@@ -477,7 +464,6 @@ describe('Subpage - 星轨自动化任务', () => {
     const err = wrapper.find('[data-test="automation-form-errors"]');
     expect(err.exists()).toBe(true);
     expect(err.text()).toContain('一次性触发时刻已过');
-    // 失败后表单保持打开，便于用户改时刻重试
     expect(wrapper.find('[data-test="automation-form"]').exists()).toBe(true);
   });
 
@@ -494,13 +480,11 @@ describe('Subpage - 星轨自动化任务', () => {
     const wrapper = mountSubpage();
     await wrapper.find('[data-test="automation-new-btn"]').trigger('click');
 
-    // 即使存在既有会话，per_run 也不渲染目标会话下拉与新建会话输入
     expect((wrapper.find('[data-test="automation-run-session-mode"]').element as HTMLSelectElement).value)
       .toBe('per_run');
     expect(wrapper.find('[data-test="automation-new-session"]').exists()).toBe(false);
     expect(wrapper.text()).not.toContain('该会话归属项目目录');
 
-    // 预览文本 = "{今天日期} {任务名}"
     const today = new Date();
     const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
     await wrapper.find('[data-test="automation-name"]').setValue('每日摘要');
@@ -513,7 +497,6 @@ describe('Subpage - 星轨自动化任务', () => {
     const payload = saveSpy.mock.calls[0][0];
     expect(payload.session_mode).toBe('per_run');
     expect(payload.target_session).toBe('');
-    // 新会话默认挂自由对话，不落到应用启动目录
     expect(payload.workdir).toBe('GLOBAL');
   });
 

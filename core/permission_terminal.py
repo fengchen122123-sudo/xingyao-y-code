@@ -1,5 +1,3 @@
-"""Interactive tool permission authorization and terminal prompts."""
-
 from __future__ import annotations
 
 import os
@@ -32,11 +30,9 @@ from core.permission_policy import (
     PermissionRisk,
     decide_permission,
 )
-# safety 场景（JEV 决策）薄包装层：只做「allow → ask」的加严，纯函数判定不受污染
 from core.permission_auto_decision import apply_auto_decision_to_permission
 from core.permission_safety_gate import apply_decision_to_permission
 
-# 工具结果中的错误哨兵前缀
 TOOL_ERROR_PREFIX = "🚨"
 ASK_USER_ERROR_PREFIX = "无法提问："
 TOOL_INTERNAL_ERROR_PREFIX = "Tool execution error:"
@@ -492,11 +488,6 @@ def _get_active_tool_registry():
 
 
 def _llm_first(name, fallback):
-    """llm-first 解析入口层绑定。
-
-    core.llm 保留兼容入口，测试/外部调用方 patch core.llm.<name> 必须生效；
-    解析失败回落本模块实现。
-    """
     try:
         import core.llm as _llm
         fn = getattr(_llm, name, None)
@@ -662,6 +653,24 @@ def authorize_tool_call(
     task_sandbox_bypass = (
         False if credential_write else is_session_sandbox_bypass_enabled()
     )
+    ai_output_write = False
+    if not credential_write and risk is PermissionRisk.NORMAL_MUTATION:
+        if (
+            tool_spec is not None
+            and getattr(tool_spec, "requires_permission", True) is False
+        ):
+            ai_output_write = True
+        elif (
+            effective_function_name
+            in {"write_file", "edit_file", "multi_edit", "office_write"}
+            and path_value
+        ):
+            try:
+                from core.ai_output_paths import is_ai_output_write_target
+
+                ai_output_write = is_ai_output_write_target(path_value)
+            except Exception as exc:
+                raise PermissionSystemError(f"AI 输出目录权限校验失败: {exc}") from exc
     facts = PermissionFacts(
         mode=app_context.get_permission_mode(),
         risk=risk,
@@ -671,10 +680,9 @@ def authorize_tool_call(
         task_sandbox_bypass=task_sandbox_bypass,
         task_grant_hit=task_hit,
         project_rule_hit=project_hit,
+        ai_output_write=ai_output_write,
     )
     decision = decide_permission(facts)
-    # 自动决策模式（auto_decision）：在保持灾难性硬拒与沙盒/凭据边界不变的前提下，
-    # 把待确认的操作交给 JEV auto_permission 场景裁决（allow / ask_user / deny）。
     decision = apply_auto_decision_to_permission(
         facts,
         decision,

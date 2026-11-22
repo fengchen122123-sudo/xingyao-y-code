@@ -1,5 +1,3 @@
-"""Contracts shared by tool registration, execution and rendering."""
-
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -20,12 +18,6 @@ class ToolSpec:
     parallel_safe: bool = False
     activity_description: str = ""
 
-    # 本工具调用依赖哪些调用（按调用序号索引）。
-    # None = 无依赖声明，落回「同层可并行」的旧语义；空元组 () = 显式声明
-    # 「无依赖」（与 None 同效，但语义更清晰）。
-    # 追加到字段列表末尾：dataclass 默认值约束要求新字段必须带默认值；且
-    # 全量搜索确认现有构造（core/、plugins/、tests/ 共 59 处）全部使用
-    # 关键字实参，因此本字段对既有代码零影响。仅调度器读取，不改工具行为。
     depends_on: tuple[int, ...] | None = None
 
     # 副作用范围，供调度与权限系统读取。
@@ -57,5 +49,4 @@ class ToolResult:
     followup_messages: tuple[dict[str, Any], ...] = ()
 
     def to_message_content(self) -> str:
-        """Return the compact content that belongs in model conversation history."""
         return str(self.content)

@@ -148,13 +148,12 @@ test("buildSshArgs does not emit raw ssh options for unknown fields", () => {
       host: "example.com",
       user: "root",
       port: 22,
-      // No extra unknown keys are accepted — typed config is the whitelist.
     },
     1080,
   );
   assert.equal(
     args.filter((a) => a === "-o" || a.startsWith("--")).length,
-    3, // ExitOnForwardFailure, ServerAliveInterval, ServerAliveCountMax (and only those)
+    3,
     "buildSshArgs must only emit the three baseline -o options when no extras given",
   );
 });

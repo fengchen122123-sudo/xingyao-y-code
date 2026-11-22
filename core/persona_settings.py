@@ -1,14 +1,3 @@
-"""智能体人设设置持久化。
-
-设置页「人设设置」分区的后端存储：智能体名称与智能体人设文本，
-持久化到 ~/.ycode/persona.json（YCODE_DATA_DIR 优先）。
-
-设计约束：
-- 空人设文本表示"使用内置默认人设"，不视为错误；
-- 读失败一律回落默认值，绝不影响启动与正常会话流程；
-- 保存前做显式校验（长度上限），非法值拒绝且不写盘。
-"""
-
 from __future__ import annotations
 
 import threading
@@ -52,10 +41,6 @@ def _defaults() -> dict[str, Any]:
 
 
 def get_persona_settings() -> dict[str, Any]:
-    """读取人设设置快照；任何读取异常回落默认值。
-
-    旧版本文件里可能残留的 gender/age 字段一律忽略（该功能已移除）。
-    """
     try:
         import config
 
@@ -67,8 +52,6 @@ def get_persona_settings() -> dict[str, Any]:
     agent_name = data.get("agent_name")
     persona = data.get("persona")
     user_title = data.get("user_title")
-    # 读取路径与保存路径同样做 strip：手改配置文件混入空白时不让
-    # 界面显示与提示词判断（name != 默认名）出现两套口径。
     name_value = agent_name.strip() if isinstance(agent_name, str) and agent_name.strip() else DEFAULT_AGENT_NAME
     return {
         "version": _VERSION,
@@ -79,11 +62,6 @@ def get_persona_settings() -> dict[str, Any]:
 
 
 def save_persona_settings(agent_name: str, persona: str, user_title: str = "") -> dict[str, Any]:
-    """校验并保存人设设置；返回保存后的完整快照。
-
-    非法输入抛 PersonaSettingsError，调用方（bridge 层）转 ok=False 响应。
-    user_title（智能体对用户的称呼）允许为空 = 不使用特定称呼。
-    """
     if not isinstance(agent_name, str) or not agent_name.strip():
         raise PersonaSettingsError("智能体名称不能为空")
     name = agent_name.strip()
@@ -118,11 +96,6 @@ def save_persona_settings(agent_name: str, persona: str, user_title: str = "") -
     _invalidate_cache()
     return {"version": _VERSION, "agent_name": name, "persona": persona, "user_title": title}
 
-
-# ---------------------------------------------------------------------------
-# 高频读取缓存（GUI 状态文案 / 每轮请求组装都会调用）
-# 缓存键为配置文件 mtime + 大小：外部手改文件后自动失效，保存路径主动失效。
-# ---------------------------------------------------------------------------
 
 _CACHE_LOCK = threading.Lock()
 _CACHE_MTIME: float | None = None
@@ -168,11 +141,6 @@ def get_user_title() -> str:
 
 
 def build_persona_prompt_block() -> str:
-    """构建并入稳定系统前缀的人设块；默认配置（名称未改、无人设、无称呼）返回空串。
-
-    返回空串可保证默认安装下系统提示词字节与旧版完全一致（byte-stability 回归不破）。
-    自定义后注入：名称覆盖、对用户的称呼、自定义人设补充。
-    """
     snapshot = _cached_snapshot()
     lines: list[str] = []
     name = str(snapshot.get("agent_name") or "").strip()

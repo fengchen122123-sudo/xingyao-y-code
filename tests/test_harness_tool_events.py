@@ -1,4 +1,3 @@
-"""S1-b：工具事件落 journal 的脱敏事实与零影响约束。"""
 from __future__ import annotations
 
 import json
@@ -110,7 +109,6 @@ def test_journal_facts_never_contain_payload_text():
     )
     assert "secret.py" not in blob
     assert "RESULT-BODY" not in blob
-    # 只允许 arguments_sha256 这类键；禁止出现携带原文的 arguments 字段。
     assert '"arguments":' not in blob
 
 
@@ -143,7 +141,7 @@ def test_sink_failure_does_not_break_execution():
 
 def test_facts_for_call_without_raw_arguments_falls_back_to_canonical_json():
     prepared = _prepared(arguments={"b": 2, "a": 1})
-    prepared.decoded.__dict__  # frozen dataclass，仅确认可读
+    prepared.decoded.__dict__
     facts = _journal_facts_for_call(prepared)
     assert facts["tool_name"] == "read_file"
     assert facts["call_ordinal"] == 0
@@ -158,14 +156,12 @@ def _prepared_pair():
 
 
 def test_journal_writes_started_finished_per_call_in_execution_order():
-    """逐调用成对交错：call0 started→finished 之后才是 call1 started。"""
     journal = []
     executor = _executor()
     context = _context(lambda kind, facts: journal.append((kind, facts)))
     batch = _PreparedToolBatch(parallel=False, calls=_prepared_pair())
 
     executor.begin_batch(batch, context, None)
-    # 入批排队不写 journal：STARTED 只在真正开始执行时落。
     assert journal == []
 
     executor.execute_batch(batch, context, None)
@@ -180,7 +176,6 @@ def test_journal_writes_started_finished_per_call_in_execution_order():
 
 
 def test_failed_call_leaves_only_started_as_uncertain_state():
-    """执行抛错的调用只留 STARTED——续跑据此识别为不确定态并 BLOCK。"""
     journal = []
 
     def boom(_decoded, _context):

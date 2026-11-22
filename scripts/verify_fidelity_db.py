@@ -1,4 +1,3 @@
-"""补验：DB 原文完整性与活跃区状态（fidelity 测试库）。"""
 import sys
 import os
 import glob

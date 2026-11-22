@@ -1,18 +1,3 @@
-"""会话分享模块。
-
-设计目标：把会话导出为可分享的 Markdown/HTML 格式，便于团队协作和归档。
-参考：OpenCode 的 share 模块
-
-用法：
-- export_session_markdown(session_name): 导出为 Markdown
-- export_session_html(session_name): 导出为 HTML（含样式）
-- export_session_json(session_name): 导出为默认脱敏 JSON
-
-与 OpenCode 区别：
-- 不做服务端分享链接（Y-code 是本地工具）
-- 仅本地导出文件，用户自行分享
-"""
-
 import datetime
 import html
 import json
@@ -23,9 +8,6 @@ import core.app_context as app_context
 
 
 def default_export_dir():
-    """导出目录跟随 YCODE_DATA_DIR（与 permissions.json / 记忆文件一致），
-    未设置时回落 ~/.ycode/exports，保持既有默认位置不变。/diagram 图表
-    目录也建立在这一约定之上。"""
     try:
         import config
 
@@ -46,13 +28,11 @@ def _redact_export_text(value):
         pass
     text = re.sub(r"(?i)\bBearer\s+[^\s\"',;]+", "Bearer ***", text)
     text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text)
-    # 按 key 名匹配敏感字段：token/secret/password/key= 等 k=v / k:v 形式
     text = re.sub(
         r"(?i)(\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|auth|key)\s*[=:]\s*)[^\s,;&\"']+",
         r"\1***",
         text,
     )
-    # 常见 provider 密钥前缀（dash/underscore 分隔族 + Google AIza / AWS AKIA|ASIA / Google OAuth ya29.）
     text = re.sub(
         r"\b(?:sk|ghp|gho|ghu|ghs|ghr|glpat|hf|xoxb|xoxp|xoxa|xoxs)[-_][A-Za-z0-9_.-]{8,}\b",
         "***",
@@ -64,16 +44,13 @@ def _redact_export_text(value):
 
 
 def _escape_html(text):
-    """HTML 转义。"""
     return html.escape(str(text or ''), quote=True)
 
 
 def _format_message_markdown(msg):
-    """把单条消息格式化为 Markdown。"""
     role = msg.get('role', 'unknown')
     content = msg.get('content', '')
 
-    # 角色显示名：以“当前会话内的自称”为准（秘书会话 → 秘书名）
     try:
         from core.secretary import get_active_agent_name
         _assistant_label = get_active_agent_name()
@@ -86,7 +63,6 @@ def _format_message_markdown(msg):
         'tool': '工具结果',
     }.get(role, role)
 
-    # 内容可能是 list（多模态）
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -111,17 +87,7 @@ def _format_message_markdown(msg):
 
 
 def export_session_markdown(session_name, manager=None, output_path=None):
-    """导出会话为 Markdown 文件。
-
-    参数：
-    - session_name: 会话名
-    - manager: MemoryManager 实例（默认从 main 获取）
-    - output_path: 输出路径（默认 ~/.ycode/exports/<session>_<timestamp>.md）
-
-    返回：导出的文件路径，或错误信息
-    """
     if manager is None:
-        # 未显式传入时回落到运行时上下文（CLI / GUI 启动时都会注册）
         manager = app_context.get_manager()
     if manager is None:
         return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
@@ -130,7 +96,6 @@ def export_session_markdown(session_name, manager=None, output_path=None):
     if not history:
         return f"🚨 会话 {session_name!r} 没有历史记录"
 
-    # 生成 Markdown
     lines = [
         f"# 会话导出: {session_name}",
         f"",
@@ -141,14 +106,12 @@ def export_session_markdown(session_name, manager=None, output_path=None):
         "",
     ]
     for msg in history:
-        # 上下文块（system 角色）是运行时脚手架，不进入导出文件
         if msg.get("role") == "system":
             continue
         lines.append(_format_message_markdown(msg))
 
     markdown_content = '\n'.join(lines)
 
-    # 写文件
     if output_path is None:
         export_dir = default_export_dir()
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -166,7 +129,6 @@ def export_session_markdown(session_name, manager=None, output_path=None):
 def export_session_html(session_name, manager=None, output_path=None):
     """导出会话为 HTML 文件（含样式，便于阅读）。"""
     if manager is None:
-        # 未显式传入时回落到运行时上下文（CLI / GUI 启动时都会注册）
         manager = app_context.get_manager()
     if manager is None:
         return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
@@ -175,11 +137,9 @@ def export_session_html(session_name, manager=None, output_path=None):
     if not history:
         return f"🚨 会话 {session_name!r} 没有历史记录"
 
-    # 生成 HTML
     messages_html = []
     for msg in history:
         role = msg.get('role', 'unknown')
-        # 上下文块（system 角色）是运行时脚手架，不进入导出文件
         if role == 'system':
             continue
         content = msg.get('content', '')
@@ -207,7 +167,6 @@ def export_session_html(session_name, manager=None, output_path=None):
             'tool': 'tool',
         }.get(role, 'other')
 
-        # 角色显示名：以“当前会话内的自称”为准（秘书会话 → 秘书名）
         try:
             from core.secretary import get_active_agent_name
             _assistant_label = get_active_agent_name()
@@ -273,7 +232,6 @@ def export_session_html(session_name, manager=None, output_path=None):
 def export_session_json(session_name, manager=None, output_path=None):
     """导出可分享 JSON；默认移除推理并脱敏常见凭据。"""
     if manager is None:
-        # 未显式传入时回落到运行时上下文（CLI / GUI 启动时都会注册）
         manager = app_context.get_manager()
     if manager is None:
         return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"

@@ -1,5 +1,3 @@
-"""Tests for GUI -> desktop pet task notifications and stdin command framing."""
-
 from __future__ import annotations
 
 import io
@@ -96,12 +94,10 @@ def test_pet_notify_event_pushes_clears_and_dedups_errors(monkeypatch):
     bridge._pet_notify_event("permission_dismiss", {})
     assert cleared == [("question", "permission")]
 
-    # turn_error + immediate duplicate error -> only 1 push
     bridge._pet_notify_event("turn_error", {"message": "网络失败"})
     bridge._pet_notify_event("error", {"message": "网络失败"})
     assert len(pushed) == 2
 
-    # standalone error with different message -> pushes normally
     bridge._pet_notify_event("error", {"message": "未激活模型"})
     assert len(pushed) == 3
     assert "未激活模型" in pushed[2][0]

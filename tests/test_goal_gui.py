@@ -1,10 +1,3 @@
-"""`/goal` 的 GUI 接入测试：命令动作、桥分支与执行器的失败路径。
-
-刻意不启动任何真实回合：命令层是纯解析，桥的 `_run_slash_action` 只依赖
-post_notice，执行器用 `types.SimpleNamespace` 替身顶住桥接口。这样整组用例
-毫秒级完成，也不会因为某个用例真的跑起模型回合而污染开发者的会话数据。
-"""
-
 import types
 import time
 
@@ -16,7 +9,6 @@ from core.slash_commands.goal_command import handle_goal
 
 
 def test_empty_args_returns_help_action():
-    """不带目标 = 教用户怎么用，而不是报错（首次尝试 `/goal` 最常见）。"""
     result = handle_goal("")
 
     assert result["ok"] is True
@@ -24,7 +16,6 @@ def test_empty_args_returns_help_action():
 
 
 def test_keyword_stop_maps_to_goal_stop():
-    """控制关键词按整段完全相等匹配，不能当成一个叫 "stop" 的目标启动回合。"""
     result = handle_goal("stop")
 
     assert result["ok"] is True
@@ -32,7 +23,6 @@ def test_keyword_stop_maps_to_goal_stop():
 
 
 def test_goal_with_check_and_rounds():
-    """目标正文、验证命令与轮次上限都要原样透传给适配层。"""
     result = handle_goal("把测试跑绿 --check pytest -q --rounds 5")
 
     action = result["action"]
@@ -44,7 +34,6 @@ def test_goal_with_check_and_rounds():
 
 
 def test_non_numeric_rounds_is_rejected():
-    """非法轮次不能静默回落到默认值：那会让用户以为上限已生效。"""
     result = handle_goal("--rounds abc 目标")
 
     assert result["ok"] is False
@@ -52,16 +41,11 @@ def test_non_numeric_rounds_is_rejected():
 
 
 def test_turn_sources_include_goal_and_match_llm():
-    """桥与低层白名单必须一致，否则 goal 回合会在模型请求处直接抛错。"""
     assert "goal" in gui_bridge.TURN_SOURCES
     assert tuple(gui_bridge.TURN_SOURCES) == tuple(core.llm.COMPUTER_TURN_SOURCES)
 
 
 def test_executor_reports_failed_when_send_rejected():
-    """send_user_message 返回 ok=False → 本轮失败并带上桥给的错误文案。
-
-    只做替身：真实 ApiBridge.__init__ 会建库、注册 GUI 全局与线程池，与本层无关。
-    """
     bridge = types.SimpleNamespace(
         send_user_message=lambda *args, **kwargs: {"ok": False, "msg": "x"}
     )
@@ -74,7 +58,6 @@ def test_executor_reports_failed_when_send_rejected():
 
 
 class _NoticeCollector:
-    """最小桥替身：只实现 _run_slash_action 会用到的 post_notice。"""
 
     def __init__(self):
         self.notices = []
@@ -87,12 +70,6 @@ class _NoticeCollector:
 
 
 class _GoalBridgeStub(_NoticeCollector):
-    """目标分支的最小桥替身：把 ApiBridge 的目标方法原样挂过来，不跑 __init__。
-
-    为什么不直接 `ApiBridge._goal_stop(stub, ...)`：这些方法互相调用
-    `self._goal_runs_map()` / `self._goal_store()`，SimpleNamespace 拿不到未绑定
-    方法；在类体里按名字取过来，等于只替换掉 __init__ 建库/建线程池那部分。
-    """
 
     _GOAL_STATUS_TEXT = gui_bridge.ApiBridge._GOAL_STATUS_TEXT
     _GOAL_RESUMABLE = gui_bridge.ApiBridge._GOAL_RESUMABLE
@@ -117,19 +94,10 @@ class _GoalBridgeStub(_NoticeCollector):
         return {"ok": True}
 
     def _materialize_goal_session(self, session_name, workdir, goal, turn_source="local"):
-        """草稿落库/改名需要真实 DB，替身桥按“名字不变”处理。
-
-        只有专门验证落库的用例会覆盖它（那几条用例自己注入 _memory 桩）。
-        """
         return session_name
 
 
 def _make_draft_stub():
-    """目标启动链路的桥替身：记录草稿落库调用与每轮 send 的关键字参数。
-
-    真实落库/改名需要完整 DB，而这几条用例验证的是「workdir 有没有透传进来、
-    状态文件按哪个会话名存」，与斜杠派发同层的 post_notice/运行表沿用类体绑定。
-    """
     stub = _GoalBridgeStub()
     stub.materialize_calls = []
     stub.sent = []
@@ -138,7 +106,6 @@ def _make_draft_stub():
         stub.materialize_calls.append(
             {"session": session_name, "workdir": workdir, "goal": goal}
         )
-        # 落库不改名：命名交给首轮结束后的自动改名（那里会随迁目标状态）
         return session_name
 
     stub._materialize_goal_session = _materialize
@@ -167,12 +134,6 @@ def _wait_goal_runs_empty(stub, session_name, timeout=10):
 
 
 def test_goal_start_on_draft_session_materializes_with_workdir():
-    """草稿会话（未落库）里直接 /goal：必须按前端携带的目录落库，而不是丢掉 workdir。
-
-    回归场景：用户在小说项目分组点「新会话」后输入 /goal …，斜杠命令在首条消息
-    落库之前就地执行且提前返回，workdir 没人接——目标循环首轮把会话 ensure 成
-    进程启动目录（星瑶自己），于是会话归组、每轮 cwd、小说项目检测全部错位。
-    """
     stub = _make_draft_stub()
 
     result = stub._goal_start(
@@ -186,7 +147,6 @@ def test_goal_start_on_draft_session_materializes_with_workdir():
     call = stub.materialize_calls[0]
     assert call["workdir"] == "D:\\fengchenhao\\小说"
     assert call["session"] == "session_a1b2c3"
-    # 落库不改名：命名交给首轮结束后的自动改名（那里会随迁目标状态）
     assert result["session"] == "session_a1b2c3"
 
     _wait_goal_runs_empty(stub, "session_a1b2c3")
@@ -196,7 +156,6 @@ def test_goal_start_on_draft_session_materializes_with_workdir():
 
 
 def test_goal_start_without_workdir_skips_materialize():
-    """已落库会话里 /goal（不带 workdir）：不落库、不改名，行为与修复前一致。"""
     stub = _make_draft_stub()
 
     result = stub._goal_start(
@@ -204,7 +163,6 @@ def test_goal_start_without_workdir_skips_materialize():
     )
 
     assert result["ok"] is True
-    # 没带目录 → 原样返回（不落库、不改名），与修复前行为一致
     assert stub.materialize_calls[0]["workdir"] == ""
     assert result["session"] == "sess_existing"
     _wait_goal_runs_empty(stub, "sess_existing")
@@ -212,11 +170,6 @@ def test_goal_start_without_workdir_skips_materialize():
 
 
 def test_materialize_goal_session_persists_draft_with_workdir():
-    """真实 _materialize_goal_session：按 workdir 落库并切当前会话，不改名。
-
-    改名留给首轮结束后的自动命名：此刻前端还在等 send_user_message 返回，
-    在这里改名会让会话名与状态刷新抢跑（GoalBar 用旧名查空后不再轮询）。
-    """
     stub = _GoalBridgeStub()
     stub._materialize_goal_session = (
         gui_bridge.ApiBridge._materialize_goal_session.__get__(stub)
@@ -249,7 +202,6 @@ def test_materialize_goal_session_persists_draft_with_workdir():
 
 
 def test_materialize_goal_session_keeps_current_for_lan():
-    """LAN 分发同样带 workdir，但不能抢本地当前会话（与普通消息落库同口径）。"""
     stub = _GoalBridgeStub()
     stub._materialize_goal_session = (
         gui_bridge.ApiBridge._materialize_goal_session.__get__(stub)
@@ -271,7 +223,6 @@ def test_materialize_goal_session_keeps_current_for_lan():
 
 
 def test_materialize_goal_session_guards():
-    """不该动的场景一律原样返回：非草稿名、无 workdir、库里已存在同名会话。"""
     stub = _GoalBridgeStub()
     stub._materialize_goal_session = (
         gui_bridge.ApiBridge._materialize_goal_session.__get__(stub)
@@ -291,7 +242,6 @@ def test_materialize_goal_session_guards():
 
     assert stub._materialize_goal_session("real_name", "D:\\x", "目标") == "real_name"
     assert stub._materialize_goal_session("session_a1b2c3", "", "目标") == "session_a1b2c3"
-    # 已存在的草稿名会话（极端：库里已有行）也不重复落库
     assert (
         stub._materialize_goal_session("session_a1b2c3", "D:\\x", "目标")
         == "session_a1b2c3"
@@ -299,11 +249,6 @@ def test_materialize_goal_session_guards():
 
 
 def test_dispatch_slash_passes_workdir_and_model_into_goal_start():
-    """workdir/model_id 必须一路透传到 goal 分支：斜杠层丢参数就是这两次 bug 的根因。
-
-    workdir 丢了 → 目标会话挂到进程目录；model_id 丢了 → 草稿 /goal 落库的新会话
-    没有模型绑定，目标循环每轮回退全局默认模型（用户"用什么模型敲就用什么模型"）。
-    """
     stub = _make_draft_stub()
     stub._dispatch_slash = gui_bridge.ApiBridge._dispatch_slash.__get__(stub)
     stub._run_slash_action = gui_bridge.ApiBridge._run_slash_action.__get__(stub)
@@ -330,11 +275,6 @@ def test_dispatch_slash_passes_workdir_and_model_into_goal_start():
 
 
 def test_goal_start_inherits_triggering_model_on_draft_session():
-    """草稿 /goal 落库后必须把触发模型绑到目标会话：否则目标循环回退全局默认模型。
-
-    回归场景：用户用 A 模型敲 `/goal …`，草稿会话落库成新会话后没有任何模型绑定，
-    目标循环每轮 get_active_model(session) 都读到全局默认，看起来像"换了模型"。
-    """
     stub = _make_draft_stub()
     stub._known_model_ids = lambda: {"m-deepseek"}
     bound = []
@@ -359,13 +299,11 @@ def test_goal_start_inherits_triggering_model_on_draft_session():
     )
 
     assert result["ok"] is True
-    # 落库不改名，绑定必须落在最终会话名上；模型必须是用户触发时用的那个
     assert bound == [("session_a1b2c3", "m-deepseek")]
     _wait_goal_runs_empty(stub, "session_a1b2c3")
 
 
 def test_goal_start_keeps_existing_session_model():
-    """目标会话已有绑定时不覆盖：用户在该会话里显式选过模型，是更强的意图。"""
     stub = _make_draft_stub()
     stub._known_model_ids = lambda: {"m-deepseek", "m-other"}
     bound = []
@@ -394,11 +332,6 @@ def test_goal_start_keeps_existing_session_model():
 
 
 def test_run_slash_action_unwraps_goal_action_dict():
-    """/goal 的动作是"字典套字典"：桥必须解包内层，否则会落到未知动作分支。
-
-    这条用例守的是 gui_bridge._run_slash_action 顶部的解包逻辑——命令层改了
-    包装形状时，这里会第一时间红。
-    """
     collector = _NoticeCollector()
     stub = types.SimpleNamespace(post_notice=collector.post_notice)
 
@@ -412,10 +345,6 @@ def test_run_slash_action_unwraps_goal_action_dict():
 
 
 def test_goal_status_without_state_says_no_active_goal():
-    """没有状态文件是正常情况（用户只是问问），应当是一句提示而不是错误卡片。
-
-    conftest 把 YCODE_DATA_DIR 指到临时目录，所以这里读到的是"干净仓库"。
-    """
     stub = _GoalBridgeStub()
 
     result = stub._goal_status("session_none")
@@ -426,7 +355,6 @@ def test_goal_status_without_state_says_no_active_goal():
 
 
 def test_goal_stop_without_running_goal_is_a_notice():
-    """没有运行中的目标时 stop 不该报错，只说明当前没有可停止的循环。"""
     stub = _GoalBridgeStub()
 
     result = stub._goal_stop("session_none")
@@ -438,7 +366,6 @@ def test_goal_stop_without_running_goal_is_a_notice():
 
 
 def test_goal_stop_sets_cancel_event_and_stops_turn():
-    """运行表里有事件时必须置位，并把取消转给真实回合（否则要等整轮跑完）。"""
     import threading
 
     stub = _GoalBridgeStub()
@@ -453,12 +380,6 @@ def test_goal_stop_sets_cancel_event_and_stops_turn():
 
 
 def test_goal_start_drives_loop_through_stub_bridge():
-    """`_goal_start` → 后台线程 → run_goal_loop 全链路（替身桥，无真实回合）。
-
-    替身桥的回合"瞬间结束"（_is_turn_active 恒 False），记忆里固定回一条带达成
-    标记的助手消息，于是第 1 轮就该判成待确认。这条用例守住三件容易写错的事：
-    turn_source 必须是 goal、进度提示必须发到用户会话、线程结束后运行表要自清。
-    """
     stub = _GoalBridgeStub()
     stub._memory = types.SimpleNamespace(
         get_last_message_id=lambda name: 0,
@@ -479,9 +400,7 @@ def test_goal_start_drives_loop_through_stub_bridge():
         {"goal": "把测试跑绿", "check": "", "max_rounds": 1}, "sess_loop"
     )
 
-    # 返回值多带 session：草稿落库改名后前端要靠它对齐当前会话
     assert result == {"ok": True, "slash": True, "session": "sess_loop"}
-    # 等后台线程收尾（daemon 线程没有句柄，只能按运行表收敛等待）
     deadline = time.time() + 10
     while time.time() < deadline and "sess_loop" in stub._goal_runs_map():
         time.sleep(0.05)
@@ -501,7 +420,6 @@ def test_goal_start_drives_loop_through_stub_bridge():
 
 
 def test_migrate_goal_state_follows_session_rename():
-    """会话改名后目标状态必须跟着改键：否则状态条/停止/继续全都查不到目标。"""
     import threading
 
     from core.slash_commands.goal.state import GoalState
@@ -528,7 +446,6 @@ def test_migrate_goal_state_follows_session_rename():
 
 
 def test_migrate_goal_state_is_noop_without_goal():
-    """没有目标的会话改名是空操作：不能因为改名就往 goals/ 写空文件。"""
     stub = _GoalBridgeStub()
     stub._migrate_goal_state = gui_bridge.ApiBridge._migrate_goal_state.__get__(stub)
     store = stub._goal_store()
@@ -541,8 +458,6 @@ def test_migrate_goal_state_is_noop_without_goal():
 
 
 def test_auto_rename_skips_session_with_running_goal():
-    """目标循环在跑时不许自动改名：循环闭包记的是旧名，改名后后续轮次会
-    写进旧名的幽灵会话（用户看到"目标还在跑，消息却进了另一个会话"）。"""
     import threading
 
     stub = _GoalBridgeStub()
@@ -558,7 +473,6 @@ def test_auto_rename_skips_session_with_running_goal():
 
 
 def test_manual_rename_rejected_while_goal_running():
-    """手动改名同样要拦：理由与自动改名一致，且失败文案要说清怎么解开。"""
     import threading
 
     stub = _GoalBridgeStub()
@@ -577,12 +491,7 @@ def test_manual_rename_rejected_while_goal_running():
     assert result["name"] == "session_bbb222"
 
 
-# ---------------------------------------------------------------------------
-# 四、待确认状态的确认入口（回归：状态条只有「停止」，用户无处确认）
-# ---------------------------------------------------------------------------
-
 def test_confirm_keyword_maps_to_goal_confirm():
-    """`/goal confirm` 必须映射到确认动作：自评档的达成要由用户点头才收尾。"""
     result = handle_goal("confirm")
 
     assert result["ok"] is True
@@ -590,11 +499,6 @@ def test_confirm_keyword_maps_to_goal_confirm():
 
 
 def test_goal_confirm_marks_awaiting_state_achieved():
-    """待确认 → 确认达成：只在这一态改状态，并把 achieved 落盘。
-
-    回归场景：循环停在 awaiting_confirm 等用户确认，但当时既没有 `/goal confirm`
-    也没有状态条按钮，用户看到「待确认」却只能"停止"。
-    """
     from core.slash_commands.goal.state import (
         STATUS_ACHIEVED,
         STATUS_AWAITING_CONFIRM,
@@ -624,7 +528,6 @@ def test_goal_confirm_marks_awaiting_state_achieved():
 
 
 def test_goal_confirm_rejects_running_state():
-    """运行中不能确认：提前点头会把剩余轮次吞掉，状态必须原样不动。"""
     from core.slash_commands.goal.state import STATUS_RUNNING, GoalState
 
     stub = _GoalBridgeStub()
@@ -639,4 +542,3 @@ def test_goal_confirm_rejects_running_state():
     assert store.load(session).status == STATUS_RUNNING
     assert any("无需确认" in item["message"] for item in stub.notices)
     store.clear(session)
-

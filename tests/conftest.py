@@ -1,5 +1,3 @@
-"""让测试收集阶段就与真实 ~/.ycode 运行数据完全隔离。"""
-
 import atexit
 import gc
 import logging
@@ -18,17 +16,6 @@ atexit.register(shutil.rmtree, _TEST_DATA_DIR, ignore_errors=True)
 
 @pytest.fixture(autouse=True)
 def _restore_entry_layer_globals():
-    """每个测试结束后还原入口层进程级全局与 GUI 回调。
-
-    真实构造 ApiBridge()（如 tests/test_gui_update.py）会在 __init__ 中注册
-    GUI 上下文、ui_flavor="gui" 和全局 broker 的权限应答通道；这些残留会让
-    后续测试里任何走到权限询问的路径 enqueue 后永远等待不存在的 GUI 提示
-    ——全量套件在 test_harness_runtime 挂起的根因（D1，见
-    docs/superpowers/reviews/2026-08-29-full-test-findings-and-fix-plan.md）。
-    快照/还原保证测试之间互不污染，而不是只修补个别测试。
-    线程级电脑操控 handoff（core.computer.capability）同样按「测试后清空」处理：
-    它是一次性取出语义，桩掉模型入口的测试会让它残留到同线程的下一个测试。
-    """
     from core import app_context
     from core import llm
     from core import mcp_client
@@ -88,30 +75,27 @@ def _restore_entry_layer_globals():
         _clear_sandbox_state_for_tests()
     except Exception:
         pass
-    # 线程级电脑操控 handoff 是「一次性取出」语义：桩掉 _consume_turn_events 的
-    # 测试（如 test_gui_automation_dispatch 的 _WorkerHarness）会在 prepare 阶段
-    # 存入却无人取出，泄漏给同线程的下一个测试——对方直接从 handoff 拿到能力
-    # 快照，不再走 resolve_computer_capability，表现为组合跑才出现的假失败。
     try:
         from core.computer.capability import take_turn_computer_capability
 
         take_turn_computer_capability()
     except Exception:
         pass
-    # 用户停止电脑操控的抑制态同样是进程级模块变量（core/computer/stop_notice.py）：
-    # 紧急热键用例会真的走 controller.stop_for_user 并置位它，残留后同进程后续用例的
-    # start_run / computer_turn_context_error 会被硬拦成 computer_user_stopped
-    # ——只在组合跑才出现的假失败。
     try:
         from core.computer import stop_notice
 
         stop_notice.deactivate_user_stop("test_reset")
     except Exception:
         pass
+    feishu_bridge_mod = sys.modules.get("core.feishu.bridge")
+    if feishu_bridge_mod is not None and hasattr(feishu_bridge_mod, "stop_all_watchdogs"):
+        try:
+            feishu_bridge_mod.stop_all_watchdogs()
+        except Exception:
+            pass
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """Windows 下先释放真实持有句柄，再删除隔离目录。"""
     managers = []
     main_module = sys.modules.get("main")
     if main_module is not None:

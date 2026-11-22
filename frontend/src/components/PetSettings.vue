@@ -21,7 +21,6 @@
       :class="messageOk ? 'pet-banner-ok' : 'pet-banner-err'"
     >{{ message }}</p>
 
-    <!-- 1. 核心状态栏（Hero Card） -->
     <section class="pet-card pet-hero">
       <div class="pet-hero-left">
         <div class="pet-hero-info">
@@ -68,7 +67,6 @@
       </div>
     </section>
 
-    <!-- 缺运行时 / 安装进度（仅在需要时出现） -->
     <section v-if="bridgeReady && !available" class="pet-warn" data-test="pet-unavailable">
       <div class="pet-warn-head">
         <strong>需要 Electron 运行时（约 151 MB）</strong>
@@ -113,7 +111,6 @@
       >重试</button>
     </section>
 
-    <!-- 2. 宠物形象与集成 -->
     <section class="pet-card">
       <div class="pet-section-head">
         <div>
@@ -162,7 +159,6 @@
             </span>
           </button>
 
-          <!-- 自定义桌宠管理操作：编辑人设 / 删除 -->
           <div v-if="s.source === 'user'" class="pet-skin-ops">
             <button
               class="pet-skin-op-btn"
@@ -184,7 +180,6 @@
       <p v-if="!skins.length" class="pet-note" data-test="pet-skins-empty">还没有可用的宠物形象。</p>
     </section>
 
-    <!-- 3. 互动与 AI 说话 -->
     <section class="pet-card">
       <div class="pet-section-head">
         <div>
@@ -232,7 +227,6 @@
           </label>
         </div>
 
-        <!-- 仅在开启「无聊时自己说话」时展开参数配置，保持界面清爽 -->
         <div v-if="chatEnabled" class="pet-chat-subpanel">
           <label class="pet-chat-field">
             <span class="pet-chat-field-label">空闲多久算无聊</span>
@@ -270,7 +264,6 @@
       </div>
     </section>
 
-    <!-- 4. 高级设置（默认折叠） -->
     <details class="pet-card pet-advanced">
       <summary class="pet-advanced-summary">
         <span>高级设置与运行环境</span>
@@ -310,7 +303,6 @@
       </div>
     </details>
 
-    <!-- 导入桌宠弹窗 -->
     <div v-if="importModal.open" class="pet-modal-backdrop" @click.self="closeImportModal">
       <div class="pet-modal" data-test="pet-import-modal">
         <header class="pet-modal-head">
@@ -400,7 +392,6 @@
       </div>
     </div>
 
-    <!-- 编辑人设弹窗 -->
     <div v-if="editModal.open" class="pet-modal-backdrop" @click.self="closeEditModal">
       <div class="pet-modal" data-test="pet-edit-modal">
         <header class="pet-modal-head">
@@ -702,10 +693,6 @@ async function sendTestBubble() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 导入自定义桌宠 / 编辑人设 / 删除
-// ---------------------------------------------------------------------------
-
 const importModal = reactive({
   open: false,
   mode: 'images' as 'images' | 'zip',
@@ -884,10 +871,6 @@ async function removeSkin(skin: PetSkinDto) {
     skinBusy.value = false;
   }
 }
-
-// ---------------------------------------------------------------------------
-// 开关与运行时安装
-// ---------------------------------------------------------------------------
 
 function onToggleChange(event: Event) {
   const target = event.target as HTMLInputElement | null;
@@ -1071,10 +1054,6 @@ async function toggleNotify(next: boolean) {
     notifyBusy.value = false;
   }
 }
-
-// ---------------------------------------------------------------------------
-// 无聊时自己说话
-// ---------------------------------------------------------------------------
 
 const chatIdlePresets = [300, 600, 1800];
 const chatEnabled = ref(false);
@@ -1265,7 +1244,6 @@ onUnmounted(() => {
 }
 .refresh-button:hover { color: var(--text); background: var(--bg3); }
 
-/* 提示条 */
 .pet-banner {
   margin: 0;
   padding: 10px 14px;
@@ -1289,7 +1267,6 @@ onUnmounted(() => {
   background: var(--bg2);
 }
 
-/* 卡片容器 */
 .pet-card {
   padding: 18px 20px;
   border: 1px solid var(--border);
@@ -1297,7 +1274,6 @@ onUnmounted(() => {
   background: var(--bg1);
 }
 
-/* Hero 状态卡 */
 .pet-hero {
   display: flex;
   align-items: center;
@@ -1349,7 +1325,6 @@ onUnmounted(() => {
 .pet-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); }
 .pet-dot.on { background: var(--green); }
 
-/* 滑动开关 Switch */
 .switch { position: relative; display: inline-flex; align-items: center; cursor: pointer; flex: none; }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
 .switch-track {
@@ -1385,7 +1360,6 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
-/* 按钮体系 */
 .primary-button, .secondary-button, .ghost-button {
   min-height: 34px;
   padding: 0 14px;
@@ -1404,7 +1378,6 @@ onUnmounted(() => {
 .ghost-button:hover:not(:disabled) { color: var(--text); background: var(--bg2); }
 .primary-button:disabled, .secondary-button:disabled, .ghost-button:disabled { opacity: .5; cursor: not-allowed; }
 
-/* 运行时警告与进度 */
 .pet-warn {
   padding: 12px 16px;
   border: 1px solid color-mix(in srgb, var(--theme-warning) 35%, var(--border));
@@ -1424,7 +1397,6 @@ onUnmounted(() => {
 .pet-progress-fill { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width .2s linear; }
 .pet-runtime-retry { margin-top: 8px; }
 
-/* 分区标题 */
 .pet-section-head {
   display: flex;
   align-items: flex-start;
@@ -1436,7 +1408,6 @@ onUnmounted(() => {
 .pet-section-desc { margin: 0; color: var(--text-faint); font-size: 12px; line-height: 1.5; }
 .pet-section-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 
-/* 宠物形象网格 */
 .pet-skin-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
@@ -1533,7 +1504,6 @@ onUnmounted(() => {
 .pet-skin-op-btn:hover { background: var(--bg3); color: var(--text); }
 .pet-skin-op-danger:hover { color: var(--theme-danger); }
 
-/* 互动开关列表 */
 .pet-setting-list { display: flex; flex-direction: column; }
 .pet-setting-row {
   display: flex;
@@ -1571,7 +1541,6 @@ onUnmounted(() => {
 }
 .pet-chat-select:disabled { opacity: .6; cursor: not-allowed; }
 
-/* 高级设置折叠面板 */
 .pet-advanced { padding: 0; overflow: hidden; }
 .pet-advanced-summary {
   display: flex;
@@ -1625,7 +1594,6 @@ onUnmounted(() => {
 .pet-skin-dir { display: block; color: var(--text-faint); font-size: 11.5px; word-break: break-all; }
 .pet-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
 
-/* 弹窗 */
 .pet-modal-backdrop {
   position: fixed;
   inset: 0;

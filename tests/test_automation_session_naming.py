@@ -1,5 +1,3 @@
-"""星轨自动化任务：运行会话名生成（纯函数层）。"""
-
 from datetime import datetime
 
 from core.automation.models import MAX_SESSION_CHARS

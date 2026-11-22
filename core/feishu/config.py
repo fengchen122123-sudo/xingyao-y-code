@@ -1,8 +1,3 @@
-"""飞书通道配置读取（只读；写入在 gui_bridge 的设置接口里）。
-
-配置键定义在根 `config.py`，密钥写盘前经 `core.credentials` 加密。
-"""
-
 from dataclasses import dataclass, field
 from typing import List
 
@@ -63,7 +58,6 @@ def load_feishu_config() -> FeishuConfig:
         try:
             secret = (unprotect_secret(raw_secret) or "").strip()
         except Exception:
-            # 解密失败（换机器/换用户）按未配置处理，不让启动链崩溃
             secret = ""
 
     return FeishuConfig(

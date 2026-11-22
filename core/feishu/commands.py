@@ -1,12 +1,3 @@
-"""飞书指令集：解析 `/xxx` 并构造对应的卡片（对齐 opencode-mobile 的指令表）。
-
-指令表：/help /panel /status /new [标题] /list /switch <序号> /model [名] /agent /inbox /stop
-除斜杠指令外的任何消息都直接作为 prompt 发给当前绑定的星瑶会话。
-
-翻页是**无状态**的：页码放在按钮的 callback value 里（`{"kind":"cmd","cmd":"/list","arg":"page:2"}`），
-服务端不保存翻页游标——与 opencode-mobile 的「无状态翻页」一致。
-"""
-
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.feishu.cards import (
@@ -71,11 +62,6 @@ def permission_mode_label(mode: str) -> str:
 
 
 def whoami_text(*, open_id: str, chat_id: str, allowed: bool) -> str:
-    """`/whoami` 回执：给出填白名单要用的 open_id。
-
-    注意 open_id 是「本应用视角」的用户标识——同一个人的 open_id 在不同应用里不同，
-    所以必须用星瑶自己看到的这个值去填白名单。
-    """
     lines = [
         "你的 open_id（复制到「设置 → 飞书集成 → 审批白名单」即可）：",
         open_id or "（拿不到 open_id：请确认应用已开通 im:message 权限）",
@@ -209,11 +195,6 @@ def status_card(*, session_label: str, session_name: str, workdir: str, model_na
 
 
 def session_list_card(*, sessions: List[Dict[str, Any]], current_session: str, page: int) -> Dict[str, Any]:
-    """会话列表卡：当前项打标 + 点按钮切换 + 无状态翻页。
-
-    每项显示工作目录（与桌面侧栏一致）：自由对话显示「自由对话」，项目会话显示其目录。
-    排序沿用后端顺序——**分组内按创建时间倒序**（最新建的在前），不是按最近活跃时间。
-    """
     elements: List[Dict[str, Any]] = [
         btn_flow([btn("🆕 新建会话", "primary", {"kind": "cmd", "cmd": "/new"})]),
     ]

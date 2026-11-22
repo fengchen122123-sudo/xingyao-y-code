@@ -1,5 +1,3 @@
-"""core/git/repository.py 测试：仓库发现、Worktree/Detached/Unborn/Bare 识别（规格 §5.1）。"""
-
 from pathlib import Path
 
 import pytest

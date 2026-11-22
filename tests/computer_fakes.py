@@ -1,35 +1,3 @@
-"""电脑操控测试共享 fixture 契约（计划 Cross-Task Interface Contract）。
-
-Task 3 已提供 use_temp_config；Task 4 补充 enabled_settings fixture、
-openai_compatible_provider() 数据 helper 与 capability 常量
-GENERIC_CAPABILITY / NATIVE_BROWSER_CAPABILITY / DISABLED_CAPABILITY；
-Task 5 补充 FakeHotkeyApi、fake_png_bytes(seed) 与 http_status(url)；
-Task 6 补充 FakePlaywrightRuntime / FakeBrowserContext / FakePage /
-FakeMouse / FakeKeyboard（记录 launch 参数、page 调用与每个调用的 thread id，
-可注入 error，绝不启动真实浏览器）；
-本 Task（Task 7）补充 FakeImage / FakeWin32Adapter（虚拟桌面截图与 SendInput
-的纯 fake：记录点击/移动/滚轮/文本/组合键，支持 fail_after 注入失败与
-secure desktop/无前台窗口/尺寸不一致场景，绝不触碰真实截屏、鼠标或键盘）。
-Task 8 补充 FakeComputerBackend（ComputerBackend 协议纯 fake：记录
-start/observe/execute/release_inputs/close 调用计数与线程，支持注入截图 hash
-序列控制 no-progress、注入 observe/execute/close 错误、execute_gate 阻塞验证
-动作串行，绝不触碰真实键鼠/浏览器）。
-Task 9 补充 FakeController（ComputerControlService 最小 fake：固定 run/owner、
-记录动作、按序注入观察或错误、snapshot 暴露 action_count，供固定适配器测试；
-绝不触碰真实键鼠/浏览器/截屏）。
-Task 13a 补充 FakeBridgeController（ComputerControlService 的 GUI Bridge fake：
-listener 注册/事件发射 + start_run(run_id=)/pause/resume/stop 透传记录与
-run_id 拒绝语义，供 Bridge 事件桥与控制 API 测试；绝不触碰真实键鼠/浏览器/截屏）。
-Task 16 给 FakeComputerBackend 增补 png_path（观察携带的虚拟截图路径，不读
-真实文件，供预览发布接线与隐私审计测试）。
-元素定位修复 E1 给 FakePage 增补元素收集脚本注入点（element_collect_result /
-element_collect_error，默认空列表，保证既有测试零影响）。
-元素定位修复 E2 给 FakePage 增补 locator 记录点（locator_calls / last_locator，
-FakeLocator 记录 click/fill 参数并支持异常注入），FakeKeyboard 增补 type
-（set_value_element 的键盘回落路径）。
-其余请求捕获 helper 由后续 Task 按需在本文件扩展，禁止平行实现。
-"""
-
 import json
 import os
 import threading
@@ -56,17 +24,9 @@ from core.computer.settings import ComputerSettingsSnapshot
 
 
 def use_temp_config(tmp_path, monkeypatch, values):
-    """把 values 写入临时 config.json 并 monkeypatch 指向它，返回 config 路径（Path）。
-
-    同时把 TOML overlay 指向同目录下不存在的 config.toml，隔离真实
-    ~/.ycode/config.toml 对读取结果的只读覆盖。
-    """
     cfg = tmp_path / "config.json"
-    # 空 dict 会被 config.py 写闸门判为读失败而拒写，故补最小可用结构。
     payload = values if values else {"active_model_id": None, "providers": []}
     cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    # 配置读取按 mtime 缓存。同一秒里连写两次会被当成没变。
-    # 增量只加几秒，避免戳到文件系统的时间上限后被夹成同一个值。
     use_temp_config._seq = getattr(use_temp_config, "_seq", 0) + 1
     stamp = time.time() + use_temp_config._seq
     os.utime(cfg, (stamp, stamp))
@@ -77,7 +37,6 @@ def use_temp_config(tmp_path, monkeypatch, values):
 
 @pytest.fixture
 def enabled_settings():
-    """两个开关均开启、Windows 平台、edge 浏览器的设置快照。"""
     return ComputerSettingsSnapshot(
         browser_control_enabled=True,
         computer_control_enabled=True,
@@ -90,7 +49,6 @@ def enabled_settings():
 
 
 def openai_compatible_provider() -> dict:
-    """OpenAI 兼容（非官方）provider dict；generic 路径不校验 provider 字段。"""
     return {"protocol": "openai", "base_url": "https://api.deepseek.com"}
 
 
@@ -110,7 +68,6 @@ NATIVE_BROWSER_CAPABILITY = ComputerCapability(
     settings_generation=1,
 )
 
-# Task 11a：browser 与 desktop 双 target 同时开启的原生能力快照。
 NATIVE_DUAL_TARGET_CAPABILITY = ComputerCapability(
     enabled=True,
     protocol="native_openai",
@@ -126,16 +83,10 @@ DISABLED_CAPABILITY = ComputerCapability(
 )
 
 
-# ---------------- Task 5 导出：热键 fake 与预览服务 helper ----------------
-
-
 class FakeHotkeyApi:
-    """最小确定性 HotkeyApi fake：只记录注册/注销，绝不触碰真实系统热键。"""
 
     def __init__(self, register_result: bool = True, last_error_code: int = 0):
         self._register_result = register_result
-        # 与 WindowsHotkeyApi 对齐的可选诊断字段：注册失败时携带 Win32 错误码，
-        # 供 EmergencyStopHotkey 生成可读原因（如 1409 = 热键已被占用）。
         self.last_error_code = last_error_code
         self.register_calls = 0
         self.unregister_calls = 0
@@ -153,12 +104,10 @@ class FakeHotkeyApi:
 
 
 def fake_png_bytes(seed: int) -> bytes:
-    """确定性伪 PNG 字节：合法 PNG 魔数 + seed 派生内容；仅供预览服务测试。"""
     return b"\x89PNG\r\n\x1a\n" + b"fake" + int(seed).to_bytes(4, "big", signed=False)
 
 
 def http_status(url: str) -> int:
-    """GET 一次并返回 HTTP 状态码；HTTPError（如 404）返回其 code。"""
     request = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -167,16 +116,12 @@ def http_status(url: str) -> int:
         return int(error.code)
 
 
-# ---------------- Task 6 导出：Playwright fake（绝不启动真实浏览器） ----------------
-
-
 class FakeMouse:
-    """page.mouse fake：按调用顺序记录 (name, *args)，可注入 move/up 失败。"""
 
     def __init__(self, runtime):
         self._runtime = runtime
         self.calls = []
-        self.move_fail_after = None  # 第 N+1 次 move 起抛 RuntimeError
+        self.move_fail_after = None
         self.up_error = None
         self._move_count = 0
 
@@ -211,12 +156,6 @@ class FakeMouse:
 
 
 class FakeKeyboard:
-    """page.keyboard fake：记录 press/insert_text/down/up。
-
-    - ``down_fail_after``：第 N+1 次 down 起抛 ``down_error``（默认
-      RuntimeError），用于验证部分按下后的逆序释放；
-    - ``up_error``：up 时抛出，用于验证释放失败保留按下记录。
-    """
 
     def __init__(self, runtime):
         self._runtime = runtime
@@ -235,7 +174,6 @@ class FakeKeyboard:
         self.calls.append(("insert_text", text))
 
     def type(self, text, **kwargs):
-        # E2：set_value_element 的 fill 回落路径（点击聚焦 + 键盘逐字符输入）。
         self._runtime._record_call("keyboard.type")
         self.calls.append(("type", text))
 
@@ -254,16 +192,6 @@ class FakeKeyboard:
 
 
 class FakeLocator:
-    """page.locator() fake（E2 元素动作）：记录 selector 与 click/fill 调用参数。
-
-    - ``click_calls``：按序记录 click 的 kwargs（含 timeout）；
-    - ``fill_calls``：按序记录 (text, kwargs)；
-    - ``click_error`` / ``fill_error``：注入异常，验证元素语义错误码与
-      set_value_element 的键盘回落路径；
-    - ``count_result``：locator.count() 返回值，用于验证「元素不在 DOM →
-      stale」的失效判定（E2 评审修复）；
-    - 绝不触碰真实页面 DOM 或 Playwright。
-    """
 
     def __init__(self, selector):
         self.selector = selector
@@ -287,16 +215,51 @@ class FakeLocator:
         return self.count_result
 
 
+class FakeElementHandle:
+
+    def __init__(self, ref, *, attached=True, click_error=None, fill_error=None):
+        self.ref = ref
+        self.attached = attached
+        self.click_calls = []
+        self.fill_calls = []
+        self.click_error = click_error
+        self.fill_error = fill_error
+        self.disposed = False
+
+    def as_element(self):
+        return self if self.attached else None
+
+    def click(self, **kwargs):
+        self.click_calls.append(dict(kwargs))
+        if self.click_error is not None:
+            raise self.click_error
+
+    def fill(self, text, **kwargs):
+        self.fill_calls.append((text, dict(kwargs)))
+        if self.fill_error is not None:
+            raise self.fill_error
+
+    def dispose(self):
+        self.disposed = True
+
+
 class FakePage:
-    """page fake：记录 goto/导航/截图调用，支持 closed 标记与错误/阻塞注入。"""
 
     def __init__(self, runtime, url="about:blank", title="", screenshot_bytes=None):
+        from core.computer.browser_backend import (
+            ELEMENT_COLLECT_SCRIPT,
+            ELEMENT_HIT_SCRIPT,
+            PAGE_TEXT_SCRIPT,
+        )
+
+        self._element_collect_script = ELEMENT_COLLECT_SCRIPT
+        self._element_hit_script = ELEMENT_HIT_SCRIPT
+        self._page_text_script = PAGE_TEXT_SCRIPT
         self._runtime = runtime
         self._context = None
         self.url = url
         self.page_title = title
         self.closed = False
-        # R5 可见性探针字段：document.visibilityState / document.hasFocus()
         self.visibility_state = "visible"
         self.focused = True
         self.mouse = FakeMouse(runtime)
@@ -306,31 +269,23 @@ class FakePage:
         self.navigation_kwargs = []
         self.screenshot_calls = []
         self.evaluate_calls = []
-        self.screenshot_bytes = screenshot_bytes  # None 时回落到 runtime.screenshot_bytes
+        self.screenshot_bytes = screenshot_bytes
         self.screenshot_error = None
-        self.screenshot_gate = None  # threading.Event：设置后 screenshot 阻塞等待
+        self.screenshot_gate = None
         self.screenshot_delay = 0.0
         self.concurrency_violations = 0
         self._inside_screenshot = False
-        # E1 元素收集脚本注入点：None 表示返回空列表（既有测试零影响）；
-        # error 非空时 evaluate 抛错，用于验证「收集失败不中断 observe」；
-        # hook 非空时在收集脚本求值后调用（测试模拟收集期间页面变化）。
         self.element_collect_result = None
         self.element_collect_error = None
         self.element_collect_hook = None
-        # E3 视觉点击点脚本注入点：None 表示求值失败（或没有可用中心点），
-        # click_element 回落 locator.click，与旧行为一致；给出 dict 时按
-        # contains/inViewport 决定是否走 page.mouse.click。
         self.element_hit_result = None
-        # B 方案（窗口被遮挡时的降级观察）：页面正文本注入点。默认空串；
-        # error 非空时 evaluate 抛错，用于验证「正文读取失败不中断 observe」。
+        self.element_attached = True
+        self.doc_token = "fake-doc-1"
         self.page_text = ""
         self.page_text_error = None
-        # E2 元素动作注入点：locator 调用记录（selector 列表）与最近创建的
-        # FakeLocator（供断言 click/fill 参数与异常注入路径）；预设字段
-        # 在 locator 创建时应用到新对象（execute 前设置即可注入失败/命中数）。
         self.locator_calls = []
         self.last_locator = None
+        self.last_element_handle = None
         self.locator_click_error = None
         self.locator_fill_error = None
         self.locator_count = 1
@@ -340,7 +295,13 @@ class FakePage:
         return self.closed
 
     def evaluate(self, expression, *args, **kwargs):
-        """仅支持 R5 可见性探针、E1 元素收集与正文提取脚本；其他表达式一律拒绝（隐私边界）。"""
+        from core.computer.browser_backend import (
+            ELEMENT_COLLECT_SCRIPT,
+            ELEMENT_HIT_SCRIPT,
+            ELEMENT_WAIT_PROBE_SCRIPT,
+            PAGE_TEXT_SCRIPT,
+        )
+
         self._runtime._record_call("page.evaluate")
         self.evaluate_calls.append(expression)
         if expression == ELEMENT_COLLECT_SCRIPT:
@@ -352,22 +313,41 @@ class FakePage:
             return [] if result is None else result
         if expression == ELEMENT_HIT_SCRIPT:
             return self.element_hit_result
+        if expression == ELEMENT_WAIT_PROBE_SCRIPT:
+            return getattr(
+                self,
+                "element_wait_probe_result",
+                {"stale": False, "exists": True, "enabled": True},
+            )
         if expression == PAGE_TEXT_SCRIPT:
             if self.page_text_error is not None:
                 raise self.page_text_error
             return self.page_text
+        if "docToken" in str(expression):
+            return self.doc_token
         if "visibilityState" in str(expression) and "hasFocus" in str(expression):
             return [self.visibility_state, self.focused]
         raise AssertionError(
             f"fake page 只允许可见性探针、元素收集与正文提取脚本，拒绝 evaluate: {expression!r}"
         )
 
+    def evaluate_handle(self, expression, arg=None):
+        self._runtime._record_call("page.evaluate_handle")
+        ref = arg.get("id") if isinstance(arg, dict) else arg
+        handle = FakeElementHandle(
+            ref,
+            attached=self.element_attached and (self.locator_count > 0),
+            click_error=self.locator_click_error,
+            fill_error=self.locator_fill_error,
+        )
+        self.last_element_handle = handle
+        return handle
+
     def title(self):
         self._runtime._record_call("page.title")
         return self.page_title
 
     def locator(self, selector):
-        """E2：返回记录型 FakeLocator；每次调用创建独立对象并记为最近对象。"""
         self._runtime._record_call("page.locator")
         self.locator_calls.append(selector)
         locator = FakeLocator(selector)
@@ -422,7 +402,6 @@ class FakePage:
 
 
 class FakeBrowserContext:
-    """persistent context fake：pages 列表、page/close 事件、new_page 计数。"""
 
     def __init__(self, runtime, pages=()):
         self._runtime = runtime
@@ -447,10 +426,6 @@ class FakeBrowserContext:
         return page
 
     def simulate_popup(self, url="https://popup.example/", title="Popup"):
-        """测试专用：模拟用户/脚本打开的 popup，触发 context 的 page 事件。
-
-        模拟真实焦点转移（R5）：既有页转为 hidden/失焦，新 popup 可见且聚焦。
-        """
         for page in self.pages:
             if not page.closed:
                 page.visibility_state = "hidden"
@@ -474,7 +449,6 @@ class FakeBrowserContext:
 
 
 class FakeChromium:
-    """runtime.chromium fake：记录 launch_persistent_context 参数与 channel。"""
 
     def __init__(self, runtime):
         self._runtime = runtime
@@ -492,14 +466,6 @@ class FakeChromium:
 
 
 class FakePlaywrightRuntime:
-    """sync_playwright() 上下文管理器 fake。
-
-    - ``error``：launch_persistent_context 时抛出（记录 channel 后再抛）；
-    - ``start_error``：runtime.start() 时抛出；
-    - ``start_thread_id`` 记录 runtime 启动线程；``call_thread_ids`` 按序记录
-      每个 fake Playwright 调用的 thread id，用于断言 worker 线程独占；
-    - 绝不启动真实浏览器、绝不导入 playwright。
-    """
 
     def __init__(self, error=None, initial_pages=(), screenshot_bytes=None, start_error=None):
         self.error = error
@@ -537,18 +503,7 @@ class FakePlaywrightRuntime:
         self.stopped = True
 
 
-# ---------------- Task 7 导出：Windows 桌面截图与 SendInput fake ----------------
-
-
 class FakeImage:
-    """Pillow Image 的纯 fake：只携带尺寸与虚拟桌面原点，绝不真实截屏。
-
-    - ``size``/``resize()``/``save()`` 与 Pillow 最小接口对齐；
-    - ``save()`` 写入由 (width, height, origin_x, origin_y) 决定的确定性字节，
-      并把调用参数记录到 ``saved_with`` 供断言确定参数编码；
-    - 默认 origin 为 (0, 0)；brief 样例使用的 3840x2160 @ (-1920, 0) 模拟
-      主屏右侧 + 左侧扩展屏的多显示器虚拟桌面。
-    """
 
     def __init__(self, width, height, origin_x=0, origin_y=0):
         self.width = width
@@ -568,7 +523,6 @@ class FakeImage:
         return FakeImage(size[0], size[1], self.origin_x, self.origin_y)
 
     def crop(self, box):
-        """R10：区域裁剪 fake；只记录并返回区域尺寸的确定性 FakeImage。"""
         self.crop_calls.append(tuple(box))
         return FakeImage(box[2] - box[0], box[3] - box[1], self.origin_x, self.origin_y)
 
@@ -585,16 +539,6 @@ class FakeImage:
 
 
 class FakeWin32Adapter:
-    """Win32InputAdapter 的纯 fake：记录全部输入，绝不触碰真实 SendInput/截屏。
-
-    - ``virtual_rect`` 默认 (-1920, 0, 3840, 2160)，与 brief 样例的
-      FakeImage(3840, 2160, origin_x=-1920) 多屏虚拟桌面一致；
-    - ``fail_after``：第 fail_after+1 个底层输入事件起抛
-      computer_input_rejected（模拟 SendInput 部分失败/UIPI 拒绝）；
-    - ``desktop_name``/``has_foreground`` 用于构造 secure desktop 与
-      无前台窗口场景；``preflight_error`` 直接注入 preflight 失败；
-    - ``keys_down``/``buttons_down`` 暴露按下状态，验证 finally 释放。
-    """
 
     def __init__(self, *, virtual_rect=(-1920, 0, 3840, 2160), desktop_name="Default",
                  has_foreground=True, foreground_title="Fake Window", foreground_id=1001,
@@ -603,7 +547,7 @@ class FakeWin32Adapter:
         self.desktop_name = desktop_name
         self.has_foreground = has_foreground
         self.foreground_title = foreground_title
-        self.foreground_id = foreground_id  # R5：前台窗口本地身份，测试可改写模拟切窗
+        self.foreground_id = foreground_id
         self.preflight_error = preflight_error
         self.fail_after = fail_after
         self.preflight_calls = 0
@@ -622,15 +566,10 @@ class FakeWin32Adapter:
         self.buttons_down = set()
         self.release_all_calls = 0
         self._events_sent = 0
-        # 通用化重构 Task C：输入前置激活的记录版 seam。
         self.window_from_point_calls = []
         self.set_foreground_calls = []
-        # 统一时间线（"window_from_point"/"set_foreground"/"send_mouse"/...）：
-        # 断言激活发生在真实输入之前。
         self.call_order = []
-        # 目标点所属窗口；None 表示与当前前台一致（默认不触发激活）。
         self.window_at_point_id = None
-        # 置 False 模拟 SetForegroundWindow 失败（含 Alt 键技巧重试后仍失败）。
         self.set_foreground_result = True
 
     def window_from_point(self, x, y):
@@ -644,7 +583,7 @@ class FakeWin32Adapter:
         self.set_foreground_calls.append(hwnd)
         self.call_order.append(("set_foreground", hwnd))
         if self.set_foreground_result:
-            self.foreground_id = hwnd  # 激活成功：前台身份随之切换（与真实语义一致）
+            self.foreground_id = hwnd
             return True
         return False
 
@@ -676,7 +615,6 @@ class FakeWin32Adapter:
         return self.foreground_id
 
     def _emit(self):
-        """模拟一个底层输入事件送达；超过 fail_after 后按 SendInput 部分失败处理。"""
         self._events_sent += 1
         if self.fail_after is not None and self._events_sent > self.fail_after:
             raise ComputerControlError(
@@ -715,14 +653,13 @@ class FakeWin32Adapter:
             elif action == "drag":
                 points = tuple(path)
                 self.drags.append((points, button))
-                self._emit()  # 移动到起点
-                self._emit()  # 按下
+                self._emit()
+                self._emit()
                 self.buttons_down.add(button)
                 try:
                     for _point in points[1:]:
-                        self._emit()  # 路径移动
+                        self._emit()
                 finally:
-                    # try/finally 保证释放，与真实 adapter 的 drag 收尾语义一致。
                     self.buttons_down.discard(button)
             else:
                 raise ComputerControlError(
@@ -736,12 +673,11 @@ class FakeWin32Adapter:
     def send_text(self, text):
         self.call_order.append(("send_text", text))
         for _char in text:
-            self._emit()  # Unicode down
-            self._emit()  # Unicode up
+            self._emit()
+            self._emit()
         self.texts.append(text)
 
     def set_clipboard_text(self, text):
-        # 2026-09-06：type_text 非 ASCII 剪贴板路径的记录点（提速计划 Task 4）。
         self.call_order.append(("set_clipboard", text))
         self.clipboard_writes.append(text)
 
@@ -756,7 +692,6 @@ class FakeWin32Adapter:
             for name in reversed(keys):
                 self.keys_down.discard(name)
         finally:
-            # 任何失败路径都必须清空本组合键的按下状态。
             self.keys_down.difference_update(keys)
 
     def release_all(self):
@@ -765,25 +700,7 @@ class FakeWin32Adapter:
         self.buttons_down.clear()
 
 
-# ---------------- Task 8 导出：ComputerBackend 协议 fake ----------------
-
-
 class FakeComputerBackend:
-    """ComputerBackend 协议的纯 fake：绝不触碰真实键鼠、浏览器或截屏。
-
-    - ``execute_calls`` 按序记录 ``(run_id, kind, target)``；``execute_log``
-      按序记录 ``("enter"|"exit", kind)``，用于断言动作串行；
-      ``concurrent_execute_violations`` 记录并发进入 execute 的次数；
-    - ``screen_hashes``：注入的截图 hash 序列，observe 依次消费、用尽后重复
-      最后一个，用于精确控制 no-progress 计数；``set_fingerprint()`` 切换
-      活动指纹（browser 体现为 page_title，desktop 体现为 window_title）；
-    - ``observe_error`` / ``execute_error`` / ``close_error`` 注入失败；
-    - ``execute_gate``（threading.Event）：设置后 execute 阻塞等待，用于
-      验证 controller 的 action_lock 串行语义；
-    - ``release_count`` / ``close_count`` 计数，验证幂等停止只释放一次；
-    - ``png_path``（Task 16）：观察携带的虚拟截图路径（不读真实文件），
-      供 controller 预览发布等接线测试使用。
-    """
 
     def __init__(self, target="browser", *, screen_hashes=(), fingerprint="fake-surface",
                  observe_error=None, execute_error=None, close_error=None,
@@ -874,32 +791,11 @@ class FakeComputerBackend:
             raise self.close_error
 
     def is_reusable(self):
-        """retained 领取裁决 fake（R4）：``reusable=False`` 模拟不健康实例。"""
         with self._lock:
             return self.reusable and not self.closed
 
 
-# ---------------- Task 13a 导出：GUI Bridge 电脑操控 Controller fake ----------------
-
-
 class FakeBridgeController:
-    """ComputerControlService 的 GUI Bridge fake（Task 13a 事件桥与控制 API）。
-
-    - ``add_listener``/``remove_listener`` 镜像真实 controller（listener 异常
-      吞掉留痕）；``listener_count`` 暴露当前注册数，供“桥接建立一次”断言；
-    - ``emit_state``/``emit_action_started``/``emit_action_finished``/
-      ``emit_observation`` 按真实事件形状（type/run_id/event_seq + 各自字段）
-      发给已注册 listener；``emit_observation`` 的 run_id/event_seq 可覆盖
-      （Task 13a brief 样例逐字使用）；
-    - ``start_run(run_id=...)`` 建立活动 run；pause/resume/stop 记录透传调用
-      并发出 computer_state 事件；run_id 与当前活动 run 不匹配抛
-      computer_invalid_state（旧 UI 事件的 run id 拒绝语义，镜像
-      _require_active_run_locked）；``stop`` 接受 ``cancel_owner`` 关键字
-      （默认 True）并记录到 ``stop_cancel_owner``，行为不变；
-    - ``snapshot()`` 返回真实 ComputerRunSnapshot（终态保留 run_id，
-      镜像 _last_snapshot 语义）；
-    - 绝不触碰真实键鼠、浏览器或截屏。
-    """
 
     def __init__(self):
         self._listeners = []
@@ -909,8 +805,6 @@ class FakeBridgeController:
         self.pause_calls = []
         self.resume_calls = []
         self.stop_calls = []
-        # 接管交还修复 L2：记录 stop 的 cancel_owner 关键字（默认 True），
-        # 使该桩能接受调用方传入的新关键字而不 TypeError。
         self.stop_cancel_owner = []
 
     @property
@@ -932,7 +826,7 @@ class FakeBridgeController:
             try:
                 listener(event)
             except Exception:
-                pass  # 镜像真实 controller：listener 异常只留痕不传播
+                pass
 
     def emit_state(self, run_id="run-a", event_seq=1, status="running", reason=""):
         self._emit({
@@ -1011,8 +905,6 @@ class FakeBridgeController:
         return self.snapshot()
 
     def stop(self, run_id, reason, *, cancel_owner=True):
-        # 接受 stop 的 cancel_owner 关键字（镜像真实 controller 签名）：该桩
-        # 只记录、行为不变，避免调用方传新关键字时 TypeError。
         self._require_active_run(run_id)
         self.stop_calls.append((run_id, reason))
         self.stop_cancel_owner.append(cancel_owner)
@@ -1021,7 +913,6 @@ class FakeBridgeController:
         return self.snapshot()
 
     def stop_for_user(self, run_id: str, reason: str = "user_stop"):
-        # 镜像真实 controller：用户停止只结束 run，不置位回合 cancel_event。
         return self.stop(run_id, reason, cancel_owner=False)
 
     def snapshot(self):
@@ -1033,31 +924,7 @@ class FakeBridgeController:
         )
 
 
-# ---------------- Task 9 导出：固定适配器 Controller fake ----------------
-
-
 class FakeController:
-    """ComputerControlService 的最小 fake（Task 9 固定适配器测试）。
-
-    - 固定 run_id/owner/capability；``execute_calls`` 按序记录 (run_id, kind, target)；
-    - 未知 run_id 抛 computer_invalid_state、owner 不一致抛 computer_owner_mismatch
-      （镜像真实 controller 的租约语义）；
-    - ``observations`` 按序注入 ComputerObservation（用尽后用默认观察），
-      默认观察的 png_path 取 ``png_path``（由测试用 tmp_path 写入虚拟字节）；
-    - ``execute_errors`` 按序注入异常（用尽后正常执行）；
-    - ``snapshot()`` 返回真实 ComputerRunSnapshot，action_count 随动作递增，
-      供固定适配器读取动作 ordinal；
-    - Task 10 补充最小 run 生命周期：``start_calls``/``start_error``、
-      ``complete_calls``/``completed_run_ids``/``complete_error``、
-      ``stop_calls``/``stop_reasons``/``stop_error``；生命周期方法只记录调用，
-      ``run_status`` 随 complete/stop 变化供 Turn 收尾判定；
-    - 接管交还修复 L1/L2 补充：``complete_run`` 记录 ``retain_browser_session``
-      到 ``complete_retain_flags``，``stop`` 记录 ``cancel_owner`` 到
-      ``stop_cancel_owner``（签名带默认值 True）；``execute`` 遇
-      ``request_user_takeover`` 时把 ``run_status`` 置为 ``waiting_for_user``
-      （镜像真实 controller 的接管交接），供「接管回合收尾」测试建模；
-    - 绝不触碰真实键鼠、浏览器或截屏。
-    """
 
     def __init__(self, *, owner, capability=GENERIC_CAPABILITY, run_id="run-a",
                  png_path="", observations=(), execute_errors=()):
@@ -1069,9 +936,8 @@ class FakeController:
         self.action_count = 0
         self._observations = list(observations)
         self.execute_errors = list(execute_errors)
-        # Task 10：Turn 接线的最小生命周期记录
         self.start_calls = 0
-        self.start_targets = []  # Task 11a：记录 start_run 传入的 target
+        self.start_targets = []
         self.start_error = None
         self.complete_calls = 0
         self.completed_run_ids = []
@@ -1080,9 +946,6 @@ class FakeController:
         self.stop_reasons = []
         self.stop_error = None
         self.run_status = "running"
-        # 接管交还修复 L1/L2：记录每次 stop/complete_run 的关键关键字参数，
-        # 供 Turn 收尾测试断言「兜底 stop 传 cancel_owner=False」「接管态收尾
-        # 传 retain_browser_session=False」。
         self.stop_cancel_owner = []
         self.complete_retain_flags = []
 
@@ -1142,8 +1005,6 @@ class FakeController:
             self._default_observation(run_id, action)
         )
         if action.kind == "request_user_takeover":
-            # 镜像真实 controller 的接管交接行为：request_user_takeover 成功
-            # 执行后 run 转入 waiting_for_user，供「接管回合收尾」测试建模。
             self.run_status = "waiting_for_user"
         return replace(
             base,
@@ -1163,18 +1024,7 @@ class FakeController:
         )
 
 
-# ---------------- R10 导出：语义定位 fake（绝不触碰真实窗口/UIA） ----------------
-
-
 class FakeSurfaceLocator:
-    """SurfaceLocator 协议的纯 fake：候选由测试配置，记录 activate/invoke 调用。
-
-    - ``windows``/``tray_icons``：SurfaceCandidate 数据字典列表（label/bounds/
-      operations）；每次 list_* 调用递增代数并重发候选（旧 ref 随即失效）；
-    - ``activate_error``/``invoke_error``：注入失败；``activate_calls``/
-      ``invoke_calls`` 按序记录 (ref, generation)；
-    - ``bounds_override``：ref → 当前边界，模拟候选移动/消失（None）。
-    """
 
     def __init__(self, *, windows=(), tray_icons=(), activate_error=None, invoke_error=None):
         from core.computer.surfaces import SurfaceCandidate

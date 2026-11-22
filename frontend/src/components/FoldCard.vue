@@ -1,7 +1,4 @@
 <template>
-  <!-- 统一折叠容器：button 头（旋转箭头 + 标题）+ v-show 内容体。
-       三个折叠体（思考过程 / 工具执行轨迹 / 回合中间过程）共用，
-       保证箭头、字号、hover、焦点、键盘可达行为完全一致 -->
   <div class="fold">
     <button class="fold-head" type="button" :aria-expanded="open" @click="open = !open">
       <AppIcon
@@ -27,9 +24,7 @@ import AppIcon from './AppIcon.vue';
 
 withDefaults(
   defineProps<{
-    /** 标题文本；复杂内容用 #title 插槽覆盖 */
     title?: string;
-    /** 箭头位置：start=标题左侧（轨迹/回合折叠），end=标题右侧（思考块） */
     caret?: 'start' | 'end';
   }>(),
   { title: '', caret: 'start' },
@@ -41,7 +36,6 @@ const open = defineModel<boolean>('open', { default: false });
 
 <style scoped>
 .fold {
-  /* 仅作结构容器，外观交给使用方 */
 }
 .fold-head {
   display: flex;
@@ -72,7 +66,6 @@ const open = defineModel<boolean>('open', { default: false });
 .fold-caret.is-open {
   transform: rotate(90deg);
 }
-/* 箭头放标题右侧（思考块形态） */
 .fold-caret.caret-end {
   order: 2;
   margin-left: auto;

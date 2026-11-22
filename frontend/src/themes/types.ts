@@ -28,7 +28,6 @@ export interface NativeTitlebarTheme {
   mode: ThemeAppearance;
 }
 
-// 全局背景图：垫在所有分区之下的最底层（body::before），无文字/边框语义
 export interface AppImageTheme {
   image: string | null;
   image_opacity: number;

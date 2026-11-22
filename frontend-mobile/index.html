@@ -10,9 +10,6 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>星瑶</title>
     <script>
-      // 防误触缩放（iOS Safari 10+ 忽略 user-scalable=no，需要三件套配合）：
-      // 1) 多指捏合阻断（gesturestart 为 iOS 专有事件）；2) 双击缩放由 CSS touch-action: manipulation 禁；
-      // 3) touchend 非 passive 监听——iOS 检测到页面接管手势后会让 user-scalable=no 生效（含输入聚焦自动放大）。
       (function () {
         var stop = function (e) { e.preventDefault(); };
         document.addEventListener('gesturestart', stop, { passive: false });
@@ -22,7 +19,6 @@
       })();
     </script>
     <style>
-      /* 首屏骨架：JS 加载期间白屏体感消除（Vue 挂载后自动替换 #app 内容） */
       #boot { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
               background: #1a1a18; color: #85847d; font: 13px/1.6 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif; }
       #boot .b { text-align: center; }

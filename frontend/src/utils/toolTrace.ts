@@ -49,7 +49,6 @@ export interface SubagentTaskSnapshot {
   elapsed: number;
   type?: string;
   background?: boolean;
-  /** 派生该子代理的 run_subagent 调用 id（旧后端缺省） */
   tool_call_id?: string;
   stages?: SubagentStage[];
 }
@@ -96,7 +95,6 @@ export interface ToolTraceRow {
   legacyDiffs?: LegacyDiff[];
 }
 
-/** 派发子代理的工具名：对话区单独渲染为「星舰」一行 */
 export const SUBAGENT_TOOL_NAME = 'run_subagent';
 
 const LEGACY_CATEGORIES: Readonly<Record<string, ToolCategory>> = {
@@ -130,16 +128,12 @@ function statusFor(call: ToolExecutionCall, state: ExecutionState): ToolCallStat
 }
 
 function kindFor(category: ToolCategory, name = ''): ToolTraceRow['kind'] {
-  // 子代理派发单独一类（对话区显示为「星舰」）：它派生的是子代理任务，
-  // 不并入 tool 的通用「工具」文案。
   if (name === SUBAGENT_TOOL_NAME) return 'subagent';
   if (category === 'read') return 'read-group';
   if (category === 'search') return 'search-group';
   if (category === 'command') return 'command';
   if (category === 'mutation') return 'mutation';
   if (category === 'skill') return 'skill';
-  // 电脑操控单独一类：行内以「动作动词 + 目标」渲染（点击 / el-20），
-  // 不并入 tool 的通用「工具」文案。
   if (category === 'computer') return 'computer';
   return 'tool';
 }
@@ -290,20 +284,15 @@ export type SubagentToolStatus = 'running' | 'ok' | 'err';
 
 export interface SubagentFlatRow {
   kind: 'stage' | 'tool';
-  /** stage 阶段名，或工具名 */
   name: string;
-  /** 行起始时刻（epoch 秒）；工具行取开始时刻 */
   at: number;
   status?: SubagentToolStatus;
-  /** ✓ 后的耗时片段，如 "0.8s" / "420ms" */
   durationText?: string;
-  /** ✗ 后的失败摘要 */
   errorText?: string;
 }
 
 export interface SubagentFlatView {
   rows: SubagentFlatRow[];
-  /** model 阶段出现次数 ≈ 模型轮次 */
   rounds: number;
   toolOk: number;
   toolErr: number;
@@ -313,7 +302,6 @@ const SUBAGENT_TOOL_FINISH_RE = /^(.*?)\s*([✓✗])\s*([\s\S]*)$/;
 
 export function buildSubagentFlatView(stages: SubagentStage[]): SubagentFlatView {
   const rows: SubagentFlatRow[] = [];
-  // 同名工具的未完成开始行（并行同名调用时后写覆盖，配对按 LIFO）
   const pending = new Map<string, SubagentFlatRow>();
   let rounds = 0;
   let toolOk = 0;
@@ -336,7 +324,6 @@ export function buildSubagentFlatView(stages: SubagentStage[]): SubagentFlatView
     const detail = stage.detail ?? '';
     const finish = detail.match(SUBAGENT_TOOL_FINISH_RE);
     if (!finish || (!finish[1].trim() && !finish[3].trim())) {
-      // tool_started：detail 就是工具名
       const row: SubagentFlatRow = {
         kind: 'tool',
         name: detail || 'tool',
@@ -347,13 +334,11 @@ export function buildSubagentFlatView(stages: SubagentStage[]): SubagentFlatView
       if (detail) pending.set(detail, row);
       continue;
     }
-    // tool_finished：detail 形如 "name ✓ 0.8s" / "name ✗ 失败摘要"
     const toolName = finish[1].trim();
     const ok = finish[2] === '✓';
     const tail = finish[3].trim();
     let row = toolName ? pending.get(toolName) : undefined;
     if (!row) {
-      // 开始行可能已被后端 64 条上限淘汰：就近配对最后一个同名 running 行
       for (let i = rows.length - 1; i >= 0; i -= 1) {
         const candidate = rows[i]!;
         if (

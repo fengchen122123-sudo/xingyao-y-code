@@ -48,7 +48,6 @@ import { useRouter } from 'vue-router';
 import { useAppStore } from '../stores/app';
 import StatusTag from '../components/StatusTag.vue';
 
-// 星瑶品牌 logo（public 静态资源，运行时引用；/m/ 前缀与 lan_server 托管路径一致）
 const logoUrl = '/m/icon.png';
 
 const store = useAppStore();
@@ -60,7 +59,6 @@ const sessionTitle = computed(() => {
 });
 
 function goSessionOps() {
-  // 会话操作（模型/权限切换）入口：回到会话详情页打开 ⋯ 菜单
   void router.push(`/convo/${encodeURIComponent(store.currentSession)}`);
 }
 </script>

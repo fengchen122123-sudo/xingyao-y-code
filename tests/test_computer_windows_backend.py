@@ -1,12 +1,5 @@
-"""Windows 桌面 backend 与 Win32 SendInput adapter 测试（计划 Task 7 / 设计 13、21、22）。
-
-所有测试只使用 tests.computer_fakes.FakeImage / FakeWin32Adapter 或注入
-send_input 等全部底层 seam 的 Win32InputAdapter；pytest 运行期间绝不真实
-移动鼠标、发送键盘或截取屏幕。scripts/smoke_computer_control.py 的
---desktop-observe / --desktop-input 人工探针不在 pytest 中执行。
-"""
-
 import logging
+import threading
 
 import pytest
 
@@ -31,16 +24,12 @@ from tests.computer_fakes import FakeImage, FakeSurfaceLocator, FakeWin32Adapter
 
 
 def _capture_send_input(captured):
-    """返回一个记录事件并全部接受的 send_input seam。"""
 
     def send_input(events):
         captured.extend(events)
         return len(events)
 
     return send_input
-
-
-# ---------------- brief 样例（逐字） ----------------
 
 
 def test_virtual_desktop_is_scaled_to_1920_and_coordinates_round_trip():
@@ -61,14 +50,56 @@ def test_sendinput_partial_result_is_error():
     assert raised.value.code == "computer_input_rejected"
 
 
+def test_stop_during_drag_rejects_later_path_points_but_releases_button():
+    input_entered = threading.Event()
+    allow_current_batch = threading.Event()
+    submitted = []
+
+    def send_input(events):
+        batch = list(events)
+        submitted.append(batch)
+        if len(submitted) == 3:
+            input_entered.set()
+            assert allow_current_batch.wait(timeout=2)
+        return len(batch)
+
+    adapter = Win32InputAdapter(send_input=send_input)
+    errors = []
+
+    def drag():
+        try:
+            adapter.send_mouse(
+                action="drag",
+                path=((10, 10), (20, 20), (30, 30)),
+            )
+        except ComputerControlError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=drag)
+    worker.start()
+    try:
+        assert input_entered.wait(timeout=1)
+        stopping = threading.Thread(target=adapter.request_stop)
+        stopping.start()
+        assert adapter._input_stop.wait(timeout=1)
+        allow_current_batch.set()
+        stopping.join(timeout=2)
+    finally:
+        allow_current_batch.set()
+        worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not stopping.is_alive()
+    assert len(errors) == 1 and errors[0].code == "computer_cancelled"
+    assert len(submitted) == 4
+    assert submitted[-1] == [MouseEventDescriptor(0, 0, MOUSEEVENTF_LEFTUP)]
+
+
 def test_pressed_keys_are_released_when_keypress_fails():
     adapter = FakeWin32Adapter(fail_after=2)
     with pytest.raises(ComputerControlError):
         adapter.send_keys(("CTRL", "SHIFT", "A"))
     assert adapter.keys_down == set()
-
-
-# ---------------- 观察：缩放、原点、比例与受控摘要 ----------------
 
 
 def test_observation_records_exact_scale_and_window_title():
@@ -101,9 +132,6 @@ def test_screenshot_size_must_match_win32_virtual_desktop():
     with pytest.raises(ComputerControlError) as raised:
         backend.observe("run-a")
     assert raised.value.code == "computer_backend_start_failed"
-
-
-# ---------------- 坐标映射：负原点、多屏边界、bool 不透传 ----------------
 
 
 def test_click_at_model_origin_maps_to_negative_virtual_desktop_origin():
@@ -182,9 +210,6 @@ def test_execute_without_prior_observation_fails():
     assert adapter.clicks == []
 
 
-# ---------------- 不可控桌面：secure desktop、无前台窗口、截图异常 ----------------
-
-
 def test_secure_desktop_blocks_observe():
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080), desktop_name="Winlogon")
     backend = WindowsComputerBackend(
@@ -227,7 +252,7 @@ def test_screenshot_failure_never_reuses_last_observation():
 
     def grab():
         calls["count"] += 1
-        if calls["count"] > 2:  # start 试抓 + 第一次 observe 成功，第二次 observe 失败
+        if calls["count"] > 2:
             raise OSError("screen grab failed")
         return FakeImage(1920, 1080)
 
@@ -238,11 +263,7 @@ def test_screenshot_failure_never_reuses_last_observation():
     with pytest.raises(ComputerControlError) as raised:
         backend.observe("run-a")
     assert raised.value.code == "computer_backend_start_failed"
-    # 旧观察不被改写、不被当作新结果返回。
     assert backend._last_observation is first
-
-
-# ---------------- 桌面动作：wheel/hwheel、Unicode、double click、drag ----------------
 
 
 def test_scroll_uses_wheel_and_hwheel():
@@ -260,7 +281,6 @@ def test_scroll_uses_wheel_and_hwheel():
 
 
 def test_type_text_routes_unicode_text_to_clipboard():
-    # 2026-09-06 行为变更：非 ASCII 文本改走剪贴板 + Ctrl+V（提速计划 Task 4）。
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080))
     backend = WindowsComputerBackend(
         image_grab=lambda: FakeImage(1920, 1080), win32_adapter=adapter
@@ -321,6 +341,44 @@ def test_release_inputs_delegates_to_adapter():
     assert adapter.release_all_calls == 1
 
 
+def test_close_signals_stop_before_waiting_for_inflight_input():
+    entered_input = threading.Event()
+    allow_input_to_finish = threading.Event()
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080))
+    original_send_mouse = adapter.send_mouse
+
+    def blocked_send_mouse(**kwargs):
+        entered_input.set()
+        assert allow_input_to_finish.wait(timeout=2)
+        original_send_mouse(**kwargs)
+
+    adapter.send_mouse = blocked_send_mouse
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1920, 1080), win32_adapter=adapter
+    )
+    backend.observe("run-a")
+    action_thread = threading.Thread(
+        target=lambda: backend.execute(
+            "run-a", ComputerAction(kind="click", target="desktop", x=10, y=10)
+        )
+    )
+    close_thread = threading.Thread(target=backend.close)
+    action_thread.start()
+    try:
+        assert entered_input.wait(timeout=2)
+        close_thread.start()
+        assert backend._stop_event.wait(timeout=0.5)
+    finally:
+        allow_input_to_finish.set()
+        action_thread.join(timeout=3)
+        if close_thread.ident is not None:
+            close_thread.join(timeout=3)
+
+    assert not action_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert adapter.release_all_calls >= 1
+
+
 def test_desktop_backend_rejects_browser_target_and_browser_only_actions():
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080))
     backend = WindowsComputerBackend(
@@ -338,9 +396,6 @@ def test_desktop_backend_rejects_browser_target_and_browser_only_actions():
     assert raised.value.code == "computer_invalid_action"
 
 
-# ---------------- Win32InputAdapter：事件形状与释放语义（全部注入 seam） ----------------
-
-
 def test_send_text_uses_unicode_key_events():
     captured = []
     adapter = Win32InputAdapter(send_input=_capture_send_input(captured))
@@ -354,7 +409,7 @@ def test_send_text_uses_unicode_key_events():
 def test_send_text_splits_surrogate_pairs_into_utf16_units():
     captured = []
     adapter = Win32InputAdapter(send_input=_capture_send_input(captured))
-    adapter.send_text("😀")  # U+1F600 -> D83D DE00
+    adapter.send_text("😀")
     scans = [(event.scan, bool(event.flags & KEYEVENTF_KEYUP)) for event in captured]
     assert scans == [(0xD83D, False), (0xD83D, True), (0xDE00, False), (0xDE00, True)]
     assert all(event.flags & KEYEVENTF_UNICODE for event in captured)
@@ -388,13 +443,12 @@ def test_mouse_move_rechecks_virtual_desktop_bounds_before_sendinput():
     adapter.send_mouse(action="move", x=-1920, y=0)
     assert len(captured) == 1
     with pytest.raises(ComputerControlError) as raised:
-        adapter.send_mouse(action="move", x=1920, y=0)  # origin_x + width 为半开区间外
+        adapter.send_mouse(action="move", x=1920, y=0)
     assert raised.value.code == "computer_coordinate_out_of_bounds"
     assert len(captured) == 1
 
 
 def test_wheel_and_hwheel_use_wheel_delta_units():
-    """R7：逻辑步进正值向下/向右；Win32 垂直滚轮正值=远离用户（向上），取反。"""
     captured = []
     adapter = Win32InputAdapter(send_input=_capture_send_input(captured))
     adapter.send_mouse(action="wheel", delta=-3)
@@ -406,7 +460,6 @@ def test_wheel_and_hwheel_use_wheel_delta_units():
 
 
 def test_wheel_positive_delta_maps_to_negative_wheel_data():
-    """R7 方向对照：+1 步进（向下）→ Win32 垂直 wheelData -120；水平 +1 → +120。"""
     captured = []
     adapter = Win32InputAdapter(send_input=_capture_send_input(captured))
     adapter.send_mouse(action="wheel", delta=1)
@@ -441,7 +494,7 @@ def test_send_keys_releases_pressed_keys_when_sendinput_fails_midway():
         calls["count"] += 1
         captured.extend(events)
         if calls["count"] == 2:
-            return 0  # 第二次按下（SHIFT）被 UIPI 拒绝
+            return 0
         return len(events)
 
     adapter = Win32InputAdapter(send_input=flaky_send_input)
@@ -460,19 +513,33 @@ def test_failed_key_release_keeps_marker_for_release_all():
     def rejecting_send_input(events):
         calls["count"] += 1
         captured.extend(events)
-        if calls["count"] > 1:
-            raise OSError("inject failure")  # down 成功，后续 up 全部被拒
+        if calls["count"] in (2, 3):
+            raise OSError("inject failure")
         return len(events)
 
     adapter = Win32InputAdapter(send_input=rejecting_send_input)
     with pytest.raises(OSError):
         adapter.send_keys(("CTRL",))
-    # up 释放失败必须保留按下标记，供 release_all 重试。
     assert adapter._pressed_keys == ["CTRL"]
     adapter.release_all()
     assert adapter._pressed_keys == []
     ups = [event for event in captured if event.flags & KEYEVENTF_KEYUP]
     assert ups and all(event.vk == KEY_NAME_TO_VK["CTRL"] for event in ups)
+
+
+def test_release_all_wraps_send_input_exception_as_cleanup_failed():
+    def failing_send_input(_events):
+        raise OSError("release inject failure")
+
+    adapter = Win32InputAdapter(send_input=failing_send_input)
+    adapter._pressed_buttons.add("left")
+    adapter._pressed_keys.append("CTRL")
+
+    with pytest.raises(ComputerControlError) as raised:
+        adapter.release_all()
+    assert raised.value.code == "computer_cleanup_failed"
+    assert adapter._pressed_buttons == {"left"}
+    assert adapter._pressed_keys == ["CTRL"]
 
 
 def test_release_all_sends_up_for_tracked_pressed_buttons():
@@ -490,7 +557,26 @@ def test_release_all_sends_up_for_tracked_pressed_buttons():
     ]
 
 
-# ---------------- Win32InputAdapter.preflight：固定顺序 fail-closed ----------------
+def test_release_all_retains_pressed_markers_after_partial_send_input():
+    submitted = []
+
+    def send_input(events):
+        submitted.append(list(events))
+        return len(events) - 1 if len(submitted) == 1 else len(events)
+
+    adapter = Win32InputAdapter(send_input=send_input)
+    adapter._pressed_buttons.add("left")
+    adapter._pressed_keys.append("CTRL")
+
+    with pytest.raises(ComputerControlError) as raised:
+        adapter.release_all()
+    assert raised.value.code == "computer_input_rejected"
+    assert adapter._pressed_buttons == {"left"}
+    assert adapter._pressed_keys == ["CTRL"]
+
+    adapter.release_all()
+    assert adapter._pressed_buttons == set()
+    assert adapter._pressed_keys == []
 
 
 def _preflight_recorder(calls, label, value=True):
@@ -522,20 +608,13 @@ def test_preflight_fails_when_dpi_awareness_cannot_be_confirmed():
     with pytest.raises(ComputerControlError) as raised:
         adapter.preflight()
     assert raised.value.code == "computer_backend_start_failed"
-    assert calls == ["dpi"]  # 顺序固定：DPI 失败后不再触碰 desktop
-
-
-# ---------------------------------------------------------------------------
-# _ctypes_ensure_dpi_awareness 降级语义（GUI 进程 System aware 放行）
-# ---------------------------------------------------------------------------
+    assert calls == ["dpi"]
 
 
 _DPI_CONTEXT_VALUES = {"unaware": -1, "system": -2, "pmv1": -3, "pmv2": -4}
 
 
 def _dpi_user32(current: str, set_succeeds: bool):
-    """DPI fake：current 为当前感知模式；SetProcessDpiAwarenessContext 成功时
-    状态切换为 pmv2（模拟真实 API 的设置后生效语义）。"""
     state = {"current": current}
     set_calls = []
 
@@ -543,7 +622,6 @@ def _dpi_user32(current: str, set_succeeds: bool):
         return _DPI_CONTEXT_VALUES[state["current"]]
 
     def contexts_equal(left, right, *_args):
-        # c_void_p(-4).value 是 64 位无符号补码（2^64-4）；归一化后再比较
         def _norm(value):
             value = getattr(value, "value", value)
             if isinstance(value, int) and value < 0:
@@ -580,14 +658,12 @@ def _dpi_user32(current: str, set_succeeds: bool):
 
 
 def _dpi_fake_windll(monkeypatch, current, set_succeeds):
-    """安装 DPI fake 到 ctypes.windll；返回 (user32, helpers)。"""
     import ctypes
     from types import SimpleNamespace
 
     from core.computer import win32_adapter
 
     user32, helpers = _dpi_user32(current, set_succeeds)
-    # _FakeWin32Function 只支持固定返回值；DPI 需要真实比较逻辑，逐个替换实现
     user32.GetThreadDpiAwarenessContext = _DpiFn(helpers["get"])
     user32.AreDpiAwarenessContextsEqual = _DpiFn(helpers["equal"])
     user32.SetProcessDpiAwarenessContext = _DpiFn(helpers["set"])
@@ -596,7 +672,6 @@ def _dpi_fake_windll(monkeypatch, current, set_succeeds):
 
 
 class _DpiFn:
-    """可比较/可配置实现的 user32 函数替身（支持 restype/argtypes 赋值）。"""
 
     def __init__(self, impl):
         self.restype = None
@@ -608,7 +683,6 @@ class _DpiFn:
 
 
 def test_dpi_ensure_accepts_pmv2_without_set_call(monkeypatch):
-    """已是 PMv2：只验证不设置（Set 不得被调用）。"""
     from core.computer import win32_adapter
 
     _, helpers = _dpi_fake_windll(monkeypatch, "pmv2", set_succeeds=False)
@@ -617,30 +691,23 @@ def test_dpi_ensure_accepts_pmv2_without_set_call(monkeypatch):
 
 
 def test_dpi_ensure_sets_pmv2_from_unaware_when_allowed(monkeypatch):
-    """UNAWARE 且允许设置：切换到 PMv2 并验证通过（CLI 独立进程路径）。"""
     from core.computer import win32_adapter
 
     _, helpers = _dpi_fake_windll(monkeypatch, "unaware", set_succeeds=True)
     assert win32_adapter._ctypes_ensure_dpi_awareness() is True
-    assert helpers["set_calls"] == [(1 << 64) - 4]  # 只尝试 PMv2（64 位补码）
+    assert helpers["set_calls"] == [(1 << 64) - 4]
 
 
 def test_dpi_ensure_accepts_system_aware_when_set_is_locked(monkeypatch):
-    """GUI 场景（pywebview WinForms 启动即 SetProcessDPIAware 锁死进程）：
-    SetProcessDpiAwarenessContext 失败但当前已是 System DPI aware 时放行——
-    System aware 下桌面坐标系（GetSystemMetrics/截图 DC/SendInput 归一化）
-    全部为物理像素，操控链路自洽（2026-09-05 修复，用户 GUI 开关死锁）。"""
     from core.computer import win32_adapter
 
     _, helpers = _dpi_fake_windll(monkeypatch, "system", set_succeeds=False)
     assert win32_adapter._ctypes_ensure_dpi_awareness() is True
-    assert helpers["set_calls"] == [(1 << 64) - 4]  # 尝试升级 PMv2 失败后按 System aware 放行
+    assert helpers["set_calls"] == [(1 << 64) - 4]
 
 
 @pytest.mark.parametrize("current", ["unaware", "pmv1"])
 def test_dpi_ensure_rejects_other_states_when_set_is_locked(monkeypatch, current):
-    """设置失败且非 PMv2/System（UNAWARE 会被 DPI 虚拟化、PMv1 语义陈旧）：
-    必须拒绝（fail-closed 保持）。"""
     from core.computer import win32_adapter
 
     _, _helpers = _dpi_fake_windll(monkeypatch, current, set_succeeds=False)
@@ -716,13 +783,7 @@ def test_backend_start_runs_adapter_preflight(tmp_path):
     assert adapter.preflight_calls == 1
 
 
-# ---------------------------------------------------------------------------
-# Task 16：64 位句柄截断防护（OpenInputDesktop / GetForegroundWindow restype）
-# ---------------------------------------------------------------------------
-
-
 class _FakeWin32Function:
-    """记录 restype/argtypes 声明的 ctypes 函数替身。"""
 
     def __init__(self, return_value=0):
         self.restype = None
@@ -736,7 +797,6 @@ class _FakeWin32Function:
 
 
 def _fake_windll(monkeypatch, user32):
-    """把 ctypes.windll 换成只暴露 user32 fake 的替身（绝不触碰真实 OS）。"""
     import ctypes
     from types import SimpleNamespace
 
@@ -744,8 +804,6 @@ def _fake_windll(monkeypatch, user32):
 
 
 def test_input_desktop_name_declares_pointer_restype(monkeypatch):
-    """OpenInputDesktop 必须声明 c_void_p restype：默认 c_int 会把 64 位
-    HDESK 截断成 32 位，CloseDesktop 拿到无效句柄（Task 16 修复）。"""
     import ctypes
 
     from core.computer import win32_adapter
@@ -761,13 +819,12 @@ def test_input_desktop_name_declares_pointer_restype(monkeypatch):
     )()
     _fake_windll(monkeypatch, user32)
 
-    assert win32_adapter._ctypes_input_desktop_name() is None  # NULL 句柄
+    assert win32_adapter._ctypes_input_desktop_name() is None
     assert user32.OpenInputDesktop.restype == ctypes.c_void_p
     assert user32.CloseDesktop.argtypes == [ctypes.c_void_p]
 
 
 def test_foreground_window_declares_pointer_restype(monkeypatch):
-    """GetForegroundWindow 必须声明 c_void_p restype：64 位 HWND 不得截断。"""
     import ctypes
 
     from core.computer import win32_adapter
@@ -779,34 +836,26 @@ def test_foreground_window_declares_pointer_restype(monkeypatch):
     )()
     _fake_windll(monkeypatch, user32)
 
-    assert win32_adapter._ctypes_foreground_window() == 0x1AB2CD3EF456  # 64 位不截断
+    assert win32_adapter._ctypes_foreground_window() == 0x1AB2CD3EF456
     assert user32.GetForegroundWindow.restype == ctypes.c_void_p
 
 
-# ---------------------------------------------------------------------------
-# R5：桌面前台窗口身份与几何代数（旧坐标失效）
-# ---------------------------------------------------------------------------
-
-
 def test_desktop_foreground_change_between_actions_rejects_stale_input():
-    """观察后用户切到其他软件：输入前身份复核失败，零输入并显式报错。"""
     image = FakeImage(width=1280, height=720)
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720), foreground_id=1001)
     backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
     observation = backend.observe("run-a")
     assert observation.surface_id == "hwnd:1001"
-    adapter.foreground_id = 2002  # 用户切到另一个前台窗口
+    adapter.foreground_id = 2002
     adapter.foreground_title = "Other App"
     with pytest.raises(ComputerControlError) as raised:
         backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
     assert raised.value.code == "computer_surface_changed"
     assert adapter.clicks == []
-    # 键盘输入同样被拒绝（前台身份不一致；真机验收修正后键盘不做事前激活）。
     with pytest.raises(ComputerControlError) as raised_keys:
         backend.execute("run-a", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",)))
     assert raised_keys.value.code == "computer_surface_changed"
     assert adapter.keys_sent == []
-    # 重新观察后基线刷新，输入恢复。
     refreshed = backend.observe("run-a")
     assert refreshed.surface_id == "hwnd:2002"
     assert refreshed.surface_generation > observation.surface_generation
@@ -815,12 +864,11 @@ def test_desktop_foreground_change_between_actions_rejects_stale_input():
 
 
 def test_desktop_geometry_change_invalidates_stale_coordinates():
-    """分辨率/多屏几何变化：surface 代数递增，旧坐标输入被拒绝。"""
     image = FakeImage(width=1280, height=720)
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
     backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
     observation = backend.observe("run-a")
-    adapter.virtual_rect = (-1920, 0, 3840, 2160)  # 显示器配置改变
+    adapter.virtual_rect = (-1920, 0, 3840, 2160)
     with pytest.raises(ComputerControlError) as raised:
         backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
     assert raised.value.code == "computer_surface_changed"
@@ -828,7 +876,6 @@ def test_desktop_geometry_change_invalidates_stale_coordinates():
 
 
 def test_desktop_same_surface_input_allowed_and_wait_unchecked():
-    """签名一致时输入正常；wait 不做 surface 复核。"""
     image = FakeImage(width=1280, height=720)
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
     backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
@@ -836,11 +883,10 @@ def test_desktop_same_surface_input_allowed_and_wait_unchecked():
     backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=100, y=100))
     backend.execute("run-a", ComputerAction(kind="type_text", target="desktop", text="你好"))
     assert adapter.clicks == [(100, 100, "left")]
-    assert adapter.clipboard_writes == ["你好"]  # 2026-09-06：非 ASCII 走剪贴板
+    assert adapter.clipboard_writes == ["你好"]
 
 
 def test_desktop_scroll_rejects_pixel_unit_and_out_of_range():
-    """R7：桌面滚动仅 wheel_step；像素单位、超限、两轴为零全部零执行拒绝。"""
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080))
     backend = WindowsComputerBackend(
         image_grab=lambda: FakeImage(1920, 1080), win32_adapter=adapter
@@ -858,7 +904,6 @@ def test_desktop_scroll_rejects_pixel_unit_and_out_of_range():
 
 
 def test_desktop_wait_is_interruptible_and_close_not_blocked():
-    """R8：桌面 wait 不持大锁睡满时长；close 可收尾且等待以取消收尾。"""
     import threading
     import time
 
@@ -879,16 +924,13 @@ def test_desktop_wait_is_interruptible_and_close_not_blocked():
 
     waiter = threading.Thread(target=wait_action, daemon=True)
     waiter.start()
-    time.sleep(0.1)  # 让 waiter 进入分片等待
+    time.sleep(0.1)
     started = time.monotonic()
-    backend.close()  # 不得被进行中的 wait 阻塞
+    backend.close()
     assert time.monotonic() - started < 3
     waiter.join(timeout=3)
     assert not waiter.is_alive(), "close 后桌面显式等待仍悬挂"
     assert outcome == ["computer_cancelled"]
-
-
-# ---------------- 通用化重构 Task C：输入前置激活 ----------------
 
 
 def _activation_backend(adapter):
@@ -899,7 +941,6 @@ def _activation_backend(adapter):
 
 
 def test_click_activates_non_foreground_window_before_send_mouse():
-    """目标点所属窗口非前台：先 set_foreground_window 再 send_mouse。"""
     adapter = FakeWin32Adapter()
     adapter.window_at_point_id = 2002
     backend = _activation_backend(adapter)
@@ -909,7 +950,7 @@ def test_click_activates_non_foreground_window_before_send_mouse():
         backend.execute(
             "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
         )
-        assert adapter.window_from_point_calls == [(-1720, 200)]
+        assert adapter.window_from_point_calls == [(-1720, 200), (-1720, 200)]
         assert adapter.set_foreground_calls == [2002]
         labels = [entry[0] for entry in adapter.call_order]
         assert labels.index("set_foreground") < labels.index("send_mouse")
@@ -919,7 +960,6 @@ def test_click_activates_non_foreground_window_before_send_mouse():
 
 
 def test_click_skips_activation_when_already_foreground():
-    """目标点所属窗口已是前台：不调用 set_foreground_window。"""
     adapter = FakeWin32Adapter()
     backend = _activation_backend(adapter)
     backend.start()
@@ -935,7 +975,6 @@ def test_click_skips_activation_when_already_foreground():
 
 
 def test_activation_failure_blocks_input_with_explicit_error():
-    """SetForegroundWindow 失败：显式报错并中止输入，避免落到旧前台窗口。"""
     adapter = FakeWin32Adapter()
     adapter.window_at_point_id = 2002
     adapter.set_foreground_result = False
@@ -966,31 +1005,29 @@ def test_drag_activates_window_of_first_path_point():
             ComputerAction(
                 kind="drag",
                 target="desktop",
-                path=((100, 100), (150, 150)),  # 模型坐标 → 物理 (-1720,200)/(-1620,300)
+                path=((100, 100), (150, 150)),
             ),
         )
         assert adapter.set_foreground_calls == [2002]
-        assert adapter.window_from_point_calls == [(-1720, 200)]
+        assert adapter.window_from_point_calls == [(-1720, 200), (-1720, 200)]
     finally:
         backend.close()
 
 
 def test_type_text_after_window_switch_is_rejected_without_focus_steal():
-    """真机验收修正：键盘动作不做事前激活——前台切走后 R5 fail-closed 拒绝，
-    绝不把旧观察窗口抢回前台（防误发消息）。"""
     adapter = FakeWin32Adapter(foreground_id=2002)
     backend = _activation_backend(adapter)
     backend.start()
     try:
         observation = backend.observe("run-c")
         assert observation.surface_id == "hwnd:2002"
-        adapter.foreground_id = 1001  # 用户/新窗口切走（如 Win+R 打开运行对话框）
+        adapter.foreground_id = 1001
         with pytest.raises(ComputerControlError) as exc:
             backend.execute(
                 "run-c", ComputerAction(kind="type_text", target="desktop", text="hello")
             )
         assert exc.value.code == "computer_surface_changed"
-        assert adapter.set_foreground_calls == []  # 未发生任何抢焦点
+        assert adapter.set_foreground_calls == []
         assert adapter.texts == []
         assert adapter.keys_sent == []
     finally:
@@ -1006,28 +1043,24 @@ def test_type_text_after_window_switch_is_rejected_without_focus_steal():
     ids=["keypress", "type_text"],
 )
 def test_keyboard_after_focus_steal_back_is_rejected_with_foreground_lost(action):
-    """键盘焦点护栏：前台回到观察过的窗口（R5 基线仍吻合），但已不是最近一次
-    点击的目标窗口 → 零输入 + 显式 computer_foreground_lost。"""
     adapter = FakeWin32Adapter(foreground_id=1001)
     backend = _activation_backend(adapter)
     backend.start()
     try:
         assert backend.observe("run-c").surface_id == "hwnd:1001"
-        # 点击命中另一个窗口（hwnd 2002）→ 前置激活把它提到前台并记为键盘参照。
         adapter.window_at_point_id = 2002
         backend.execute(
             "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
         )
         assert adapter.set_foreground_calls == [2002]
-        assert adapter.clicks  # 点击本身照常送出
-        # 焦点被切回观察过的窗口：R5 基线吻合，但键盘目标已不是 2002。
+        assert adapter.clicks
         adapter.foreground_id = 1001
         adapter.window_at_point_id = None
         with pytest.raises(ComputerControlError) as exc:
             backend.execute("run-c", action)
         assert exc.value.code == "computer_foreground_lost"
         assert exc.value.details == {"expected_hwnd": 2002, "current_hwnd": 1001}
-        assert "activate_surface" in exc.value.message  # 提示模型重建焦点的路径
+        assert "activate_surface" in exc.value.message
         assert adapter.texts == []
         assert adapter.keys_sent == []
         assert adapter.clipboard_writes == []  # 非 ASCII 路径也绝不落剪贴板
@@ -1044,7 +1077,6 @@ def test_keyboard_after_focus_steal_back_is_rejected_with_foreground_lost(action
     ids=["keypress", "type_text"],
 )
 def test_keyboard_without_focus_reference_is_allowed(action):
-    """拿不到参照窗口（未观察、也没点过）时放行，键盘护栏不阻塞首次输入。"""
     adapter = FakeWin32Adapter(foreground_id=1001)
     backend = _activation_backend(adapter)
     try:
@@ -1057,7 +1089,6 @@ def test_keyboard_without_focus_reference_is_allowed(action):
 
 
 def test_input_activated_reflects_activation_once():
-    """input_activated 只在发生激活后的那次观察为 True，消费后清零。"""
     adapter = FakeWin32Adapter()
     adapter.window_at_point_id = 2002
     backend = _activation_backend(adapter)
@@ -1074,7 +1105,6 @@ def test_input_activated_reflects_activation_once():
 
 
 def test_projection_excludes_input_activated():
-    """投影字节稳定：input_activated 绝不进入 observation_provider_projection。"""
     from core.computer.actions import observation_provider_projection
 
     observation = ComputerObservation(
@@ -1084,7 +1114,6 @@ def test_projection_excludes_input_activated():
 
 
 def test_adapter_activation_seams_swallow_errors():
-    """seam 抛错归一为安全返回值：window_from_point→0，set_foreground→False。"""
 
     def _boom(*args, **kwargs):
         raise RuntimeError("injected failure")
@@ -1096,18 +1125,7 @@ def test_adapter_activation_seams_swallow_errors():
     assert adapter.set_foreground_window(123) is False
 
 
-# ---------------------------------------------------------------------------
-# list_surfaces 解耦：窗口（Win32 快路径）与托盘（UIA 慢路径）不绑成原子动作
-# ---------------------------------------------------------------------------
-
-
 class _SurfaceLocatorStub(FakeSurfaceLocator):
-    """本地 stub：在既有 fake 语义上叠加「某一侧枚举失败」的注入能力。
-
-    继承 tests.computer_fakes.FakeSurfaceLocator 的候选 ref/代数重发语义，只
-    增加 list_windows/list_tray_icons 的异常注入与调用计数；绝不触碰真实窗口、
-    托盘或 UI Automation（也避免改动 tests/computer_fakes.py 的共享契约）。
-    """
 
     def __init__(self, *, windows=(), tray_icons=(), windows_error=None, tray_error=None):
         super().__init__(windows=windows, tray_icons=tray_icons)
@@ -1130,7 +1148,6 @@ class _SurfaceLocatorStub(FakeSurfaceLocator):
 
 
 def _surface_backend(locator):
-    """构造注入 stub locator 的桌面 backend 并完成首次观察。"""
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
     backend = WindowsComputerBackend(
         image_grab=lambda: FakeImage(1280, 720),
@@ -1150,7 +1167,6 @@ _TRAY_SPEC = {
 
 
 def test_list_surfaces_degrades_when_tray_enumeration_times_out(caplog):
-    """托盘（UIA 慢路径）失败只降级为「托盘候选为空」：窗口候选照常产出并可用。"""
     timeout = ComputerControlError(
         "computer_surfaces_unavailable", "UI Automation 调用超时"
     )
@@ -1163,7 +1179,6 @@ def test_list_surfaces_degrades_when_tray_enumeration_times_out(caplog):
     candidates = backend.observe("run-a").surface_candidates
     assert [candidate["kind"] for candidate in candidates] == ["window"]
     assert "记事本" in candidates[0]["label"]
-    # 窗口候选仍可驱动 activate_surface（用户能据此把目标窗口调前台）。
     candidate = candidates[0]
     backend.execute(
         "run-a",
@@ -1186,7 +1201,6 @@ def test_list_surfaces_degrades_when_tray_enumeration_times_out(caplog):
 
 
 def test_list_surfaces_degrades_on_unexpected_tray_exception(caplog):
-    """非 ComputerControlError 的托盘异常同样降级，动作不失败。"""
     locator = _SurfaceLocatorStub(
         windows=[_WINDOW_SPEC], tray_error=RuntimeError("UIA 元素树读取崩溃")
     )
@@ -1203,7 +1217,6 @@ def test_list_surfaces_degrades_on_unexpected_tray_exception(caplog):
 
 
 def test_list_surfaces_still_fails_closed_when_window_enumeration_fails():
-    """窗口枚举失败照常抛错（不掩盖真实故障），且不发布任何候选。"""
     error = ComputerControlError(
         "computer_surfaces_unavailable", "窗口枚举句柄无效"
     )
@@ -1218,7 +1231,6 @@ def test_list_surfaces_still_fails_closed_when_window_enumeration_fails():
 
 
 def test_list_surfaces_success_keeps_window_then_tray_order():
-    """成功路径零回归：候选集合与顺序与解耦前完全一致（窗口在前、托盘在后）。"""
     locator = _SurfaceLocatorStub(
         windows=[
             {"label": "记事本", "bounds": (10, 20, 300, 200)},
@@ -1241,5 +1253,194 @@ def test_list_surfaces_success_keeps_window_then_tray_order():
         "微信",
     ]
     assert candidates[2]["operations"] == ("invoke", "click_point")
-    # 候选一次性消费：普通观察不再携带候选。
     assert backend.observe("run-a").surface_candidates == ()
+
+
+def test_observe_returns_stale_observation_when_hwnd_changes_during_capture():
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+
+    def switching_grab():
+        adapter.foreground_id = 2002
+        return FakeImage(1280, 720)
+
+    backend = WindowsComputerBackend(
+        image_grab=switching_grab, win32_adapter=adapter
+    )
+    backend._started = True
+    try:
+        obs = backend.observe("run-stale-cap")
+        assert obs.ok is False
+        assert obs.error_code == "computer_surface_changed"
+        assert obs.width == 0 and obs.height == 0
+        assert obs.elements == ()
+        with pytest.raises(ComputerControlError) as raised:
+            backend.execute(
+                "run-stale-cap", ComputerAction(kind="click", target="desktop", x=10, y=10)
+            )
+        assert raised.value.code == "computer_invalid_action"
+    finally:
+        backend.close()
+
+
+def test_click_rejects_when_post_activation_target_or_foreground_drifts():
+    class _DriftingAdapter(FakeWin32Adapter):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.point_sequence = [2002, 3003]
+
+        def window_from_point(self, x, y):
+            self.window_from_point_calls.append((x, y))
+            return self.point_sequence.pop(0) if self.point_sequence else 3003
+
+    adapter = _DriftingAdapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720), win32_adapter=adapter
+    )
+    backend.start()
+    try:
+        backend.observe("run-drift")
+        with pytest.raises(ComputerControlError) as raised:
+            backend.execute(
+                "run-drift", ComputerAction(kind="click", target="desktop", x=50, y=50)
+            )
+        assert raised.value.code == "computer_surface_changed"
+        assert adapter.clicks == []
+    finally:
+        backend.close()
+
+    # 若 set_foreground_window 返回 True 但 GetForegroundWindow 仍不是目标 HWND
+    adapter2 = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    adapter2.window_at_point_id = 2002
+    adapter2.set_foreground_window = lambda hwnd: True  # 不改 foreground_id
+    backend2 = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720), win32_adapter=adapter2
+    )
+    backend2.start()
+    try:
+        backend2.observe("run-fg-mismatch")
+        with pytest.raises(ComputerControlError) as raised2:
+            backend2.execute(
+                "run-fg-mismatch",
+                ComputerAction(kind="click", target="desktop", x=50, y=50),
+            )
+        assert raised2.value.code == "computer_foreground_activation_failed"
+        assert adapter2.clicks == []
+    finally:
+        backend2.close()
+
+
+def test_activate_surface_invalidates_prior_observation_and_elements():
+    from tests.test_computer_elements import FakeComHost
+    from core.computer.platforms.windows_elements import WindowsElementLocator
+
+    locator_el = WindowsElementLocator(
+        collect_fn=FakeComHost().collect_impl,
+        click_fn=lambda ref: None,
+        set_value_fn=lambda ref, text: None,
+    )
+    surface_stub = _SurfaceLocatorStub(windows=[_WINDOW_SPEC])
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720),
+        win32_adapter=adapter,
+        surface_locator=surface_stub,
+        element_locator=locator_el,
+    )
+    backend.start()
+    try:
+        obs = backend.observe("run-act")
+        assert obs.elements
+        backend.execute("run-act", ComputerAction(kind="list_surfaces", target="desktop"))
+        candidates = backend.observe("run-act").surface_candidates
+        backend.execute(
+            "run-act",
+            ComputerAction(
+                kind="activate_surface",
+                target="desktop",
+                surface_ref=candidates[0]["ref"],
+                surface_generation=candidates[0]["surface_generation"],
+            ),
+        )
+        # 激活/恢复窗口后旧坐标与元素引用立即失效，未重新 observe 前必须拒绝
+        with pytest.raises(ComputerControlError) as raised:
+            backend.execute(
+                "run-act", ComputerAction(kind="click", target="desktop", x=20, y=20)
+            )
+        assert raised.value.code == "computer_invalid_action"
+        with pytest.raises(ComputerControlError) as raised_el:
+            locator_el.click("el-1")
+        assert raised_el.value.code == "computer_element_stale"
+    finally:
+        backend.close()
+
+
+def test_drag_samples_only_caller_path_and_scroll_does_not_activate_foreground():
+    captured = []
+    adapter = Win32InputAdapter(
+        send_input=_capture_send_input(captured),
+        get_system_metrics=lambda idx: {76: 0, 77: 0, 78: 1920, 79: 1080}.get(idx, 4),
+    )
+    # 水平和垂直跨度即使小于系统阈值 SM_CXDRAG/SM_CYDRAG，也只沿用户 path 采样、绝不外推
+    adapter.send_mouse(action="drag", path=((100, 100), (102, 100)))
+    moves = [ev for ev in captured if ev.flags & MOUSEEVENTF_MOVE]
+    assert len(moves) == 2
+    assert moves[0].x <= moves[1].x
+    assert all(ev.y == moves[0].y for ev in moves)
+
+    captured_v = []
+    adapter_v = Win32InputAdapter(send_input=_capture_send_input(captured_v))
+    adapter_v.send_mouse(action="drag", path=((100, 100), (100, 102)))
+    moves_v = [ev for ev in captured_v if ev.flags & MOUSEEVENTF_MOVE]
+    assert len(moves_v) == 2 and all(ev.x == moves_v[0].x for ev in moves_v)
+
+    fake_adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    fake_adapter.window_at_point_id = 2002
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720), win32_adapter=fake_adapter
+    )
+    backend.start()
+    try:
+        backend.observe("run-scroll")
+        backend.execute("run-scroll", ComputerAction(kind="scroll", target="desktop", delta_y=2))
+        backend.execute(
+            "run-scroll",
+            ComputerAction(kind="scroll", target="desktop", x=200, y=200, delta_y=-2),
+        )
+        assert fake_adapter.set_foreground_calls == []
+        assert fake_adapter.wheels == [2, -2]
+        assert fake_adapter.moves == [(200, 200)]
+    finally:
+        backend.close()
+
+
+def test_ctypes_set_foreground_window_skips_vk_menu_and_attach_thread_input(monkeypatch):
+    import core.computer.win32_adapter as wa
+
+    keybd_calls = []
+    attach_calls = []
+    fg_calls = []
+
+    class _SetFgFn:
+        def __call__(self, hwnd):
+            fg_calls.append(hwnd)
+            return False
+
+    class _GetFgFn:
+        def __call__(self):
+            return 1001
+
+    class _FakeUser32:
+        SetForegroundWindow = _SetFgFn()
+        GetForegroundWindow = _GetFgFn()
+
+        def keybd_event(self, *args):
+            keybd_calls.append(args)
+
+        def AttachThreadInput(self, *args):
+            attach_calls.append(args)
+
+    monkeypatch.setattr(wa.ctypes, "windll", type("_W", (), {"user32": _FakeUser32()})())
+    assert wa._ctypes_set_foreground_window(2002) is False
+    assert fg_calls == [2002]
+    assert keybd_calls == []
+    assert attach_calls == []

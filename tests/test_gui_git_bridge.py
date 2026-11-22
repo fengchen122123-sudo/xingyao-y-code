@@ -1,5 +1,3 @@
-"""GUI Git 桥接层测试（规格 §13/§17.3 后端侧，真实临时仓库）。"""
-
 import threading
 import time
 
@@ -51,7 +49,6 @@ def test_git_get_status_and_stage_commit(bridge, tmp_path):
     assert len(res["snapshot"]["worktree_version"]) == 64
 
     (repo / "f1.txt").write_bytes(b"bridge change\n")
-    # 未刷新版本前 stage 用旧版本 → 可能过期；先刷新
     _trust(bridge, repo)
     refreshed = bridge.git_get_status(str(repo))
     assert refreshed["ok"]
@@ -70,7 +67,6 @@ def test_error_shape_structured(bridge, tmp_path):
     _trust(bridge, repo)
     (repo / "f1.txt").write_bytes(b"x")
     bridge.git_stage(str(repo), ["f1.txt"])
-    # 空标题提交 → invalid_state
     res = bridge.git_commit(str(repo), "")
     assert res["ok"] is False
     assert res["error"]["code"] == "invalid_state"
@@ -129,7 +125,6 @@ def test_git_state_changed_event_dispatched(bridge, tmp_path):
     bridge._window = fake
     assert bridge.git_get_status(str(repo))["ok"]
     time.sleep(0.2)
-    # 外部变化
     make_commit(repo, "external")
     deadline = time.time() + 3
     seen = False

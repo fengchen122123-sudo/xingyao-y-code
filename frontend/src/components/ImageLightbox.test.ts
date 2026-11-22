@@ -5,9 +5,6 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import ImageLightbox from './ImageLightbox.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 灯箱缩放/平移是组件本地状态，测试通过真实 store 打开灯箱后
-// 驱动 DOM 事件（wheel / pointer / dblclick / Esc）断言 img 的 transform。
-
 beforeEach(() => setActivePinia(createPinia()));
 
 function openSingleImage() {
@@ -103,14 +100,11 @@ describe('ImageLightbox 缩放与拖动', () => {
   });
 
   it('SVG 分支垫主题底板（浅色主题边线在纯黑遮罩上隐形的修复）', async () => {
-    // 根因：mermaid 浅色主题边线为深色描边且 SVG 背景透明，气泡里有卡片
-    // 底色承托，灯箱里直接贴黑色遮罩导致边线隐形。底板样式被删除时本用例失败
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10"><text>x</text></svg>';
     const store = useAppStore();
     store.openLightbox([svg], 0);
     const wrapper = mount(ImageLightbox);
 
-    // 运行时断言：渲染出的 .lb-svg 容器存在（底板类挂在它身上）
     expect(wrapper.find('.lb-svg').exists()).toBe(true);
     wrapper.unmount();
 
@@ -136,7 +130,6 @@ describe('ImageLightbox 缩放与拖动', () => {
     expect(wrapper.find('.lb-img').exists()).toBe(false);
     expect(holder.html()).toContain('<text>节点</text>');
 
-    // 缩放/平移对 SVG 分支同样生效
     await wrapper.get('.lightbox-mask').trigger('wheel', { deltaY: -100 });
     expect(holder.attributes('style')).toContain('scale(1.2)');
     wrapper.unmount();

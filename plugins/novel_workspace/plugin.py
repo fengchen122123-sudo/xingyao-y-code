@@ -1,9 +1,3 @@
-"""novel_workspace：小说工作区插件入口（薄壳）。
-
-业务实现位于 core.novel_service（随主程序编译进 PYZ 分发），本文件只负责
-注册工具与转发调用，不含目录创建、Agent 转换等任何业务逻辑。
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,7 +14,6 @@ from core.tool_protocol import ToolResult, ToolSpec
 
 
 def _to_result(result: dict) -> ToolResult:
-    """把核心实现返回的字典序列化为工具结果；失败时标记 is_error。"""
     return ToolResult(
         json.dumps(result, ensure_ascii=False, indent=2),
         is_error=not result.get("ok", False),
@@ -28,7 +21,6 @@ def _to_result(result: dict) -> ToolResult:
 
 
 def _run_novel_init(workdir, title, genre="", platform="", target_words=0):
-    """工具执行体：仅把核心实现返回的字典序列化为工具结果文本。"""
     result = init_novel_project(
         workdir,
         title,
@@ -40,7 +32,6 @@ def _run_novel_init(workdir, title, genre="", platform="", target_words=0):
 
 
 def _run_novel_outline(workdir, unit_id=None, stage="outline", toc=False, path=None):
-    """工具执行体：转发 core.novel_service.novel_outline，不做文本加工。"""
     return _to_result(novel_outline(
         workdir,
         unit_id=unit_id,
@@ -51,18 +42,15 @@ def _run_novel_outline(workdir, unit_id=None, stage="outline", toc=False, path=N
 
 
 def _run_novel_track(workdir, mode, transaction):
-    """工具执行体：转发 core.novel_service.novel_track，不重算追踪状态。"""
     return _to_result(novel_track(workdir, mode, transaction))
 
 
 def _run_novel_status(workdir):
-    """工具执行体：转发 novel_status；非小说项目返回 is_novel=False 仍属正常结果。"""
     result = novel_status(workdir)
     return ToolResult(json.dumps(result, ensure_ascii=False, indent=2), is_error=False)
 
 
 def _run_novel_wordcount(text=None, workdir=None, chapter=None):
-    """工具执行体：转发 novel_wordcount；参数/文件错误按 is_error 标记。"""
     return _to_result(novel_wordcount(text=text, workdir=workdir, chapter=chapter))
 
 
@@ -116,8 +104,8 @@ def register(registry):
         },
         execute=_run_novel_init,
         read_only=False,
-        mutates_files=True,          # 建目录、写标记与 Agent 文件
-        requires_permission=True,    # 写操作走用户审批
+        mutates_files=True,
+        requires_permission=True,
         parallel_safe=False,
         activity_description="初始化小说项目",
         side_effect_scope="workspace",
@@ -218,8 +206,8 @@ def register(registry):
         },
         execute=_run_novel_track,
         read_only=False,
-        mutates_files=True,          # 写 _tracking-state.json 与派生的追踪视图
-        requires_permission=True,    # 写操作走用户审批
+        mutates_files=True,
+        requires_permission=True,
         parallel_safe=False,
         activity_description="提交追踪事务",
         side_effect_scope="workspace",

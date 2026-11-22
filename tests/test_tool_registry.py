@@ -40,9 +40,6 @@ def test_subagent_schema_defaults_to_foreground_and_hides_timeout():
     properties = schema["function"]["parameters"]["properties"]
 
     assert properties["run_in_background"]["default"] is False
-    # 时间预算由系统内部管理（Task 8）：模型可见 schema 不再暴露
-    # timeout_seconds；内部默认值仍为 explore 240 / review 300 /
-    # test 480 / implement、general 600，前台硬上限 600 秒
     assert "timeout_seconds" not in properties
 
 
@@ -50,7 +47,6 @@ def test_subagent_schema_exposes_role_and_plan_item():
     properties = build_default_registry().get("run_subagent").api_schema()["function"]["parameters"]["properties"]
 
     assert properties["subagent_type"]["default"] == "general"
-    # subagent_type 不再限制 enum，允许传入 ~/.ycode/agents/*.md 中定义的自定义子 agent name
     assert "enum" not in properties["subagent_type"]
     assert "description" in properties["subagent_type"]
     assert "plan_item_id" in properties
@@ -153,7 +149,6 @@ def test_execute_command_description_warns_about_powershell_quotes():
 def test_manage_task_only_prompts_for_kill():
     registry = build_default_registry()
 
-    # list/status 只读操作不在 spec 层面弹确认（kill 由工具内部单独请求权限）
     assert registry.get("manage_task").requires_permission is False
 
 
@@ -177,7 +172,6 @@ def test_read_file_schema_exposes_paging_and_edit_file_exposes_replace_all():
 
 
 def test_edit_file_choice_constraint_is_moonshot_compatible():
-    """函数参数根节点保持 object，选择约束不得直接把 anyOf 放在根节点。"""
     registry = build_default_registry()
     parameters = registry.get("edit_file").api_schema()["function"]["parameters"]
 
@@ -209,7 +203,6 @@ def test_manage_task_schema_exposes_wait_parameters():
 
 
 def test_run_subagent_schema_does_not_expose_timeout_seconds():
-    """模型可见 schema 不再暴露 timeout_seconds：时间预算由系统内部管理。"""
     from core.tool_registry import build_default_registry
 
     schema = (
@@ -218,9 +211,6 @@ def test_run_subagent_schema_does_not_expose_timeout_seconds():
         .api_schema()["function"]["parameters"]
     )
     assert "timeout_seconds" not in schema["properties"]
-
-
-# ── Task 9：电脑操控保留名拒绝（插件/MCP 不得占用固定 Harness 名） ──
 
 
 def _hijack_spec(name):
@@ -248,7 +238,6 @@ def test_default_registry_excludes_reserved_computer_names():
 
 
 def test_plugin_registering_reserved_name_is_recorded_as_failed(tmp_path, monkeypatch):
-    """插件尝试注册 computer_action 时：拒绝注册且插件状态记为 failed。"""
     import core.plugin_loader as plugin_loader
 
     plugin_root = tmp_path / "plugins"
@@ -324,11 +313,8 @@ def test_mcp_reserved_schemas_are_filtered_from_tools_schema(monkeypatch):
     assert "remote" in names
 
 
-# ── A2：side_effect_scope 契约校验（03 规格 3.2） ──
-
 _VALID_SIDE_EFFECT_SCOPES = {"none", "workspace", "git", "network", "system"}
 
-# build_default_registry 的 31 个内置工具（不含插件与固定 computer 适配器）
 _BUILTIN_TOOL_NAMES = (
     "read_file", "list_directory", "search_code", "find_definition", "search_news",
     "fetch_url", "get_weather", "glob_files", "automation_list", "ask_user",
@@ -341,7 +327,6 @@ _BUILTIN_TOOL_NAMES = (
 
 
 def test_all_builtin_tools_have_valid_side_effect_scope():
-    """所有内置工具的 side_effect_scope 非空且属于合法集合（03 规格 T-T10）。"""
     registry = build_default_registry()
 
     for name in _BUILTIN_TOOL_NAMES:
@@ -351,7 +336,6 @@ def test_all_builtin_tools_have_valid_side_effect_scope():
 
 
 def test_side_effect_scope_matches_spec_categories():
-    """03 规格 3.2 取值表的代表性归类不得漂移。"""
     registry = build_default_registry()
 
     assert registry.get("read_file").side_effect_scope == "none"
@@ -364,11 +348,6 @@ def test_side_effect_scope_matches_spec_categories():
 
 
 def _load_plugin_module_by_path(module_name, plugin_dir):
-    """按文件路径加载插件薄壳（与 plugin_loader 的加载方式一致）。
-
-    直接走 importlib 而不用插件加载器：本测试只验证插件源码里的 ToolSpec
-    声明，不应依赖插件启用状态 / 信任状态 / 全局注册表等外部环境。
-    """
     import importlib.util
     import os
 
@@ -380,11 +359,6 @@ def _load_plugin_module_by_path(module_name, plugin_dir):
 
 
 def test_image_plugin_tools_declare_network_scope():
-    """A 阶段评审修复：生图插件工具必须声明 side_effect_scope=network。
-
-    规格 03 §3.2 取值表点名 hunyuan_generate_image / tokenrhythm_* 归
-    network；此前插件未声明导致取默认 none，本测试锁定该契约。
-    """
     import os
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -410,11 +384,6 @@ def test_image_plugin_tools_declare_network_scope():
 
 
 def test_fixed_computer_adapter_declares_system_scope():
-    """A 阶段评审补修：固定 computer 适配器必须声明 side_effect_scope=system。
-
-    规格 03 §3.2 取值表点名 computer_action 归 system；此前未声明导致取默认
-    none，本测试锁定该契约（与生图插件 network 同理，不经注册表加载）。
-    """
     from core.computer.tool_adapter import computer_action_tool_spec
 
     assert computer_action_tool_spec().side_effect_scope == "system"

@@ -6,7 +6,6 @@ import App from './App.vue';
 import { useAppStore } from './stores/appStore';
 import { useGitStore } from './stores/gitStore';
 
-// 子组件全部 stub：只断言对话标题栏自身的按钮，不依赖子组件行为
 const stubs = {
   Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
   InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
@@ -14,7 +13,6 @@ const stubs = {
   AppIcon: true, MessageNavRail: true, RemoteDirBrowser: true,
 };
 
-// mock 决策桥方法：入口可见性探测只依赖 get_decision_audit_summary(limit, session)
 function mockDecisionApi(overrides: Record<string, unknown> = {}) {
   const api = {
     get_decision_audit_summary: vi.fn(async () => ({ ok: true, has_business_records: true })),
@@ -72,7 +70,6 @@ it('对话标题栏渲染 Git 分支 chip，点击展开 Git 面板', async () =
 
   const wrapper = mount(App, { global: { stubs } });
   const chip = wrapper.get('[data-test="chat-header-git-branch"]');
-  // 复用状态栏文案（去 ⎇ 前缀）：分支名 + 脏标记
   expect(chip.text()).toContain('dev');
 
   store.rightPanelCollapsed = true;
@@ -95,7 +92,6 @@ it('未产生过决策记录时，头部不渲染「决策」入口', () => {
 it('对话标题栏渲染「决策」入口，点击展开/收起决策记录面板', async () => {
   const store = useAppStore();
   store.initialized = true;
-  // 入口只在真的产生过决策记录时显示
   store.decisionHasRecords = true;
   const wrapper = mount(App, { global: { stubs } });
 
@@ -123,7 +119,6 @@ it('决策未读徽章：decision_recorded 事件累计，打开面板后清零'
   await wrapper.vm.$nextTick();
   expect(wrapper.get('[data-test="decision-entry-badge"]').text()).toBe('2');
 
-  // 打开面板 → onMounted 清零未读
   await wrapper.find('[data-test="decision-entry"]').trigger('click');
   await flushPromises();
   expect(store.decisionUnread).toBe(0);
@@ -172,7 +167,6 @@ it('refreshDecisionAvailability 会话名为空时不请求后端，且入口保
   expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
   expect(store.decisionHasRecords).toBe(false);
 
-  // 不传参且 currentSessionName 为空时同样不发请求
   await store.refreshDecisionAvailability();
   expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
   expect(store.decisionHasRecords).toBe(false);
@@ -191,7 +185,6 @@ it('decision_recorded 带其他会话 session_id：只推进 tick，不累加未
   expect(store.decisionUnread).toBe(0);
   expect(store.decisionHasRecords).toBe(false);
 
-  // 当前会话自己的决策仍按旧行为累加未读 + 点亮入口
   store.handleBridgeEvent({ type: 'decision_recorded', data: { session_id: 'sess-A' } } as any);
 
   expect(store.decisionEventTick).toBe(tickBefore + 2);
@@ -246,12 +239,10 @@ it('后台任务入口收进会话头部，点击向下展开卡片且与「星�
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(false);
 
-  // 打开「星链」会互斥关闭后台任务下拉卡片
   await header.get('[data-test="task-entry"]').trigger('click');
   expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(false);
 
-  // 再打开后台任务会互斥关闭「星链」
   await header.get('[data-test="bg-bar-details"]').trigger('click');
   expect(wrapper.find('[data-test="bg-card"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="task-dialog"]').exists()).toBe(false);

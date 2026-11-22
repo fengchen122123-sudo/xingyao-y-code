@@ -72,7 +72,6 @@ it('normalizes CLI-style totals with zero fallback', () => {
   expect(usage.total_completion).toBe(20000);
   expect(usage.total_cached).toBe(382200);
 
-  // 旧后端 payload 无新字段时回落 0，不产生 NaN
   const legacy = normalizeTokenUsage({ used: 1, window: 128000 });
   expect(legacy.total_prompt).toBe(0);
   expect(legacy.total_completion).toBe(0);
@@ -97,7 +96,6 @@ it('normalizes a legacy backend payload without inventing cache rates', () => {
 it('captures and restores tokenUsage per session runtime (无闪烁切换)', () => {
   const store = useAppStore();
 
-  // 会话 A 收到一份窗口用量
   store.currentSessionName = 'session-a';
   store.handleBridgeEvent({
     type: 'token_usage',
@@ -105,14 +103,11 @@ it('captures and restores tokenUsage per session runtime (无闪烁切换)', () 
   });
   expect(store.tokenUsage.used).toBe(36800);
 
-  // 切走：捕获 A 的 runtime（含 tokenUsage）
   store._captureRuntime('session-a');
 
-  // 切到会话 B（无暂存快照 → 保持当前值，等后端事件校正）
   store._bindSessionRuntime('session-b');
   expect(store.tokenUsage.used).toBe(36800);
 
-  // B 收到自己的用量
   store.currentSessionName = 'session-b';
   store.handleBridgeEvent({
     type: 'token_usage',
@@ -121,7 +116,6 @@ it('captures and restores tokenUsage per session runtime (无闪烁切换)', () 
   store._captureRuntime('session-b');
   expect(store.tokenUsage.used).toBe(5000);
 
-  // 切回 A：立即恢复 A 上次快照，无需等后端事件
   store._bindSessionRuntime('session-a');
   expect(store.tokenUsage.used).toBe(36800);
   expect(store.tokenUsage.total_prompt).toBe(36800);
@@ -159,7 +153,6 @@ it('normalizeTokenUsage 对 context_breakdown 缺失/异常输入回落 []', () 
   });
   expect(usage.context_breakdown).toEqual([{ source: 'system_prompt', chars: 200 }]);
 
-  // 旧后端无该字段 / 字段为 null → []
   expect(normalizeTokenUsage({ used: 1, window: 128000 }).context_breakdown).toEqual([]);
   expect(normalizeTokenUsage({ context_breakdown: null }).context_breakdown).toEqual([]);
 });
@@ -217,7 +210,6 @@ it('normalizes session_totals（本会话落库口径）with legacy fallback', (
   expect(usage.session_totals.last_ts).toBe(1759000000);
   expect(usage.session_totals.keepalive_requests).toBe(5);
 
-  // 旧后端无 session_totals 字段：回落全零 + 空 session_id + last_ts null
   const legacy = normalizeTokenUsage({ used: 1, window: 128000 });
   expect(legacy.session_totals.session_id).toBe('');
   expect(legacy.session_totals.prompt).toBe(0);

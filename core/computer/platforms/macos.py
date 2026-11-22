@@ -1,5 +1,3 @@
-"""macOS 接入位置；授权、坐标、输入与热键未实现前保持不可用。"""
-
 from core.computer.platforms.base import UnavailablePlatformAdapter
 
 

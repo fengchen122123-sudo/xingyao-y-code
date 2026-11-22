@@ -1,9 +1,3 @@
-"""极简中转服务器 HTTP/WS（提取自旧网关 gateway/app.py 的 relay 段）。
-
-路由与帧序和旧网关逐帧一致：/health、换票、/relay/device、/relay/client、
-桌面/移动页面托管。剥离 account 维度与全部管理面。
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -42,7 +36,6 @@ class DeviceEnrollBody(BaseModel):
 
 
 def _namespace_rpc(relay: RelayRegistry, device_id: str, app_key: str, raw: str) -> dict | None:
-    """只改传输层的 id：两个 App 各自的 id=1 不串，method/args 原样透传。"""
     try:
         frame = json.loads(raw)
     except Exception:
@@ -54,7 +47,6 @@ def _namespace_rpc(relay: RelayRegistry, device_id: str, app_key: str, raw: str)
 
 
 def _offline_reply(raw: str) -> bool | dict:
-    """设备不在线：带 id 的 RPC 立刻回 device_offline，App 不必等超时。"""
     try:
         frame = json.loads(raw)
     except Exception:
@@ -86,7 +78,6 @@ async def _fanout(
                 {receive, incoming},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            # receive 常驻不取消（取消会偷帧）；只取消队列等待，消费结果后重建 receive。
             for task in pending:
                 if task is not receive:
                     task.cancel()
@@ -117,7 +108,6 @@ async def _fanout(
 
 
 def _web_file(root: Path, relative: str) -> Path | None:
-    """只认打包目录内真实存在的文件；逃出目录或不存在都当没有。"""
     if not relative:
         return None
     try:
@@ -129,15 +119,10 @@ def _web_file(root: Path, relative: str) -> Path | None:
 
 
 def _mount_desktop(app: FastAPI, desktop_dir: Path | None, shim: Path | None) -> None:
-    """完整 GUI 前端暴露为 /desktop/<device_id>，资源走 /desktop-assets/*。"""
     if desktop_dir is None or not (desktop_dir / "index.html").is_file():
         return
-    # vite --base=/desktop-assets/ 的产物引用 /desktop-assets/assets/*（base 前缀 + 默认
-    # assetsDir），与旧网关一致 mount 整个 dist 目录，icon.png 等根文件也一并覆盖。
     if desktop_dir.is_dir():
         app.mount("/desktop-assets", StaticFiles(directory=str(desktop_dir)), name="desktop-assets")
-    # 安装包 _internal/frontend/dist 以 base=/ 构建，HTML 与 JS chunk 引用 /assets/*；
-    # 同挂一份 /assets，使安装包用户无需源码与 Node 重编译即可直接托管桌面远端页。
     assets = desktop_dir / "assets"
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=str(assets)), name="desktop-root-assets")
@@ -167,10 +152,6 @@ def _mount_desktop(app: FastAPI, desktop_dir: Path | None, shim: Path | None) ->
 
 
 def _mount_mobile(app: FastAPI, mobile_dir: Path | None, shim: Path | None) -> None:
-    """独立移动端暴露为 /m/<device_id>，与桌面 UI 共用同一套 relay 协议。
-
-    目录缺失（没部署移动端包）时完全不挂路由，二维码退回 /desktop/<device_id>。
-    """
     if mobile_dir is None or not (mobile_dir / "index.html").is_file():
         return
     root = Path(mobile_dir)
@@ -251,7 +232,6 @@ def create_app(
             return True
 
     def _ticket_allowed(device_id: str, now: float) -> bool:
-        """同一设备窗口内最多换票 ticket_max 次：正常用法是「用户打开二维码」级别。"""
         return _rate_allowed(_ticket_hits, _ticket_lock, device_id, now, ticket_max, ticket_window)
 
     @asynccontextmanager
@@ -284,11 +264,6 @@ def create_app(
 
     @app.post("/api/relay/device-token")
     def relay_device_token(body: DeviceTokenBody):
-        """桌面用设备令牌自证，换取只读 remote JWT，供公网二维码扫码入站。
-
-        三处收口：只签给未吊销的设备、票里只绑自己这台 device_id、
-        同一设备 10 分钟内最多换 6 次。
-        """
         row = database.execute("SELECT * FROM devices WHERE id = ?", (body.device_id,)).fetchone()
         # 令牌比对走常量时间：不能按响应耗时逐字节反推 token_hash
         if row is None or int(row["revoked"]) or not secrets.compare_digest(
@@ -374,7 +349,6 @@ def create_app(
         device["send"] = send_raw
         await websocket.send_text(json.dumps(result["registered"], ensure_ascii=False))
         if result.get("reset_frame"):
-            # GUI 重启换了 boot_id：先让已连上的 App 重置水位，再播在线。
             relay.publish(device_id, result["reset_frame"])
         if result.get("online_frame"):
             relay.publish(device_id, result["online_frame"])
@@ -417,7 +391,6 @@ def create_app(
                     await websocket.send_text(json.dumps({"type": "pong"}))
                     continue
                 if frame.get("type") == "relay_lost":
-                    # 桌面出站队列满丢过帧：这段补不回来，只能让 App 整态自愈。
                     lost = relay.enqueue(device_id)
                     if lost is not None:
                         relay.publish(device_id, lost)
@@ -427,7 +400,6 @@ def create_app(
                     relay.remember(device_id, seq, raw)
                 route = relay.resolve_rpc(device_id, frame.get("id"))
                 if route is not None:
-                    # RPC 回程定向回原 App，并把服务器加的前缀还原成 App 自己的 id。
                     app_key, original = route
                     reply = dict(frame)
                     reply["id"] = original
@@ -474,7 +446,6 @@ def create_app(
             def forward(raw: str) -> bool | dict:
                 send = (relay.devices.get(device_id) or {}).get("send")
                 if not callable(send):
-                    # 在途 RPC 由服务器立即报错并带上 id，App 不用等到 30 秒超时。
                     return _offline_reply(raw)
                 frame = _namespace_rpc(relay, device_id, app_key, raw)
                 send(json.dumps(frame, ensure_ascii=False) if frame is not None else raw)

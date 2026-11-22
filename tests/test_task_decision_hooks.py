@@ -1,19 +1,4 @@
 # -*- coding: utf-8 -*-
-"""任务执行期 JEV 自动决策钩子测试（不干预模型路由）。
-
-覆盖：
-1. 默认关闭（enabled=False）：零请求、零审计、行为完全不变；
-2. 开启全局决策（enabled=True）：不打开 router 选模型，但 4 个执行期决策点自动调用 JEV；
-   - shadow_mode=True 时写影子审计（shadow=True, adopted=False）但不改业务；
-   - shadow_mode=False 时正式采纳（shadow=False, adopted=True）；
-   - 显式在 scenes 里设 enabled=False 可单项关闭；
-3. 4 个执行期接入点真实联动：
-   - loop_guard：连续报错/停滞时触发纠偏（pivot / ask_user / continue）；
-   - subagent_review：SubagentManager._run_task 验收子代理结果（accepted / incomplete / failed）；
-   - plan_recovery：plan_retry 对失败项给出恢复策略（retry_same / split_smaller / escalate_user）；
-   - memory_filter：后台学习落盘前过滤噪音记忆（keep_all / keep_facts_only / skip_all）；
-4. 隐私脱敏：sk- / Bearer / api_key 等密钥不进入发给 JEV 的 state。
-"""
 
 import json
 import os
@@ -96,10 +81,6 @@ def data_dir(tmp_path, monkeypatch):
     svc._reset_runtime_state()
 
 
-# ---------------------------------------------------------------------------
-# 1. 自动开启与路由隔离
-# ---------------------------------------------------------------------------
-
 def test_disabled_by_default_zero_requests(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     calls = _mock_no_network(monkeypatch)
@@ -124,7 +105,6 @@ def test_disabled_by_default_zero_requests(data_dir, monkeypatch):
 
 
 def test_global_enabled_auto_activates_task_scenes_without_enabling_router(data_dir, monkeypatch):
-    """仅开全局开关 enabled=True（不改 scenes）：router 仍关闭，4 个任务决策点自动调用 JEV。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({"enabled": True, "shadow_mode": False})
     assert router_scene_live() is False
@@ -165,7 +145,6 @@ def test_global_enabled_auto_activates_task_scenes_without_enabling_router(data_
 
 
 def test_global_shadow_mode_records_audit_without_affecting_behavior(data_dir, monkeypatch):
-    """全局 shadow_mode=True 时自动发请求并写影子审计，但返回值全为 None / 保留原样。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({"enabled": True, "shadow_mode": True})
     calls = _mock_post(
@@ -224,10 +203,6 @@ def test_state_redacts_sensitive_tokens(data_dir, monkeypatch):
     assert "sk-secret999999" not in sent_state
 
 
-# ---------------------------------------------------------------------------
-# 2. loop_guard：构建纠偏消息 + chat_with_model_events 异常步触发联动
-# ---------------------------------------------------------------------------
-
 def test_loop_intervention_message_variants():
     assert "纠偏" in hooks.build_loop_intervention_message("pivot")
     assert "向用户" in hooks.build_loop_intervention_message("ask_user")
@@ -236,7 +211,6 @@ def test_loop_intervention_message_variants():
 
 
 def test_loop_guard_injects_pivot_guidance_in_chat_turn(data_dir, monkeypatch):
-    """chat_with_model_events 连续 2 步工具报错时，自动触发 loop_guard 并注入纠偏消息。"""
     from types import SimpleNamespace
     from core import llm as llm_mod
 
@@ -282,17 +256,12 @@ def test_loop_guard_injects_pivot_guidance_in_chat_turn(data_dir, monkeypatch):
     ))
 
     assert any(e.kind == "turn_finished" for e in events)
-    # 第 3 次模型请求应能看到 loop_guard 注入的纠偏提示
     assert len(captured_requests) == 3
     assert any(
         msg.get("role") == "user" and "JEV 执行纠偏建议" in str(msg.get("content", ""))
         for msg in captured_requests[2]
     )
 
-
-# ---------------------------------------------------------------------------
-# 3. subagent_review：SubagentManager._run_task 联动验收
-# ---------------------------------------------------------------------------
 
 def test_subagent_review_marks_fake_completion_as_failed(data_dir, monkeypatch):
     from core.tools import SubagentManager, SubagentTask
@@ -344,10 +313,6 @@ def test_subagent_review_appends_warning_on_incomplete(data_dir, monkeypatch):
     assert "[JEV 验收提醒]" in task.result
 
 
-# ---------------------------------------------------------------------------
-# 4. plan_recovery：plan_retry 联动恢复策略
-# ---------------------------------------------------------------------------
-
 def test_plan_recovery_intercepts_blind_retry_on_split_smaller(data_dir, monkeypatch):
     from core import plan as plan_mod
     from core.task_scheduler import TaskScheduler
@@ -375,7 +340,6 @@ def test_plan_recovery_intercepts_blind_retry_on_split_smaller(data_dir, monkeyp
     assert "JEV 恢复建议：拆小或调整方案" in out
     assert mgr.snapshot()[0]["status"] == "failed"
 
-    # force=True 时尊重显式强制重试
     forced = plan_mod.plan_retry("p1", force=True)
     assert "已重置为 pending" in forced
     assert mgr.snapshot()[0]["status"] == "pending"
@@ -408,10 +372,6 @@ def test_plan_recovery_allows_retry_same(data_dir, monkeypatch):
     assert "已重置为 pending" in out
     assert mgr.snapshot()[0]["status"] == "pending"
 
-
-# ---------------------------------------------------------------------------
-# 5. memory_filter：run_turn_learning 联动过滤噪音记忆
-# ---------------------------------------------------------------------------
 
 def test_memory_filter_blocks_noisy_writes_in_run_turn_learning(data_dir, monkeypatch):
     from core import learning as learning_mod
@@ -449,7 +409,6 @@ def test_memory_filter_blocks_noisy_writes_in_run_turn_learning(data_dir, monkey
 
 
 def test_memory_filter_records_target_session_even_when_ui_views_other(data_dir, monkeypatch):
-    """后台学习运行期即使 UI 当前看着别的会话，memory_filter 也必须记在目标会话名下。"""
     from core import app_context
     from core import learning as learning_mod
 
@@ -491,7 +450,6 @@ def test_memory_filter_records_target_session_even_when_ui_views_other(data_dir,
 
 
 def test_subagent_run_task_restores_thread_session_on_exit(data_dir, monkeypatch):
-    """SubagentManager._run_task 退出时恢复调用方线程会话，不残留父会话。"""
     from core import app_context
     from core.tools import SubagentManager, SubagentTask
 

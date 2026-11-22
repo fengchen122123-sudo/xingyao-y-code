@@ -69,9 +69,6 @@ afterEach(() => {
 
 describe('applyGuiTheme', () => {
   it('清除 body 上启动期写入的 inline 背景色，避免旧主题实色残留在面板缝隙', async () => {
-    // 启动时 applyBootTheme 会把首屏主题的背景实色写进 body.style（防白闪）；
-    // 运行期切换主题后若不清除，深色主题下 body 仍是旧浅色，面板之间 1px
-    // 的缝隙会露出这层旧色，看上去像两条亮线。
     document.body.style.backgroundColor = 'rgb(244, 244, 241)';
 
     const applied = await applyGuiTheme(theme(), fakeApi());
@@ -81,8 +78,6 @@ describe('applyGuiTheme', () => {
   });
 
   it('把主题 ID 写到 documentElement 的 data-gui-theme-id，供主题专属 CSS 作用域激活', async () => {
-    // 主题专属样式表（如 qq2009.css）用 html[data-gui-theme-id="builtin.qq2009"]
-    // 限定作用域，只有该主题激活时才生效。
     const value = theme();
     value.id = 'builtin.qq2009';
 
@@ -143,7 +138,6 @@ describe('applyGuiTheme', () => {
 
     const applied = await applyGuiTheme(value, api);
 
-    // 全局图与 workspace 分区引用同一资源：只解码一次、共用一个 Blob URL
     expect(api.get_gui_theme_asset).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
     expect(document.documentElement.style.getPropertyValue('--theme-app-image'))
@@ -168,7 +162,6 @@ describe('applyGuiTheme', () => {
 
     const applied = await applyGuiTheme(value, api);
 
-    // 全局图生效：分区图全部强制 none，且分区图资源不被解码（只解码全局图一次）
     expect(document.documentElement.style.getPropertyValue('--theme-app-image'))
       .toBe('url("blob:workspace")');
     expect(document.documentElement.style.getPropertyValue('--theme-workspace-image')).toBe('none');
@@ -188,11 +181,9 @@ describe('applyGuiTheme', () => {
     const applied = await applyGuiTheme(value, api);
 
     expect(document.documentElement.style.getPropertyValue('--theme-workspace-bg-opacity-pct')).toBe('0%');
-    // 原始 0-1 值仍如实写入（供编辑器回读）
     expect(document.documentElement.style.getPropertyValue('--theme-workspace-bg-opacity')).toBe('1');
     applied.dispose();
 
-    // 移除全局图后分区背景透明度恢复用户设置
     value.app_image.image = null;
     const restored = await applyGuiTheme(value, api);
     expect(document.documentElement.style.getPropertyValue('--theme-workspace-bg-opacity-pct')).toBe('100%');
@@ -253,7 +244,6 @@ describe('applyGuiTheme', () => {
   });
 
   it('decodes validated assets into blobs with the exact mime and bytes', async () => {
-    // base64 'AQID' → 字节 01 02 03
     const api = {
       get_gui_theme_asset: vi.fn().mockResolvedValue({
         ok: true, mime: 'image/png', base64: 'AQID',

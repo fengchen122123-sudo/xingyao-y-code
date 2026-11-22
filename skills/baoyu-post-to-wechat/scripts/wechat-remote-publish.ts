@@ -242,14 +242,12 @@ async function killChild(child: ChildProcessByStdio<null, Readable, Readable>, k
   try {
     child.kill("SIGTERM");
   } catch {
-    /* already dead */
   }
 
   const timer = setTimeout(() => {
     try {
       child.kill("SIGKILL");
     } catch {
-      /* already dead */
     }
   }, killTimeoutMs);
 

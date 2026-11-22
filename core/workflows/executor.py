@@ -1,21 +1,3 @@
-"""星流工作流解释执行器：逐步执行 plan IR，每步发事件（纯 Python，零 Node）。
-
-设计：
-
-- **确定性**：步骤是数据，执行器逐步驱动——进度不再依赖模型即兴；
-- **事件驱动**：每个阶段/子代理/命令/产物通过 ``publish(kind, payload)`` 上报，
-  调用方决定落库与实时推送（runs.publish_run_event → 台账 + 桥层 emit_event）；
-- **可注入**：``agent_runner`` / ``command_runner`` 可替换（测试桩），默认实现
-  桥接 core.tools.run_subagent 与 core.tools.execute_command；
-- **失败语义**：步骤失败抛内部 :class:`StepFailure`；``fallback`` 步骤接住后
-  执行回退分支，否则整次运行失败——绝不静默吞错；
-- **取消**：步骤间与循环迭代间检查 ``cancel_event``，子代理/命令透传。
-
-命令权限策略（与星轨无人值守同源）：``permission_mode`` 为 accept_edits/full
-时命令步骤才执行；confirm/plan 档一律跳过并记失败——工作流运行通常是无人
-值守形态，等待审批会挂死回合。
-"""
-
 from __future__ import annotations
 
 import json
@@ -31,7 +13,6 @@ PublishFn = Callable[[str, dict], None]
 AgentRunner = Callable[..., tuple[bool, str]]
 CommandRunner = Callable[..., tuple[bool, dict]]
 
-#: 单次运行的报告条目与事件上限（防御异常 plan 的放大效应）。
 MAX_EVENTS = 2000
 
 
@@ -50,7 +31,6 @@ def _default_agent_runner(
     timeout_seconds: int,
     cancel_event=None,
 ) -> tuple[bool, str]:
-    """默认子代理执行器：桥接 core.tools.run_subagent（前台等待）。"""
     from core.tools import run_subagent
 
     try:
@@ -63,8 +43,6 @@ def _default_agent_runner(
     except Exception as exc:
         return False, f"子代理启动失败: {exc}"
     text = str(raw or "")
-    # run_subagent 返回混合形态：成功=结果文本；失败=结构化文本/JSON。
-    # JSON 且 status 非 completed 视为失败；其余按成功文本对待（与模型读法一致）。
     stripped = text.strip()
     if stripped.startswith("{"):
         try:
@@ -82,11 +60,6 @@ def _default_command_runner(
     timeout_seconds: int,
     cancel_event=None,
 ) -> tuple[bool, dict]:
-    """默认命令执行器：argv 安全拼接后走 core.tools.execute_command。
-
-    execute_command 自带危险命令策略 / 沙盒 / 撤销冻结 / 输出抓取；
-    返回文本作为 output 绑定（exitCode 语义 v1 不解析，条件判断用 output 文本）。
-    """
     from core.tools import execute_command
 
     if os.name == "nt":
@@ -163,7 +136,6 @@ class PlanExecutor:
         self._permission_mode = str(permission_mode or "confirm")
         self._agent_runner = agent_runner or _default_agent_runner
         self._command_runner = command_runner or _default_command_runner
-        # 运行参数作初始绑定：模板 {var} 直接引用生效参数（workflow_run 传入）
         self._scope: dict = dict(initial_scope or {})
         self._phase_total = 0
         self._phase_index = 0
@@ -173,8 +145,6 @@ class PlanExecutor:
         for step in plan.get("steps") or []:
             if isinstance(step, dict) and step.get("op") == "phase":
                 self._phase_total += 1
-
-    # -- 对外 --
 
     def run(self) -> dict:
         """执行全部步骤；返回摘要。任何未捕获失败 → run_failed 事件 + 摘要。"""
@@ -195,8 +165,6 @@ class PlanExecutor:
         except Exception as exc:  # 执行器自身异常也只记失败，绝不抛出工具调用
             self._publish("run_failed", {"error": f"执行器异常: {exc}"})
             return {"ok": False, "summary": f"工作流执行失败：执行器异常 {exc}", "reports": self._reports}
-
-    # -- 步骤分发 --
 
     def _emit(self, kind: str, payload: dict) -> None:
         self._event_count += 1
@@ -219,13 +187,10 @@ class PlanExecutor:
                 raise StepFailure(f"未知步骤 op: {op!r}")
             handler(step)
 
-    # -- 各 op --
-
     def _step_phase(self, step: dict) -> None:
         self._phase_index += 1
         name = str(step.get("name") or "")
         self._emit("phase_started", {"index": self._phase_index, "total": self._phase_total, "name": name})
-        # phase 是标记不是容器：后续步骤自然属于当前阶段（ZCode 语义）
 
     def _step_agent(self, step: dict) -> None:
         name = str(step.get("name") or f"agent-{self._event_count}")
@@ -303,8 +268,6 @@ class PlanExecutor:
                 try:
                     should_run = eval_condition(str(while_expr), self._scope)
                 except PlanError:
-                    # 首轮条件引用了循环体内才绑定的变量（重试型循环的惯用形态）：
-                    # 视为进入循环；若循环体始终不绑定，max 上限保证终止
                     should_run = True
                 if not should_run:
                     break
@@ -339,17 +302,6 @@ def execute_plan(
     command_runner: CommandRunner | None = None,
     initial_scope: dict | None = None,
 ) -> dict:
-    """按计划执行一次工作流，返回 ``{"ok", "summary", "reports"}``。
-
-    这是给 ``core.tool_registry`` 用的模块级入口：调用方只想「给 plan、给事件
-    回调、拿摘要」，不需要自己管理 executor 的生命周期。此前 tool_registry 直接
-    ``from core.workflows.executor import execute_plan``，但本模块只有
-    :class:`PlanExecutor` 类、没有这个函数，导致带 plan 边车的工作流一执行就
-    ImportError；这里补上薄包装，恢复那条调用链。
-
-    ``publish`` 缺省时用空回调：执行器每个阶段都会上报事件，传 None 会在第一步
-    就抛 TypeError，而调用方未必关心事件流。
-    """
     executor = PlanExecutor(
         plan,
         run_id=run_id,

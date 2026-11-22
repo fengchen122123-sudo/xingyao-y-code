@@ -25,7 +25,6 @@ def test_event_payload_is_a_snapshot():
 
 
 def test_event_factory_sequences_are_unique_across_threads():
-    """并行工具批次跨线程 emit 时序号不得重复或丢失。"""
     factory = TurnEventFactory("turn-parallel")
     sequences = []
     sequences_lock = threading.Lock()

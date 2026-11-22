@@ -8,7 +8,6 @@
 
     <div class="kimi-card" ref="kimiCardRef" :class="{ 'drop-hover': dragging }">
       <AttachmentChips :items="attachments" @remove="removeAttachment" @open="openAttachmentImage" />
-      <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
       <InputSuggest
         :items="suggestItems"
         :active-index="suggestIndex"
@@ -16,7 +15,6 @@
         @select="applySuggest"
         @hover="i => suggestIndex = i"
       />
-      <!-- 富文本输入框：@ 引用与 / 技能渲染成胶囊（带图标、整块选中、退格一次全删） -->
       <div class="kimi-field">
         <ComposerEditor
           ref="editorRef"
@@ -42,15 +40,12 @@
             title="添加附件"
             @click.stop="onAttachClick"
           ><AppIcon name="paperclip" :size="14.5" :stroke-width="1.8" /></button>
-          <!-- 屏幕截图：全屏框选屏幕任意区域；截图「发到输入框」后后端经
-               snip_attachment_ready 桥事件回传路径，由 store 加入输入框附件 -->
           <button
             data-test="screen-snip-button"
             class="kimi-pill-btn kimi-icon-btn snip-pill"
             title="截图：框选屏幕任意区域"
             @click.stop="onScreenSnipClick"
           ><AppIcon name="scissors" :size="14.5" :stroke-width="1.8" /></button>
-          <!-- 触摸设备隐藏文件入口：点击后由系统弹出拍照/相册/文件选择 -->
           <input ref="touchFileInputRef" type="file" multiple style="display:none" @change="onPickInputChange">
           <span class="composer-sep" aria-hidden="true"></span>
           <button
@@ -61,7 +56,6 @@
             title="切换权限模式"
             @click.stop="togglePermDropdown"
           ><span class="perm-dot" aria-hidden="true"></span><AppIcon class="perm-icon" name="shield" :size="13" :stroke-width="2" /><span class="perm-label">{{ formatPermMode(store.permissionMode) }}</span></button>
-          <!-- 沙盒限制开关（绿框位）：与输入框沙盒 chip 同一后端配置 -->
           <button
             data-test="hero-sandbox-button"
             class="kimi-pill-btn sandbox-pill"
@@ -109,7 +103,6 @@
       <span class="model-chevron" aria-hidden="true">▾</span>
     </div>
 
-    <!-- 秘书会话快捷起手建议（跨项目分析、任务进度、个人记忆） -->
     <div
       v-if="isSecretarySession"
       class="kimi-project-prompts"
@@ -126,7 +119,6 @@
       >{{ item.label }}</button>
     </div>
 
-    <!-- 项目感知推荐提示词：仅在非秘书、绑定项目工作区且存在建议时出现，自由对话保持留白 -->
     <div
       v-if="!isSecretarySession && projectPromptSuggestions.length"
       class="kimi-project-prompts"
@@ -143,7 +135,6 @@
       >{{ item.label }}</button>
     </div>
 
-    <!-- 工作区切换下拉：可退出工作区回自由对话 / 快捷切换项目 / 引入新项目 -->
     <div v-if="showWorkdirDropdown" class="workdir-dropdown" :style="workdirDropdownStyle" @click.stop>
       <div
         v-if="!isGlobalWorkdir"
@@ -168,7 +159,6 @@
       </div>
     </div>
 
-    <!-- 下拉弹出节点 -->
     <ModelCascader 
       :visible="showModelCascader" 
       :anchor-el="modelBtnRef" 
@@ -180,7 +170,6 @@
       @close="showPermDropdown = false" 
     />
 
-    <!-- 触摸设备不再使用应用内附件菜单：点回形针直接唤起系统文件选择器 -->
   </div>
 </template>
 
@@ -207,9 +196,7 @@ const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
 });
-// 富文本输入框：@ 引用渲染成胶囊
 const editorRef = ref<InstanceType<typeof ComposerEditor> | null>(null);
-// 补全用的鸭子类型控件（与 textarea 同名成员，useSuggest 无需改动）
 const composerControl = computed(() => editorRef.value?.control ?? null);
 
 const showModelCascader = ref(false);
@@ -222,8 +209,6 @@ const permBtnRef = ref<HTMLElement | null>(null);
 const workdirBtnRef = ref<HTMLElement | null>(null);
 const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
 
-// 工作区下拉数据：非 GLOBAL 的项目分组（秘书分组不是工作区，选它会切到
-// folder_path='SECRETARY' 这个并不存在的"目录"，故一并过滤）
 const projectGroups = computed(() =>
   store.sessionGroups.filter(g => !g.is_global && !g.is_secretary && g.folder_path && g.folder_path !== 'GLOBAL')
 );
@@ -370,7 +355,6 @@ let barObserver: ResizeObserver | null = null;
 function measureBarFit() {
   const el = barLeftRef.value;
   if (!el) return;
-  // 收起态量不到真实需求宽度：先摘掉 is-tight 同步量一次，再按结果决定是否戴回
   if (el.classList.contains('is-tight')) el.classList.remove('is-tight');
   if (el.scrollWidth > el.clientWidth + 1) el.classList.add('is-tight');
 }
@@ -386,7 +370,6 @@ function scheduleBarMeasure() {
 onMounted(() => {
   scheduleBarMeasure();
   if (typeof ResizeObserver === 'undefined') return;
-  // 卡片变窄、或右侧模型名变长都会挤占可用宽度，两处都要跟着重量
   barObserver = new ResizeObserver(() => scheduleBarMeasure());
   if (kimiCardRef.value) barObserver.observe(kimiCardRef.value);
   if (barRightRef.value) barObserver.observe(barRightRef.value);
@@ -404,8 +387,6 @@ async function handlePickFiles() {
   await pickAttachments();
 }
 
-// 触摸设备（手机/平板）：点回形针直接触发隐藏文件入口，由系统弹出拍照/相册/文件选择；
-// 桌面仍走系统文件对话框
 const isTouch = useIsTouch();
 const touchFileInputRef = ref<HTMLInputElement | null>(null);
 
@@ -414,8 +395,6 @@ function onAttachClick() {
   touchFileInputRef.value?.click();
 }
 
-// 屏幕截图：调后端打开全屏框选遮罩窗口；截图结果经桥事件
-// snip_attachment_ready 回传（见 appStore._attachSnipToComposer）
 async function onScreenSnipClick() {
   const api = window.pywebview?.api;
   if (!api?.screen_snip_start) {
@@ -433,13 +412,12 @@ async function onScreenSnipClick() {
 async function onPickInputChange(e: Event) {
   const input = e.target as HTMLInputElement;
   const files = Array.from(input.files || []);
-  input.value = '';  // 允许重复选同一文件
+  input.value = '';
   if (files.length) await uploadFiles(files);
 }
 
 function handleSend() {
   if (store.currentSessionRunning) return;
-  // 补全面板打开时由 onKeydown 拦截，不会走到这里
   const text = inputVal.value;
   // 拖拽的附件还在等路径时不允许发送，避免把占位的假路径发给后端
   if (attachments.value.some(a => a.loading)) {
@@ -453,12 +431,9 @@ function handleSend() {
   store.sendMessage(text, paths);
 }
 
-// 独立的 Enter 发送处理：onKeydown 没拦截时（补全未打开）才发送
 function handleKeydown(e: KeyboardEvent) {
   onKeydown(e);
-  // 补全已处理（导航键/选中/关闭），不需要进一步处理
   if (e.defaultPrevented) return;
-  // Enter 发送（补全关闭时）
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     handleSend();
@@ -467,7 +442,6 @@ function handleKeydown(e: KeyboardEvent) {
 </script>
 
 <style scoped>
-/* 输入框字体：与改动前的 .kimi-card textarea 保持一致（15px / 1.6） */
 .kimi-field {
   font-size: 15px;
   line-height: 1.6;
@@ -483,7 +457,6 @@ function handleKeydown(e: KeyboardEvent) {
   backdrop-filter: blur(14px);
   animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
-/* 沙盒开关与权限圆点（对齐极简设计稿 v2） */
 .composer-sep {
   width: 1px;
   height: 14px;
@@ -551,7 +524,6 @@ function handleKeydown(e: KeyboardEvent) {
   color: var(--accent);
   margin-left: 8px;
 }
-/* 模型/工作区按钮上的小箭头（对齐旧 10px 文字箭头的视觉重量） */
 .model-chevron {
   color: var(--text-faint);
 }
@@ -560,32 +532,20 @@ function handleKeydown(e: KeyboardEvent) {
   background: var(--border);
   margin: 5px 6px;
 }
-/* 紧凑形态元素（图标）仅手机端显示，桌面端隐藏 */
 .perm-icon,
 .model-icon,
 .sandbox-label-short {
   display: none;
 }
 
-/* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
-   侧栏/右侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
-   档位与对话中输入栏一致：≤660 权限转图标 / ≤560 沙盒收成 开/限 /
-   ≤520 模型转图标（模型名优先保留，只有真挤不下才退化）。
-   阈值必须大于对应形态的实际所需宽度（完整文字约 610px：左组 附件+截图+
-   完全访问+沙盒: 开 ≈264、右组 模型名+思考档位+发送 ≈317、卡片内边距 28）；
-   阈值偏小会留出“文字完整但放不下”的空档，此时 .kimi-bar-left 的
-   overflow:hidden 会把末尾的沙盒胶囊裁得只剩一条边框（成小方块） */
 .kimi-card {
   container-type: inline-size;
   container-name: composer;
 }
-/* 卡片标题区按首页实际宽度分档（侧栏 + 右侧栏同时展开时中间列只剩两百多像素） */
 .kimi-empty-container {
   container-type: inline-size;
   container-name: empty-page;
 }
-/* 卡片尽量吃满主区宽度（全局 .kimi-empty-container 左右各留 20px）：
-   卡片宽出来这 20px，正好是权限文字与「只显示图标」之间的差距 */
 .kimi-empty-container {
   padding-left: 10px;
   padding-right: 10px;
@@ -617,7 +577,6 @@ function handleKeydown(e: KeyboardEvent) {
   gap: 6px;
   flex-shrink: 0;
 }
-/* 工具栏内边距 */
 .kimi-card-bar .kimi-bar-left .kimi-pill-btn,
 .kimi-card-bar .kimi-bar-right .kimi-pill-btn {
   padding-left: 8px;
@@ -628,14 +587,12 @@ function handleKeydown(e: KeyboardEvent) {
   padding-left: 10px;
   padding-right: 10px;
 }
-/* 工作区标签：窄容器下省略号收尾，不折行把卡片撑高 */
 .workdir-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 权限文案只在真放不下时让位 */
 .kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .perm-dot,
 .kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .perm-label,
 .kimi-card-bar .kimi-bar-left.is-tight .permission-mode-btn .permission-chevron {
@@ -644,8 +601,6 @@ function handleKeydown(e: KeyboardEvent) {
 .kimi-card-bar .kimi-bar-left.is-tight .perm-icon {
   display: inline-flex;
 }
-/* 真挤不下才把模型收成图标：此时权限已图标化、沙盒多半也收成 开/限，
-   完整「模型名 + 思考档位 + 发送」仍放不下才退化为纯图标形态 */
 @container composer (max-width: 520px) {
   .model-chip .model-label,
   .model-chip .model-chevron {
@@ -663,11 +618,6 @@ function handleKeydown(e: KeyboardEvent) {
     display: inline;
   }
 }
-/* ── 极窄档：侧栏与右侧栏同时展开时中间列只剩两百来像素 ──
-   按“重要性由低到高”依次收纳次要入口，保证任何档位都是单行、
-   发送按钮永远留在卡片内：≤400 截图隐藏、思考档位只留图标 /
-   ≤340 沙盒隐藏 / ≤290 思考档位隐藏 / ≤210 工具按钮收紧内边距。
-   隐藏的开关仍可在设置页与对话中输入栏调整 */
 @container composer (max-width: 470px) {
   .snip-pill {
     display: none;
@@ -698,7 +648,6 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 @media (max-width: 768px) {
-  /* 手机端收窄按钮：权限/模型只显示图标（颜色仍跟随状态），对齐对话中输入栏样式 */
   .permission-mode-btn .perm-dot,
   .permission-mode-btn .perm-label,
   .permission-mode-btn .permission-chevron,
@@ -715,7 +664,6 @@ function handleKeydown(e: KeyboardEvent) {
   .sandbox-label-short {
     display: inline;
   }
-  /* 手机端沙盒只留 开/限 */
   .sandbox-pill {
     font-size: 12px;
     padding: 0 9px;

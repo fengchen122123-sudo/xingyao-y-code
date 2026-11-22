@@ -5,11 +5,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import Subpage from './Subpage.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 插件页「内置插件可移除 / 可恢复」相关 UI：
-// - 内置插件与用户插件一样有垃圾桶（走软移除，不删随包文件）
-// - status='removed' 的行默认隐藏，工具栏出现「已移除 N」切换按钮
-// - 已移除行只给「恢复」按钮，不给启用开关
-
 function mountPluginsPage() {
   return mount(Subpage, { props: { visible: true, subType: 'plugins' } });
 }
@@ -75,16 +70,13 @@ describe('Subpage - 插件移除与恢复', () => {
     store.plugins = [loadedUser, removedBuiltin] as any;
     const wrapper = mountPluginsPage();
 
-    // 默认视图：只列在用插件
     expect(rowNames(wrapper)).toEqual(['tokenrhythm-image']);
     expect(wrapper.text()).not.toContain('old_builtin');
-    // 工具栏按钮文案带数量
     const toggle = wrapper.get('[data-test="plugins-show-removed"]');
     expect(toggle.text()).toContain('已移除 1');
 
     await toggle.trigger('click');
 
-    // 已移除视图：只列可恢复项
     expect(rowNames(wrapper)).toEqual(['old_builtin']);
     const row = wrapper.findAll('.sub-row')[0];
     expect(row.find('[data-test="plugin-restore-btn"]').exists()).toBe(true);
@@ -118,10 +110,8 @@ describe('Subpage - 插件移除与恢复', () => {
 
     expect(restorePlugin).toHaveBeenCalledTimes(1);
     expect(restorePlugin).toHaveBeenCalledWith('old_builtin');
-    // 列表以桥返回为准：不再是本地脏数据
     expect(store.plugins).toEqual(restoredList);
     expect(store.plugins.find(p => p.name === 'old_builtin')!.status).toBe('loaded');
-    // 恢复后已无 removed 项，工具栏切换按钮消失、回到常规视图
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="plugins-show-removed"]').exists()).toBe(false);
   });

@@ -1,5 +1,3 @@
-"""Linux 只提供无头浏览器。桌面输入和紧急停止仍然明确拒绝。"""
-
 from __future__ import annotations
 
 import shutil

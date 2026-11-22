@@ -1,18 +1,3 @@
-"""拓扑感知的工具批次规划（「面向 ZCode 能力借鉴」工作包 A5，规格 03 §2.2）。
-
-为什么单独成模块（而不是继续留在 tool_pipeline.py）：
-1. 调度算法（依赖分层 + 并行分组）与执行管线职责不同；独立后可以对拍与
-   单元测试（tests/test_tool_scheduler.py），也便于二期"自动拓扑重排"
-   只改这一个文件；
-2. 执行层接口保持 ``tuple[ToolBatch, ...]`` 不变（规格 2.6），调用方零改动。
-
-异常类型选择：规格原文写"抛 CoreError"，但全仓搜索确认项目内不存在该类型
-（core/harness/models.py 的 InvalidHarnessTransition 只用于 harness 状态机
-转移，语义不符）。依赖声明非法属于"调用方给出的 ToolSpec 契约 / 调用序列
-非法"，与项目内工具参数校验、注册表参数校验（均用 ValueError）最贴近，
-故统一使用 ValueError，不引入新的公共异常类型。
-"""
-
 from __future__ import annotations
 
 from core.harness.tool_pipeline import ToolBatch
@@ -25,29 +10,6 @@ def plan_tool_batches(
     *,
     max_concurrency: int = 4,
 ) -> tuple[ToolBatch, ...]:
-    """按依赖拓扑分层 + 并行安全元数据分组。
-
-    ===== 兼容性契约（最高优先级）=====
-    对「所有 depends_on 均为 None」的输入，本函数在 max_concurrency 大到
-    不触发截断时，输出与旧实现 _legacy_group_tool_batches() 逐批、逐项、
-    逐顺序完全一致（tests/test_tool_scheduler.py 有 1000 用例级对拍守护）。
-
-    ===== 算法 =====
-    1. 计算每个调用的层号：depends_on 为 None/空 → 层号 0；否则 →
-       max(依赖调用层号) + 1（依赖序号必须小于自身序号，不支持前向依赖）。
-    2. 按层号升序处理，每层内保持原始相对顺序：
-       parallel_safe=True 的累积到当前并行批；parallel_safe=False 的先
-       flush 当前并行批、再单独成批；并行批达到 max_concurrency 时 flush。
-    3. 跨层不合并：层 N 的批次必须全部先于层 N+1。
-
-    为什么不自动重排（规格 1.4 非目标）：模型输出的工具调用顺序隐含了
-    意图顺序（例如"先写后读"验证），v1 只做不改变相对顺序的优化。
-
-    max_concurrency 语义：单批调用数上限（与执行侧 BoundedSemaphore 额度
-    对齐，避免批内排队 future 长期占位）。旧实现没有该上限，因此
-    group_tool_batches() 兼容包装会传入「不截断」的值以保持零回归，
-    真实并发上限仍由 ToolBatchExecutor 的 max_parallel=4 执行期兜底。
-    """
     if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
         raise ValueError("max_concurrency 必须是整数")
     if max_concurrency < 1:
@@ -63,7 +25,6 @@ def plan_tool_batches(
         try:
             spec = registry.get(name)
         except KeyError:
-            # 与旧实现一致：未注册的工具按「非并行安全」保守处理。
             parallel_flags.append(False)
             dependencies.append(None)
             continue
@@ -78,11 +39,8 @@ def plan_tool_batches(
             raise ValueError(
                 f"工具 {name} 的 depends_on 必须是调用序号元组"
             ) from error
-        # 空元组等于显式声明「无依赖」，与 None 同效（规格 2.1）。
         dependencies.append(normalized or None)
 
-    # 依赖成环检查放在序号校验之前：自我依赖与相互依赖（0→1、1→0）报"成环"
-    # 比报"前向依赖"更贴近真实问题；越界/非整数引用交给 _resolve_layers 报错。
     _assert_acyclic(dependencies, count)
     layers = _resolve_layers(dependencies, count)
 
@@ -123,12 +81,6 @@ def _resolve_layers(
     dependencies: list[tuple[int, ...] | None],
     count: int,
 ) -> list[int]:
-    """把依赖序号折算成层号，并校验依赖引用的合法性。
-
-    为什么拒绝前向依赖（dep >= index）：v1 不重排调用顺序（规格 1.4），
-    前向依赖意味着必须重排才能满足，属于不支持但必须显式爆响的输入；
-    该约束同时保证依赖图必然是 DAG，索引越界/不存在的引用也在此拦下。
-    """
     layers = [0] * count
     for index, deps in enumerate(dependencies):
         if not deps:
@@ -158,13 +110,6 @@ def _assert_acyclic(
     dependencies: list[tuple[int, ...] | None],
     count: int,
 ) -> None:
-    """依赖成环的防御性检查（Kahn 拓扑计数）。
-
-    在后向引用约束下环天然不可能（层号计算本身就要求 dep < index），
-    但保留检查的原因是：若将来有人放宽引用校验或引入自动重排，
-    成环必须立刻爆响，而不是让层号计算陷入死循环/错误分层。
-    非法引用（非整数/越界）在此跳过，交由 _resolve_layers 给出精确报错。
-    """
     if not any(dependencies):
         return
     indegree = [0] * count
@@ -197,12 +142,6 @@ def _assert_batches_respect_dependencies(
     planned: list[tuple[bool, list[int]]],
     dependencies: list[tuple[int, ...] | None],
 ) -> None:
-    """防御性检查：同一批内不得存在依赖关系（规格 2.2 校验第 3 条）。
-
-    分层算法保证被依赖调用严格位于更早的层 → 更早的批，因此该检查经公共
-    入口不可触发；保留它是因为「批内依赖」意味着依赖方可能先于被依赖方
-    执行（执行顺序被静默破坏），一旦未来分层逻辑回归必须爆响。
-    """
     if not any(dependencies):
         return
     batch_of: dict[int, int] = {}

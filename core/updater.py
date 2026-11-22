@@ -1,16 +1,3 @@
-"""
-core/updater.py
-===============
-Y-CODE 自动与手动更新管理模块：
-对接 Gitee Releases API，支持版本检测、后台流式分块下载、进度通知与安装后自清理。
-
-Gitee 单附件 100MB 上限的适配（方案 A 分卷）：
-  主安装包超过 100MB 时由 build_release.py 切成 .part1/.part2/... 二进制分卷
-  （每片 ≤ 95MB）作为 Release 附件上传；本模块识别分卷序列后顺序下载、
-  流式拼接还原 exe，并用 Release 描述里发布的 SHA256 强制校验拼接结果，
-  校验不过即拒绝安装（防分卷被篡改后二次传播）。
-"""
-
 import hashlib
 import json
 import logging
@@ -30,13 +17,10 @@ from core.version import __version__ as YCODE_VERSION
 
 logger = logging.getLogger(__name__)
 
-# 默认 Gitee 仓库地址
 GITEE_REPO = "feng-chenhao/xingyao-y-code"
 GITEE_API_URL = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/releases/latest"
 HTTP_USER_AGENT = f"ycode-updater/{YCODE_VERSION} (Windows)"
 
-# 分卷下载失败（HTML 拒绝/网络错误/截断）的退避重试间隔（秒）。
-# Gitee 限流/风控是瞬时性的，退避后通常可恢复；测试可 patch 为 (0,0,0) 加速。
 RETRY_DELAYS = (2, 5, 10)
 
 # 版本号白名单：tag_name 来自远程 API，拼接进文件名与 cmd 前必须约束字符集
@@ -46,10 +30,8 @@ _SAFE_VERSION_RE = re.compile(r"^[0-9A-Za-z.\-_]+$")
 # 分卷/单文件安装包下载完成后必须与之比对，不一致即拒绝安装
 _SHA256_RE = re.compile(r"SHA256\s*[:：]\s*([0-9a-fA-F]{64})", re.IGNORECASE)
 
-# 分卷附件名尾部序号（如 Y-code-1.2.6.exe.part2）
 _PART_SUFFIX_RE = re.compile(r"\.part(\d+)$", re.IGNORECASE)
 
-# 更新缓存目录里的正式安装包命名：Y-CODE-Setup-v{版本}.exe
 _INSTALLER_NAME_RE = re.compile(r"^Y-CODE-Setup-v(.+)\.exe$", re.IGNORECASE)
 
 # 复用缓存安装包的最小体积兜底（字节）：Release 既无 SHA256 也无 size 时，
@@ -70,12 +52,6 @@ def parse_release_sha256(body: str) -> str:
 
 
 def _collect_split_parts(assets: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """按基名分组收集 .partN 分卷，返回 {基名: [按序号升序的附件]}。
-
-    每组序号必须从 1 连续编号——断号（漏传某片）的组直接丢弃，
-    防止拼出残缺文件。同一 Release 允许多组分卷共存（主安装包 + CLI
-    安装包），由调用方按命名规则挑选要下载的那组。
-    """
     groups: Dict[str, Dict[int, Dict[str, Any]]] = {}
     for asset in assets or []:
         name = str(asset.get("name") or "")
@@ -100,13 +76,6 @@ def _collect_split_parts(assets: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
 def _pick_main_installer_group(
     complete: Dict[str, List[Dict[str, Any]]], version: str
 ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
-    """从多组完整分卷里挑主安装包（GUI 版）那组。
-
-    优先精确匹配主安装包分发名 XingYaoCode-{版本}.exe；为兼容旧命名，
-    再匹配 Y-code-{版本}.exe；退而求其次取基名小写以 xingyaocode 或
-    y-code 开头且不含 cli 的组；都没有时返回第一组（极端兜底，总比拒绝
-    更新好）。找不到任何完整分卷时返回 None。
-    """
     if not complete:
         return None
     for exact in (f"XingYaoCode-{version}.exe", f"Y-code-{version}.exe"):
@@ -123,12 +92,6 @@ def _pick_main_installer_group(
 def _pick_main_installer_exe(
     assets: List[Dict[str, Any]], version: str
 ) -> Optional[Dict[str, Any]]:
-    """从单 exe 附件里挑主安装包（GUI 版）。
-
-    同 Release 可能同时挂主安装包与 CLI 安装包两个 exe，自动更新必须
-    优先选主安装包：精确名 XingYaoCode-{版本}.exe（兼容旧命名
-    Y-code-{版本}.exe）> xingyaocode / y-code 前缀且非 cli > 任意 exe。
-    """
     exe_assets = [
         a for a in (assets or [])
         if str(a.get("name") or "").lower().endswith(".exe")
@@ -150,7 +113,6 @@ def parse_version(v_str: str) -> Tuple[int, ...]:
     """将版本号字符串（如 'v1.2.6', '1.2.6-beta', '1.3'）解析为整型元组供比较。"""
     if not v_str:
         return (0, 0, 0)
-    # 提取所有数字序列
     nums = re.findall(r"\d+", str(v_str))
     if not nums:
         return (0, 0, 0)
@@ -158,15 +120,8 @@ def parse_version(v_str: str) -> Tuple[int, ...]:
 
 
 def compare_versions(v1: str, v2: str) -> int:
-    """比较两个版本号。
-    返回值：
-      1  若 v1 > v2
-      0  若 v1 == v2
-     -1  若 v1 < v2
-    """
     t1 = parse_version(v1)
     t2 = parse_version(v2)
-    # 补齐长度以便对比
     max_len = max(len(t1), len(t2), 3)
     t1_padded = t1 + (0,) * (max_len - len(t1))
     t2_padded = t2 + (0,) * (max_len - len(t2))
@@ -196,21 +151,6 @@ def _remove_file_quietly(path: str) -> bool:
 
 
 def cleanup_old_installers(current_version: str = "", keep_days: int = 7) -> int:
-    """按策略清理更新缓存目录，返回清理的条目数（异常不抛出，仅告警）。
-
-    策略（不再整个清空缓存目录）：
-      1. Y-CODE-Setup-v{X}.exe 且 X <= 当前运行版本 → 删除
-         （该版本已装上或已过时，留着无用）；
-      2. Y-CODE-Setup-v{X}.exe 且 X > 当前运行版本 → 保留
-         （用户可能还要手动安装这个包）；
-      3. 命名不符合上述模式的文件 → 按最后修改时间，超过 keep_days 天删除；
-      4. 任何 .downloading 残片（含 *.exe.downloading）→ 一律删除；
-      5. current_version 缺省时取 core/version.py 的 __version__；取不到时
-         视为"无法比较"，此时不动任何 exe，只清残片。
-
-    本函数在启动后台线程中被调用（gui_bridge），全程只做本地文件操作，
-    无阻塞、无交互。
-    """
     cleaned = 0
     try:
         if not current_version:
@@ -221,7 +161,6 @@ def cleanup_old_installers(current_version: str = "", keep_days: int = 7) -> int
                 logger.debug("读取当前版本号失败，按无法比较处理: %s", e)
                 current_version = ""
 
-        # 当前版本可比较时才允许按版本号删包（空版本号 = 无法比较）
         can_compare = bool(current_version)
 
         cache_dir = get_update_cache_dir()
@@ -241,7 +180,6 @@ def cleanup_old_installers(current_version: str = "", keep_days: int = 7) -> int
                 if not os.path.isfile(fpath):
                     continue
 
-                # 下载残片一律清理（不完整文件没有复用价值）
                 if fname.lower().endswith(".downloading"):
                     if _remove_file_quietly(fpath):
                         logger.info("清理下载残片: %s", fpath)
@@ -259,7 +197,6 @@ def cleanup_old_installers(current_version: str = "", keep_days: int = 7) -> int
                                 ver_str, current_version, fpath,
                             )
                             cleaned += 1
-                    # X > current_version：版本更新，保留给用户安装
                     continue
 
                 # 走到这里：命名非标准，或当前版本不可比较。
@@ -288,21 +225,6 @@ def find_cached_installer(
     expected_sha256: str = "",
     expected_size: int = 0,
 ) -> str:
-    """在更新缓存目录中查找可复用的安装包，返回路径；不可用时返回空串。
-
-    严格校验（SHA256 优先，其次大小，再叠加 PE 头/体积兜底）：
-      1. 必须存在文件 Y-CODE-Setup-v{target_version}.exe，否则返回 ""；
-      2. 体积小于 _MIN_INSTALLER_BYTES，或 expected_size > 0 且实际大小不符
-         → 视为不完整下载：删除该文件、记录 warning 并返回 ""（重新下载）；
-      3. 文件头不是 PE 的 MZ 魔数（HTML 错误页/损坏文件）→ 删除并返回 ""；
-      4. expected_sha256 非空 → 用 _sha256_file 比对（大小写不敏感），
-         不匹配则删除该文件、记录 warning 并返回 ""；
-      5. 校验全部通过才返回路径。
-
-    第 2、3 条是兜底：Release 既无 SHA256 也无附件大小时，只按文件名复用会让
-    坏包被反复当成「已就绪」，而启动时又必被 launch_installer 的 MZ 检查拒绝，
-    且这类包版本高于当前运行版本、不会被启动清理带走，用户会卡在装不上的状态。
-    """
     try:
         if not target_version or not is_safe_version_string(target_version):
             logger.warning("非法目标版本号，跳过缓存查找: %r", target_version)
@@ -371,13 +293,6 @@ def find_cached_installer(
 def fetch_latest_release(
     repo: str = GITEE_REPO, timeout: float = 8.0
 ) -> Dict[str, Any]:
-    """查询 Gitee Releases 最新版本信息（列表接口取首位非预发布条目）。
-
-    不用 /releases/latest：实测 Gitee 在 API 创建 Release 后该指针可能
-    长期滞留旧版本（PATCH 触碰 Release 才重算），而列表首位始终是最新
-    创建的条目。若 Gitee 尚无 Release（空列表或 404），安全返回
-    has_update: False。
-    """
     url = f"https://gitee.com/api/v5/repos/{repo}/releases?per_page=5&direction=desc"
     req = urllib.request.Request(
         url,
@@ -392,7 +307,6 @@ def fetch_latest_release(
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            # 仓库暂无 Release，正常判定为无更新
             return {
                 "ok": True,
                 "has_update": False,
@@ -427,7 +341,6 @@ def fetch_latest_release(
             "current_version": YCODE_VERSION,
             "msg": "检查更新失败: 响应格式异常",
         }
-    # 跳过预发布条目；tag 为空的脏数据同样忽略
     entry = next(
         (
             item
@@ -439,7 +352,6 @@ def fetch_latest_release(
         None,
     )
     if entry is None:
-        # 空列表（仓库尚无 Release）与 404 同语义
         return {
             "ok": True,
             "has_update": False,
@@ -450,7 +362,6 @@ def fetch_latest_release(
     data = entry
 
     raw_tag = data.get("tag_name") or ""
-    # 清洗 tag 中的版本号（如 'v1.2.6' -> '1.2.6'）
     latest_version = raw_tag.lstrip("vV").strip() or raw_tag
     release_title = data.get("name") or f"星瑶Code v{latest_version}"
     release_notes = data.get("body") or "暂无更新说明。"
@@ -473,8 +384,6 @@ def fetch_latest_release(
         part_count = len(part_assets)
         asset_name = parts_base
         asset_size = sum(int(a.get("size") or 0) for a in part_assets)
-        # 分卷模式下载由 part_urls 驱动；download_url 指向 Release 页面
-        # 供人工查看，自动更新流程不再使用它
         download_url = f"https://gitee.com/{repo}/releases/tag/{raw_tag}"
         logger.info(
             "识别到分卷安装包: %s 共 %d 片 (%d 字节)", parts_base, part_count, asset_size
@@ -503,12 +412,9 @@ def fetch_latest_release(
         "download_url": download_url,
         "asset_name": asset_name,
         "asset_size": asset_size,
-        # 分卷信息：part_urls 非空即分卷模式（下载器顺序下载拼接）
         "part_urls": part_urls,
         "part_count": part_count,
         "is_split": bool(part_urls),
-        # 官方 SHA256（来自 Release 描述）。有值时下载器强制校验，
-        # 不匹配即拒绝安装；空串表示该 Release 未发布校验和（仅提示）
         "sha256": official_sha256,
     }
 
@@ -526,12 +432,6 @@ def _sha256_file(path: str) -> str:
 
 
 class UpdateDownloader:
-    """后台分块流式下载器，支持实时进度汇报与取消控制。
-
-    分卷模式（part_urls 非空）：顺序下载各分卷并流式追加进同一个临时文件
-    （首片重建、后续追加），全部完成后计算 SHA256 与官方校验和比对。
-    边下边拼接，无二次全量读写，还原耗时约等于纯磁盘写入。
-    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -557,14 +457,6 @@ class UpdateDownloader:
         expected_sha256: str = "",
         total_size_hint: int = 0,
     ) -> bool:
-        """启动后台下载。
-
-        download_url    单文件模式的安装包直链（分卷模式忽略）
-        part_urls       分卷 URL 列表（按 .part1..partN 顺序）；非空即分卷模式
-        expected_sha256 官方 SHA256（来自 Release 描述）。非空时下载完成后
-                        强制校验，不匹配即删除产物并报错拒绝安装
-        total_size_hint 总字节数（分卷模式 = 各片之和），用于稳定进度百分比
-        """
         # 版本号白名单校验：target_version 会拼进文件名与 shell 命令，必须先约束
         if not is_safe_version_string(target_version):
             logger.error("非法版本号，拒绝下载: %r", target_version)
@@ -574,14 +466,12 @@ class UpdateDownloader:
                 pass
             return False
 
-        # 归一化分卷列表：仅接受 http(s) 直链
         clean_parts: List[str] = []
         for u in (part_urls or []):
             u = str(u or "").strip()
             if u.lower().startswith(("http://", "https://")):
                 clean_parts.append(u)
         if len(clean_parts) == 1:
-            # 单片"分卷"没有拼接意义，直接按单文件下载
             download_url = clean_parts[0]
             clean_parts = []
 
@@ -615,14 +505,11 @@ class UpdateDownloader:
 
         def _worker():
             try:
-                # 下载源序列：分卷模式用 part_urls，单文件模式用 download_url
                 urls = clean_parts or [str(download_url or "").strip()]
                 logger.info(
                     "开始下载新版本安装包: %d 个分卷 -> %s", len(urls), tmp_path
                 )
                 downloaded_total = 0
-                # 进度分母：优先 total_size_hint（分卷求和，来自 Release 元数据）；
-                # 缺省时由首片 Content-Length 推算
                 grand_total = int(total_size_hint or 0)
                 last_emit_time = 0.0
                 last_percent = -1
@@ -631,17 +518,9 @@ class UpdateDownloader:
                 def _report_progress(
                     force: bool = False, part_done: int = 0, part_size: int = 0
                 ):
-                    # part_done / part_size 必须由调用方显式传入：它们本是
-                    # _download_one_part 的局部变量，而本闭包的外层作用域是
-                    # _worker（并未绑定这两个名字），直接引用会 NameError
-                    # ——响应用 chunked 传输、拿不到 Content-Length 时即触发，
-                    # 会让整次更新以"下载失败"收场。
                     nonlocal last_emit_time, last_percent
                     now = time.monotonic()
                     if len(urls) > 1 and grand_total <= 0:
-                        # 分卷且无总大小元数据（Gitee 公开 API 附件不带 size）：
-                        # 按片数比例混算（片完成度 + 当前片内进度），避免末片
-                        # 偏小导致"估总分母"进度漂移（如 77% 直接跳 100%）
                         part_frac = part_done / part_size if part_size > 0 else 0
                         percent = int(min(99, ((part_index - 1 + part_frac) / len(urls)) * 100))
                     else:
@@ -668,10 +547,6 @@ class UpdateDownloader:
                             }
                         )
 
-                # 带 Cookie 的 opener：Gitee 下载链是 302 重定向（releases/download →
-                # attach_files → foruda CDN），携带 Set-Cookie 的 session 更接近
-                # 浏览器行为，降低触发风控/登录墙的概率。install_opener 后 urlopen
-                # 即走该 opener（测试 patch urlopen 时不受影响）
                 import http.cookiejar as _cj
 
                 urllib.request.install_opener(
@@ -680,13 +555,9 @@ class UpdateDownloader:
                     )
                 )
 
-                # 首片重建文件（"wb"），后续追加（"ab"）：边下边拼接
                 open_mode = "wb"
 
                 def _download_one_part(i: int, url: str) -> bool:
-                    """下载单个分卷（流式追加到 tmp_path）。Gitee 限流/风控是
-                    瞬时性的，HTML 拒绝/网络错误自动退避重试（2/5/10s），重试前
-                    截断本片未完成的字节。全部失败才 on_error。"""
                     nonlocal open_mode, downloaded_total, part_index, grand_total
                     part_index = i + 1
                     start_offset = 0 if i == 0 else (
@@ -709,7 +580,6 @@ class UpdateDownloader:
                                 attempt, len(RETRY_DELAYS),
                             )
                             time.sleep(delay)
-                            # 截断上一次失败残留的不完整字节
                             try:
                                 with open(tmp_path, "r+b") as f:
                                     f.truncate(start_offset)
@@ -724,8 +594,6 @@ class UpdateDownloader:
                         part_downloaded = 0
                         try:
                             with urllib.request.urlopen(req, timeout=30.0) as resp:
-                                # 安全防线 1：Content-Type 校验。Gitee 限流/登录墙/
-                                # 风控页会返回 text/html，拒绝当成功（但可重试）
                                 content_type = str(
                                     resp.headers.get("Content-Type", "")
                                 ).lower()
@@ -738,8 +606,6 @@ class UpdateDownloader:
                                 part_total = int(
                                     resp.headers.get("Content-Length", 0)
                                 )
-                                # 分卷且无总大小元数据时，用首片 Content-Length
-                                # 推算总分母（进度展示用）
                                 if grand_total <= 0 and part_total > 0:
                                     grand_total = part_total * len(urls)
                                 with open(tmp_path, open_mode) as f:
@@ -774,7 +640,6 @@ class UpdateDownloader:
                             continue
                         open_mode = "ab"
                         return True
-                    # 重试耗尽
                     logger.error(
                         "分卷 %d/%d 重试 %d 次后仍失败: %s",
                         i + 1, len(urls), len(RETRY_DELAYS), last_reason,
@@ -795,8 +660,6 @@ class UpdateDownloader:
                         _cleanup_tmp()
                         return
 
-                # 官方 SHA256 强制校验：分卷被篡改/缺片时拼接结果哈希必然
-                # 对不上，这里直接拒绝安装并清理产物（安全底线）
                 if expected_sha256:
                     actual_hash = _sha256_file(tmp_path)
                     if actual_hash != expected_sha256.lower():
@@ -812,7 +675,6 @@ class UpdateDownloader:
                         )
                         return
 
-                # 下载完成，重命名临时文件为正式安装包
                 if os.path.exists(dest_path):
                     try:
                         os.remove(dest_path)
@@ -843,20 +705,10 @@ class UpdateDownloader:
         self._cancel_event.set()
 
 
-# 全局单例下载器
 updater_downloader = UpdateDownloader()
 
 
 def launch_installer(installer_path: str) -> bool:
-    """启动安装向导（此处不再删除安装包）。
-
-    安装包的清理责任已移交，避免"向导一退出包就被删"导致用户必须重新下载：
-      * 安装成功：由安装向导（ycode_setup.py）在退出前自行清理安装包；
-      * 未安装成功（用户中途关闭向导、安装失败、需要重试）：安装包保留，
-        交由下次启动时的 cleanup_old_installers 按策略清理。
-
-    使用 cmd.exe /c start /wait 运行安装包（隐藏黑框），只负责启动，不删除任何文件。
-    """
     if not os.path.isfile(installer_path):
         logger.error("安装程序不存在: %s", installer_path)
         return False
@@ -888,7 +740,6 @@ def launch_installer(installer_path: str) -> bool:
     logger.info("唤起安装程序（不在此处清理安装包）: %s", cmd)
 
     try:
-        # 隐藏批处理黑框
         creationflags = 0
         if sys.platform == "win32":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)

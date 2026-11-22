@@ -1,5 +1,3 @@
-"""Durable harness lifecycle journal and process-owner leases."""
-
 import os
 import threading
 import uuid
@@ -21,10 +19,6 @@ PROCESS_OWNER_ID = f"harness-{uuid.uuid4().hex}"
 _HEARTBEAT_INTERVAL_MS = 2_000
 _OWNER_STALE_AFTER_MS = 10_000
 
-# Journal 依赖的 MemoryManager 存储接口（duck-type 能力面）。真实
-# MemoryManager 由 schema 迁移保证全部具备；只实现 add_messages 的
-# 鸭子类型管理器（旧测试替身、外部调用方）不进入 Journal，继续走
-# legacy 持久化路径。
 _JOURNAL_STORAGE_METHODS = (
     "acquire_lock",
     "heartbeat_harness_owner",
@@ -41,7 +35,6 @@ _JOURNAL_STORAGE_METHODS = (
 
 
 def journal_storage_supported(manager) -> bool:
-    """判断 manager 是否实现了 Journal 所需的完整存储接口。"""
     if manager is None:
         return False
     return all(

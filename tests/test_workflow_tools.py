@@ -1,9 +1,3 @@
-"""workflow_list / workflow_run 工具 wrapper 测试。
-
-wrapper 经 core.tool_registry 暴露给模型；这里直接调 wrapper 函数，
-用 monkeypatch 把会话工作目录与用户主目录指到 tmp，绝不触碰真实目录。
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -41,7 +35,6 @@ def workflow_env(tmp_path, monkeypatch):
     home, root = tmp_path / "home", tmp_path / "proj"
     root.mkdir()
     monkeypatch.setattr(Path, "home", lambda: home)
-    # 用户档工作流落在数据目录。测试隔离把这个目录指到假的 ~/.ycode。
     monkeypatch.setenv("YCODE_DATA_DIR", str(home / ".ycode"))
     monkeypatch.setattr(
         "core.workspace_context.get_workdir", lambda: root, raising=False
@@ -55,7 +48,6 @@ def workflow_env(tmp_path, monkeypatch):
 
 @pytest.fixture
 def run_ledger(tmp_path):
-    """注入运行台账（真 MemoryManager + tmp 库）；用例结束摘除进程级句柄。"""
     from core.memory import MemoryManager
     from core.workflows import runs as runs_module
 
@@ -116,7 +108,6 @@ def test_workflow_run_returns_directive_with_contract_and_defaults(workflow_env)
     result = _workflow_run_wrapper(name="pr-review", args={"base": "origin/main"})
     assert not result.is_error
     content = result.content
-    # 固定映射契约 + 生效参数（default 3 已填充）+ 脚本原文
     assert "工作流转译执行契约" in content
     assert '"base": "origin/main"' in content
     assert '"maxRounds": 3' in content
@@ -145,7 +136,6 @@ def test_workflow_save_creates_workflow_and_skill(workflow_env):
     assert saved.is_file()
     assert (home / ".ycode" / "skills" / "zcode-workflows" / "my-flow" / "SKILL.md").is_file()
 
-    # 立即可运行：参数校验走声明
     listing = _workflow_list_wrapper()
     assert "my-flow" in listing.content
     run = _workflow_run_wrapper(name="my-flow", args={"limit": "not-a-number"})
@@ -174,7 +164,6 @@ def test_workflow_save_rejects_bad_names(workflow_env):
 
 
 def test_registry_exposes_workflow_tools_in_gui_profile():
-    """工具注册进默认（GUI）registry；按用户要求 CLI 档剔除全部工作流工具。"""
     from core.tool_registry import CLI_EXCLUDED_TOOLS, build_default_registry
 
     registry = build_default_registry()
@@ -186,12 +175,10 @@ def test_registry_exposes_workflow_tools_in_gui_profile():
 def test_workflow_run_registers_run_and_directive_carries_run_info(workflow_env, run_ledger):
     result = _workflow_run_wrapper(name="pr-review", args={"base": "origin/main"})
     assert not result.is_error
-    # 台账登记 running；记录的是生效参数（default 已填充）
     runs = run_ledger.list_runs("pr-review")
     assert len(runs) == 1
     assert runs[0]["status"] == "running"
     assert runs[0]["args"] == {"base": "origin/main", "maxRounds": 3}
-    # 指令带运行信息块：run_id / 产物目录 / 收尾要求 / 渐进呈现
     content = result.content
     assert runs[0]["id"] in content
     assert "workflow-artifacts" in content
@@ -208,7 +195,6 @@ def test_workflow_finish_closes_run(workflow_env, run_ledger):
     assert not finish.is_error
     assert run_ledger.get_run(run["id"])["status"] == "completed"
 
-    # 重复收尾：幂等接受，不改写
     again = _workflow_finish_wrapper(run_id=run["id"], ok=False, summary="迟到")
     assert not again.is_error
     assert run_ledger.get_run(run["id"])["status"] == "completed"
@@ -216,7 +202,7 @@ def test_workflow_finish_closes_run(workflow_env, run_ledger):
 
 def test_workflow_finish_tolerates_unknown_and_missing_ledger(workflow_env, run_ledger):
     unknown = _workflow_finish_wrapper(run_id="wfr-nope", ok=True)
-    assert not unknown.is_error  # 未知 run_id 静默接受
+    assert not unknown.is_error
 
     from core.workflows import runs as runs_module
 
@@ -225,13 +211,12 @@ def test_workflow_finish_tolerates_unknown_and_missing_ledger(workflow_env, run_
     try:
         result = _workflow_finish_wrapper(run_id="wfr-x", ok=True)
         assert not result.is_error
-        assert "无需收尾" in result.content  # 台账不可用：不报错不卡模型
+        assert "无需收尾" in result.content
     finally:
         runs_module._storage = saved
 
 
 def test_workflow_run_without_ledger_still_executes(workflow_env):
-    """台账未注入（CLI/headless 同态）：指令照常返回，无运行信息块。"""
     result = _workflow_run_wrapper(name="pr-review", args={"base": "main"})
     assert not result.is_error
     assert "run_id" not in result.content

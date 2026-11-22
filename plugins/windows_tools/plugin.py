@@ -1,22 +1,3 @@
-"""windows_tools：Windows 系统能力插件（进程 / 剪贴板 / 注册表 / 通知）。
-
-设计要点（对齐 docs/2026-11-09-windows-mcp-parity-design.md §5.3）：
-
-- 平台门控：``register()`` 在非 Windows 或 CLI 轻量模式下直接返回，不注册任何
-  工具——macOS/Linux 上不白占 tools schema 字节。
-- 模块顶层只导入标准库 os / sys：psutil、ctypes、win32api 之类一律在函数内惰性
-  导入，保证本文件在任何平台都能安全 exec，不会因缺依赖而让插件加载失败。
-- 错误码英文小写下划线、message 中文；进程不存在 / 剪贴板被占用一律返回
-  ToolResult(is_error=True) 的明确提示，绝不向上抛栈。
-- 只依赖标准库与 psutil（后者已在 requirements.txt；通知额外用 pywin32 的
-  win32gui，同样只在函数内惰性导入，缺依赖时返回明确错误而不是加载失败）。
-- 只读 / 写入拆成独立工具：``ToolSpec.requires_permission`` 是工具级静态标记，
-  双模式工具无法表达「list/get 免审批、kill/set 要审批」，因此进程与剪贴板各拆成
-  ``windows_process_list`` / ``windows_process_kill``、
-  ``windows_clipboard_get`` / ``windows_clipboard_set``。旧的双模式实现函数
-  （``_process_tool`` / ``_clipboard_tool``）保留为底层逻辑，只改注册与入口。
-"""
-
 from __future__ import annotations
 
 import os
@@ -24,15 +5,12 @@ import sys
 
 from core.tool_protocol import ToolResult, ToolSpec
 
-# 剪贴板常量（wingdi/winuser）：CF_UNICODETEXT = 13；
-# GMEM_MOVEABLE(0x0002) | GMEM_ZEROINIT(0x0040) = 0x0042。
 _CF_UNICODETEXT = 13
 _GMEM_FLAGS = 0x0042
 _OPEN_CLIPBOARD_ATTEMPTS = 5
 _OPEN_CLIPBOARD_INTERVAL = 0.03
 _CLIPBOARD_TEXT_LIMIT = 20000
 
-# ── 注册表常量（winreg）：输出上限与根键白名单。
 _REGISTRY_OUTPUT_LIMIT = 4000
 _REGISTRY_LIST_VALUE_LIMIT = 200
 _REGISTRY_LIST_SUBKEY_LIMIT = 200
@@ -55,13 +33,11 @@ _REGISTRY_TYPE_NAMES = {
     11: "REG_QWORD",
 }
 
-# 通知常量（winuser）：MB_OK | MB_ICONINFORMATION。
 _NOTIFY_TITLE_LIMIT = 64
 _NOTIFY_MESSAGE_LIMIT = 256
 _MB_OK = 0x00000000
 _MB_ICONINFORMATION = 0x00000040
 
-# 关键系统进程（小写名）：结束它们会直接导致蓝屏 / 掉登录 / 服务全停。
 _PROTECTED_NAMES = frozenset({
     "system",
     "system idle process",
@@ -72,7 +48,6 @@ _PROTECTED_NAMES = frozenset({
     "lsass.exe",
 })
 
-# PID 0 = System Idle Process，PID 4 = System（Windows 内核伪进程，杀不掉也不该杀）。
 _PROTECTED_PIDS = frozenset({0, 4})
 
 _SORT_KEYS = ("cpu", "memory", "name")
@@ -80,16 +55,11 @@ _DEFAULT_LIMIT = 50
 _MAX_LIMIT = 500
 
 
-# ── 通用小工具 ──────────────────────────────────────────────
-
-
 def _error(code: str, message: str) -> ToolResult:
-    """统一错误格式：英文小写下划线错误码 + 中文说明。"""
     return ToolResult(content=f"{code}: {message}", is_error=True)
 
 
 def _protected_reason(pid_value: int, name_value: str) -> str:
-    """返回拒绝结束该进程的原因；空串表示可以结束。"""
     lowered = str(name_value or "").strip().lower()
     if lowered in _PROTECTED_NAMES:
         return "受保护的 Windows 关键系统进程"
@@ -121,14 +91,10 @@ def _iter_processes():
 
 
 def _cpu_percent(proc) -> float:
-    """进程 CPU 百分比；首次采样（无历史基准）返回 0.0。"""
     try:
         return float(proc.cpu_percent(None))
     except Exception:
         return 0.0
-
-
-# ── windows_process ────────────────────────────────────────
 
 
 def _list_processes(keyword: str, sort_by: str, limit: int) -> ToolResult:
@@ -154,7 +120,7 @@ def _list_processes(keyword: str, sort_by: str, limit: int) -> ToolResult:
         for row in rows:
             row["cpu"] = _cpu_percent(row["proc"])
         rows.sort(key=lambda row: row["cpu"], reverse=True)
-    else:  # memory（默认）
+    else:
         rows.sort(key=lambda row: row["memory_mb"], reverse=True)
 
     total = len(rows)
@@ -197,7 +163,6 @@ def _kill_processes(pid_value, name_value, force: bool) -> ToolResult:
                 continue
         else:
             lowered = row_name.strip().lower()
-            # 允许省略 .exe（chrome 等价 chrome.exe）
             if lowered != target_name and lowered != target_name + ".exe":
                 continue
         candidates.append((proc, row_pid, row_name))
@@ -232,7 +197,7 @@ def _kill_processes(pid_value, name_value, force: bool) -> ToolResult:
             failures.append("%s（PID %d）已自行退出" % (row_name or "<未知>", row_pid))
         except psutil.AccessDenied:
             failures.append("%s（PID %d）权限不足（拒绝访问）" % (row_name or "<未知>", row_pid))
-        except Exception as exc:  # ctypes / OS 层异常统一归一，不向上抛栈
+        except Exception as exc:
             failures.append("%s（PID %d）失败：%s" % (row_name or "<未知>", row_pid, exc))
         else:
             done.append("%s（PID %d）" % (row_name or "<未知>", row_pid))
@@ -259,7 +224,6 @@ def _process_tool(
     name: str = "",
     force: bool = False,
 ) -> ToolResult:
-    """windows_process 实现：mode=list 列表 / mode=kill 结束。"""
     normalized_mode = str(mode or "list").strip().lower()
     if normalized_mode == "list":
         normalized_sort = str(sort_by or "memory").strip().lower()
@@ -295,15 +259,10 @@ def _process_kill_tool(
     name: str = "",
     force: bool = False,
 ) -> ToolResult:
-    """windows_process_kill 入口：结束进程（复用 _process_tool 的 kill 分支）。"""
     return _process_tool(mode="kill", pid=pid, name=name, force=force)
 
 
-# ── windows_clipboard ──────────────────────────────────────
-
-
 def _clipboard_api():
-    """惰性构造 user32/kernel32 句柄并显式声明签名（64 位默认 restype 会截断指针）。"""
     import ctypes
 
     user32 = ctypes.windll.user32
@@ -328,7 +287,6 @@ def _clipboard_api():
 
 
 def _open_clipboard(user32) -> bool:
-    """尝试打开剪贴板：被别的程序占用时短暂重试几次。"""
     import time
 
     for _attempt in range(_OPEN_CLIPBOARD_ATTEMPTS):
@@ -358,7 +316,7 @@ def _clipboard_get() -> ToolResult:
             text = ctypes.wstring_at(pointer)
         finally:
             kernel32.GlobalUnlock(handle)
-    except Exception as exc:  # ctypes 函数缺失抛 AttributeError，统一归一
+    except Exception as exc:
         return _error("windows_clipboard_read_failed", "读取剪贴板失败：%s" % exc)
     finally:
         user32.CloseClipboard()
@@ -419,7 +377,6 @@ def _clipboard_set(text: str) -> ToolResult:
 
 
 def _clipboard_tool(mode: str = "get", text: str = "") -> ToolResult:
-    """windows_clipboard 实现：mode=get 读文本 / mode=set 写文本。"""
     normalized_mode = str(mode or "get").strip().lower()
     if normalized_mode == "get":
         return _clipboard_get()
@@ -434,15 +391,10 @@ def _clipboard_get_tool() -> ToolResult:
 
 
 def _clipboard_set_tool(text: str = "") -> ToolResult:
-    """windows_clipboard_set 入口：写入剪贴板文本（复用 _clipboard_tool 的 set 分支）。"""
     return _clipboard_tool(mode="set", text=text)
 
 
-# ── windows_registry（只读） ────────────────────────────────
-
-
 def _split_registry_path(path: str):
-    """拆分注册表路径：返回 (规范化路径, 错误说明)；非法时路径为 None。"""
     text = str(path or "").strip()
     if not text:
         return None, "path 不能为空：需形如 HKEY_CURRENT_USER\\Software\\Microsoft 的绝对根键路径"
@@ -465,7 +417,6 @@ def _split_registry_path(path: str):
 
 
 def _truncate_text(text: str, limit: int) -> str:
-    """超限截断并追加说明，避免把巨量注册表内容灌进上下文。"""
     if len(text) <= limit:
         return text
     return "%s\n\n（输出过长，已截断到 %d 字符；完整长度 %d 字符）" % (
@@ -490,13 +441,12 @@ def _registry_value_text(value) -> str:
 
 
 def _registry_list_text(winreg, key, normalized_path: str) -> str:
-    """枚举项下的值与子键（各自有上限，避免超大项拖垮上下文）。"""
     values = []
     index = 0
     while len(values) < _REGISTRY_LIST_VALUE_LIMIT:
         try:
             value_name, value, value_type = winreg.EnumValue(key, index)
-        except Exception:  # 枚举结束抛 OSError(22)，统一按「没有了」处理
+        except Exception:
             break
         values.append(
             "[值] %s (%s) = %s"
@@ -611,11 +561,7 @@ def _registry_tool(
     return ToolResult(content=_truncate_text(text, _REGISTRY_OUTPUT_LIMIT))
 
 
-# ── windows_notify ─────────────────────────────────────────
-
-
 def _notify_tool(title: str = "", message: str = "") -> ToolResult:
-    """windows_notify 实现：弹出系统 MessageBox 提醒（阻塞到用户点确定）。"""
     clean_title = str(title or "").strip()
     clean_message = str(message or "").strip()
 
@@ -663,9 +609,6 @@ def _notify_tool(title: str = "", message: str = "") -> ToolResult:
             % (clean_title or "<无标题>",)
         )
     )
-
-
-# ── ToolSpec 注册 ──────────────────────────────────────────
 
 
 def _process_list_spec() -> ToolSpec:

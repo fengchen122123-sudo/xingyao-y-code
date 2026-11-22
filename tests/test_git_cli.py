@@ -1,8 +1,3 @@
-"""CLI Git 工作台测试：子命令解析、命令执行、状态栏段（规格 §12/§17.1）。
-
-print_formatted_text 在无控制台的 pytest 环境不可用，注入收集器验证输出。
-"""
-
 import pytest
 
 import core.git_cli as git_cli
@@ -47,8 +42,6 @@ def _text(output) -> str:
     return "\n".join(text for _style, text in output)
 
 
-# ---------------------------------------------------------------- 解析器
-
 def test_parse_git_subcommand():
     assert git_cli.parse_git_subcommand("/git status") == ("status", ["status"])
     assert git_cli.parse_git_subcommand("/git diff --staged a.py") == ("diff", ["diff", "--staged", "a.py"])
@@ -60,8 +53,6 @@ def test_unknown_subcommand_reports_usage(output, env):
     assert "未知子命令" in _text(output)
     assert "用法" in _text(output)
 
-
-# ---------------------------------------------------------------- 命令执行
 
 def test_cmd_status_clean(output, env):
     identity, repo = env
@@ -122,11 +113,9 @@ def test_cmd_reset_hard_two_step_confirm(output, env):
     git_cli.handle_git_command("/git trust repo")
     _text(output)
     make_commit(repo, "droppable")
-    # 第一次：需要确认（展示 preview + 提示 --confirm）
     git_cli.handle_git_command("/git reset --hard HEAD~1")
     first = _text(output)
     assert "--confirm" in first and "高风险" in first
-    # 第二次：带 --confirm 执行
     git_cli.handle_git_command("/git reset --hard HEAD~1 --confirm HEAD~1")
     second = _text(output)
     assert "完成" in second
@@ -142,7 +131,6 @@ def test_cmd_clean_dry_run_then_go(output, env):
     assert (repo / "junk.txt").exists()
     git_cli.handle_git_command("/git trust repo")
     _text(output)
-    # 第一次 --go：preview + 暂存令牌；第二次 --go：带 --confirm 执行
     git_cli.handle_git_command("/git clean --go")
     first = _text(output)
     assert "--confirm" in first
@@ -160,13 +148,10 @@ def test_cmd_push_force_requires_confirm(output, env):
     assert "--confirm" in _text(output)
 
 
-# ---------------------------------------------------------------- 状态栏
-
 def test_render_status_bar(env):
     identity, repo = env
     text = git_cli.render_git_status_bar(str(repo))
     assert "⎇" in text and "main" in text and "clean" in text
-    # 缓存生效：第二次调用同 key 短间隔返回一致
     assert git_cli.render_git_status_bar(str(repo)) == text
 
 

@@ -1,9 +1,3 @@
-"""T1 子进程环境变量策略：默认排除敏感变量的安全默认 + 逃生门。
-
-覆盖 build_child_env 纯函数语义、config.json 读取，以及 execute_command /
-后台任务两处 spawn 的接入行为。
-"""
-
 import json
 from types import SimpleNamespace
 
@@ -17,7 +11,6 @@ from core.command_policy import (
 
 
 def _use_tmp_config(tmp_path, monkeypatch, data):
-    """让 config._load() 只读临时配置，避免真实用户配置干扰断言。"""
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
@@ -51,10 +44,6 @@ def _capture_execute_command_env(monkeypatch, tmp_path, config_data):
     assert result == "ok"
     return captured["env"]
 
-
-# ---------------------------------------------------------------------------
-# 纯函数语义
-# ---------------------------------------------------------------------------
 
 def test_default_excludes_sensitive_keeps_common():
     base = {"PATH": "/bin", "HOME": "/u", "OPENAI_API_KEY": "sk-x", "GITHUB_TOKEN": "gh"}
@@ -120,10 +109,6 @@ def test_values_are_normalized_to_strings():
     assert build_child_env({"PORT": 8080}, policy={"set": {"PORT": 9090}}) == {"PORT": "9090"}
 
 
-# ---------------------------------------------------------------------------
-# config.json 读取
-# ---------------------------------------------------------------------------
-
 def test_load_shell_env_policy_defaults_without_config(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, {})
     assert load_shell_env_policy() == {"inherit": "all", "exclude_sensitive": True}
@@ -147,16 +132,11 @@ def test_load_shell_env_policy_ignores_invalid_values(tmp_path, monkeypatch):
     assert load_shell_env_policy() == {"inherit": "all", "exclude_sensitive": True}
 
 
-# ---------------------------------------------------------------------------
-# 两处 spawn 接入
-# ---------------------------------------------------------------------------
-
 def test_execute_command_spawn_env_excludes_sensitive(tmp_path, monkeypatch):
     env = _capture_execute_command_env(monkeypatch, tmp_path, {})
 
     assert "OPENAI_API_KEY" not in env
     assert env["YCODE_KEEP_ME"] == "1"
-    # 编码注入必须保留在安全默认之上
     assert env["PYTHONIOENCODING"]
     assert env["PYTHONUTF8"] == "0"
 
@@ -195,7 +175,6 @@ def test_background_task_spawn_env_excludes_sensitive(tmp_path, monkeypatch):
         env = captured["env"]
         assert "OPENAI_API_KEY" not in env
         assert env["YCODE_KEEP_ME"] == "1"
-        # 实时日志所需的注入必须保留在安全默认之上
         assert env["PYTHONUNBUFFERED"] == "1"
         assert env["PYTHONIOENCODING"]
         assert env["PYTHONUTF8"] == "0"

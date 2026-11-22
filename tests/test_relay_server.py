@@ -1,10 +1,3 @@
-"""relay_server 协议验收测试（TDD 红灯阶段）。
-
-契约来源：docs/superpowers/specs/2026-11-17-minimal-relay-server-design.md
-覆盖：db / RelayRegistry / remote JWT / 换票端点 / 设备 WS / App WS / 页面托管。
-只依赖被测 API 契约，不依赖任何实现细节。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -34,9 +27,6 @@ from relay_server.registry import (
 
 SECRET = "unit-test-jwt-secret-0123456789abcdef"
 
-# --- harness 兼容（starlette>=1.x）：WebSocketTestSession 必须先 __enter__ 才建 portal。
-# --- 下方 device_ws/app_ws helper 在 with 之前就 send/receive，这里做自动进入＋幂等进入，
-# --- 不改动任何用例断言与协议契约。
 from starlette.testclient import WebSocketTestSession as _WSTS
 
 _orig_enter = _WSTS.__enter__
@@ -65,9 +55,6 @@ def _receive_auto(self, *args, **kwargs):
 _WSTS.__enter__ = _enter_idempotent
 _WSTS.send = _send_auto
 _WSTS.receive = _receive_auto
-
-
-# ---------------------------------------------------------------- fixtures
 
 
 @pytest.fixture()
@@ -126,9 +113,6 @@ def client(app):
         yield c
 
 
-# ---------------------------------------------------------------- helpers
-
-
 def raw(seq: int) -> str:
     return json.dumps({"type": "evt", "data": {"n": seq}, "seq": seq})
 
@@ -182,9 +166,6 @@ def ticket(client, device_id, device_token):
     )
 
 
-# ---------------------------------------------------------------- db
-
-
 def test_db_connect_row_factory_and_schema(tmp_path):
     c = connect(str(tmp_path / "x.db"))
     try:
@@ -201,9 +182,6 @@ def test_protocol_constants():
     assert OUTBOUND_LIMIT == 500
     assert OFFLINE_AFTER == 45
     assert RPC_ROUTE_LIMIT == 512
-
-
-# ---------------------------------------------------------------- registry
 
 
 class TestRegistry:
@@ -339,7 +317,6 @@ class TestRegistry:
         ns = reg.namespace_rpc(dev, att["key"], 7)
         assert ns == f'{att["key"]}:7'
         assert reg.resolve_rpc(dev, ns) == (att["key"], 7)
-        # 一次性：回程路由用完即焚
         assert reg.resolve_rpc(dev, ns) is None
 
     def test_namespace_rpc_route_eviction(self, reg, device):
@@ -437,9 +414,6 @@ class TestRegistry:
         assert sweeper is not None
 
 
-# ---------------------------------------------------------------- auth
-
-
 class TestAuth:
     def test_issue_read_roundtrip(self, conn, device):
         dev, _ = device
@@ -487,9 +461,6 @@ class TestAuth:
         assert read_remote_token(conn, token, SECRET, dev) is None
 
 
-# ---------------------------------------------------------------- 换票端点
-
-
 class TestTicketEndpoint:
     def test_success_and_verifiable(self, client, conn, device):
         dev, token = device
@@ -514,9 +485,6 @@ class TestTicketEndpoint:
         for _ in range(6):
             assert ticket(client, dev, token).status_code == 200
         assert ticket(client, dev, token).status_code == 429
-
-
-# ---------------------------------------------------------------- 设备 WS
 
 
 class TestDeviceWS:
@@ -599,7 +567,6 @@ class TestDeviceWS:
                 app_b.send_json({"method": "echo", "args": ["B"], "id": 1})
                 for _ in range(2):
                     req = recv_until(dws, lambda f: "method" in f)
-                    # id 必须被前缀化，不能原样透传
                     assert req["id"] != 1
                     assert ":" in str(req["id"])
                     dws.send_json({"id": req["id"], "result": {"echo": req["args"]}})
@@ -611,12 +578,6 @@ class TestDeviceWS:
                 assert resp_b["result"] == {"echo": ["B"]}
 
     def test_dual_app_rpc_stress(self, client, device):
-        """两 App 各流水线 20 轮 RPC：id/result 不串，且一帧都不能丢。
-
-        收发同时压满，专门制造 asyncio.wait(FIRST_COMPLETED) 里 receive 与
-        from_phone/incoming 同批完成的竞态；实现若 continue 丢弃同批另一个
-        结果，本用例会挂起（faulthandler 超时）或断言失败。
-        """
         dev, token = device
         jwt_a = issue_remote_token(SECRET, dev)["token"]
         jwt_b = issue_remote_token(SECRET, dev)["token"]
@@ -625,20 +586,17 @@ class TestDeviceWS:
             assert app_a.receive_json()["type"] == "replay"
             assert app_b.receive_json()["type"] == "replay"
             with device_ws(client, dev, token) as dws:
-                # 两 App 连发 20 轮请求，把设备侧 receive/from_phone 管道压满
                 for i in range(1, rounds + 1):
                     app_a.send_json({"method": "echo", "args": ["A", i], "id": i})
                     app_b.send_json({"method": "echo", "args": ["B", i], "id": i})
                 seen = set()
                 for _ in range(2 * rounds):
                     req = recv_until(dws, lambda f: "method" in f)
-                    # id 必须被前缀化且全局唯一，不能原样透传/重复
                     assert ":" in str(req["id"])
                     assert req["id"] not in seen
                     seen.add(req["id"])
                     tag, num = req["args"]
                     assert tag in ("A", "B") and 1 <= num <= rounds
-                    # 立刻应答，让回程与后续请求在设备循环里同批就绪
                     dws.send_json({"id": req["id"], "result": {"echo": req["args"]}})
                 for app, tag in ((app_a, "A"), (app_b, "B")):
                     got = {}
@@ -647,7 +605,6 @@ class TestDeviceWS:
                         assert isinstance(resp["id"], int)
                         assert resp["id"] not in got
                         got[resp["id"]] = resp
-                        # 回程必须还原自己的 id，result 不能串到另一个 App
                         assert resp["result"] == {"echo": [tag, resp["id"]]}
                     assert set(got) == set(range(1, rounds + 1))
 
@@ -687,9 +644,6 @@ class TestDeviceWS:
             assert got["data"]["online"] is False
 
 
-# ---------------------------------------------------------------- App WS
-
-
 class TestAppWS:
     def test_bad_jwt_close_4401(self, client, device):
         dev, _ = device
@@ -700,13 +654,10 @@ class TestAppWS:
             assert exc.value.code == 4401
 
     def test_first_connect_sends_empty_replay(self, client, device):
-        """首连不补历史窗口：App 启动会自己 get_initial_state 拿整态，
-        窄带外网上再把同一批状态传一遍纯属浪费（实测单次 1MB 级）。"""
         dev, token = device
         with device_ws(client, dev, token) as dws:
             dws.send_json({"type": "evt", "data": {"n": 1}, "seq": 1})
             dws.send_json({"type": "evt", "data": {"n": 2}, "seq": 2})
-            # ping/pong 做处理屏障：确保上面的 seq 帧已被 remember
             dws.send_json({"type": "ping"})
             assert dws.receive_json() == {"type": "pong"}
             jwt_token = issue_remote_token(SECRET, dev)["token"]
@@ -760,9 +711,6 @@ class TestAppWS:
                 assert exc.value.code == 4401
 
 
-# ---------------------------------------------------------------- 页面托管
-
-
 class TestPages:
     def test_health(self, client):
         resp = client.get("/health")
@@ -790,8 +738,6 @@ class TestPages:
         assert html.index(inject) < html.index("</head>")
 
     def test_shim_route_priority_over_device_id(self, client, dirs):
-        # /m/mobile-shim.js 必须先于 /m/{device_id} 注册：
-        # 用设备号 "mobile-shim.js" 请求，应返回 shim 内容而不是注入页面。
         shim_text = dirs.shim.read_text(encoding="utf-8")
         r1 = client.get("/desktop-shim.js")
         assert r1.status_code == 200
@@ -801,9 +747,7 @@ class TestPages:
         assert r2.text == shim_text
 
     def test_assets_served(self, client):
-        # 桌面 dist 以 --base=/desktop-assets/ 构建：资源 URL 带 assets/ 段（整目录 mount）
         assert client.get("/desktop-assets/assets/app.js").status_code == 200
-        # 安装包 _internal/frontend/dist 以 base=/ 构建：资源走 /assets/*
         assert client.get("/assets/app.js").status_code == 200
         assert client.get("/m/assets/app.js").status_code == 200
 
@@ -871,11 +815,9 @@ def test_device_enroll_issues_distinct_tokens_and_rejects_duplicate(tmp_path):
         )
         assert dup.status_code == 409
 
-        # 空设备编码返回 400
         bad = client.post("/api/relay/device-enroll", json={"device_code": "   "})
         assert bad.status_code == 400
 
-        # 新领到的 device_id + token 可直接换取 remote JWT 并建立 /relay/device 连接
         t1 = client.post(
             "/api/relay/device-token",
             json={"device_id": d1["device_id"], "device_token": d1["token"]},

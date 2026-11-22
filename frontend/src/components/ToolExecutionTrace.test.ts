@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
 import type { ToolDisplay, ToolExecutionCall } from '../utils/toolTrace';
 
-// 行组件内 openSubagentDetail 依赖 pinia store
 beforeEach(() => {
   setActivePinia(createPinia());
 });
@@ -49,7 +48,6 @@ describe('ToolExecutionTrace', () => {
         state: 'running',
       },
     });
-    // 外壳标题已移除，但无障碍播报保留（视觉隐藏）
     expect(wrapper.get('.sr-only').text()).toBe('执行过程 · 2 项 · 进行中');
     expect(wrapper.find('.fold-head').exists()).toBe(false);
   });
@@ -86,7 +84,6 @@ describe('ToolExecutionTrace', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [finishedCall('a')], legacyDiffs: [], state: 'completed' },
     });
-    // 没有"执行过程 · N 项"折叠头，工具行直接可见
     expect(wrapper.find('.fold').exists()).toBe(false);
     expect(wrapper.get('.exec-trace').find('.trace-line').isVisible()).toBe(true);
     expect(wrapper.findAll('.trace-row')).toHaveLength(1);
@@ -102,17 +99,14 @@ describe('ToolExecutionTrace', () => {
     });
     expect(setSpy).toHaveBeenCalledTimes(1);
 
-    // 实时秒表驱动运行中行的耗时
     vi.advanceTimersByTime(3000);
     await wrapper.vm.$nextTick();
     expect(wrapper.get('.trace-meta').text()).toBe('5.0s');
 
-    // 进入终态后清除定时器，且 elapsed 秒数不在 aria-live 区域内
     await wrapper.setProps({ state: 'completed' });
     expect(clearSpy).toHaveBeenCalledTimes(1);
     wrapper.unmount();
 
-    // 再次挂载 running 轨迹：仍是恰好一个定时器，卸载即清理
     setSpy.mockClear();
     clearSpy.mockClear();
     const again = mount(ToolExecutionTrace, {
@@ -141,7 +135,6 @@ describe('ToolExecutionTrace', () => {
     });
     const rows = wrapper.findAll('.trace-row');
     expect(rows).toHaveLength(2);
-    // 分组行摘要只给类别与文件数，完整清单在展开区
     expect(rows[0].get('.trace-kind').text()).toBe('读取');
     expect(rows[0].get('.trace-target').text()).toBe('2 个文件');
     await rows[0].get('[data-row-toggle]').trigger('click');
@@ -149,7 +142,6 @@ describe('ToolExecutionTrace', () => {
     expect(files).toHaveLength(2);
     expect(files[0].text()).toContain('a.ts');
     expect(files[1].text()).toContain('b.ts');
-    // 未绑定的历史 Diff 行：行内给变更类别与文件，Diff 内容在展开区
     expect(rows[1].get('.trace-kind').text()).toBe('变更');
     expect(rows[1].get('.trace-target').text()).toContain('old.py');
     await rows[1].get('[data-row-toggle]').trigger('click');

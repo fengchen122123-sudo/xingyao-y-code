@@ -45,13 +45,9 @@ describe('TurnGroup', () => {
     expect(head.attributes('aria-expanded')).toBe('false');
     expect(head.text()).toContain('2 个工具调用');
     expect(head.text()).toContain('已完成');
-    // 折叠体存在但不显示
     expect(wrapper.find('.fold-body').exists()).toBe(true);
     expect((wrapper.find('.fold-body').element as HTMLElement).style.display).toBe('none');
-    // 最终总结始终可见
     expect(wrapper.text()).toContain('修复完成');
-    // 中间过程文字不出现在可见 DOM 文本之外的位置（v-show 隐藏但仍在 DOM，
-    // 这里验证总结与摘要头都在，中间内容被 fold-body 包裹）
     expect(wrapper.find('.fold-body').text()).toContain('先看代码');
   });
 
@@ -116,7 +112,6 @@ describe('TurnGroup', () => {
   it('折叠收起时名字行只落在组尾总结上', () => {
     const wrapper = mount(TurnGroup, { props: { group: finishedGroup() } });
 
-    // 整个回合只有一处「星瑶 · 模型」名字行，且不在折叠体内
     expect(wrapper.findAll('.assistant-name')).toHaveLength(1);
     expect(wrapper.find('.fold-body .assistant-name').exists()).toBe(false);
   });

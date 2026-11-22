@@ -1,23 +1,3 @@
-"""真实预压缩测试（dev-compact 验证用，真实 LLM、真实回合路径，零桩）。
-
-验证内容（生产默认配置，不改任何配置项）：
-  T1  会话历史灌到 ~88%（预压缩区间 [0.85, 0.95) 内）；
-  T2  真实调用 prepare_turn_messages（GUI 同款路径）→ 断言：
-      - 本回合立即返回（不被压缩阻塞，用户感知等待 ≈ 0）；
-      - 后台预压缩线程真实启动（真实 LLM 压缩请求经中转 provider 发出）；
-      - notice 出现「正在后台智能压缩」提示（时机前移的产物）；
-  T3  等后台真实压缩完成 → 断言：
-      - CompressionOutcome 落库（memory_summary 非空、summarized_until 推进）；
-      - 水位显著回落（88% → 期望 <30%）；
-      - 守卫释放、冷却时间已登记；
-  T4  冷却期内（120s）再次触发点 → 不重复启动；冷却过后（等 120s 太久，
-      仅验证冷却时间戳已记录——协议里冷却常量缩放不改动生产值）；
-  T5  预压缩落库后紧接一轮 96% 冲顶回合 → Tier3 只压增量或直接跳过
-      （大部分历史已被预压缩摘要覆盖）。
-
-零桩：不替换任何函数；LLM 请求真实发出（tokenrhythm 中转，qwen3.8-flash
-计费），分段时间预计 30~120s/段。输出全程 UTF-8。
-"""
 import sys
 import os
 import time
@@ -44,7 +24,6 @@ def pick_provider():
             for m in p.get("models", []):
                 if m.get("litellm_model") == TARGET_MODEL:
                     return p["api_key"], p["base_url"]
-    # 兜底：任一有 key 的 provider
     for p in cfg.get("providers", []):
         if p.get("api_key"):
             return p["api_key"], p.get("base_url", "")
@@ -76,7 +55,6 @@ def main():
     sess = "real_pre"
     mgr.add_messages(sess, [("user", "开始任务")])
 
-    # T1: 灌到 ~88%
     i = 0
     t_fill0 = time.time()
     while est_of(mgr, sess) <= WINDOW * 0.88:
@@ -87,7 +65,6 @@ def main():
           % (100 * est / WINDOW, est, i, time.time() - t_fill0))
     assert 0.85 <= est / WINDOW < 0.95, "应在预压缩区间内"
 
-    # T2: 真实回合（预压缩应转后台，回合立即返回）
     notices = []
     t0 = time.time()
     msgs = agent_service.prepare_turn_messages(
@@ -111,7 +88,6 @@ def main():
     assert started, "后台预压缩线程应真实运行中"
     assert compressing_notices, "应出现压缩提示"
 
-    # T3: 等后台真实压缩完成（真实 LLM，预计 2-5 分钟）
     print("[T3] 等待后台真实压缩完成（真实 LLM 分段请求，请稍候）...")
     t_bg0 = time.time()
     while mc.is_session_compressing(mgr, sess):
@@ -133,7 +109,6 @@ def main():
     assert row[0] and row[1], "摘要应已落库且水位推进"
     assert est_after < WINDOW * 0.5, "水位应显著回落"
 
-    # T4: 冷却期内再触发点 → 不重复启动
     notice2 = []
     t0 = time.time()
     agent_service.prepare_turn_messages(

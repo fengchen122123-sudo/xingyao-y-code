@@ -1,5 +1,3 @@
-"""进程级 Git 服务与监控单例（GUI 与 CLI 共用，规格 §6 架构图）。"""
-
 from __future__ import annotations
 
 import threading

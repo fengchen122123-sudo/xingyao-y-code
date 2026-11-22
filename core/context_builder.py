@@ -1,5 +1,3 @@
-"""Compose stable instructions and per-turn runtime context."""
-
 from __future__ import annotations
 
 from copy import deepcopy
@@ -36,59 +34,23 @@ class RuntimeContext:
     memory: str = "无"
     skills: str = "无"
     custom_subagents: str = "无"
-    # Turn 起点冻结的电脑操控能力（Task 10，设计 9.3）：默认 None，
-    # disabled/None 时动态块字节与历史版本完全一致。
     computer_capability: "ComputerCapability | None" = None
-    # 按回合撤销纠正动态块（规格 15.3）：无纠正时为空串，动态块字节不变。
     workspace_corrections: str = ""
-    # AI 生成内容目录（Task 6）：配置级稳定值（默认 ~/.ycode/tmp），
-    # 跨轮不变，符合动态块"不放每轮必变字段"的约束。
     ai_output_dir: str = ""
     # 全局子代理开关（设置页「子代理」）：默认 True，关闭时运行上下文块
     # 明确告知模型不要派子代理、也不要建计划编排。
     subagent_enabled: bool = True
-    # 秘书会话标记：默认 False，保持普通会话动态块字节逐字节不变。
     is_secretary: bool = False
+    browser_preference: str = ""
 
 
 def build_stable_prompt(base_prompt: str) -> str:
-    """Build the stable prefix that stays unchanged across turns.
-
-    Contains only the base system prompt and the hardcoded decision policy.
-    This prefix is safe for provider-side prompt caching because it does not
-    include per-turn dynamic data (time, plan snapshot, memory, skills).
-    """
     stable = (base_prompt or "").strip()
     parts = [section for section in (stable, _DECISION_POLICY) if section]
     return "\n\n".join(parts)
 
 
-# 保留标记的唯一来源已收敛到 core/injection_markers.py（T1.5 防伪造基础设施），
-# 由文件顶部 import 引入。常量值逐字未变，且
-# `from core.context_builder import DYNAMIC_CONTEXT_PREFIX` 等既有引用路径保持可用。
-
-
 def build_dynamic_prompt(runtime: RuntimeContext) -> str:
-    """Build the per-turn runtime context block.
-
-    该块以 system 角色持久化到会话历史中（append-only），内容不变时不再
-    重复注入，保证跨轮请求的 prefix 连续、最大化 provider 侧缓存命中。
-    因此块内绝不放每轮必变的字段（当前时间单独用 build_time_note 注入）。
-
-    注意：长期记忆 / 技能目录 / 自定义子 Agent 清单等跨轮基本不变的静态内容
-    已并入稳定系统提示词（core.agent_service.build_stable_system_message），
-    本块只承载会话内可能变化的字段（模型 / 权限模式 / 工作目录 / 计划快照）。
-
-    电脑操控说明（Task 10，设计 10.1）：只在 Turn 冻结的 capability 开启时
-    追加到块末尾；默认 None / disabled 时返回值与历史版本逐字节一致。
-
-    渲染方式（规格 02 §3.2 步骤 2 渲染接管）：本函数不再手工拼段，而是遍历
-    注入注册表的 PERSISTED/SYSTEM 通道——注入点 3（_build_runtime_context_block）
-    / 注入点 6（电脑操控说明）/ 注入点 7（按回合撤销纠正）——按登记顺序取非空段
-    并以 "\\n\\n" 连接。分段点正落在改造前手工追加 "\\n\\n" 的位置，故输出逐字节
-    一致。防递归：注册表的 runtime_context_block builder 指向基础块函数
-    _build_runtime_context_block，绝不回调本函数。
-    """
     from core.context_injection import build_default_injection_registry
 
     registry = build_default_injection_registry(runtime_provider=lambda: runtime)
@@ -97,13 +59,6 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
 
 
 def _build_runtime_context_block(runtime: RuntimeContext) -> str:
-    """运行上下文基础块（注入点 3）：不含电脑操控说明与按回合撤销纠正。
-
-    为什么从 build_dynamic_prompt 里拆出来：注册表把基础块 / 电脑操控说明 /
-    按回合纠正登记为三条独立 PERSISTED/SYSTEM source（规格 02 §2.2），每条
-    builder 必须能独立取值，否则会出现"基础块已含 6/7、注册表再拼一次"的双份
-    注入；同时这也避免注册表 builder 回调 build_dynamic_prompt 造成的无限递归。
-    """
     if getattr(runtime, "is_secretary", False):
         return (
             f"{DYNAMIC_CONTEXT_PREFIX}\n"
@@ -128,6 +83,9 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
             "子代理：已关闭（设置 → 子代理）。run_subagent 与计划编排工具均不可用，"
             "所有子任务由你自己按顺序完成，不要尝试派子代理，也不要创建计划。\n"
         )
+    browser_instruction = ""
+    if runtime.browser_preference:
+        browser_instruction = f"{runtime.browser_preference}\n"
     prompt = (
         f"{DYNAMIC_CONTEXT_PREFIX}\n"
         f"当前模型：{runtime.model_name}\n"
@@ -136,6 +94,7 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
         f"默认命令解释器：{runtime.command_shell}\n"
         "生成命令时必须优先使用该解释器的语法；命令失败后根据错误调整语法，"
         "必要时可通过 execute_command 的 shell_id 显式选择其他已安装解释器。\n"
+        f"{browser_instruction}"
         f"AI 生成内容目录：{runtime.ai_output_dir}\n"
         "AI 产出的图片、下载文件与临时脚本一律写到该目录；"
         "用户显式指定了保存位置时以用户指定为准。\n"
@@ -148,7 +107,6 @@ def _build_runtime_context_block(runtime: RuntimeContext) -> str:
 
 
 def _build_computer_prompt_section(capability) -> str:
-    """电脑操控动态说明：capability 关闭时返回空串（动态块字节不变）。"""
     if capability is None or not capability.enabled:
         return ""
     from core.computer.models import ComputerProtocol
@@ -158,10 +116,28 @@ def _build_computer_prompt_section(capability) -> str:
     if generic_section:
         return generic_section
     if capability.protocol == ComputerProtocol.NATIVE_OPENAI.value:
+        from core.computer.settings import get_browser_label, is_external_browser
+
+        targets = tuple(getattr(capability, "targets", ()) or ())
+        browser = str(getattr(capability, "browser", "") or "").strip()
+        browser_note = ""
+        if "browser" in targets:
+            if browser == "embedded":
+                browser_note = (
+                    " 当前系统默认浏览器为「星瑶内置浏览器」（在 GUI 右侧面板内嵌浏览器呈现），"
+                    "浏览器操作必须优先使用原生电脑动作执行，不要先用 browser_pane 打开无调试端口页面。"
+                )
+            elif is_external_browser(browser):
+                label = get_browser_label(browser)
+                browser_note = (
+                    f" 当前系统默认浏览器为「{label}」（{browser}），"
+                    "浏览器操作必须优先并严格使用原生电脑动作驱动该浏览器，"
+                    "禁止改用 browser_pane 内置面板绕开系统设置。"
+                )
         return (
             "电脑操控使用说明（OpenAI 原生协议）：请先单独调用 "
             "computer_select_target 选择唯一操控目标，之后再执行原生电脑动作；"
-            "每次动作后依据返回的最新截图决定下一步。"
+            f"每次动作后依据返回的最新截图决定下一步。{browser_note}"
         )
     return ""
 
@@ -177,16 +153,10 @@ def build_time_note(runtime: RuntimeContext) -> str:
 
 
 def build_system_prompt(base_prompt: str, runtime: RuntimeContext) -> str:
-    """Legacy combined prompt (stable + dynamic).
-
-    Kept for backward compatibility.  New code should prefer
-    build_stable_prompt + build_dynamic_prompt to enable prompt caching.
-    """
     stable = build_stable_prompt(base_prompt)
     dynamic = build_dynamic_prompt(runtime)
     return "\n\n".join([stable, dynamic])
 
 
 def without_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return a copy without stale system prompts from previous turns."""
     return [deepcopy(message) for message in messages if message.get("role") != "system"]

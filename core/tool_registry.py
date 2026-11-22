@@ -1,5 +1,3 @@
-"""Capability registry for the built-in tools."""
-
 from __future__ import annotations
 
 import logging
@@ -14,7 +12,6 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _absolute_path_example() -> str:
-    """full / cli 保持原来的 Windows 示例。server 档改成容器里的 POSIX 路径。"""
     if os.environ.get("YCODE_TOOL_PROFILE", "").strip().lower() == "server":
         return "/data/work/demo"
     return "D:\\\\work\\\\demo"
@@ -40,9 +37,6 @@ class ToolRegistry:
         if not spec.name:
             raise ValueError("tool name must not be empty")
         if spec.name in RESERVED_COMPUTER_TOOL_NAMES:
-            # Harness 保留名（设计第 6 节规则 8）：computer_action /
-            # computer_select_target 由固定适配器执行，插件注册同名工具
-            # 直接拒绝；插件加载器会把该异常记为插件 failed 状态。
             raise ValueError(f"reserved computer tool name: {spec.name}")
         if spec.name in self._specs:
             raise ValueError(f"duplicate tool: {spec.name}")
@@ -66,7 +60,6 @@ class ToolRegistry:
 
     @staticmethod
     def _filtered_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Drop model-invented arguments while preserving scheduler context."""
         props = (spec.input_schema or {}).get("properties")
         if isinstance(props, dict) and props:
             return {
@@ -76,12 +69,6 @@ class ToolRegistry:
         return arguments
 
     def execute_strict(self, tool_name: str, **arguments: Any) -> ToolResult:
-        """Execute a registered tool while preserving execution exceptions.
-
-        首个形参刻意命名为 ``tool_name``：工具自身的参数里可能包含名叫 ``name`` 的
-        字段（如 mcp_add_server / automation_create），若形参叫 ``name`` 会与
-        ``**arguments`` 冲突（TypeError: multiple values for argument 'name'）。
-        """
         spec = self.get(tool_name)
         result = spec.execute(**self._filtered_arguments(spec, arguments))
         if isinstance(result, ToolResult):
@@ -102,7 +89,6 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None, **ext
     result: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         result["required"] = required
-    # 支持 anyOf / oneOf / allOf 等 JSON Schema 顶层约束
     for key, value in extra.items():
         if value is not None:
             result[key] = value
@@ -110,12 +96,6 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None, **ext
 
 
 def filter_reserved_tool_schemas(schemas: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """MCP schema 合并时的保留名过滤（设计 19.2）。
-
-    MCP server 暴露 computer_action / computer_select_target 同名工具时，
-    明确跳过该扩展并记录失败状态（warning 日志）；无保留名时返回与输入
-    逐项相同的列表，tools 字节保持不变。
-    """
     blocked: list[str] = []
     allowed: list[dict[str, Any]] = []
     for schema in schemas:
@@ -132,39 +112,27 @@ def filter_reserved_tool_schemas(schemas: Iterable[dict[str, Any]]) -> list[dict
     return allowed
 
 
-# ── 运行形态档位（CLI 轻量档）────────────────────────────────────────
-# CLI 的定位是"开发者终端里写代码"，不与 GUI 共享全部富交互面板能力。
-# 下列工具在 CLI 下要么必然不可用（内嵌浏览器面板、星轨自动化、选区截图），
-# 要么与写代码无关（皮肤/人设/飞书/局域网/决策面板/图片生成/更新向导），
-# 注册它们只会让每次请求都多背约 5.6k tokens 的工具定义，因此在 CLI 档位剔除。
-# 注意：这里只裁"对模型暴露的工具表"，对应的斜杠命令与业务能力不受影响。
 CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
-    # 外观与人设
     "theme_manage",
     "persona_manage",
-    # 星轨自动化（CLI/headless 下服务句柄未注册，调用必然失败）
     "automation_list",
     "automation_create",
     "automation_update",
     "automation_delete",
     "automation_run_now",
-    # 星流工作流（用户明确 CLI 不需要工作流：管理走 GUI 星流面板，创建/执行走对话）
     "workflow_list",
     "workflow_run",
     "workflow_save",
     "workflow_finish",
-    # 外部集成与决策面板
     "feishu_manage",
     "lan_manage",
     "decision_manage",
-    # 交互面板（GUI 专属 UI 能力）
     "computer_control",
     "pty_manage",
     "browser_pane",
     "screenshot_capture",
     "browser_set_viewport",
     "clipboard_image",
-    # 跨会话派发 / 秘书
     "dispatch_task",
     "open_session",
     "secretary_probe",
@@ -172,7 +140,6 @@ CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "list_sessions",
     "read_session",
     "manage_memory",
-    # 运维与内容生成
     "update_manage",
     "diagram_manage",
     # 只读查询类：斜杠命令（/usage /share /doctor）或已保留的同名工具
@@ -181,25 +148,17 @@ CLI_EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "session_export",
     "doctor_run",
     "search_conversations",
-    # 会话/模型配置：斜杠命令 /session、/models 覆盖；保留 skill_manage /
-    # plugin_manage / hook_manage / mcp_* / system_settings 的对话式配置能力。
     "session_manage",
     "model_manage",
-    # 与写代码无关（fetch_image 只在网页图文并茂展示时用，写代码不需要）
     "get_weather",
     "search_news",
     "fetch_image",
 })
 
-# server：部署档。在 CLI 剔除集合上再拿掉技能/插件/钩子管理，
-# 但保留浏览器视口和电脑操控停止面板。full / cli 的工具表不走这里。
 SERVER_EXCLUDED_TOOLS: frozenset[str] = (
     CLI_EXCLUDED_TOOLS - {"browser_set_viewport", "computer_control"}
 ) | frozenset({"skill_manage", "plugin_manage", "hook_manage"})
 
-# coding：写代码极速精简档。仅保留源码读写、批量编辑、代码检索/LSP、命令执行、
-# 子代理、计划与历史回溯等核心研发工具，剔除生图/天气/小说/飞书/UI 面板等，
-# 将工具 Schema 体积从 ~65KB（full）/ ~40KB（cli）压缩至 ~14KB。
 CODING_INCLUDED_TOOLS: frozenset[str] = frozenset({
     "read_file",
     "write_file",
@@ -231,12 +190,6 @@ VALID_TOOL_PROFILES: tuple[str, ...] = ("full", "cli", "server", "coding")
 
 
 def _resolve_tool_profile(profile: str | None = None) -> str:
-    """解析工具表档位：显式参数 > 环境变量 > config.tool_profile > app_context UI 形态 > full。
-
-    环境变量优先于 app_context，是因为 core.llm 在模块导入期就会构建工具表，
-    此时入口层往往还没来得及 set_ui_flavor；main.py 在 import core.llm 之前
-    用 YCODE_TOOL_PROFILE=cli 声明形态。
-    """
     candidate = str(profile or "").strip().lower()
     if candidate in VALID_TOOL_PROFILES:
         return candidate
@@ -279,9 +232,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         plan_write,
     )
 
-    # 管理类工具（21 个）：各模块自带 build_specs() 提供 ToolSpec 契约，
-    # 注册表只做装配与分组，不在此重复定义任何工具或实现；模块内部执行逻辑
-    # 一律函数内惰性导入，注册阶段仅构造 ToolSpec 对象，不触发扫描/网络/写盘。
     from core import tools_admin_integration
     from core import tools_admin_interaction
     from core import tools_admin_look
@@ -290,9 +240,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
     from core import tools_admin_session
     from core import tools_admin_skill
 
-    # side_effect_scope 归类依据《03-工具调度拓扑化设计规格》3.2 取值表
-    # （none / workspace / git / network / system）；表未覆盖的工具按语义归类，
-    # 行尾注释说明理由。该字段 v1 不参与调度决策，仅为契约元数据。
     read_specs = [
         ToolSpec(
             name="read_file",
@@ -608,8 +555,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="查看工作流",
             side_effect_scope="none",  # 表未覆盖：只读查询，无持久副作用
         ),
-        # 秘书调度台（设计 2026-10-15 第 3 节）：仅秘书会话可见（core.secretary
-        # 的 SECRETARY_ONLY_TOOLS），普通会话的工具集零变化。
         ToolSpec(
             name="search_conversations",
             description=(
@@ -757,10 +702,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
     ]
 
     mutating_specs = [
-        # 项目画像写入（升级设计 2026-11-04 第 5.2 节）：只写
-        # ~/.ycode/memory/projects/，路径校验在 core.project_profile 内。
-        # requires_permission=False：这是秘书自己的长期记忆，写的是 memory 目录
-        # 而非项目文件（路径越界直接拒绝），逐次弹确认只会卡住汇总流程。
         ToolSpec(
             name="remember_decision",
             description=(
@@ -781,7 +722,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             execute=tools.remember_decision,
             requires_permission=False,
             activity_description="记录项目决策",
-            side_effect_scope="system",  # 只写 ~/.ycode/memory/projects/（跨项目记忆，非工作区）
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="ask_user",
@@ -824,7 +765,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             }, ["items"]),
             execute=plan_write,
             activity_description="更新任务计划",
-            side_effect_scope="workspace",  # 表未覆盖：持久化修改任务计划状态（.ycode_tasks/plans）
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="plan_update",
@@ -843,7 +784,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_update,
             activity_description="更新计划项",
-            side_effect_scope="workspace",  # 表未覆盖：持久化修改计划项元数据
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="plan_read",
@@ -865,7 +806,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_retry,
             activity_description="重试计划项",
-            side_effect_scope="workspace",  # 表未覆盖：修改计划项状态
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="plan_resume_takeover",
@@ -879,7 +820,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_resume_takeover,
             activity_description="恢复主 Agent 接管",
-            side_effect_scope="workspace",  # 表未覆盖：修改计划项接管状态
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="plan_finish",
@@ -897,7 +838,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             }, ["item_id", "result"]),
             execute=plan_finish,
             activity_description="完成接管计划项",
-            side_effect_scope="system",  # 表未覆盖：会真实执行 verification shell 命令
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="write_file",
@@ -1124,7 +1065,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="启动子 Agent",
             side_effect_scope="system",  # 表未覆盖：子代理可执行任意工具，副作用范围不可预知（保守归 system）
         ),
-        # ── MCP 服务配置工具（让 AI 能自己配置/启用/禁用 MCP server）─────
         ToolSpec(
             name="mcp_add_server",
             description=(
@@ -1149,7 +1089,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="新增 MCP server",
-            side_effect_scope="system",  # 表未覆盖：写 mcp.json 且以任意 command/args 启动外部进程
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="mcp_remove_server",
@@ -1164,7 +1104,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="删除 MCP server",
-            side_effect_scope="system",  # 表未覆盖：关闭外部进程并写 mcp.json
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="mcp_set_enabled",
@@ -1180,7 +1120,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="切换 MCP server 开关",
-            side_effect_scope="system",  # 表未覆盖：可能启动外部进程并写 mcp.json
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="mcp_list_servers",
@@ -1197,7 +1137,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="查看 MCP 服务列表",
             side_effect_scope="none",  # 表未覆盖：只读查询
         ),
-        # ── 项目浏览器分辨率（星瑶按项目自设视口）─────────────────────────
         ToolSpec(
             name="browser_set_viewport",
             description=(
@@ -1216,7 +1155,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="设置项目浏览器分辨率",
             side_effect_scope="workspace",
         ),
-        # ── 工作流执行与创建（设计 待开发/ZCode钩子与工作流导入/设计规格.md §3.4）──
         ToolSpec(
             name="workflow_run",
             description=(
@@ -1316,9 +1254,8 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=False,
             activity_description="工作流收尾",
-            side_effect_scope="none",  # 表未覆盖：仅运行台账回写，无工作区副作用
+            side_effect_scope="none",
         ),
-        # ── 星轨自动化工具（对话里创建/修改/删除/立即执行定时任务）───────
         ToolSpec(
             name="automation_create",
             description=(
@@ -1509,8 +1446,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="立即执行星轨自动化任务",
             side_effect_scope="workspace",
         ),
-        # 秘书调度台（设计 2026-10-15 第 4/5 节）：仅秘书会话可见；派活/跳转会
-        # 改动别的会话与界面视图，按保守口径归 system。
         ToolSpec(
             name="dispatch_task",
             description=(
@@ -1531,7 +1466,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=False,
             activity_description="派发任务给会话",
-            side_effect_scope="system",  # 表未覆盖：会向其它会话投递消息并触发真实执行
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="dispatch_batch",
@@ -1570,7 +1505,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=False,
             activity_description="批量派发任务",
-            side_effect_scope="system",  # 与 dispatch_task 同口径：向多个会话投递消息并触发真实执行
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="open_session",
@@ -1586,7 +1521,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=False,
             activity_description="跳转到会话",
-            side_effect_scope="system",  # 表未覆盖：切换当前会话与界面视图
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="create_project",
@@ -1607,7 +1542,7 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=False,
             activity_description="新建并引入项目文件夹",
-            side_effect_scope="system",  # 表未覆盖：创建磁盘目录、登记工作区并改变侧栏分组
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="manage_memory",
@@ -1643,24 +1578,13 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         ),
     ]
 
-    # ── 管理类工具（21 个）─────────────────────────────────────────────
-    # 会话 / 模型 / 技能插件 hook / 运维系统设置 / 外观人设 / 集成 / 交互面板。
-    # 各模块 build_specs() 返回的就是可直接注册的 ToolSpec（含 execute 可调用
-    # 对象与 side_effect_scope 元数据），此处仅按来源分组拼接。
     admin_specs = [
-        # 会话与上下文管理（1）
         *tools_admin_session.build_specs(),
-        # 模型与供应商管理（1）
         *tools_admin_model.build_specs(),
-        # 技能 / 插件 / hook 管理（3）
         *tools_admin_skill.build_specs(),
-        # 运维与诊断：用量、导出、更新、系统设置、架构图、体检（6）
         *tools_admin_ops.build_specs(),
-        # 外观与人设：主题、人格设定（2）
         *tools_admin_look.build_specs(),
-        # 集成与协作：飞书、局域网、决策记录（3）
         *tools_admin_integration.build_specs(),
-        # 交互面板：pty、浏览器面板、截图、剪贴板、电脑操控（5）
         *tools_admin_interaction.build_specs(),
     ]
 
@@ -1672,9 +1596,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
         plugin_loader.load_and_register(registry)
     except Exception:
         pass
-    # CLI 轻量档位：剔除 GUI 专属工具（见 CLI_EXCLUDED_TOOLS 说明）。
-    # 放在插件加载之后，避免插件重新注册同名工具又把它们带回来。
-    # server 档用自己的集合，不改 full / cli 的请求字节。
     _profile_name = _resolve_tool_profile(profile)
     _excluded = None
     if _profile_name == "cli":
@@ -1702,11 +1623,6 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
 
 
 def _apply_managed_tool_filter(registry: ToolRegistry) -> None:
-    """受管策略 ``disabled_tools``：注册（含插件加载）完成后过滤禁用工具。
-
-    无策略/无禁用项时不做任何事（零行为变化）；管理端未列出的工具照常可用。
-    禁用了本发行版未安装的工具名时静默忽略（管理文件可能面向多版本分发）。
-    """
     try:
         from core.managed_policy import disabled_tool_names, load_managed_policy
 
@@ -1726,7 +1642,6 @@ def _apply_managed_tool_filter(registry: ToolRegistry) -> None:
         _LOGGER.warning("受管策略已禁用工具: %s", ", ".join(sorted(removed)))
 
 
-# ── MCP 配置工具的执行包装函数 ──────────────────────────────────────
 def _mcp_add_server_wrapper(name, command, args, env, enabled):
     from core.mcp_client import mcp_manager
     ok, msg = mcp_manager.add_server(name, command, args, env, enabled)
@@ -1750,7 +1665,6 @@ def _mcp_list_servers_wrapper():
     return ToolResult(content=mcp_manager.list_servers(), is_error=False)
 
 
-# ── 项目浏览器分辨率工具的执行包装函数 ──────────────────────────────
 def _browser_set_viewport_wrapper(width, height):
     from core.computer.models import ComputerControlError
     from core.computer.settings import set_project_browser_viewport
@@ -1788,7 +1702,6 @@ _AUTOMATION_PERMISSION_MODE_MESSAGE = (
 
 
 def _automation_service_or_error():
-    """取服务句柄；未注册（CLI/headless）时返回 (None, 错误结果)。"""
     from core.automation import service as automation_service
 
     svc = automation_service.get()
@@ -1814,7 +1727,6 @@ def _automation_permission_mode_error(permission_mode):
 
 
 def _automation_bridge_error_text(resp) -> str:
-    """把桥侧返回值里的 errors/msg 拼成人类可读文本。"""
     if isinstance(resp, dict):
         errors = resp.get("errors")
         if isinstance(errors, (list, tuple)) and errors:
@@ -1832,13 +1744,6 @@ def _automation_bridge_error_text(resp) -> str:
 def _automation_build_trigger_config(
     trigger_type, interval_minutes, time, weekdays, delay_minutes=None
 ):
-    """按触发器类型组装 trigger_config；返回 (config, 错误文本)。
-
-    只做「参数是否齐备」的检查，取值范围/格式由桥侧 validate_task 兜底并原样
-    透出错误，避免 core 层出现两套校验。例外：once 触发器在对话内只收相对延迟
-    ``delay_minutes``，绝对时刻 ``run_at`` 由本层用服务端真实时钟换算，模型不得
-    自算（设计规格 3.1 的 ZCode 1.4-2 移植）。
-    """
     trigger_type = str(trigger_type or "").strip()
     if trigger_type == "interval":
         if interval_minutes is None:
@@ -1891,7 +1796,6 @@ def _automation_build_trigger_config(
 
 
 def _automation_trigger_summary(task: dict) -> str:
-    """取/算任务的触发器摘要（DTO 可能已带 trigger_summary）。"""
     summary = task.get("trigger_summary")
     if summary:
         return str(summary)
@@ -1915,7 +1819,6 @@ def _automation_format_ts(value) -> str:
 
 
 def _automation_run_count_text(task: dict) -> str:
-    """次数文案：已执行 N/M 次（有限次）/ 已执行 N 次（不限次）。"""
     count = int(task.get("scheduled_run_count") or 0)
     max_runs = task.get("max_runs")
     if isinstance(max_runs, bool) or not isinstance(max_runs, int):
@@ -1945,9 +1848,6 @@ def _automation_run_line(run: dict) -> str:
         f"｜结束={run.get('finished_at')}"
         + (f"｜错误={run.get('error')}" if run.get("error") else "")
     )
-
-
-# ── 工作流工具 wrapper（ZCode 导入，core/workflows）──────────────────
 
 
 def _workflow_workspace_root():
@@ -2131,7 +2031,6 @@ def _workflow_run_wrapper(*, name, args=None, **_ignored):
 
 
 def _workflow_finish_wrapper(*, run_id, ok=None, summary="", **_ignored):
-    """运行台账收尾：只在 run 仍为 running 时生效，未知/重复调用静默接受。"""
     from core.workflows.runs import get_run_storage
 
     storage = get_run_storage()
@@ -2269,8 +2168,6 @@ def _automation_create_wrapper(
     max_runs=None,
     **_ignored,
 ):
-    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
-    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
     if automation_tool_policy.automation_write_denied():
         return ToolResult(
             content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
@@ -2371,8 +2268,6 @@ def _automation_update_wrapper(
     enabled=None,
     **_ignored,
 ):
-    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
-    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
     if automation_tool_policy.automation_write_denied():
         return ToolResult(
             content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
@@ -2461,7 +2356,6 @@ def _automation_update_wrapper(
             )
 
     if enabled is not None:
-        # 启停走桥侧专用方法（轻量、并发安全）；已保存的合并结果不覆盖它。
         resp = svc.set_enabled(task_id, bool(enabled))
         if not isinstance(resp, dict) or not resp.get("ok"):
             return ToolResult(
@@ -2478,8 +2372,6 @@ def _automation_update_wrapper(
 
 
 def _automation_delete_wrapper(*, task_id, **_ignored):
-    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
-    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
     if automation_tool_policy.automation_write_denied():
         return ToolResult(
             content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,
@@ -2506,8 +2398,6 @@ def _automation_delete_wrapper(*, task_id, **_ignored):
 
 
 def _automation_run_now_wrapper(*, task_id, **_ignored):
-    # 自动化回合安全门控（G3 防任务自我繁殖）：schema 层已隐藏写类工具，
-    # 这里保证直接调用（MCP/插件/脚本旁路）同样不会落库。
     if automation_tool_policy.automation_write_denied():
         return ToolResult(
             content=automation_tool_policy.AUTOMATION_TURN_DENIED_MESSAGE,

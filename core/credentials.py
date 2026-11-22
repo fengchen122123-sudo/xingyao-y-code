@@ -1,5 +1,3 @@
-"""Windows DPAPI helpers for user-bound credential encryption at rest."""
-
 from __future__ import annotations
 
 import base64

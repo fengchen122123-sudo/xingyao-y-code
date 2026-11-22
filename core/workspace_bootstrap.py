@@ -1,5 +1,3 @@
-"""Workspace bootstrap helpers: project rule loading and repo orientation summary."""
-
 from __future__ import annotations
 
 import json
@@ -53,11 +51,6 @@ def load_workspace_rules(
     *,
     max_chars: int = 8000,
 ) -> str:
-    """加载工作区工程规范（AGENTS.md / CLAUDE.md / YCODE.md / .ycode/rules/*.md）。
-
-    按固定顺序去重读取，总长度受 max_chars 上限保护。
-    不存在规则文件或无有效内容时返回空串。
-    """
     root = _resolve_root(workdir)
     if root is None or not root.is_dir():
         return ""
@@ -118,7 +111,6 @@ def load_workspace_rules(
 
 
 def _detect_stack_hints(root: Path) -> list[str]:
-    """检测常见项目配置文件、虚拟环境与测试命令提示。"""
     hints: list[str] = []
     if (root / "pyproject.toml").is_file() or (root / "pytest.ini").is_file() or (root / "setup.cfg").is_file():
         hints.append("Python")

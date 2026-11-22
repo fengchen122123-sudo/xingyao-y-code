@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""架构度量与模块地图（T7：借鉴 ZCode architecture:check/context）。
-
-子命令：
-    scan  行数基线：生成/更新 docs/architecture_baseline.json
-    deps  循环依赖检测：ast 解析 core/ 包内部相对/绝对导入
-    map   模块地图：提取 docstring 首行 → docs/module_map.md
-
-设计约定：
-- 只读度量工具：不修改任何被扫描源码；只有 scan / map 写各自的产物文件。
-- 确定性：相同输入 → 相同输出字节（全部排序、LF 行尾、不写时间戳）。
-- 仅标准库（argparse/ast/json/pathlib/dataclasses）。
-- 告警阈值：新增文件 >800 行；存量较基线增长 >10%（current*10 > baseline*11）。
-- 基线语义：存量只登记不前移；新文件按当前行数登记；已消失文件从基线移除。
-- 退出码：scan 检出告警 → 1（--check 同样），否则 0；deps 为纯报告工具，
-  检出存量循环依赖不改变退出码（本任务只报告、不修复）。
-"""
 
 from __future__ import annotations
 
@@ -30,7 +14,7 @@ DEFAULT_ROOT = "core"
 DEFAULT_BASELINE_PATH = "docs/architecture_baseline.json"
 DEFAULT_MAP_PATH = "docs/module_map.md"
 NEW_FILE_LINE_THRESHOLD = 800
-GROWTH_ALERT_RATIO = 1.1  # 仅用于文案展示；判定用整数比较 current*10 > baseline*11
+GROWTH_ALERT_RATIO = 1.1
 BASELINE_SCHEMA = 1
 SUMMARY_MAX_CHARS = 120
 
@@ -53,11 +37,7 @@ class ModuleInfo:
     summary: str | None
 
 
-# --------------------------------------------------------------------- scan
-
-
 def iter_python_files(root: Path) -> list[Path]:
-    """返回 root 下全部 .py 文件（跳过 __pycache__），按相对路径排序。"""
 
     def sort_key(path: Path) -> str:
         return path.relative_to(root).as_posix()
@@ -137,11 +117,7 @@ def save_baseline(path: Path, files: dict[str, int], *, root_name: str) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
-# --------------------------------------------------------------------- deps
-
-
 def _module_name(root: Path, prefix: str, path: Path) -> str:
-    """core/a/b.py → core.a.b；core/a/__init__.py → core.a；core/__init__.py → core。"""
     parts = list(path.relative_to(root).parts)
     if parts[-1] == "__init__.py":
         parts = parts[:-1]
@@ -160,7 +136,6 @@ def _longest_module(candidate: str, modules: set[str]) -> str | None:
 
 
 def _resolve_relative(package: str, level: int) -> str | None:
-    """Python 语义：level=1 指当前包，level=2 指向上一级；越界返回 None。"""
     parts = package.split(".")
     if level < 1 or level > len(parts):
         return None
@@ -169,7 +144,6 @@ def _resolve_relative(package: str, level: int) -> str | None:
 
 
 def _dependency_targets(stem: str, aliases: list[str], modules: set[str]) -> set[str]:
-    """对 `from X import a, b`：优先解析子模块 X.a/X.b；全部落空才退回 X。"""
     targets = set()
     for name in aliases:
         if name == "*":
@@ -187,10 +161,6 @@ def _dependency_targets(stem: str, aliases: list[str], modules: set[str]) -> set
 def collect_dependencies(
     root: Path, *, prefix: str | None = None
 ) -> tuple[dict[str, set[str]], list[str]]:
-    """ast 解析 root 内全部 .py，返回（模块→被依赖模块集合, 无法解析文件列表）。
-
-    只登记 root 包内部依赖；stdlib / 第三方导入忽略。自环边忽略。
-    """
     name = root.name if prefix is None else prefix
     files = iter_python_files(root)
     modules = {_module_name(root, name, path): path for path in files}
@@ -234,10 +204,6 @@ def collect_dependencies(
 
 
 def find_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
-    """Tarjan 找强连通分量；size>1 的 SCC 即循环依赖组（自环不计）。
-
-    返回按（首元素, 长度, 全量）排序的环列表，每个环成员已排序。
-    """
     index: dict[str, int] = {}
     low: dict[str, int] = {}
     on_stack: set[str] = set()
@@ -288,15 +254,7 @@ def find_cycles(graph: dict[str, set[str]]) -> list[list[str]]:
     return sorted(comps, key=lambda comp: (comp[0], len(comp), comp))
 
 
-# ---------------------------------------------------------------------- map
-
-
 def _is_title_line(line: str, path: Path) -> bool:
-    """docstring 里的"标题样式行"：纯分隔线，或无空格且以文件名结尾（如 core/x.py）。
-
-    仓库中部分模块 docstring 以文件路径作标题、等号行作分隔线；跳过它们
-    可让摘要落到真正描述上（T7 目标是"供人与 agent 导航"）。
-    """
     if set(line) <= set("=-_*#"):
         return True
     return " " not in line and line.endswith(path.name)
@@ -365,9 +323,6 @@ def render_module_map(root_name: str, modules: dict[str, ModuleInfo]) -> str:
     return "\n".join(lines)
 
 
-# --------------------------------------------------------------------- CLI
-
-
 def _configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -377,7 +332,6 @@ def _configure_stdio() -> None:
 
 
 def _resolve(path_str: str) -> Path:
-    """相对路径按仓库根解析（脚本位置推算），与 CWD 无关。"""
     path = Path(path_str)
     return path if path.is_absolute() else REPO_ROOT / path
 

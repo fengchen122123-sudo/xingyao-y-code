@@ -111,7 +111,6 @@ test("buildMultipart produces a parsable multipart payload", () => {
     /Content-Disposition: form-data; name="media"; filename="image\.png"\r\n/,
   );
   assert.match(text, /Content-Type: image\/png\r\n/);
-  // The raw file bytes must appear verbatim after a blank line.
   assert.ok(
     text.includes("\r\n\r\nZZZ\r\n"),
     "body must contain the raw file bytes after the part headers",

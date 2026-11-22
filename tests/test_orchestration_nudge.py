@@ -1,5 +1,3 @@
-"""编排提醒（多步未建计划）行为守护：触发、阈值、豁免与去重。"""
-
 import json
 from types import SimpleNamespace
 
@@ -13,11 +11,6 @@ NUDGE_PREFIX = "本回合已连续执行多步操作，仍未建立任务计划"
 
 @pytest.fixture(autouse=True)
 def _reset_orchestration_turn_dedup():
-    """每个用例前清空"按 turn_id 去重"登记表，保证用例互不干扰。
-
-    实现前该属性不存在（getattr 返回 None），跳过清理；实现在 red→green
-    之间补齐后即可生效。
-    """
     registry = getattr(llm, "_orchestration_nudged_turns", None)
     if registry is not None:
         registry.clear()
@@ -142,7 +135,6 @@ def test_should_nudge_orchestration_conditions(mocker):
     mocker.patch("core.llm._has_pending_plan", return_value=False)
     mocker.patch("core.llm._is_plan_turn", return_value=False)
 
-    # 阈值口径：实质操作数需超过 3（即 ≥4）才提醒，恰好 3 步不提醒。
     base = dict(count=4, session_id="s", turn_id="t")
     assert (
         llm._should_nudge_orchestration(allow_subagents=True, already_sent=False, **base)
@@ -156,7 +148,6 @@ def test_should_nudge_orchestration_conditions(mocker):
         llm._should_nudge_orchestration(allow_subagents=False, already_sent=False, **base)
         is False
     )
-    # 边界：恰好 3 步不提醒
     assert (
         llm._should_nudge_orchestration(
             allow_subagents=True, already_sent=False, count=3, session_id="s", turn_id="t"
@@ -179,7 +170,6 @@ def test_should_nudge_orchestration_conditions(mocker):
 
 
 def test_three_ops_without_plan_does_not_inject_nudge(mocker):
-    """恰好 3 步不提醒（与文案"3 条及以内直接执行"一致）。"""
     previous = _bind_empty_plan("orch-nudge-test")
     try:
         responses = [
@@ -264,7 +254,6 @@ def test_subagent_turn_does_not_inject_nudge(mocker):
 
 
 def _assert_tool_pairing_valid(messages):
-    """校验消息序列合法：assistant(tool_calls) 之后必须紧跟 tool 消息。"""
     for index, message in enumerate(messages):
         if message.get("role") == "assistant" and message.get("tool_calls"):
             assert index + 1 < len(messages), (
@@ -278,11 +267,6 @@ def _assert_tool_pairing_valid(messages):
 
 
 def test_nudge_injected_after_tool_results(mocker):
-    """编排提醒必须追加在全部 tool 结果之后（Issue 2）。
-
-    否则会形成 assistant(tool_calls) → user(提醒) → tool(结果)，
-    违反 Anthropic/OpenAI 的 tool_use 必须紧跟 tool_result 约束。
-    """
     previous = _bind_empty_plan("orch-order-test")
     try:
         responses = [
@@ -305,7 +289,6 @@ def test_nudge_injected_after_tool_results(mocker):
 
 
 def test_same_turn_id_not_nudged_twice(mocker):
-    """同一 turn_id 异常重入时不得重复注入（进程内按 turn_id 去重，Issue 6）。"""
     previous = _bind_empty_plan("orch-turn-dedup")
     try:
         captured = []

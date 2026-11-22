@@ -1,5 +1,3 @@
-"""DeepSeek / Kimi 安全合成前缀缓存命中率基准程序。"""
-
 from __future__ import annotations
 
 import argparse

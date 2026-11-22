@@ -5,8 +5,6 @@ import { nextTick } from 'vue';
 import TokenRhythmAccountDialog from './TokenRhythmAccountDialog.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 桥接 mock（写法与 TokenRhythmAccountPanel.test.ts 一致）：弹窗只剩「用量明细 /
-// 个人信息」两个视图，各对应一个官方接口，默认都返回 ok；单个用例按需覆盖某个接口
 function okUsage() {
   return { ok: true, data: { summary: null, list: [] } };
 }
@@ -26,19 +24,16 @@ function installBridge(overrides: Record<string, any> = {}) {
 
 let wrapper: VueWrapper | null = null;
 
-/** 建 store + 挂组件（弹窗默认关闭，由用例自己调 openTrDialog） */
 function setup() {
   const pinia = createPinia();
   setActivePinia(pinia);
   const store = useAppStore();
   wrapper = mount(TokenRhythmAccountDialog, {
-    // 组件用 Teleport 挂到 body；测试里 stub 掉，内容仍留在组件内可查询
     global: { plugins: [pinia], stubs: { teleport: true } },
   });
   return { store, wrapper };
 }
 
-/** 打开弹窗并等首次请求落地（组件自己不加载数据，必须显式触发） */
 async function openDialog(store: ReturnType<typeof useAppStore>, tab: 'usage' | 'profile') {
   store.openTrDialog(tab);
   await flushPromises();
@@ -119,7 +114,6 @@ it('用量视图：summary 指标千分位 + 调用日志列表，首次请求�
   const logs = w!.findAll('[data-test="trd-log-item"]');
   expect(logs).toHaveLength(1);
   expect(logs[0].text()).toContain('qwen-max');
-  // 默认时间窗 7d、第 1 页、每页 20 条
   expect(api.tr_usage_detail).toHaveBeenCalledTimes(1);
   expect(api.tr_usage_detail.mock.calls[0]).toEqual(['7d', 1, 20]);
 });
@@ -156,7 +150,6 @@ it('两个视图的「去官网查看」按钮各自打开对应官网页并关�
   installBridge();
   const { store, wrapper: w } = setup();
 
-  // 用量明细 → 官方控制台首页
   await openDialog(store, 'usage');
   await w!.get('[data-test="trd-site-usage"]').trigger('click');
   await flushPromises();
@@ -164,7 +157,6 @@ it('两个视图的「去官网查看」按钮各自打开对应官网页并关�
   // 遮罩会挡住右栏，所以点完必须收起弹窗
   expect(store.trDialog.show).toBe(false);
 
-  // 个人信息 → 官方个人中心
   await openDialog(store, 'profile');
   await w!.get('[data-test="trd-site-profile"]').trigger('click');
   await flushPromises();
@@ -208,15 +200,12 @@ it('顶部 tab 栏只剩用量明细与个人信息，充值 tab 已彻底删除
 
   await openDialog(store, 'usage');
 
-  // 本次需求的核心回归：充值 tab 与其视图整体移除
   expect(w!.find('[data-test="trd-tab-recharge"]').exists()).toBe(false);
   expect(w!.find('[data-test="tr-dialog"]').text()).not.toContain('充值');
-  // 剩下两个入口仍在，且默认停在用量明细
   expect(w!.find('[data-test="trd-tab-usage"]').exists()).toBe(true);
   expect(w!.find('[data-test="trd-tab-profile"]').exists()).toBe(true);
   expect(w!.find('[data-test="trd-usage"]').exists()).toBe(true);
 
-  // 点个人信息 tab 能正常切过去
   await w!.get('[data-test="trd-tab-profile"]').trigger('click');
   await flushPromises();
   expect(store.trDialog.tab).toBe('profile');

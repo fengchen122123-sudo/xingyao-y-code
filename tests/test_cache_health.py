@@ -1,20 +1,3 @@
-"""跨渠道缓存命中率修复 · Task 3 —— 车道健康派生层测试（严格 TDD）。
-
-fixture 按 cache_request_diagnostics 的真实行形状构造，关键数字逐字取自
-设计文档《待开发/跨渠道缓存命中率修复/设计规格与实施计划.md》§1.2/§1.3（脱敏）：
-
-- 阿里云 token-plan 车道（openai/deepseek-v4.1-flash @ maas 兼容域）：
-  upstream loss 真实形状 prev=254057 → cached=6144、prev=226647 → cached=0、
-  prev=164945 → cached=0；
-- 基元律动车道（openai/deepseek-flash @ tokenrhythm.studio）：
-  cached / prev ≈ 100%（prompt=70000, prev=69500, cached=69500）；
-- 本地 vLLM 车道（qwen38-27b @ http://127.0.0.1:8000/v1）：
-  71/71 全 NULL（cache_reported=0、usage_valid=0）→ 必须判 unreported，不是 0%；
-- 冷启动 / 上下文压缩或历史重写 行：都不入健康分母，后者计入 client_rewrite_count。
-
-正文类字段（sha256、session 名、Workspace ID）均为脱敏假值。
-"""
-
 import time
 
 import pytest
@@ -60,13 +43,6 @@ def _diag_row(
     cache_write_tokens=_UNSET,
     prev_prompt=_UNSET,
 ):
-    """按 cache_request_diagnostics 全列真实形状构造一行（None 表示未报告）。
-
-    cache_write_tokens 不传时该键缺失（老诊断行形状）；显式传 None 表示
-    「列存在但未报告」，传数值表示该轮已报告写入量（Task 7 新增列）。
-    prev_prompt 同理：不传时该键缺失（派生层退回窗口内滚动取上一行），传值表示
-    「查询层已按 (session, lane) 算好上一行」（设计 §Task3 口径）。
-    """
     row = {
         "id": row_id,
         "ts": ts,
@@ -105,7 +81,6 @@ def _diag_row(
 
 
 def test_single_upstream_loss_row_detected_with_correct_rate():
-    """设计文档 §1.3 真实形状：prev=254057 → cached=6144 判一次 upstream loss。"""
     rows = [
         _diag_row(1, prompt_tokens=254057, cached_tokens=253000),
         _diag_row(2, prompt_tokens=255100, cached_tokens=6144),
@@ -125,11 +100,10 @@ def test_single_upstream_loss_row_detected_with_correct_rate():
     assert health.upstream_loss_rate == pytest.approx(0.5)
     assert health.consecutive_loss == 0
     assert health.client_rewrite_count == 0
-    assert health.verdict == "insufficient"  # 样本 2 < 20：先按样本不足处理
+    assert health.verdict == "insufficient"
 
 
 def test_upstream_loss_threshold_uses_min_of_prev_and_prompt():
-    """loss 条件 = cached < min(prev, prompt) * theta，且严格小于。"""
     base = [_diag_row(1, prompt_tokens=100000, cached_tokens=99000)]
 
     at_threshold = classify_lane_health(
@@ -141,8 +115,6 @@ def test_upstream_loss_threshold_uses_min_of_prev_and_prompt():
         theta=0.5,
     )
 
-    # min(prev=100000, prompt=200000) * 0.5 = 50000：恰等于不算 loss（严格小于）；
-    # 若误用 prompt（200000 * 0.5 = 100000）则 50000 会被误判为 loss。
     assert at_threshold.samples == 1
     assert at_threshold.upstream_loss_rate == 0.0
     assert below_threshold.samples == 1
@@ -150,7 +122,6 @@ def test_upstream_loss_threshold_uses_min_of_prev_and_prompt():
 
 
 def test_fully_unreported_vllm_lane_is_never_reported_as_zero_hit_rate():
-    """本地 vLLM 71/71 全 NULL：判 unreported，绝不当 0% 命中率展示。"""
     rows = [
         _diag_row(
             index,
@@ -196,7 +167,6 @@ def test_cold_start_and_history_rewrite_rows_stay_out_of_health_denominator():
 
     health = classify_lane_health(rows)
 
-    # 分母只有 3 条纯追加行；冷启动连换写计数都不进（只排除）。
     assert health.samples == 3
     assert health.client_rewrite_count == 1
     assert health.hot_prompt == 101000 + 90500 + 95000
@@ -296,8 +266,6 @@ def test_healthy_tokenrhythm_lane_hits_approximately_full_rate():
 
 
 def test_lane_health_lists_write_turns_without_shrinking_denominator():
-    """写入轮单列（Task 7 派生层补全）：write_turns / hot_write_tokens 只单列，
-    不把写入轮从 samples 分母剔除（Task 3 的分母与 verdict 规则已验收）。"""
     rows = [
         _diag_row(1, prompt_tokens=10000, cached_tokens=9500, cache_write_tokens=None),
         _diag_row(2, prompt_tokens=10000, cached_tokens=9500, cache_write_tokens=800),
@@ -306,7 +274,6 @@ def test_lane_health_lists_write_turns_without_shrinking_denominator():
 
     health = classify_lane_health(rows)
 
-    # 首行无 prev 不入分母（write=None 也不计写入轮）；第 2/3 行都留在分母里。
     assert health.samples == 2
     assert health.write_turns == 2
     assert health.hot_write_tokens == 1700
@@ -314,7 +281,6 @@ def test_lane_health_lists_write_turns_without_shrinking_denominator():
 
 
 def test_lane_health_write_turns_zero_when_unreported():
-    """两行都不带 cache_write_tokens 键：缺失 ≠ 0，写入轮计数与写入量保持 0。"""
     rows = [
         _diag_row(1, prompt_tokens=10000, cached_tokens=9500),
         _diag_row(2, prompt_tokens=10000, cached_tokens=9500),
@@ -363,8 +329,6 @@ def test_row_after_unreported_row_is_excluded_from_denominator():
 
     health = classify_lane_health(rows)
 
-    # 行 4 的上一行（行 3）未报告 → 行 4 不可判定、不进分母；
-    # 行 5 的上一行（行 4）已报告有值 → 行 5 进分母。
     assert health.samples == 2
     assert health.hot_prompt == 51000 + 53000
     assert health.hot_cached == 50000 + 52000
@@ -387,7 +351,7 @@ def test_window_keeps_only_the_most_recent_rows():
     rows = early_losses + recent_healthy
 
     recent = classify_lane_health(rows, window=200)
-    assert recent.samples == 199  # 窗口首行没有窗口内上一行 → 不可判定
+    assert recent.samples == 199
     assert recent.upstream_loss_rate == 0.0
     assert recent.consecutive_loss == 0
 
@@ -412,7 +376,6 @@ def test_consecutive_loss_skips_undecidable_rows_without_breaking():
     ]
 
     health = classify_lane_health(rows)
-    # 行 2 是 loss；行 3/4 不可判定（不打断也不计数）；行 5 是 loss → 末尾连续 2。
     assert health.consecutive_loss == 2
 
     broken = classify_lane_health(
@@ -424,7 +387,6 @@ def test_consecutive_loss_skips_undecidable_rows_without_breaking():
             _diag_row(5, prompt_tokens=72000, cached_tokens=0),
         ]
     )
-    # 末尾 loss 之后遇到行 4（可判定、未丢前缀）即停止计数。
     assert broken.consecutive_loss == 1
 
 
@@ -482,12 +444,7 @@ def _store_diagnostic(manager, row):
     manager.add_cache_request_diagnostic(payload)
 
 
-# ---------------------------------------------------------------------------
-# 显式 prev_prompt（设计 §Task3：prev 由查询层按 session 分链算好，不是窗口内滚动）
-# ---------------------------------------------------------------------------
-
 def test_explicit_prev_prompt_makes_window_head_decidable():
-    """带 prev_prompt 的行即使是窗口首行也可判定：不再「宁可少一个样本」。"""
     rows = [
         _diag_row(1, prompt_tokens=254057, cached_tokens=253000, prev_prompt=250000),
     ]
@@ -501,7 +458,6 @@ def test_explicit_prev_prompt_makes_window_head_decidable():
 
 
 def test_explicit_prev_prompt_detects_loss_on_the_first_row_of_the_window():
-    """真实形状 prev=254057 → cached=6144：首行也能判出整段丢前缀。"""
     health = classify_lane_health([
         _diag_row(1, prompt_tokens=255100, cached_tokens=6144, prev_prompt=254057),
     ])
@@ -511,7 +467,6 @@ def test_explicit_prev_prompt_detects_loss_on_the_first_row_of_the_window():
 
 
 def test_explicit_none_prev_still_excludes_the_row():
-    """prev_prompt 显式为 None（该会话首行 / 上一行未报告）→ 仍不可判定、不入分母。"""
     health = classify_lane_health([
         _diag_row(1, prompt_tokens=100000, cached_tokens=99000, prev_prompt=None),
     ])
@@ -521,7 +476,6 @@ def test_explicit_none_prev_still_excludes_the_row():
 
 
 def test_prev_prompt_also_unblocks_write_turn_counting():
-    """首行不再被整体剔除后，它的写入量也要计入单列。"""
     health = classify_lane_health([
         _diag_row(1, prompt_tokens=100000, cached_tokens=90000,
                   cache_write_tokens=5000, prev_prompt=95000),
@@ -533,7 +487,6 @@ def test_prev_prompt_also_unblocks_write_turn_counting():
 
 
 def test_query_lane_cache_health_prev_prompt_follows_session_chain(tmp_path):
-    """查询层必须把 prev 算好：时间/窗口过滤的第一行照样可判定，且不跨会话借 prev。"""
     manager = MemoryManager(tmp_path / "prev.db")
     base_ts = _ts("2026-09-24", "10:00:00")
     for offset, (prompt, cached) in enumerate(((100000, 99000), (101000, 100000))):
@@ -548,13 +501,11 @@ def test_query_lane_cache_health_prev_prompt_follows_session_chain(tmp_path):
             ),
         )
 
-    # 只要第二行：它的 prev 来自同会话第一行（在时间范围之外）→ 仍应可判定
     healths = manager.query_lane_cache_health(start_ts=base_ts + 60)
     assert len(healths) == 1
     assert healths[0].samples == 1, "时间范围首行必须拿到会话内上一行"
     assert healths[0].hot_prompt == 101000
 
-    # 不得跨会话借 prev：另一会话的首行没有本会话上一行 → 不可判定
     other = MemoryManager(tmp_path / "prev2.db")
     _store_diagnostic(
         other,
@@ -627,17 +578,13 @@ def test_query_lane_cache_health_filters_by_time_window(tmp_path):
     assert early[0].samples == 1
     assert early[0].upstream_loss_rate == 1.0
 
-    # 新口径（设计 §Task3）：prev 由查询层在**过滤前的全表**上按会话分链算好，
-    # 时间范围只决定「取哪些行做样本」，不切断 prev 链 → 区间首行不再白丢一个样本。
     late = manager.query_lane_cache_health(start_ts=base_ts + 120)
     assert late[0].samples == 1
     assert late[0].hot_prompt == 260000
-    # 上一行 prev=255100、本轮 cached=259500 → 不算丢前缀
     assert late[0].upstream_loss_rate == 0.0
     assert late[0].reported is True
-    assert late[0].verdict == "insufficient"  # 仅 1 轮，低于 MIN_HEALTH_SAMPLES=20
+    assert late[0].verdict == "insufficient"
 
-    # 区间首行仍拿不到 prev 的情形：它本身就是该会话首行
     only_first = manager.query_lane_cache_health(
         start_ts=base_ts, end_ts=base_ts
     )
@@ -689,7 +636,6 @@ def test_query_lane_cache_health_preserves_null_versus_real_zero(tmp_path):
     assert queried[2]["cached_tokens"] is None
 
     health = manager.query_lane_cache_health()[0]
-    # 真实 0 进分母（0 < 29000 * 0.6 → loss）；NULL 不进分母。
     assert health.samples == 1
     assert health.hot_prompt == 30000
     assert health.hot_cached == 0

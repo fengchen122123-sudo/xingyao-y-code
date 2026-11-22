@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""plugins/office 写入工具的按回合撤销接入用例（规格 9.5）。
-
-覆盖：
-- office_write 声明 mutates_files，且已列入记录器覆盖白名单（启动校验通过）
-- 无活动检查点时降级为裸写，产物可被 openpyxl 读回
-- 目标已存在且未传 overwrite 时拒绝，原文件字节不变
-- 非 .xlsx 扩展名直接拒绝
-
-依赖：office_write 需要 openpyxl；未安装时整组跳过（requirements.txt 已声明）。
-"""
 
 import os
 import sys
@@ -39,7 +29,6 @@ def _sheets():
 
 
 def test_office_write_is_listed_in_recorder_coverage():
-    """声明了 mutates_files 就必须在覆盖白名单里，否则启动校验直接失败。"""
     from core.turn_undo import service as tu_service
 
     spec = _office_write_spec()
@@ -49,7 +38,6 @@ def test_office_write_is_listed_in_recorder_coverage():
 
 
 def test_office_write_degrades_to_plain_write_without_checkpoint(tmp_path):
-    """没有活动检查点（CLI / 测试 / 未开启撤销）时按裸写降级，产物照常可用。"""
     spec = _office_write_spec()
     target = tmp_path / "报表.xlsx"
     with workspace_scope(str(tmp_path)):
@@ -66,7 +54,6 @@ def test_office_write_degrades_to_plain_write_without_checkpoint(tmp_path):
 
 
 def test_office_write_refuses_overwrite_without_flag(tmp_path):
-    """覆盖保护：未传 overwrite 时一个字节都不碰。"""
     spec = _office_write_spec()
     target = tmp_path / "报表.xlsx"
     target.write_bytes(b"original-bytes")
@@ -78,7 +65,6 @@ def test_office_write_refuses_overwrite_without_flag(tmp_path):
 
 
 def test_office_write_rejects_non_xlsx(tmp_path):
-    """只写 .xlsx；docx/pptx 直出不支持，要明确拒绝而不是产出坏文件。"""
     spec = _office_write_spec()
     target = tmp_path / "报告.docx"
     with workspace_scope(str(tmp_path)):

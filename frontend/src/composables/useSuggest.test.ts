@@ -17,7 +17,6 @@ function mockTextarea(value: string, cursor: number = value.length) {
   return el;
 }
 
-// 构造 KeyboardEvent
 function key(key: string, opts: { shiftKey?: boolean } = {}): KeyboardEvent {
   return new KeyboardEvent('keydown', { key, shiftKey: opts.shiftKey || false, cancelable: true });
 }
@@ -42,7 +41,6 @@ describe('useSuggest', () => {
     detectToken();
 
     expect(suggest.value?.mode).toBe('command');
-    // 只有 enabled 的技能才出现，且使用侧栏同款星盘图标（sparkle）
     expect(suggestItems.value.length).toBe(1);
     expect(suggestItems.value[0].label).toBe('/debug');
     expect(suggestItems.value[0].iconName).toBe('sparkle');
@@ -103,26 +101,21 @@ describe('useSuggest', () => {
     expect(suggestItems.value.length).toBe(3);
     expect(suggestIndex.value).toBe(0);
 
-    // ArrowDown → index 1
     const e1 = key('ArrowDown');
     onKeydown(e1);
     expect(suggestIndex.value).toBe(1);
     expect(e1.defaultPrevented).toBe(true);
 
-    // 模拟 keyup 触发 detectToken —— suppressDetect 应跳过，不重置 index
     detectToken();
     expect(suggestIndex.value).toBe(1);
 
-    // ArrowDown → index 2
     const e2 = key('ArrowDown');
     onKeydown(e2);
     expect(suggestIndex.value).toBe(2);
 
-    // keyup 再次跳过
     detectToken();
     expect(suggestIndex.value).toBe(2);
 
-    // ArrowDown 回到 0（循环）
     const e3 = key('ArrowDown');
     onKeydown(e3);
     expect(suggestIndex.value).toBe(0);
@@ -143,7 +136,6 @@ describe('useSuggest', () => {
     detectToken();
     expect(suggestIndex.value).toBe(0);
 
-    // ArrowUp 从 0 → 最后一个（循环）
     const e = key('ArrowUp');
     onKeydown(e);
     expect(suggestIndex.value).toBe(1);
@@ -164,16 +156,13 @@ describe('useSuggest', () => {
     detectToken();
     expect(suggest.value).not.toBeNull();
 
-    // Tab 选中
     const tabEvent = key('Tab');
     onKeydown(tabEvent);
     expect(tabEvent.defaultPrevented).toBe(true);
-    // applySuggest 写入：/aa + 空格
     expect(inputVal.value).toBe('/aa ');
     expect(suggest.value).toBeNull();
     expect(suggestItems.value.length).toBe(0);
 
-    // 重新触发，用 Enter 选中
     inputVal.value = '/';
     taRef.value = mockTextarea('/', 1);
     detectToken();
@@ -225,7 +214,6 @@ describe('useSuggest', () => {
     detectToken();
     expect(suggest.value).toBeNull();
 
-    // 随便按方向键（补全未打开，onKeydown 不处理）
     onKeydown(key('ArrowDown'));
     // detectToken 不应因为 suppressDetect 而跳过（标志未设置）
     detectToken();
@@ -278,7 +266,6 @@ describe('useSuggest', () => {
     await vi.advanceTimersByTimeAsync(200);
     expect(searchSessions).toHaveBeenCalledWith('登录', 12, '');
     expect(searchFiles).toHaveBeenCalledWith('登录', 8);
-    // 会话候选在前、文件候选在后
     expect(suggestItems.value.length).toBe(2);
     expect(suggestItems.value[0].group).toBe('session');
     expect(suggestItems.value[0].label).toBe('登录bug排查');
@@ -347,7 +334,6 @@ describe('useSuggest', () => {
     await vi.advanceTimersByTimeAsync(200);
 
     const groups = suggestItems.value.map(it => it.group);
-    // 会话最多 4 条，剩余名额留给文件候选
     expect(groups.filter(g => g === 'session').length).toBe(4);
     expect(groups.filter(g => g === 'file').length).toBe(2);
     expect(suggestItems.value[0].label).toBe('会话0');
@@ -376,7 +362,6 @@ describe('useSuggest', () => {
     detectToken();
     await vi.advanceTimersByTimeAsync(200);
     expect(suggestItems.value.length).toBe(1);
-    // 会话名内花括号被剥离，产出 @{...} 标记
     expect(suggestItems.value[0].apply).toBe('@{我的怪对话}');
     expect(suggestItems.value[0].key).toBe('session:我的{怪}对话');
 
@@ -387,7 +372,6 @@ describe('useSuggest', () => {
   it('search_sessions 接口缺失时退化为纯文件补全', async () => {
     vi.useFakeTimers();
     const searchFiles = vi.fn().mockResolvedValue({ files: ['core/login.py'] });
-    // api 只实现 search_workspace_files，不提供 search_sessions
     vi.stubGlobal('pywebview', { api: { search_workspace_files: searchFiles } });
 
     const inputVal = ref('@login');
@@ -397,7 +381,6 @@ describe('useSuggest', () => {
     taRef.value = mockTextarea('@login', 6);
     detectToken();
     await vi.advanceTimersByTimeAsync(200);
-    // 不抛错，仍返回文件项
     expect(suggestItems.value.map(it => it.apply)).toEqual(['@core/login.py']);
     expect(suggestItems.value[0].group).toBe('file');
 
@@ -422,7 +405,6 @@ describe('useSuggest', () => {
     detectToken();
     await vi.advanceTimersByTimeAsync(200);
     expect(searchSessions).toHaveBeenCalledWith('login', 12, '');
-    // 会话接口异常不应拖垮文件补全：文件候选仍正常出现
     expect(suggestItems.value.map(it => it.apply)).toEqual(['@core/login.py', '@README.md']);
     expect(suggestItems.value.every(it => it.group === 'file')).toBe(true);
 
@@ -436,7 +418,6 @@ describe('useSuggest', () => {
       ok: true,
       sessions: [{ name: '登录bug排查', count: 3, updated_at: '', workdir: '' }],
     });
-    // 文件扫描：手工控制 resolve 时机，模拟「很慢的文件接口」一直 pending
     let resolveFiles!: (v: any) => void;
     const searchFiles = vi.fn(
       () => new Promise(resolve => { resolveFiles = resolve; }),
@@ -464,7 +445,6 @@ describe('useSuggest', () => {
     expect(searchFiles).toHaveBeenCalledWith('登录', 8);
     expect(suggestItems.value.map(it => it.group)).toEqual(['session']);
 
-    // 文件候选到达后合并为最终列表：会话在前、文件在后
     resolveFiles({ files: ['core/login.py'] });
     await vi.advanceTimersByTimeAsync(1);
     expect(suggestItems.value.map(it => it.group)).toEqual(['session', 'file']);
@@ -495,7 +475,6 @@ describe('useSuggest', () => {
 
     taRef.value = mockTextarea('@登录', 3);
     detectToken();
-    // 会话先到并渲染
     await vi.advanceTimersByTimeAsync(1);
     expect(suggestItems.value.length).toBe(1);
 
@@ -528,12 +507,10 @@ describe('useSuggest', () => {
     const taRef = ref<HTMLTextAreaElement | null>(null);
     const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
 
-    // 第一次输入：会话请求挂起不返回
     taRef.value = mockTextarea('@旧', 2);
     detectToken();
     await vi.advanceTimersByTimeAsync(1);
 
-    // 用户继续打字，query 变成 @新
     inputVal.value = '@新';
     taRef.value = mockTextarea('@新', 2);
     detectToken();
@@ -564,13 +541,11 @@ describe('useSuggest', () => {
     const taRef = ref<HTMLTextAreaElement | null>(null);
     const { detectToken, suggest, suggestItems, suggestEmpty } = useSuggest(inputVal, taRef);
 
-    // 输入 @：出候选
     taRef.value = mockTextarea('@', 1);
     detectToken();
     await vi.advanceTimersByTimeAsync(200);
     expect(suggestItems.value.length).toBe(1);
 
-    // 删除 @：面板关闭、空态清空
     inputVal.value = '';
     taRef.value = mockTextarea('', 0);
     detectToken();
@@ -605,8 +580,8 @@ describe('useSuggest', () => {
     const { detectToken } = useSuggest(inputVal, taRef);
 
     taRef.value = mockTextarea('@登录', 3);
-    detectToken(); // input 事件
-    detectToken(); // 紧跟着的 keyup 事件
+    detectToken();
+    detectToken();
     await vi.advanceTimersByTimeAsync(200);
 
     // 同一个 token 的重复事件必须复用同一轮检索，否则每次按键打两遍 SQL
@@ -661,7 +636,6 @@ describe('useSuggest', () => {
     expect(suggest.value?.mode).toBe('file');
     expect(suggestEmpty.value).toBe('没有匹配的对话或文件');
 
-    // 继续输入到超过软阈值（14）：用户显然在写正文，面板自己收起
     const long = '@' + '文'.repeat(14);
     inputVal.value = long;
     taRef.value = mockTextarea(long, long.length);
@@ -669,7 +643,6 @@ describe('useSuggest', () => {
     expect(suggest.value).toBeNull();
     expect(suggestEmpty.value).toBe('');
 
-    // 继续输入不会把面板重新挂回来，也不该再发起检索
     const callsBefore = searchSessions.mock.calls.length;
     const longer = long + '字';
     inputVal.value = longer;
@@ -699,7 +672,6 @@ describe('useSuggest', () => {
     const taRef = ref<HTMLTextAreaElement | null>(null);
     const { detectToken, suggest } = useSuggest(inputVal, taRef);
 
-    // 20 个字符但有命中：软阈值只管空态，候选照常展示
     const mid = '@' + 'x'.repeat(19);
     inputVal.value = mid;
     taRef.value = mockTextarea(mid, mid.length);
@@ -707,7 +679,6 @@ describe('useSuggest', () => {
     await vi.advanceTimersByTimeAsync(200);
     expect(suggest.value?.mode).toBe('file');
 
-    // 达到硬上限（query 40 个字符）：无论有无命中一律收起
     const hard = '@' + 'x'.repeat(40);
     inputVal.value = hard;
     taRef.value = mockTextarea(hard, hard.length);
@@ -764,7 +735,6 @@ describe('useSuggest', () => {
     await vi.advanceTimersByTimeAsync(1);
     expect(suggestItems.value.length).toBe(2);
 
-    // 用户按 ↓ 选中第二条
     onKeydown(key('ArrowDown'));
     expect(suggestIndex.value).toBe(1);
 
@@ -778,8 +748,6 @@ describe('useSuggest', () => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
-
-  // ---------------- 内置斜杠命令（后端清单纯读投影） ----------------
 
   it('斜杠命令：内置命令参与补全，前缀命中只留 /goal', () => {
     const store = useAppStore();
@@ -797,7 +765,6 @@ describe('useSuggest', () => {
     detectToken();
 
     expect(suggest.value?.mode).toBe('command');
-    // 只有 /goal 命中前缀 /go
     expect(suggestItems.value.map(it => it.label)).toEqual(['/goal']);
     // 右侧说明取 summary，key 带 cmd: 前缀避免与技能/MCP 撞 key
     expect(suggestItems.value[0].desc).toBe('目标模式');
@@ -822,8 +789,6 @@ describe('useSuggest', () => {
     taRef.value = mockTextarea('/', 1);
     detectToken();
 
-    // 命令在前；技能里的 /goal 因 label 重复被丢弃，/graph 仍然保留（" /" 单独
-    // 输入时技能候选照旧可见，既有行为不变）
     expect(suggestItems.value.map(it => it.label)).toEqual(['/goal', '/graph']);
     expect(suggestItems.value[0].key).toBe('cmd:/goal');
     expect(suggestItems.value[1].key).toBe('skill:graph');
@@ -889,7 +854,6 @@ describe('useSuggest', () => {
     taRef.value = mockTextarea('/usr', 4);
     detectToken();
 
-    // /usr 未命中任何内置命令，也没有技能/MCP 匹配：面板保持空列表
     expect(suggestItems.value.filter(it => it.key.startsWith('cmd:'))).toEqual([]);
     expect(suggestItems.value.length).toBe(0);
   });
@@ -921,12 +885,10 @@ describe('useSuggest', () => {
       { name: '/keep', usage: '', summary: '', kind: 'local' } as any,
     ];
 
-    // reject 被吞掉：补全面板退化为原有候选，不影响输入
     await expect(store.loadSlashCommands()).resolves.toBeUndefined();
     expect(store.slashCommands.map(c => c.name)).toEqual(['/keep']);
     vi.unstubAllGlobals();
 
-    // 旧版桥没有该方法：直接返回，同样不抛错
     vi.stubGlobal('pywebview', { api: {} });
     await expect(store.loadSlashCommands()).resolves.toBeUndefined();
     expect(store.slashCommands.map(c => c.name)).toEqual(['/keep']);

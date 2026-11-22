@@ -1,5 +1,3 @@
-"""turn_undo 多文件恢复事务测试：预检、令牌、执行、冲突与幂等。"""
-
 import hashlib
 import time
 
@@ -61,7 +59,6 @@ def _record_write(env, ctx, path, content, call="call-1"):
 
 
 def _record_delete(env, ctx, path):
-    """回合内删除一个已存在文件：before 存在 → after missing。"""
     from core.turn_undo import recorder as tu_recorder
 
     handle = tu_recorder.prepare_mutation(
@@ -78,10 +75,6 @@ def _record_delete(env, ctx, path):
 def _finish(env, ctx):
     return turn_undo_service.finish_turn(ctx)
 
-
-# ---------------------------------------------------------------------------
-# 正常多文件撤销
-# ---------------------------------------------------------------------------
 
 def test_multi_file_undo_restores_all_files(env):
     ws = env["ws"]
@@ -118,7 +111,6 @@ def test_multi_file_undo_restores_all_files(env):
     row = env["storage"].get_checkpoint(checkpoint.checkpoint_id)
     assert row.status_enum is TurnUndoStatus.REVERTED
     assert row.reverted_at_ms is not None
-    # 纠正记录已提交
     corrections = env["storage"].list_corrections(row.workspace_root)
     assert len(corrections) == 1
     assert corrections[0]["turn_id"] == checkpoint.turn_id
@@ -151,7 +143,6 @@ def test_conflict_zero_writes_and_no_token(env):
     _record_write(env, ctx, f1, "new", call="c1")
     _finish(env, ctx)
 
-    # 预检前外部修改
     f1.write_bytes(b"external-edit")
     preview, token = turn_undo_service.preview_turn_undo(
         env["session_id"], checkpoint.turn_id
@@ -161,12 +152,10 @@ def test_conflict_zero_writes_and_no_token(env):
     conflict = preview.conflicts[0]
     assert conflict.expected.sha256 == hashlib.sha256(b"new").hexdigest()
     assert conflict.actual.sha256 == hashlib.sha256(b"external-edit").hexdigest()
-    # 状态进入 conflicted，磁盘未被触碰
     assert env["storage"].get_checkpoint(checkpoint.checkpoint_id).status_enum \
         is TurnUndoStatus.CONFLICTED
     assert f1.read_bytes() == b"external-edit"
 
-    # 用户恢复文件后可重新预检 → ready → 成功撤销
     f1.write_bytes(b"new")
     preview2, token2 = turn_undo_service.preview_turn_undo(
         env["session_id"], checkpoint.turn_id
@@ -190,12 +179,10 @@ def test_change_between_preview_and_execute_rejected(env):
     _finish(env, ctx)
 
     _, token = turn_undo_service.preview_turn_undo(env["session_id"], checkpoint.turn_id)
-    # 预检后、执行前外部修改
     f1.write_bytes(b"sneaky-edit")
     with pytest.raises(TurnUndoError) as exc:
         turn_undo_service.execute_turn_undo(env["session_id"], checkpoint.turn_id, token)
     assert exc.value.code == UndoErrorCode.FILE_CONFLICT
-    # 零文件写入
     assert f1.read_bytes() == b"sneaky-edit"
     assert env["storage"].get_checkpoint(checkpoint.checkpoint_id).status_enum \
         is TurnUndoStatus.CONFLICTED
@@ -227,7 +214,7 @@ def test_token_from_other_turn_rejected(env):
     _, token_a = turn_undo_service.preview_turn_undo(env["session_id"], "turn-a")
 
     cp2, ctx2 = _begin_turn(env, turn="turn-b")
-    _finish(env, ctx2)  # no_changes
+    _finish(env, ctx2)
     with pytest.raises(TurnUndoError):
         turn_undo_service.execute_turn_undo(env["session_id"], "turn-b", token_a)
 
@@ -242,7 +229,6 @@ def test_reverted_repeat_call_is_idempotent(env):
     _, token = turn_undo_service.preview_turn_undo(env["session_id"], checkpoint.turn_id)
     first = turn_undo_service.execute_turn_undo(env["session_id"], checkpoint.turn_id, token)
     assert first.status is TurnUndoStatus.REVERTED
-    # 重复调用：幂等成功，不再改文件
     second = turn_undo_service.execute_turn_undo(
         env["session_id"], checkpoint.turn_id, "stale-token"
     )
@@ -260,7 +246,6 @@ def test_active_turn_blocks_undo(env):
     _finish(env, ctx_done)
     _, token = turn_undo_service.preview_turn_undo(env["session_id"], "turn-done")
 
-    # 另一回合正在 recording：锁内判定活跃回合 → workspace_busy，零文件写入
     checkpoint, ctx = _begin_turn(env, turn="turn-running")
     try:
         with pytest.raises(TurnUndoError) as exc:
@@ -272,7 +257,6 @@ def test_active_turn_blocks_undo(env):
 
 
 def test_cross_workspace_isolation(env, tmp_path):
-    """纠正记录按规范化工作区隔离，不同工作区不串。"""
     other_ws = env["tmp"] / "other-ws"
     other_ws.mkdir()
     f1 = env["ws"] / "mine.py"
@@ -313,23 +297,19 @@ def test_subsequent_completed_turns_warned(env):
     _record_write(env, ctx1, f1, "v1")
     _finish(env, ctx1)
     time.sleep(0.005)
-    # 后续回合修改不同文件（同文件修改会让早期回合按指纹规则冲突拒绝）
     cp2, ctx2 = _begin_turn(env, turn="turn-late")
     _record_write(env, ctx2, f2, "later-content")
     _finish(env, ctx2)
-    # 撤销较早回合时：警告后续还有完成回合
     preview, token = turn_undo_service.preview_turn_undo(env["session_id"], "turn-early")
     assert preview.subsequent_completed_turns >= 1
     result = turn_undo_service.execute_turn_undo(env["session_id"], "turn-early", token)
     assert result.status is TurnUndoStatus.REVERTED
     assert f1.read_bytes() == b"old"
-    # 纠正记录里记录了后续回合数
     corr = env["storage"].list_corrections(cp1.workspace_root)
     assert corr and corr[0]["subsequent_completed_turns"] >= 1
 
 
 def test_later_turn_same_file_blocks_early_undo(env):
-    """后续回合修改过同一文件时，早期回合按指纹规则冲突拒绝（零写入）。"""
     ws = env["ws"]
     f1 = ws / "same.py"
     f1.write_bytes(b"old")
@@ -345,7 +325,6 @@ def test_later_turn_same_file_blocks_early_undo(env):
 
 
 def test_preview_skips_conflicted_file_and_still_undoes_others(env):
-    """因回合内外部修改退出撤销范围的文件不参与撤销，其余文件正常还原。"""
     from core.turn_undo import recorder as tu_recorder
 
     ws = env["ws"]
@@ -357,7 +336,6 @@ def test_preview_skips_conflicted_file_and_still_undoes_others(env):
     checkpoint, ctx = _begin_turn(env, turn="turn-tx-skip")
     _record_write(env, ctx, f1, "new-skip", call="c1")
     _record_write(env, ctx, f2, "new-keep", call="c2")
-    # f1 被外部修改后再次写入 → 该文件退出撤销范围，回合继续
     f1.write_bytes(b"external")
     handle = tu_recorder.prepare_mutation(
         display_path=str(f1),

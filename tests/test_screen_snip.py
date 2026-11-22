@@ -1,10 +1,3 @@
-"""core.screen_snip 的 headless 测试：遮罩页模板注入与虚拟桌面度量。
-
-刻意不调用 capture_virtual_screen：真实抓屏会把用户屏幕冻结帧拉进测试进程
-（既无必要也踩隐私红线）。build_snip_page 只做字符串注入，get_virtual_screen_rect
-只读 Win32 度量常量，全程不需要任何真实窗口。
-"""
-
 import base64
 import sys
 from types import SimpleNamespace
@@ -21,17 +14,14 @@ def png_data_url(payload: bytes = b"any-content") -> str:
     return _PNG_PREFIX + base64.b64encode(payload).decode("ascii")
 
 
-# -------------------------------------------------------------- build_snip_page
-
 def test_build_snip_page_injects_frame_once_and_keeps_critical_elements():
     data_url = png_data_url()
     page = build_snip_page(data_url, 1920, 2280)
 
-    assert page.count(data_url) == 1  # 冻结帧原样注入且只注入一次
+    assert page.count(data_url) == 1
     for placeholder in ("__SNIP_FRAME_DATA_URL__", "__SNIP_ORIG_W__", "__SNIP_ORIG_H__"):
-        assert placeholder not in page  # 无占位符残留
+        assert placeholder not in page
     assert page.lstrip().startswith("<!DOCTYPE html>")
-    # 原始尺寸必须注入：预览可能被压缩，选区换算以原始尺寸为准
     assert "var ORIG_W = 1920" in page
     assert "var ORIG_H = 2280" in page
     for needle in (
@@ -61,19 +51,17 @@ def test_build_snip_page_rejects_invalid_original_size():
 @pytest.mark.parametrize(
     "bad",
     [
-        "data:text/plain;base64,QUJD",  # 非图片 MIME
-        "data:image/png,QUJD",  # 缺 ;base64,
-        "",  # 空串
-        None,  # 非字符串
-        b"\x89PNG\r\n\x1a\n",  # bytes 也不接受
+        "data:text/plain;base64,QUJD",
+        "data:image/png,QUJD",
+        "",
+        None,
+        b"\x89PNG\r\n\x1a\n",
     ],
 )
 def test_build_snip_page_rejects_non_image_data_url(bad):
     with pytest.raises(ValueError):
         build_snip_page(bad, 1920, 2280)
 
-
-# ------------------------------------------------------- get_virtual_screen_rect
 
 @pytest.mark.skipif(sys.platform != "win32", reason="虚拟桌面度量仅 Windows 真实可读")
 def test_get_virtual_screen_rect_returns_physical_rect():

@@ -1,10 +1,3 @@
-"""插件设置页端到端（隔离环境）：真实 loader 加载外部插件 → 钩子渲染 → 删除卸载。
-
-隔离约定：子进程 + 临时 YCODE_DATA_DIR + 临时用户插件目录；
-install 一份最小测试插件（带 plugin_settings 钩子）验证通用能力，
-再验证"删除目录 → refresh 后记录消失 + 模块/工具卸载"。
-"""
-
 import json
 import os
 import subprocess

@@ -6,8 +6,6 @@ import { nextTick } from 'vue';
 import SettingsPage from './SettingsPage.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 「会话归档」从侧栏底部搬到设置页：数据源仍是 store.archivedSessions（后端 get_archived_sessions），
-// 故沿用 Sidebar.archive.test.ts 的写法——不 mock store 数据，只 spy 会走桥接的 action。
 function ts(minutesAgo: number) {
   const d = new Date(Date.now() - minutesAgo * 60000);
   const p = (n: number) => String(n).padStart(2, '0');
@@ -15,7 +13,6 @@ function ts(minutesAgo: number) {
     + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-/** 归档列表故意按「旧的在前」给，用于验证前端自行按 archived_at 倒序渲染 */
 function archivedList() {
   return [
     {
@@ -68,7 +65,6 @@ describe('SettingsPage 会话归档分区', () => {
 
     const nav = wrapper.get('[data-test="session-archive-nav"]');
     expect(nav.text()).toContain('会话归档');
-    // 切走前不渲染归档页
     expect(wrapper.find('[data-test="session-archive-page"]').exists()).toBe(false);
 
     await openArchiveSection(wrapper);
@@ -134,14 +130,12 @@ describe('SettingsPage 会话归档分区', () => {
     await openArchiveSection(wrapper);
     const firstItem = () => wrapper.findAll('[data-test="session-archive-item"]')[0];
 
-    // 第一段：仅进入确认态，不落盘
     await firstItem().get('[data-test="session-archive-delete-btn"]').trigger('click');
     await nextTick();
 
     expect(deleteSpy).not.toHaveBeenCalled();
     expect(firstItem().find('[data-test="session-archive-delete-confirm"]').exists()).toBe(true);
 
-    // 第二段：确认才删除，用的是该归档会话的名字
     await firstItem().get('[data-test="session-archive-delete-confirm"]').trigger('click');
     await flushPromises();
 
@@ -150,21 +144,18 @@ describe('SettingsPage 会话归档分区', () => {
   });
 });
 
-// 批量恢复 / 批量删除：归档区多选模式（桌面与手机端共用同一套交互）
 describe('SettingsPage 会话归档·批量管理', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     delete (window as any).pywebview;
   });
 
-  /** 进入归档分区并打开批量模式 */
   async function enterBatchMode(wrapper: VueWrapper) {
     await openArchiveSection(wrapper);
     await wrapper.get('[data-test="session-archive-batch-toggle"]').trigger('click');
     await nextTick();
   }
 
-  /** 第 i 行的勾选框（列表按 archived_at 倒序，索引 0 是最新归档的会话） */
   function selectBox(wrapper: VueWrapper, index: number) {
     return wrapper.findAll('[data-test="session-archive-item"]')[index]
       .get('[data-test="session-archive-select"]');
@@ -207,12 +198,10 @@ describe('SettingsPage 会话归档·批量管理', () => {
     expect(wrapper.findAll('[data-test="session-archive-select"]')
       .every(n => (n.element as HTMLInputElement).checked)).toBe(true);
 
-    // 全选状态下再点一次 = 取消全选
     await wrapper.get('[data-test="session-archive-select-all"]').setValue(false);
     await nextTick();
     expect(selectedCount(wrapper)).toContain('0');
 
-    // 勾一项后退出批量模式：操作栏收起，再次进入时勾选已清空
     await selectBox(wrapper, 0).setValue(true);
     await nextTick();
     await wrapper.get('[data-test="session-archive-batch-toggle"]').trigger('click');
@@ -275,7 +264,6 @@ describe('SettingsPage 会话归档·批量管理', () => {
 
   it('恢复后只清掉成功项的勾选，失败项保留以便重试', async () => {
     const { wrapper, store } = setup();
-    // 列表倒序：索引 0 = session-old-2，索引 1 = session-old-1；只有后者恢复成功
     vi.spyOn(store, 'batchUnarchiveSessions').mockResolvedValue(['session-old-1']);
 
     await enterBatchMode(wrapper);
@@ -304,14 +292,12 @@ describe('SettingsPage 会话归档·批量管理', () => {
   });
 });
 
-// 目录分组：归档列表按 workdir 折叠分组（组头 = 目录名 + 完整路径 + 数量）
 describe('SettingsPage 会话归档·按目录分组', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     delete (window as any).pywebview;
   });
 
-  /** 两个目录各两个会话 + 一条全局会话，便于验证组内/组间顺序与分组归并 */
   function groupedList() {
     return [
       {
@@ -390,9 +376,7 @@ describe('SettingsPage 会话归档·按目录分组', () => {
     await heads()[0].trigger('click');
     await nextTick();
 
-    // 第一组收起：只剩另外两组各 1 条
     expect(archivedNames(wrapper)).toEqual(['global-1', 'proj-b-1']);
-    // 收起时组头仍在，数量不变
     expect(wrapper.findAll('[data-test="session-archive-group-count"]')[0].text()).toBe('2');
 
     await heads()[0].trigger('click');
@@ -420,18 +404,15 @@ describe('SettingsPage 会话归档·按目录分组', () => {
     expect(groupBoxes().length).toBe(3);
     expect((groupBoxes()[0].element as HTMLInputElement).indeterminate).toBe(false);
 
-    // 勾组内第一条：该组进入半选
     await wrapper.findAll('[data-test="session-archive-select"]')[0].setValue(true);
     await nextTick();
     expect((groupBoxes()[0].element as HTMLInputElement).indeterminate).toBe(true);
     expect(wrapper.get('[data-test="session-archive-selected-count"]').text()).toContain('1');
 
-    // 点组头勾选框：未全选 → 补齐该组两条
     await groupBoxes()[0].setValue(true);
     await nextTick();
     expect(wrapper.get('[data-test="session-archive-selected-count"]').text()).toContain('2');
 
-    // 再点一次：整组取消勾选，不影响其它组
     await groupBoxes()[0].setValue(false);
     await nextTick();
     expect(wrapper.get('[data-test="session-archive-selected-count"]').text()).toContain('0');

@@ -187,7 +187,6 @@ function stageLabel(stage: unknown): string {
 function formatTime(value: unknown): string {
   const text = String(value || '').trim();
   if (!text) return '—';
-  // 后端存的是 ISO 风格时间串：展示到秒，去掉 T 与毫秒
   return text.replace('T', ' ').replace(/\.\d+Z?$/, '').replace(/Z$/, '');
 }
 
@@ -228,7 +227,6 @@ async function loadGrowth(options: { silent?: boolean } = {}) {
   }
 }
 
-/** 只提交本次涉及的字段，其余传 null 表示「不修改」 */
 async function saveGrowthPatch(patch: {
   enabled?: boolean;
   learning_enabled?: boolean;
@@ -255,7 +253,6 @@ async function toggleSetting(key: 'enabled' | 'learning_enabled', value: boolean
     if (res?.ok) {
       applySettings(res.settings);
       showTip('设置已保存');
-      // 开关变化会影响自我模型是否写入，刷新一次快照保持一致
       await loadGrowth({ silent: true });
     } else {
       // 失败时回滚开关，避免界面与实际配置不一致

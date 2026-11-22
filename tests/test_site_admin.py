@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""官网后台：校验、下架不公开、登录后才能改。"""
 
 import json
 import threading

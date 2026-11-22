@@ -99,9 +99,6 @@ def test_ui_sanitizer_redacts_common_secret_shapes():
 
 
 def test_turn_worker_serialized_forwards_without_serialization():
-    """2026-08-17 多会话并行改造：_run_turn_worker_serialized 不再用
-    _turn_workdir_lock 串行化（直接转发 _run_turn_worker）；workdir 隔离
-    改由线程本地上下文（core.workspace_context）承担，并发回合允许并行。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._turn_workdir_lock = threading.Lock()
     calls = []
@@ -112,9 +109,7 @@ def test_turn_worker_serialized_forwards_without_serialization():
     bridge._run_turn_worker = worker
     bridge._run_turn_worker_serialized("text", "session", internal_kind="bg_summary")
 
-    # 直接转发：参数原样到达 _run_turn_worker
     assert calls == [(("text", "session"), {"internal_kind": "bg_summary"})]
-    # 串行锁全程未被持有：并发路径不会被 _turn_workdir_lock 阻塞
     assert bridge._turn_workdir_lock.acquire(blocking=False) is True
     bridge._turn_workdir_lock.release()
 
@@ -134,10 +129,6 @@ def test_shutdown_blocks_new_background_summary_turns():
     assert bridge._cancel_events == {}
 
 
-# ---------------------------------------------------------------------------
-# open_path 工作区限制放宽：GLOBAL 放行 + 凭据文件永久拒绝（沙盒开关跟随同
-# read_file_preview，由 core.gui_path_policy 统一裁决）
-# ---------------------------------------------------------------------------
 import core.gui_path_policy as gpp
 
 
@@ -169,16 +160,10 @@ def test_open_path_credential_config_denied(tmp_path, monkeypatch):
     bridge._current_session = "session"
     bridge._session_workdir = lambda session: "GLOBAL"
 
-# 凭据文件必须拒绝，且不能真的去启动它
     res = bridge.open_path(str(f))
 
     assert res["ok"] is False
     assert opened == []
-
-
-# ---------------------------------------------------------------------------
-# reveal_in_explorer：只开资源管理器定位，不启动文件本身（文档页签工具栏用）
-# ---------------------------------------------------------------------------
 
 
 def test_reveal_in_explorer_prefers_shell_api(tmp_path, monkeypatch):
@@ -196,7 +181,6 @@ def test_reveal_in_explorer_prefers_shell_api(tmp_path, monkeypatch):
     res = bridge.reveal_in_explorer(str(f))
 
     assert res["ok"] is True
-    # Shell API 成功时不再拼命令行（避免任何解析变形）
     assert popped == []
 
 
@@ -210,7 +194,6 @@ def test_reveal_in_explorer_falls_back_to_single_command_string(tmp_path, monkey
     f = tmp_path / "报告 with space.docx"
     f.write_text("hi", encoding="utf-8")
     popped = []
-    # Shell API 不可用（没 CoInitialize 的老环境等）时走命令行兜底
     monkeypatch.setattr(gb, "_reveal_via_shell_api", lambda path: False)
     monkeypatch.setattr("subprocess.Popen", lambda args, **kw: popped.append(args))
     bridge = ApiBridge.__new__(ApiBridge)
@@ -220,8 +203,6 @@ def test_reveal_in_explorer_falls_back_to_single_command_string(tmp_path, monkey
     res = bridge.reveal_in_explorer(str(f))
 
     assert res["ok"] is True
-    # 必须是整串命令：用参数列表时 subprocess 会转义引号，explorer 解析不到
-    # /select, 的路径，会退回打开「桌面」（2026-11-06 用户实测踩到）
     assert popped == [f'explorer /select,"{f.resolve()}"']
 
 

@@ -1,5 +1,3 @@
-"""只读查询测试：分支/历史/Diff/Blame/Reflog/Tag/Remote/Stash（规格 §17.2）。"""
-
 from core.git.query_refs import (
     blame,
     diff_document,
@@ -64,7 +62,6 @@ def test_log_page_pagination_and_parents(tmp_path):
     assert page1[0].summary == "third"
     page2, more2 = log_page(GitRunner(), identity, skip=2, limit=2)
     assert more2 is False
-    # 拓扑由父提交关系计算（不解析 --graph 文本）
     child = page1[0]
     assert child.parents and child.parents[0] in {c.oid for c in page1[1:] + page2}
 

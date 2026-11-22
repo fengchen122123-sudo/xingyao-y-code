@@ -1,5 +1,3 @@
-// 星瑶 Token 统计可视化的纯计算工具：色板、热力图、趋势折线、环图切片、累计摘要与日期格式化。
-// 组件只负责渲染，所有分级、聚合与格式化逻辑集中在这里，便于单元测试。
 import type {
   TokenStatisticsDay,
   TokenStatisticsMetrics,
@@ -13,7 +11,6 @@ const TREND_MAX_SERIES = 6;
 const DONUT_MAX_SLICES = 6;
 const DONUT_SLICE_GAP = 0.003;
 
-/** 图表序列色板，索引取模循环使用。 */
 export const CHART_SERIES_COLORS = [
   'var(--accent)',
   'var(--green)',
@@ -61,10 +58,6 @@ export function formatMonthLabel(monthKey: string): string {
   if (month < 1 || month > 12) return monthKey;
   return `${month}月`;
 }
-
-// ---------------------------------------------------------------------------
-// 热力图
-// ---------------------------------------------------------------------------
 
 export type HeatmapMode = 'daily' | 'weekly' | 'cumulative';
 
@@ -119,7 +112,6 @@ export function buildHeatmapWeeks(
   const end = parseUtcDate(endDate);
   if (totalWeeks === 0 || !end) return [];
 
-  // 最后一列 = endDate 所在自然周（周日起始），向前共 weekCount 列。
   const lastWeekStart = new Date(end.getTime());
   lastWeekStart.setUTCDate(end.getUTCDate() - end.getUTCDay());
   const firstWeekStart = new Date(lastWeekStart.getTime());
@@ -130,7 +122,6 @@ export function buildHeatmapWeeks(
     if (day && typeof day.date === 'string') daysByDate.set(day.date, day);
   }
 
-  // 窗口内补齐缺失日期为 0 值格子，保证网格恒为 weekCount×7。
   const windowDays: HeatmapWindowDay[] = [];
   for (let offset = 0; offset < totalWeeks * HEATMAP_DAYS_PER_WEEK; offset += 1) {
     const date = toDateKey(new Date(firstWeekStart.getTime() + offset * DAY_MS));
@@ -165,7 +156,6 @@ export function buildHeatmapWeeks(
     return columns;
   }
 
-  // weekly / cumulative：先按周聚合，再按全窗口最大值分级。
   const weeklyTotals: number[] = [];
   const weeklyRequests: number[] = [];
   for (let weekIndex = 0; weekIndex < totalWeeks; weekIndex += 1) {
@@ -208,7 +198,6 @@ export function buildHeatmapWeeks(
       date: day.date,
       total: day.total,
       requests: day.requests,
-      // 从底部起填充 filledRows 格，其余保持 0 级。
       level: dayOffset >= HEATMAP_DAYS_PER_WEEK - filledRows ? level : 0,
       title,
     }));
@@ -235,18 +224,12 @@ export function buildHeatmapMonthLabels(
     }
   }
 
-  // 52 个自然周可能横跨 13 个月；保留多余起始月份的 span 以维持对齐，
-  // 只隐藏其文字，底部始终最多显示最近 12 个月。
   const hiddenCount = Math.max(0, labels.length - HEATMAP_VISIBLE_MONTH_LABEL_COUNT);
   for (let index = 0; index < hiddenCount; index += 1) {
     labels[index].label = '';
   }
   return labels;
 }
-
-// ---------------------------------------------------------------------------
-// 趋势折线
-// ---------------------------------------------------------------------------
 
 export interface TrendSeries {
   key: string;
@@ -305,7 +288,6 @@ export function buildLinePath(
     const current = points[index];
     const next = points[index + 1];
     const afterNext = index + 2 < count ? points[index + 2] : next;
-    // Catmull-Rom 转三次贝塞尔：控制点偏移为相邻点差值的 1/6。
     const control1x = current.x + (next.x - previous.x) / 6;
     const control1y = current.y + (next.y - previous.y) / 6;
     const control2x = next.x - (afterNext.x - current.x) / 6;
@@ -314,10 +296,6 @@ export function buildLinePath(
   }
   return path;
 }
-
-// ---------------------------------------------------------------------------
-// 环图切片
-// ---------------------------------------------------------------------------
 
 export interface DonutSlice {
   key: string;
@@ -353,7 +331,6 @@ export function buildDonutSlices(models: TokenStatisticsModel[]): {
     });
   }
 
-  // 多片时每片两端各留 0.003 圆周间隙；单片时整圆铺满。
   const gap = sources.length > 1 ? DONUT_SLICE_GAP : 0;
   let cursor = 0;
   const slices = sources.map((source, index) => {
@@ -373,10 +350,6 @@ export function buildDonutSlices(models: TokenStatisticsModel[]): {
   });
   return { slices, total };
 }
-
-// ---------------------------------------------------------------------------
-// 累计摘要
-// ---------------------------------------------------------------------------
 
 export interface LifetimeSummary {
   totalTokens: number;
@@ -406,7 +379,6 @@ export function buildLifetimeSummary(days: TokenStatisticsDay[]): LifetimeSummar
     }
   }
 
-  // 从最后一天往前数连续活跃天数；最后一天为 0 则当前连续为 0。
   let currentStreak = 0;
   for (let index = days.length - 1; index >= 0; index -= 1) {
     const total = Number(days[index].total) || 0;
@@ -416,10 +388,6 @@ export function buildLifetimeSummary(days: TokenStatisticsDay[]): LifetimeSummar
 
   return { totalTokens, peakDay, activeDays, currentStreak, longestStreak };
 }
-
-// ---------------------------------------------------------------------------
-// 选中日期明细（热力图点开的单日 / 单周）
-// ---------------------------------------------------------------------------
 
 const SELECTION_METRIC_FIELDS = [
   'prompt', 'completion', 'cached', 'cache_prompt', 'total', 'requests',
@@ -462,7 +430,6 @@ export function buildSelectionTitle(dates: string[]): string {
   return `${format(first)} - ${format(last)}`;
 }
 
-/** 把选中的日期集合（单日格 1 个、周聚合格 7 个）聚合成一行合计 + 按总量降序的模型列表。 */
 export function buildSelectionDetail(
   days: TokenStatisticsDay[],
   dates: string[],
@@ -506,10 +473,6 @@ export function buildSelectionDetail(
 
   return { dates: wanted, title: buildSelectionTitle(wanted), ...withCacheHitRate(totals), models };
 }
-
-// ---------------------------------------------------------------------------
-// 模型用量排行折线（横轴 = 按总量降序的模型，三条序列：总量 / 输入 / 输出）
-// ---------------------------------------------------------------------------
 
 export const RANKING_MAX_MODELS = 6;
 const RANKING_LABEL_MAX_LENGTH = 12;
@@ -570,7 +533,6 @@ export function buildRankingChart(
     return {
       ...definition,
       values,
-      // 单个模型时没有连线，组件只画数据点。
       path: values.length >= 2 ? buildLinePath(values, width, height, maxValue) : '',
     };
   });

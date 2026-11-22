@@ -1,24 +1,3 @@
-"""零成本模拟：预压缩（precompress_ratio=0.85）对用户感知等待的影响（dev-compact 验证用）。
-
-生产路径全部真实：prepare_turn_messages 四级水位阶梯、compress_session_memory
-分段 / CAS 增量落库、真实 SQLite、真实 tiktoken 估算。唯一替换点：
-core.llm._dispatch_completion 打成"按 prompt 大小注入延迟"的桩（长输入短输出
-负载，20k token 段 ≈ 8s），零 API 成本。
-
-场景 A（旧行为，precompress_ratio=0）：水位 ~96% 发消息 → Tier3 同步压缩
-挡在回合关键路径 → 用户等待 ≈ 全部压缩耗时（约 5 段）。
-
-场景 B（新行为，precompress_ratio=0.85）：从 50% 水位起按真实聊天节奏
-（每轮 CHAT_PACE 秒、每轮 +5k token）逐轮推进——
-  - 过 85% 水位的那轮：预压缩转入后台，消息即时发出（等待 ≈ 0）；
-  - 85%→96% 区间每轮：照常即时响应；
-  - 冲上 96% 的那轮：后台预压缩仍在进行 → Tier3 命中 already_running
-    分支 + I4 内存级裁剪兜底，等待仍 ≈ 0；
-  - 后台压完落库后：水位骤降回 ~20%，恢复正常。
-
-时间尺度压缩说明：预压缩冷却常量 120s 等比缩至 5s（保留防抖语义），
-聊天节奏 CHAT_PACE=3s 模拟真人打字+模型回复间隔；其余全部为生产原逻辑。
-"""
 import sys
 import os
 import time
@@ -36,13 +15,10 @@ import core.llm as llm
 
 WINDOW = 128000
 MODEL = "openai/sim-model"
-# 桩延迟系数：len(prompt) 字符（中文≈1 token/字）× 0.0004 秒 → 20k token 段 ≈ 8s
 STUB_SECONDS_PER_CHAR = 0.0004
-# 模拟真实聊天节奏：每轮间隔（用户打字 + 模型回复）
 CHAT_PACE = 3.0
 # 预压缩冷却常量等比缩放（真实 120s），保留防抖语义
 PRECOMPRESS_COOLDOWN_SIM = 5.0
-# 受控压缩配置：与生产默认一致（段间延时 0 = 新行为），precompress_ratio 按场景注入
 BASE_CFG = {
     "retain_count": 4,
     "retain_count_force": 2,
@@ -127,20 +103,19 @@ def show_notices(notices, indent="  "):
             print("%s[%6.2fs] %s" % (indent, t, line[:88]))
 
 
-current_precompress = 0.0  # stub_loader 读取，main 内 global 修改
+current_precompress = 0.0
 
 
 def main():
     global current_precompress
     tmp_root = tempfile.mkdtemp(prefix="sim_precompress_")
 
-    # ---- 桩注入与受控配置（finally 全量还原） ----
     orig_completion = llm._dispatch_completion
     orig_loader = mc._load_compression_config
     orig_cooldown = agent_service._PRECOMPRESS_COOLDOWN_SECONDS
     orig_trigger = agent_service._trigger_background_precompress
 
-    llm._dispatch_completion = FakeLLM()  # 压缩器运行时 from core.llm import，直接生效
+    llm._dispatch_completion = FakeLLM()
 
     def stub_loader():
         cfg = dict(BASE_CFG)
@@ -150,7 +125,7 @@ def main():
     mc._load_compression_config = stub_loader
     agent_service._PRECOMPRESS_COOLDOWN_SECONDS = PRECOMPRESS_COOLDOWN_SIM
 
-    precompress_starts = []  # 记录每次真正启动后台预压缩的时刻
+    precompress_starts = []
 
     def counting_trigger(*a, **k):
         started = orig_trigger(*a, **k)
@@ -161,7 +136,6 @@ def main():
     agent_service._trigger_background_precompress = counting_trigger
 
     try:
-        # ========== 场景 A：旧行为（预压缩关闭） ==========
         current_precompress = 0.0
         mgr_a = make_manager(tmp_root, "old_behavior")
         sess_a = "sim_old"
@@ -177,7 +151,6 @@ def main():
         show_notices(notices_a)
         print("[场景A] 压缩后水位回落到 %.1f%%\n" % (current_baseline(mgr_a, sess_a) / WINDOW * 100))
 
-        # ========== 场景 B：新行为（预压缩开启，逐回合真实节奏） ==========
         current_precompress = 0.85
         mgr_b = make_manager(tmp_root, "new_behavior")
         sess_b = "sim_new"
@@ -223,7 +196,6 @@ def main():
                   % (turn, level / WINDOW * 100, t_wait, "；".join(flags) or "正常"))
             prev_compressing = compressing
 
-            # 终止：见过 Tier3 事件 + 后台已结束 + 水位已回落（恢复完成）
             if seen_tier3 and not compressing and level < WINDOW * 0.6:
                 break
             time.sleep(CHAT_PACE)
@@ -241,7 +213,6 @@ def main():
         print("[场景B] 85%%+ 水位区间共 %d 轮，其中用户最大等待 %.2f 秒；最终水位回落 %.1f%%"
               % (len(high_zone), high_max_wait, final_level / WINDOW * 100))
 
-        # ========== 汇总 ==========
         print()
         print("=" * 66)
         print("模拟对比结论（桩 LLM：%.1f 秒/万字符 ≈ 20k token 段 8s；段间延时 0）"

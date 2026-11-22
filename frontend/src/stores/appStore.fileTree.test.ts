@@ -14,7 +14,6 @@ afterEach(() => {
 it('refreshFileTree 重拉整树并恢复展开目录的子节点，已删除目录从展开记录清除', async () => {
   const getFileTree = vi.fn().mockResolvedValue({
     ok: true,
-    // 新树：src 仍在，old_dir 已被删除，根目录多了 new.txt
     file_tree: [
       { n: 'new.txt', d: 0 },
       { n: 'src', d: 1 },
@@ -36,13 +35,10 @@ it('refreshFileTree 重拉整树并恢复展开目录的子节点，已删除目
 
   await store.refreshFileTree();
 
-  // 整树已更新（新文件出现、旧目录消失）
   expect(store.fileTree.map(n => n.n)).toEqual(['new.txt', 'src']);
-  // 展开中的 src：子节点已刷新为新内容
   expect(getDirChildren).toHaveBeenCalledWith('E:\\projects\\demo\\src');
   const src = store.fileTree.find(n => n.n === 'src')!;
   expect(src.children).toEqual([{ n: 'Main.java', d: 0 }]);
-  // 展开记录：src 保留，已删除的 old_dir 被清除
   expect(store.fileTreeExpanded).toEqual(['E:\\projects\\demo\\src']);
   expect(store.fileTreeRefreshing).toBe(false);
 });

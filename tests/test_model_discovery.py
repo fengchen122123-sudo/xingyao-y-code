@@ -1,10 +1,7 @@
-"""core.model_discovery：端点拼接、元数据提取与多 Key 拉取可用模型列表。"""
-
 import core.model_discovery as discovery
 
 
 def test_models_endpoint_keeps_existing_version_segment():
-    """Base URL 已含版本段时直接拼 /models，绝不重复拼出版本段。"""
     assert (
         discovery.models_endpoint("https://api.example.com/v1")
         == "https://api.example.com/v1/models"
@@ -13,7 +10,6 @@ def test_models_endpoint_keeps_existing_version_segment():
         discovery.models_endpoint("https://api.kimi.com/coding/v1/")
         == "https://api.kimi.com/coding/v1/models"
     )
-    # 智谱 …/paas/v4 也是版本段，补 /v1 会得到 /v4/v1/models（必然 404）
     assert (
         discovery.models_endpoint("https://open.bigmodel.cn/api/paas/v4")
         == "https://open.bigmodel.cn/api/paas/v4/models"
@@ -21,7 +17,6 @@ def test_models_endpoint_keeps_existing_version_segment():
 
 
 def test_models_endpoint_adds_v1_for_bare_base():
-    """裸端点（不含版本段）补 /v1/models。"""
     assert (
         discovery.models_endpoint("https://api.stepfun.com/step_plan")
         == "https://api.stepfun.com/step_plan/v1/models"
@@ -33,7 +28,6 @@ def test_models_endpoint_adds_v1_for_bare_base():
 
 
 def test_normalize_models_extracts_metadata_and_sorts_non_chat_last():
-    """厂商元数据形状差异要能提取，语音/图像类条目排到末尾。"""
     models = discovery.normalize_models([
         {"id": "zeta-tts", "model_type": "语音合成"},
         {
@@ -52,7 +46,6 @@ def test_normalize_models_extracts_metadata_and_sorts_non_chat_last():
     assert by_id["step-x"]["supports_vision"] is True
     assert by_id["or-y"]["supports_vision"] is True
     assert by_id["or-y"]["max_tokens"] == 8192
-    # 厂商没给的字段保持 None（调用方按自己的默认值兜底）
     assert by_id["plain-z"]["supports_vision"] is None
 
 
@@ -67,7 +60,6 @@ class _FakeResponse:
 
 
 def test_fetch_model_list_retries_alternate_endpoint_and_next_key(monkeypatch):
-    """首个端点 404 时换拼法重试，鉴权失败则换下一个 Key。"""
     import httpx
 
     calls = []
@@ -109,7 +101,6 @@ def test_fetch_model_list_reports_http_error_for_single_key(monkeypatch):
 
 
 def test_fetch_model_list_mentions_all_keys_failed(monkeypatch):
-    """多 Key 全部失败时错误信息要点明尝试过的 Key 数量。"""
     import httpx
 
     monkeypatch.setattr(
@@ -131,7 +122,6 @@ def test_fetch_model_list_requires_base_url():
 
 
 def test_fetch_model_list_has_no_key_sends_no_auth_header(monkeypatch):
-    """无 Key（本地网关场景）：不发送 Authorization / x-api-key。"""
     import httpx
 
     captured = {}

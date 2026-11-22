@@ -1,27 +1,3 @@
-"""管理集成类 Agent 工具：飞书通道 / 局域网远程控制 / 决策模型（JEV）。
-
-设计约束：
-- 只复用 core 层公开模块，禁止 import gui_bridge / main / pywebview；
-- 所有工具统一返回 JSON 字符串（ensure_ascii=False）：
-  成功 ``{"ok": true, ...}``，失败 ``{"ok": false, "error": "中文原因"}``；
-- 所有异常在工具入口处兜底，任何情况下都不向调度层抛出；
-- 密钥 / 令牌一律脱敏：只回 ``has_secret`` 之类的布尔，绝不回明文；
-- 决策工具只操作 JEV 决策模型的开关与业务场景配置，不做权限 / 信任类动作。
-
-工具清单（build_specs() 返回 3 个 ToolSpec）：
-feishu_manage / lan_manage / decision_manage
-
-实际复用的 core 接口：
-- 飞书：``core.feishu.config.load_feishu_config``（读）、
-  ``config.update_config`` + ``core.credentials.protect_secret``（写）、
-  ``core.feishu.service.feishu_service``（模块级单例，启停 / 状态）、
-  ``core.feishu._lark_ws.Client``（真实连接测试）；
-- 局域网：``core.lan_server.LanServer``（start / stop / port / lan_ip / _thread）；
-- 决策：``core.decision_service`` 的 load_decision_config /
-  save_decision_config / get_decision_settings_snapshot / probe_decision /
-  _load_keys（只取数量，绝不回明文）。
-"""
-
 from __future__ import annotations
 
 import functools
@@ -32,10 +8,6 @@ from typing import Any
 
 from core.tool_protocol import ToolSpec
 
-
-# ---------------------------------------------------------------------------
-# 通用返回与容错
-# ---------------------------------------------------------------------------
 
 def _dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
@@ -136,18 +108,12 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
     return schema
 
 
-# ---------------------------------------------------------------------------
-# 飞书通道
-# ---------------------------------------------------------------------------
-
 FEISHU_ACTIONS = ("get", "set", "test", "status")
 
-# set 允许写入的 payload 键（其余键忽略并在返回里说明）
 _FEISHU_WRITABLE_KEYS = ("enabled", "app_id", "app_secret", "approvers", "notify_chat_id")
 
 
 def _feishu_status_snapshot() -> dict[str, Any]:
-    """当前飞书长连接服务的运行时状态（无 broker 时按未启动处理）。"""
     from core.feishu.service import feishu_service
 
     status = feishu_service.status()
@@ -155,7 +121,6 @@ def _feishu_status_snapshot() -> dict[str, Any]:
 
 
 def _feishu_settings() -> dict[str, Any]:
-    """飞书设置快照：**不含 app_secret 明文**，只回 has_secret 布尔。"""
     from core.feishu.config import load_feishu_config
 
     cfg = load_feishu_config()
@@ -170,11 +135,6 @@ def _feishu_settings() -> dict[str, Any]:
 
 
 def _refresh_feishu_service() -> dict[str, Any]:
-    """配置变更后让飞书服务按新配置生效（启动 / 停止 / 重连）。
-
-    与 gui_bridge._refresh_feishu_service 同口径，但走 core.feishu.service 的
-    模块级单例，不依赖 GUI 桥接对象。返回最新状态快照（不抛异常）。
-    """
     from core.feishu.config import load_feishu_config
     from core.feishu.service import feishu_service
 
@@ -207,7 +167,6 @@ def _refresh_feishu_service() -> dict[str, Any]:
 
 
 def _feishu_test_connection(app_id: str, app_secret: str) -> dict[str, Any]:
-    """请求飞书长连接接入点，校验凭据是否可用；异常原样带回真实原因。"""
     from core.feishu._lark_ws import Client
     from core.feishu.config import load_feishu_config
 
@@ -265,7 +224,6 @@ def feishu_manage(action: str = "get", payload: dict | None = None) -> str:
             app_id=str(result.get("app_id") or ""),
         )
 
-    # act == "set"
     if payload is not None and not isinstance(payload, dict):
         return _fail("payload 必须是对象（键值对）")
     data = dict(payload or {})
@@ -285,7 +243,6 @@ def feishu_manage(action: str = "get", payload: dict | None = None) -> str:
         stored[app_config.FEISHU_ENABLED_KEY] = enabled
         stored[app_config.FEISHU_APP_ID_KEY] = app_id
         if secret_provided:
-            # 密钥写盘前加密（dpapi:/keyring:）；空字符串表示「不修改已有密钥」
             stored[app_config.FEISHU_APP_SECRET_KEY] = protect_secret(secret.strip())
         stored[app_config.FEISHU_APPROVERS_KEY] = approvers
         stored[app_config.FEISHU_NOTIFY_CHAT_ID_KEY] = notify_chat_id
@@ -303,10 +260,6 @@ def feishu_manage(action: str = "get", payload: dict | None = None) -> str:
     return _ok(**result)
 
 
-# ---------------------------------------------------------------------------
-# 局域网远程控制
-# ---------------------------------------------------------------------------
-
 LAN_ACTIONS = ("status", "start", "stop")
 
 _LAN_LOCK = threading.Lock()
@@ -319,7 +272,6 @@ def _lan_owned_server() -> Any:
 
 
 def _lan_running(server: Any) -> bool:
-    """服务是否在运行：监听 socket 存在且 daemon 线程存活。"""
     if server is None:
         return False
     if getattr(server, "_server", None) is None:
@@ -332,7 +284,6 @@ def _lan_running(server: Any) -> bool:
 
 
 def _port_listening(port: int, host: str = "127.0.0.1", timeout: float = 0.3) -> bool:
-    """探测本机端口是否已被监听（用于识别「别人已经在跑」而不是起第二个）。"""
     if not port or not (0 < int(port) < 65536):
         return False
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -349,7 +300,6 @@ def _port_listening(port: int, host: str = "127.0.0.1", timeout: float = 0.3) ->
 
 
 def _persisted_lan_port() -> int:
-    """读取 config.json 里持久化的远程端口（无效返回 0）。"""
     try:
         import config as app_config
 
@@ -360,7 +310,6 @@ def _persisted_lan_port() -> int:
 
 
 def _lan_snapshot(server: Any = None) -> dict[str, Any]:
-    """监听地址 / 端口 / 运行状态快照（不启动任何东西，不做网络 IO）。"""
     owned = server is not None
     running = _lan_running(server)
     if owned:
@@ -398,7 +347,6 @@ def lan_manage(action: str = "status") -> str:
             server = _lan_owned_server()
             snapshot = _lan_snapshot(server)
         if not snapshot["running"] and snapshot["port"]:
-            # 端口被监听但本工具未持有实例：说明服务由其他入口（桌面端）启动
             if _port_listening(snapshot["port"]):
                 snapshot["running"] = True
                 snapshot["host"] = "0.0.0.0"
@@ -414,7 +362,6 @@ def lan_manage(action: str = "status") -> str:
                 return _ok(action="start", **snapshot)
 
             if server is None:
-                # 端口已被占用（多半是桌面端已在跑）：不再起第二个服务，如实回报
                 persisted = _persisted_lan_port()
                 if _port_listening(persisted):
                     snapshot = {
@@ -463,7 +410,6 @@ def lan_manage(action: str = "status") -> str:
             )
             return _ok(action="start", **snapshot)
 
-    # act == "stop"
     with _LAN_LOCK:
         server = _lan_owned_server()
         if server is None:
@@ -498,13 +444,8 @@ def lan_manage(action: str = "status") -> str:
     return _ok(**result)
 
 
-# ---------------------------------------------------------------------------
-# 决策模型（JEV）
-# ---------------------------------------------------------------------------
-
 DECISION_ACTIONS = ("get", "set", "probe", "scenes", "set_scene")
 
-# 四个业务场景的元信息（顺序与 core.decision_service.DEFAULT_CONFIG["scenes"] 一致）
 _DECISION_SCENE_META = (
     ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
     ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
@@ -517,7 +458,6 @@ _DECISION_SCENE_MODE_TEXT = {"off": "关闭", "shadow": "影子", "live": "正�
 
 
 def _decision_scene_mode(cfg: dict, scene_cfg: dict) -> str:
-    """按两个布尔的组合反推三态（口径与 core.decision_gateway.decide 一致）。"""
     if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
         return "off"
     if bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True)):
@@ -526,7 +466,6 @@ def _decision_scene_mode(cfg: dict, scene_cfg: dict) -> str:
 
 
 def _decision_scene_rows(cfg: dict) -> list[dict[str, Any]]:
-    """配置 → 四个场景的展示行（三态、阈值、超时；形状容错）。"""
     scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
     global_shadow = bool(cfg.get("shadow_mode"))
     rows: list[dict[str, Any]] = []
@@ -676,7 +615,6 @@ def decision_manage(
             key_count=_decision_key_count(current_cfg),
         )
 
-    # act == "set_scene"
     scene_name = str(scene or "").strip()
     mode_name = str(mode or "").strip().lower()
     if scene_name not in _DECISION_SCENES:
@@ -695,7 +633,6 @@ def decision_manage(
         scene_patch["shadow"] = True
     elif mode_name == "live":
         scene_patch["shadow"] = False
-    # off 不动场景自身的 shadow：保留上一次档位，重新开启时语义不变
 
     if threshold is not None:
         if isinstance(threshold, bool):
@@ -749,12 +686,7 @@ def decision_manage(
     )
 
 
-# ---------------------------------------------------------------------------
-# 工具契约
-# ---------------------------------------------------------------------------
-
 def build_specs() -> list[ToolSpec]:
-    """返回 3 个集成管理工具契约（供工具注册表装配）。"""
     return [
         ToolSpec(
             name="feishu_manage",

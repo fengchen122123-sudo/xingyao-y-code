@@ -100,7 +100,6 @@ describe('isOfficeFilePath', () => {
     expect(isOfficeFilePath('a.XLS')).toBe(true);
     expect(isOfficeFilePath('docs/方案.pptx')).toBe(true);
     expect(isOfficeFilePath('a.PPT')).toBe(true);
-    // WPS / LibreOffice 另存格式
     expect(isOfficeFilePath('a.rtf')).toBe(true);
     expect(isOfficeFilePath('a.odt')).toBe(true);
     expect(isOfficeFilePath('a.ods')).toBe(true);

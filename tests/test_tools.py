@@ -21,12 +21,6 @@ from core.tools import (
 
 @pytest.fixture(autouse=True)
 def _disable_free_web_search(monkeypatch):
-    """search_news 的用例以 DDGS 桩为契约，这里禁用免费网页通道。
-
-    2026-11-15 起 search_news 先走 core.web_search（百度/360/必应），ddgs 退为兜底。
-    本文件的用例靠替换 ``tools.DDGS`` 断言结果格式与失败语义，若免费通道先联网
-    就会绕过桩。免费通道自身的行为由 tests/test_web_search.py 覆盖。
-    """
     from core import web_search
 
     def _unavailable(*args, **kwargs):
@@ -50,12 +44,6 @@ def test_subagent_task_id_validation_is_strict():
 
 
 def _wait_until(condition, timeout=5.0, interval=0.02):
-    """轮询等待异步条件成立。
-
-    run(run_in_background=True) 的调用线程只等启动器返回，真正执行任务的
-    _run_task 工作线程与终态通知是异步落定的；join 启动线程后立即断言存在
-    竞态，必须轮询到条件成立（或超时失败）。
-    """
     import time as _time
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline:
@@ -66,25 +54,17 @@ def _wait_until(condition, timeout=5.0, interval=0.02):
 
 
 def _all_tasks_terminal(manager):
-    """manager 名下所有任务都已进入终态（用于 drain 前的等待）。"""
     snapshots = manager.snapshot()
     return bool(snapshots) and all(
         s.status in _SUBAGENT_TERMINAL_STATUSES for s in snapshots
     )
 
 
-# 本文件共享的 turn_undo 服务（module 级装配，见 _turn_undo_service_ready）
 _TURN_UNDO_SHARED: dict = {}
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _turn_undo_module_service(tmp_path_factory):
-    """本文件装配一次共享 turn_undo 服务（后台子代理启动要建独立撤销检查点）。
-
-    configure_default_manager 会重建工具注册表做记录器接入校验（约 0.7s），
-    不能每用例执行，故 module 级只做一次；每个用例的绑定/还原在
-    _turn_undo_service_ready 里完成。
-    """
     from core.memory import MemoryManager
     from core.turn_undo import service as turn_undo_service
 
@@ -99,14 +79,6 @@ def _turn_undo_module_service(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _turn_undo_service_ready():
-    """每个用例前把进程级默认 turn_undo 指回本文件共享服务，结束还原。
-
-    此前本文件的 run_in_background 子代理用例依赖同文件更早用例配置后
-    遗留的进程级全局——单独运行或顺序变化时报"turn_undo service 尚未配置"，
-    子代理线程在启动段崩溃，started 事件永不置位（2s 启动等待超时）。
-    用例内自行 configure_default_manager 的（撤销记录断言类用例）其配置
-    在用例期间优先生效，结束后由本夹具还原，不跨用例泄漏。
-    """
     from core.turn_undo import service as turn_undo_service
 
     with turn_undo_service._service_lock:
@@ -137,7 +109,7 @@ def test_declared_search_dependency_uses_renamed_ddgs_package():
 class _FakeHTTPResponse:
     def __init__(self, body, content_type="application/json; charset=utf-8"):
         self._body = body.encode("utf-8")
-        self._pos = 0  # 流式读取位置，模拟真实 HTTP 响应的连续读取
+        self._pos = 0
         self.status = 200
         self.headers = {"content-type": content_type}
 
@@ -148,13 +120,10 @@ class _FakeHTTPResponse:
         return False
 
     def read(self, limit=-1):
-        """模拟真实 HTTP 响应的流式读取：每次 read 从当前位置继续，而非从头开始。"""
         if limit < 0:
-            # 读全部剩余内容
             chunk = self._body[self._pos:]
             self._pos = len(self._body)
             return chunk
-        # 读指定长度
         chunk = self._body[self._pos:self._pos + limit]
         self._pos += len(chunk)
         return chunk
@@ -168,7 +137,6 @@ def test_fetch_url_uses_local_http_client_and_returns_response(monkeypatch):
         return _FakeHTTPResponse('{"ok": true}')
 
     monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
-    # 测试关注点为本机 HTTP 客户端调用与响应解析，SSRF 防护独立测试
     monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
 
     result = fetch_url("https://example.com/data")
@@ -181,7 +149,6 @@ def test_fetch_url_uses_local_http_client_and_returns_response(monkeypatch):
 
 
 def test_fetch_url_uses_browser_like_headers(monkeypatch):
-    """fetch_url 应使用伪装的浏览器请求头（绕过反爬 403）"""
     captured_request = []
 
     def fake_urlopen(request, timeout):
@@ -195,21 +162,17 @@ def test_fetch_url_uses_browser_like_headers(monkeypatch):
 
     assert len(captured_request) == 1
     req = captured_request[0]
-    # User-Agent 应为 Chrome 浏览器伪装，而非 ycode/...
     ua = req.get_header("User-agent")
     assert "Mozilla/5.0" in ua, f"应伪装为浏览器 UA，实际: {ua}"
     assert "Chrome" in ua, f"UA 应包含 Chrome 标识，实际: {ua}"
     assert "ycode" not in ua, f"UA 不应包含 ycode（会被反爬拦截），实际: {ua}"
-    # 应携带浏览器常见请求头
     assert req.get_header("Accept-language"), "应携带 Accept-Language 头"
     assert req.get_header("Referer"), "应携带 Referer 头"
 
 
 def test_fetch_url_truncates_large_response_instead_of_failing(monkeypatch):
-    """响应超过 512KB 时应截断并附加提示，而非直接报错"""
-    # 构造超过 HTTP_MAX_BYTES 的响应体
     from core.tools import HTTP_MAX_BYTES
-    large_body = "x" * (HTTP_MAX_BYTES + 1024)  # 超过 512KB
+    large_body = "x" * (HTTP_MAX_BYTES + 1024)
 
     def fake_urlopen(request, timeout):
         return _FakeHTTPResponse(large_body, "text/html; charset=utf-8")
@@ -219,18 +182,13 @@ def test_fetch_url_truncates_large_response_instead_of_failing(monkeypatch):
 
     result = fetch_url("https://example.com/large-article")
 
-    # 不应报错（不以 🚨 开头）
     assert not result.startswith("🚨"), f"大响应应截断而非报错，实际: {result[:100]}"
-    # 应包含 HTTP 200 状态
     assert "HTTP 200" in result
-    # 应包含截断提示
     assert "已截断" in result, "应附加截断提示"
-    # 应包含部分内容（截断后的前 512KB）
     assert "x" in result
 
 
 def test_fetch_url_does_not_truncate_small_response(monkeypatch):
-    """小响应不应被截断，也不应附加截断提示"""
     def fake_urlopen(request, timeout):
         return _FakeHTTPResponse('{"small": "content"}', "application/json; charset=utf-8")
 
@@ -288,7 +246,6 @@ def test_get_weather_uses_geocoded_open_meteo_payload(monkeypatch):
         return _FakeHTTPResponse(json.dumps(payload))
 
     monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
-    # 测试关注点为天气 API 调用与数据解析，SSRF 防护独立测试
     monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
 
     result = get_weather("北京")
@@ -310,7 +267,6 @@ def test_get_weather_requires_explicit_city():
     assert "城市" in result
 
 def test_read_and_write_file(tmp_path, monkeypatch):
-    """测试 Agent 是否能正确读取和写入文件"""
     monkeypatch.chdir(tmp_path)
     test_file = tmp_path / "hello.py"
     content_to_write = "print('Hello, Y-code!')"
@@ -321,27 +277,19 @@ def test_read_and_write_file(tmp_path, monkeypatch):
     assert read_content == content_to_write
 
 def test_list_directory(tmp_path, monkeypatch):
-    """测试雷达功能：能否看清文件夹里有什么"""
     monkeypatch.chdir(tmp_path)
-    # 1. 准备：在隔离区造一个假项目，里面有两个文件
     (tmp_path / "main.py").touch()
     (tmp_path / "readme.md").touch()
     
-    # 2. 执行：启动雷达扫描
     files = list_directory(str(tmp_path))
     
-    # 3. 断言验证：检查雷达有没有扫出这两个文件
     assert "main.py" in files
     assert "readme.md" in files
 
 def test_execute_command():
-    """测试引擎功能：能否在终端里执行命令"""
     import sys
-    # 1. 执行：用当前 Python 解释器跑一句打印命令
-    # 使用 sys.executable 避免在纯净 Windows runner 上找不到 python 命令
     result = execute_command(f'{sys.executable} -c "print(\'hello engine\')"')
 
-    # 2. 断言验证：终端里是不是真的输出了这句话
     assert "hello engine" in result
 
 
@@ -355,7 +303,6 @@ def test_execute_command_rejects_catastrophic_commands_before_spawn(monkeypatch)
 
     assert result.startswith("🚨")
     assert "危险命令" in result
-    # B2-03：拒绝对话需提示文档/文件内容改走 write_file 通道
     assert "write_file" in result
 
 
@@ -392,7 +339,6 @@ def test_non_skill_command_bypasses_dependency_tokenization(monkeypatch):
 
     def fake_popen(*args, **kwargs):
         calls.append((args, kwargs))
-        # 新版 execute_command 把输出重定向到临时文件 sink，fake 直接写入
         kwargs["stdout"].write(b"shell handled command")
         kwargs["stdout"].flush()
         return FakeProcess()
@@ -425,7 +371,6 @@ def test_foreground_subagent_waits_and_returns_public_result():
 
 
 def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypatch):
-    """前台子代理的文件写入应归入父回合的持久化撤销检查点（规格 9.2）。"""
     from core.memory import MemoryManager
     from core.turn_undo import service as turn_undo_service
     from core.turn_undo import recorder as turn_undo_recorder
@@ -473,7 +418,6 @@ def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypa
     assert row.before_sha256 == hashlib.sha256(b"before").hexdigest()
     assert row.after_sha256 == hashlib.sha256(b"after").hexdigest()
     assert row.verified_at_ms is not None
-    # 子代理（借记录权线程）的写入必须严格标记为 subagent 来源（规格 5.4）
     assert row.last_source_kind == "subagent"
 
 def test_subagent_records_role_and_plan_item():
@@ -514,7 +458,6 @@ def test_subagent_terminal_callback_receives_real_result():
 
 
 def test_completed_callback_claim_blocks_cancel_idle_and_prune_until_done():
-    """completed 回调一旦被认领，取消不得二次回调；finalizing 仍属于 active。"""
     entered = threading.Event()
     release = threading.Event()
     callbacks = []
@@ -580,7 +523,6 @@ def test_subagent_structured_tool_failure_cannot_complete():
     manager = SubagentManager(runner=runner)
     result = manager.run("查询天气", "s1", "t1", timeout_seconds=30)
 
-    # 失败结果为结构化文本，包含失败原因和工具清单
     assert "失败" in result
     assert "天气服务超时" in result
     assert "get_weather" in result
@@ -588,7 +530,6 @@ def test_subagent_structured_tool_failure_cannot_complete():
 
 
 def test_subagent_cancel_terminates_running_task():
-    """cancel 方法应把运行中的子代理任务标记为 cancelled"""
     import threading
     import time as _time
 
@@ -597,7 +538,6 @@ def test_subagent_cancel_terminates_running_task():
 
     def runner(record):
         started.set()
-        # 模拟长任务，等待取消信号
         for _ in range(100):
             if cancel_ready.is_set() or record.status == "cancelled":
                 return "被取消"
@@ -605,7 +545,6 @@ def test_subagent_cancel_terminates_running_task():
         return "未取消"
 
     manager = SubagentManager(runner=runner)
-    # 后台启动子代理
     thread = threading.Thread(
         target=manager.run,
         args=("长任务", "s1", "t1"),
@@ -615,7 +554,6 @@ def test_subagent_cancel_terminates_running_task():
     thread.start()
     assert started.wait(10.0), "子代理未在 10 秒内启动"
 
-    # 找到运行中的 task_id 并取消
     snapshots = manager.snapshot()
     assert snapshots, "snapshot 不应为空"
     task_id = snapshots[0].task_id
@@ -624,44 +562,35 @@ def test_subagent_cancel_terminates_running_task():
     ok = manager.cancel(task_id, reason="测试取消")
     assert ok is True, "cancel 应返回 True"
 
-    # 通知 runner 可以退出
     cancel_ready.set()
-    # 等待线程结束
     thread.join(timeout=5.0)
 
-    # 最终状态应该是 cancelled
     final = [s for s in manager.snapshot() if s.task_id == task_id][0]
     assert final.status == "cancelled", f"期望 cancelled，实际 {final.status}"
 
 
 def test_subagent_cancel_returns_false_for_unknown_or_terminal_task():
-    """cancel 对不存在的 task_id 或已终态任务应返回 False"""
     manager = SubagentManager(runner=lambda record: "完成")
-    # 不存在的 task_id
     assert manager.cancel("nonexistent-id") is False
 
-    # 先正常跑完一个任务，再尝试 cancel
     manager.run("已完成任务", "s1", "t1", timeout_seconds=30)
     snapshots = manager.snapshot()
     task_id = snapshots[0].task_id
     assert snapshots[0].status == "completed"
-    # 已终态任务 cancel 应返回 False
     assert manager.cancel(task_id) is False
 
 
 def test_background_subagent_terminal_notification_fires_on_complete():
-    """后台子代理完成时应触发 on_terminal 回调，前台不触发"""
     import threading
     import time as _time
 
-    notifications = []  # list of (task_id, status, description, summary)
+    notifications = []
     lock = threading.Lock()
 
     def on_terminal(task_id, status, description, summary):
         with lock:
             notifications.append((task_id, status, description, summary))
 
-    # 后台任务：完成
     manager = SubagentManager(
         runner=lambda record: "查询结果：晴",
         on_terminal=on_terminal,
@@ -685,7 +614,6 @@ def test_background_subagent_terminal_notification_fires_on_complete():
 
 
 def test_background_subagent_terminal_notification_fires_on_failure():
-    """后台子代理失败时应触发 on_terminal 回调，summary 包含错误信息"""
     import threading
 
     notifications = []
@@ -715,12 +643,10 @@ def test_background_subagent_terminal_notification_fires_on_failure():
         tid, status, desc, summary = notifications[0]
         assert status == "failed"
         assert "后台查新闻" in desc
-        # 失败时 summary 是 error 信息
         assert "search_news" in summary or "无结果" in summary
 
 
 def test_foreground_subagent_does_not_trigger_terminal_notification():
-    """前台子代理不应触发 on_terminal（状态栏已有实时显示，避免重复通知）"""
     notifications = []
 
     def on_terminal(task_id, status, description, summary):
@@ -730,26 +656,20 @@ def test_foreground_subagent_does_not_trigger_terminal_notification():
         runner=lambda record: "前台结果",
         on_terminal=on_terminal,
     )
-    # 前台模式（默认）
     result = manager.run("前台任务", "s1", "t1", timeout_seconds=30)
     assert "前台结果" in result
-    # 前台任务不应触发通知
     assert len(notifications) == 0, f"前台任务不应触发通知，实际触发了 {len(notifications)} 次"
 
 
 def test_set_on_terminal_can_register_callback_after_init():
-    """set_on_terminal 允许运行时注册回调（main.py 初始化 UI 后调用）"""
     notifications = []
 
-    # 初始化时不传 on_terminal
     manager = SubagentManager(runner=lambda record: "结果")
     assert manager._on_terminal is None
 
-    # 运行时注册
     manager.set_on_terminal(lambda tid, st, desc, sum: notifications.append((tid, st, desc, sum)))
     assert manager._on_terminal is not None
 
-    # 后台任务完成后应触发
     import threading
     thread = threading.Thread(
         target=manager.run,
@@ -766,7 +686,6 @@ def test_set_on_terminal_can_register_callback_after_init():
 
 
 def test_terminal_notification_callback_exception_does_not_break_subagent():
-    """on_terminal 回调抛异常时不能影响子代理主流程"""
     import threading
 
     def bad_callback(task_id, status, description, summary):
@@ -785,7 +704,6 @@ def test_terminal_notification_callback_exception_does_not_break_subagent():
     thread.start()
     thread.join(timeout=5.0)
 
-    # 子代理状态应正常完成，回调异常被吞掉
     assert _wait_until(
         lambda: manager.snapshot() and manager.snapshot()[0].status == "completed"
     ), "回调异常不应影响子代理完成"
@@ -794,7 +712,6 @@ def test_terminal_notification_callback_exception_does_not_break_subagent():
 
 
 def test_is_plan_item_running_returns_true_for_running_task():
-    """is_plan_item_running 应识别仍在运行的后台子代理任务（避免误杀）"""
     import threading
     import time as _time
 
@@ -802,7 +719,6 @@ def test_is_plan_item_running_returns_true_for_running_task():
 
     def slow_runner(record):
         started.set()
-        # 让任务持续运行，直到 cancel_event 被设置
         while not record.cancel_event.is_set():
             _time.sleep(0.01)
         return "已取消"
@@ -822,20 +738,15 @@ def test_is_plan_item_running_returns_true_for_running_task():
     assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
-        # 任务运行中：应返回 True
         assert manager.is_plan_item_running("plan-running-1") is True
-        # 无关联任务的 plan_item_id：应返回 False
         assert manager.is_plan_item_running("plan-nonexistent") is False
-        # 空 plan_item_id：应返回 False
         assert manager.is_plan_item_running("") is False
     finally:
-        # 清理：取消运行中的任务
         manager.cancel(manager.snapshot()[0].task_id, "测试结束")
         thread.join(timeout=2.0)
 
 
 def test_is_plan_item_running_returns_false_for_completed_task():
-    """is_plan_item_running 对已完成的任务应返回 False"""
     import threading
 
     manager = SubagentManager(runner=lambda record: "完成")
@@ -852,18 +763,13 @@ def test_is_plan_item_running_returns_false_for_completed_task():
     thread.start()
     thread.join(timeout=5.0)
 
-    # 先等任务真正进入终态，避免"尚未注册即返回 False"的假阳性
     assert _wait_until(lambda: _all_tasks_terminal(manager)), "后台任务应在超时前进入终态"
-    # 任务已完成：应返回 False
     assert manager.is_plan_item_running("plan-done-1") is False
 
 
 def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
-    """drain_terminal_background_tasks 应返回所有终态（成功+失败）且未被消费的后台任务"""
     import threading
 
-    # 用一个 manager 管理两个后台任务：一个成功，一个失败
-    # runner 根据 description 区分返回不同结果
     def runner(record):
         if "失败" in record.description:
             record.tool_errors["search_news"] = "无结果"
@@ -872,7 +778,6 @@ def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
 
     manager = SubagentManager(runner=runner)
 
-    # 后台任务1：成功完成
     thread1 = threading.Thread(
         target=manager.run,
         args=("后台查天气", "s-fallback", "t1"),
@@ -886,7 +791,6 @@ def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
     thread1.start()
     thread1.join(timeout=5.0)
 
-    # 后台任务2：失败
     thread2 = threading.Thread(
         target=manager.run,
         args=("后台查失败新闻", "s-fallback", "t2"),
@@ -900,10 +804,8 @@ def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
     thread2.start()
     thread2.join(timeout=5.0)
 
-    # 两个后台任务异步执行，drain 前必须等到全部进入终态
     assert _wait_until(lambda: len(manager.snapshot()) == 2 and _all_tasks_terminal(manager)), \
         "两个后台任务都应进入终态"
-    # drain：应返回 2 个任务（1 成功 + 1 失败）
     drained = manager.drain_terminal_background_tasks("s-fallback")
     assert len(drained) == 2, f"应提取 2 个任务，实际 {len(drained)}"
 
@@ -911,26 +813,17 @@ def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
     assert "completed" in statuses, "应包含已完成的任务"
     assert "failed" in statuses, "应包含失败的任务"
 
-    # 验证成功任务的结果
     completed_task = next(t for t in drained if t.status == "completed")
     assert "晴" in completed_task.result
 
-    # 第二次 drain：应返回空（已通过 summary_injected 标记消费）
     drained_again = manager.drain_terminal_background_tasks("s-fallback")
     assert drained_again == [], "已消费的任务不应重复提取"
 
-    # 不同会话：应返回空
     drained_other = manager.drain_terminal_background_tasks("s-other")
     assert drained_other == [], "其他会话的任务不应被提取"
 
 
 def test_drain_terminal_independent_from_notification_consumed():
-    """drain_terminal_background_tasks 应独立于 drain_notifications 的消费标志。
-
-    场景：drain_notifications 在普通 turn 中消费了任务通知（notification_consumed=True），
-    但汇总 turn 仍应能看到任务结果（summary_injected=False → 可提取）。
-    这修复了"第一次过早汇总消费了 AI 任务后，第二次汇总看不到 AI 任务结果"的 bug。
-    """
     import threading
 
     manager = SubagentManager(runner=lambda record: "查询结果：晴")
@@ -947,13 +840,10 @@ def test_drain_terminal_independent_from_notification_consumed():
     thread.start()
     thread.join(timeout=5.0)
 
-    # drain_notifications 是消费式读取，先等任务进入终态再消费
     assert _wait_until(lambda: _all_tasks_terminal(manager)), "后台任务应在超时前进入终态"
-    # 先用 drain_notifications 消费通知（模拟普通 turn 的 LLM 上下文注入）
     notifications = manager.drain_notifications("s-indep")
     assert len(notifications) == 1, "drain_notifications 应返回 1 条通知"
 
-    # 再用 drain_terminal_background_tasks 提取：应仍能返回任务（独立标志）
     drained = manager.drain_terminal_background_tasks("s-indep")
     assert len(drained) == 1, (
         "drain_terminal_background_tasks 应独立于 notification_consumed，"
@@ -962,17 +852,14 @@ def test_drain_terminal_independent_from_notification_consumed():
     assert drained[0].status == "completed"
     assert "晴" in drained[0].result
 
-    # 第二次 drain_terminal：应返回空（summary_injected 已标记）
     drained_again = manager.drain_terminal_background_tasks("s-indep")
     assert drained_again == [], "summary_injected 已标记的任务不应重复提取"
 
 
 def test_drain_terminal_background_tasks_skips_running_and_foreground():
-    """drain_terminal_background_tasks 应跳过运行中任务和前台任务"""
     import threading
     import time as _time
 
-    # 后台任务：运行中（不结束）
     started = threading.Event()
     manager = SubagentManager(runner=lambda record: (
         started.set(),
@@ -989,24 +876,20 @@ def test_drain_terminal_background_tasks_skips_running_and_foreground():
     assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
-        # drain：不应返回运行中的任务
         drained = manager.drain_terminal_background_tasks("s-mix")
         assert drained == [], "运行中的后台任务不应被 drain"
     finally:
         manager.cancel(manager.snapshot()[0].task_id, "测试结束")
         thread1.join(timeout=2.0)
 
-    # 前台任务：完成
     manager_fg = SubagentManager(runner=lambda record: "前台结果")
     manager_fg.run("前台任务", "s-mix", "t1", timeout_seconds=30, plan_item_id="p-fg-ok")
 
-    # drain：不应返回前台任务
     drained_fg = manager_fg.drain_terminal_background_tasks("s-mix")
     assert drained_fg == [], "前台任务不应被 drain"
 
 
 def test_has_running_background_tasks_detects_running():
-    """has_running_background_tasks 应正确识别运行中的后台任务"""
     import threading
     import time as _time
 
@@ -1029,17 +912,13 @@ def test_has_running_background_tasks_detects_running():
     assert started.wait(10.0), "子代理应在 10s 内启动"
 
     try:
-        # 有运行中的任务：应返回 True
         assert manager.has_running_background_tasks("s-running") is True
-        # 无任务的会话：应返回 False
         assert manager.has_running_background_tasks("s-other") is False
-        # 空会话：应返回 False
         assert manager.has_running_background_tasks("") is False
     finally:
         manager.cancel(manager.snapshot()[0].task_id, "测试结束")
         thread.join(timeout=2.0)
 
-    # 任务取消后：应返回 False
     assert manager.has_running_background_tasks("s-running") is False
 
 
@@ -1073,7 +952,6 @@ def test_run_subagent_updates_associated_plan_only_after_completion(monkeypatch)
 
 
 def test_run_subagent_denied_command_verification_never_executes_command(monkeypatch):
-    """子代理计划验证被拒绝后不得再触发任何命令执行路径。"""
     import core.tools as tools_module
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
@@ -1150,7 +1028,6 @@ def test_run_subagent_denied_command_verification_never_executes_command(monkeyp
 
 
 def test_run_subagent_command_verification_fails_for_nonzero_exit_without_output(monkeypatch):
-    """验证命令的真实非零退出码必须使计划项失败，即使没有任何输出。"""
     import sys
     import core.tools as tools_module
     from core.plan import PlanManager
@@ -1190,7 +1067,6 @@ def test_run_subagent_command_verification_fails_for_nonzero_exit_without_output
 
 
 def test_run_subagent_command_verification_completes_for_zero_exit(monkeypatch):
-    """验证命令的真实零退出码必须完成计划项。"""
     import sys
     import core.tools as tools_module
     from core.plan import PlanManager
@@ -1228,7 +1104,6 @@ def test_run_subagent_command_verification_completes_for_zero_exit(monkeypatch):
 
 
 def test_execute_command_internal_results_are_call_scoped():
-    """内部执行结果仅属于传入的调用对象，不能在后续命令间共享。"""
     import sys
     import core.tools as tools_module
 
@@ -1305,11 +1180,6 @@ def test_background_subagent_returns_task_id_immediately():
 
 
 def test_background_subagent_startup_failure_reaches_terminal_state():
-    """启动段异常（如 turn_undo 未配置）必须落成 failed 终态，不得留僵尸 running。
-
-    回归守护：_run_task 启动段兜底前，线程带 running 状态裸崩——无终态回调、
-    无 done_event，started 等待方只能靠超时失败。
-    """
     from core.turn_undo import service as turn_undo_service
 
     manager = SubagentManager(runner=lambda record: "不应被执行到")
@@ -1383,7 +1253,6 @@ def test_foreground_timeout_sets_terminal_state():
 
     result = manager.run("慢任务", "s1", "t1", timeout_seconds=30)
 
-    # 超时返回结构化文本
     assert "超时" in result
     snapshot = manager.snapshot()[0]
     assert snapshot.status == "timed_out"
@@ -1435,7 +1304,6 @@ def test_foreground_timeout_cancels_owned_permission_requests(monkeypatch):
 
     result = manager.run("慢任务", "s1", "t1", timeout_seconds=30)
 
-    # 失败结果为结构化文本，从中提取 task_id
     import re
     match = re.search(r"task_id=(subagent-[a-f0-9]+)", result)
     assert match is not None, f"未在结果中找到 task_id: {result}"
@@ -1465,7 +1333,6 @@ def test_parent_cancel_marks_foreground_task_cancelled():
 
 
 def test_timeout_sets_cancel_before_handoff_callback():
-    """超时移交前必须先取消旧子代理：回调执行时 cancel_event 必须已置位。"""
     seen = {}
 
     def terminal_callback(task, status, _result, _error):
@@ -1485,7 +1352,6 @@ def test_timeout_sets_cancel_before_handoff_callback():
 
 
 def test_run_subagent_timeout_hands_off_plan_item_to_main(monkeypatch):
-    """计划项子代理首次超时：原计划项移交主 Agent，不进入 failed/retry。"""
     import core.tools as tools_module
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
@@ -1529,7 +1395,6 @@ def test_run_subagent_timeout_hands_off_plan_item_to_main(monkeypatch):
 
 
 def test_run_subagent_rejects_redelegation_after_timeout_takeover(monkeypatch):
-    """接管中的计划项禁止重新派发子代理（timed_out → takeover ≠ retry）。"""
     import core.tools as tools_module
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
@@ -1542,7 +1407,6 @@ def test_run_subagent_rejects_redelegation_after_timeout_takeover(monkeypatch):
     )
     monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
 
-    # 用生产调度 API 构造首次超时后的接管现场
     assert scheduler.start_delegated_item(
         "item", "subagent-abcd1234", "subagent:implement", None
     ) is True
@@ -1572,7 +1436,6 @@ def test_run_subagent_rejects_redelegation_after_timeout_takeover(monkeypatch):
 
 
 def test_run_subagent_rejects_redelegation_of_queued_takeover(monkeypatch):
-    """排队等待接管的计划项同样禁止重新派发。"""
     import core.tools as tools_module
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
@@ -1625,7 +1488,6 @@ def test_empty_or_exceptional_subagent_is_failed(runner):
 
     result = manager.run("失败任务", "s1", "t1", timeout_seconds=30)
 
-    # 失败结果为结构化文本，包含失败原因
     assert "失败" in result
     assert "失败原因" in result
     assert manager.snapshot()[0].status == "failed"
@@ -1667,7 +1529,6 @@ def test_edit_file_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
     result = edit_file("undo.py", "不存在的片段", "beta")
 
     assert result.startswith("🚨")
-    # 失败编辑不得改动文件（因此也不产生任何可撤销记录）
     assert target.read_text(encoding="utf-8") == "alpha\n"
 
 
@@ -1692,7 +1553,6 @@ def test_edit_file_crlf_replacement_with_existing_crlf_is_not_corrupted(tmp_path
     target = tmp_path / "crlf.txt"
     target.write_bytes(b"alpha\r\nbeta\r\nomega\r\n")
 
-    # target 用 LF（不匹配 CRLF 文件，触发换行转换分支），replacement 自带 \r\n
     result = edit_file("crlf.txt", "beta\nomega", "line1\r\nline2")
 
     assert result.startswith("✔")
@@ -1737,7 +1597,6 @@ def test_manage_task_kill_passes_permission_context(monkeypatch):
     ],
 )
 def test_manage_task_kill_messages_match_kill_result(monkeypatch, result_constant, expected_fragment):
-    """kill 结果分类必须映射到准确文案：自然死亡不得误报为"终止失败"。"""
     import core.tools as tools_module
     import core.task_manager as task_manager_module
 
@@ -1756,7 +1615,6 @@ def test_manage_task_kill_messages_match_kill_result(monkeypatch, result_constan
 
 
 def test_manage_task_kill_identity_unverifiable_message(monkeypatch):
-    """无法校验进程身份时的保守拒绝也应有专属文案，而不是笼统的终止失败。"""
     import core.tools as tools_module
     import core.task_manager as task_manager_module
 
@@ -1778,7 +1636,6 @@ def test_file_tools_reject_paths_outside_workspace(tmp_path, monkeypatch):
     from core.tools import edit_file, list_directory, read_file, write_file
 
     monkeypatch.chdir(tmp_path)
-    # 不依赖真实配置文件，强制沙盒开启
     monkeypatch.setattr(tools_mod, "_outside_workspace_allowed", lambda: False)
 
     with _pytest.raises(ValueError, match="路径越界"):
@@ -1790,7 +1647,6 @@ def test_file_tools_reject_paths_outside_workspace(tmp_path, monkeypatch):
 
 
 def test_file_tools_allow_outside_workspace_when_sandbox_off(tmp_path, monkeypatch):
-    """/sandbox on 后（allow_outside_workspace=True）文件工具可访问工作目录外的路径"""
     import core.tools as tools_mod
     from core.tools import list_directory, read_file, write_file
 
@@ -1809,12 +1665,6 @@ def test_file_tools_allow_outside_workspace_when_sandbox_off(tmp_path, monkeypat
 
 
 def test_relative_paths_resolve_against_thread_workdir(tmp_path, monkeypatch):
-    """回归：相对路径（含目录工具默认 "."）必须按线程本地 workdir 解析。
-
-    GUI 多会话并行时进程 cwd 可能停在安装目录；若相对路径按进程 cwd
-    解析，沙盒守卫会把项目根内的相对路径误判为"工作目录之外"——开关
-    打开时静默放行到错误目录，开关关闭时误弹权限询问。
-    """
     from core.workspace_context import workspace_scope
     from core.tools import _resolve_workspace_path, is_outside_workspace
 
@@ -1822,7 +1672,6 @@ def test_relative_paths_resolve_against_thread_workdir(tmp_path, monkeypatch):
     workspace.mkdir()
     (workspace / "note.txt").write_text("内容", encoding="utf-8")
 
-    # 进程 cwd 故意停在 workdir 之外（模拟打包版 GUI：cwd=安装目录）
     monkeypatch.chdir(tmp_path)
 
     with workspace_scope(str(workspace)):
@@ -1834,11 +1683,6 @@ def test_relative_paths_resolve_against_thread_workdir(tmp_path, monkeypatch):
 
 
 def test_ycode_dir_reads_allowed_under_sandbox_restriction(tmp_path, monkeypatch):
-    """回归：沙盒限制开启时，~/.ycode 全目录读取（含凭据文件）必须可用。
-
-    覆盖 @附件挂载与 read_file 的免 bypass 直读路径（allow_trusted_read）；
-    写入路径不走该豁免，凭据写入仍由沙盒守卫逐次询问。
-    """
     import core.memory_kairos as mk
     from core.tools import _resolve_workspace_path
     from core.workspace_context import workspace_scope
@@ -1854,13 +1698,10 @@ def test_ycode_dir_reads_allowed_under_sandbox_restriction(tmp_path, monkeypatch
     monkeypatch.chdir(workspace)
 
     with workspace_scope(str(workspace)):
-        # 读取（含凭据文件）：沙盒限制下也直接解析成功
         for rel in ("memory/MEMORY.md", "config.json"):
             resolved = _resolve_workspace_path(str(ycode_dir / rel), allow_trusted_read=True)
             assert resolved == (ycode_dir / rel).resolve()
 
-        # 写入语义（不传 allow_trusted_read）：.ycode 仍视为沙盒外，
-        # 必须走守卫询问（此处断言边界校验会拒绝裸写入）
         try:
             _resolve_workspace_path(str(ycode_dir / "config.json"))
             raised = False
@@ -1870,7 +1711,6 @@ def test_ycode_dir_reads_allowed_under_sandbox_restriction(tmp_path, monkeypatch
 
 
 def test_ycode_and_agents_files_are_not_trusted_read_paths(tmp_path, monkeypatch):
-    """Only configured Skill packages may bypass the workspace sandbox for reads."""
     import core.skills as skills_mod
 
     fake_home = tmp_path / "home"
@@ -1896,7 +1736,6 @@ def test_ycode_and_agents_files_are_not_trusted_read_paths(tmp_path, monkeypatch
 
 
 def test_trusted_read_path_requires_a_skill_package_not_just_its_search_root(tmp_path, monkeypatch):
-    """A scan root and unrelated siblings must not inherit a Skill package's trust."""
     import core.skills as skills_mod
 
     search_root = tmp_path / "skills"
@@ -1917,7 +1756,6 @@ def test_trusted_read_path_requires_a_skill_package_not_just_its_search_root(tmp
 
 
 def test_skill_path_expansion_supports_home_environment_and_relative_inputs(tmp_path, monkeypatch):
-    """Trusted Skill resources retain the public path-expansion input contract."""
     import core.skills as skills_mod
 
     fake_home = tmp_path / "home"
@@ -1949,7 +1787,6 @@ def test_skill_path_expansion_supports_home_environment_and_relative_inputs(tmp_
 
 
 def test_write_file_rejects_trusted_skill_path_without_outside_approval(tmp_path, monkeypatch):
-    """write_file must not use the read-only Skill exemption."""
     import pytest as _pytest
     import core.skills as skills_mod
     import core.tools as tools_mod
@@ -1967,7 +1804,6 @@ def test_write_file_rejects_trusted_skill_path_without_outside_approval(tmp_path
 
 
 def test_skill_markdown_is_trusted_for_read_only(tmp_path, monkeypatch):
-    """A configured Skill package remains readable outside the workspace."""
     import core.skills as skills_mod
 
     skill_dir = tmp_path / "skills" / "example"
@@ -1981,7 +1817,6 @@ def test_skill_markdown_is_trusted_for_read_only(tmp_path, monkeypatch):
 
 
 def test_outside_workspace_allowed_reads_config(monkeypatch):
-    """开关默认 False，配置 allow_outside_workspace=True 时为 True"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(
@@ -1997,17 +1832,7 @@ def test_outside_workspace_allowed_reads_config(monkeypatch):
     assert tools_mod._outside_workspace_allowed() is False
 
 
-# ---------------------------------------------------------------------------
-# search_news 无结果必须返回 🚨 前缀，否则子代理会被误判为 completed
-# ---------------------------------------------------------------------------
-# 历史问题：search_news 无结果时返回 "🔍 互联网上没有找到..."，
-# 不以 🚨 开头，_tool_result_ok 判定为工具成功，tool_errors 不收录，
-# LLM 编一段"我没搜到"的文本通过 _has_meaningful_subagent_result，
-# 最终 _complete 被调用，task.status="completed"，但实际结果是失败的。
-# 修复：无结果也返回 🚨 前缀，走 _terminate("failed") 流程。
-
 def test_search_news_no_results_returns_error_prefix(monkeypatch):
-    """search_news 无结果时返回 🚨 前缀，确保被识别为工具失败"""
     import core.tools as tools_mod
 
     class _FakeDDGS:
@@ -2018,7 +1843,7 @@ def test_search_news_no_results_returns_error_prefix(monkeypatch):
             return False
 
         def news(self, query, max_results=5):
-            return []  # 模拟无结果
+            return []
 
     monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
 
@@ -2030,7 +1855,6 @@ def test_search_news_no_results_returns_error_prefix(monkeypatch):
 
 
 def test_search_news_with_results_returns_normal_text(monkeypatch):
-    """search_news 有结果时正常返回，不带 🚨 前缀"""
     import core.tools as tools_mod
 
     class _FakeDDGS:
@@ -2055,7 +1879,6 @@ def test_search_news_with_results_returns_normal_text(monkeypatch):
 
 
 def test_tool_result_ok_treats_search_news_no_results_as_failure(monkeypatch):
-    """_tool_result_ok 必须把 search_news 的无结果返回识别为失败（ok=False）"""
     import core.tools as tools_mod
     from core.llm import _tool_result_ok, TOOL_ERROR_PREFIX
 
@@ -2072,7 +1895,6 @@ def test_tool_result_ok_treats_search_news_no_results_as_failure(monkeypatch):
     monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
 
     result_text = tools_mod.search_news("Kimi AI")
-    # 模拟 llm.py 中 tool_finished 事件的 payload 构造
     fake_result = {"content": result_text}
 
     assert result_text.startswith(TOOL_ERROR_PREFIX)
@@ -2080,7 +1902,6 @@ def test_tool_result_ok_treats_search_news_no_results_as_failure(monkeypatch):
 
 
 def test_subagent_with_search_news_no_results_is_marked_failed(monkeypatch):
-    """端到端：子代理调用 search_news 无结果时，task.status 必须是 failed 而非 completed"""
     import core.tools as tools_mod
 
     class _FakeDDGS:
@@ -2095,36 +1916,24 @@ def test_subagent_with_search_news_no_results_is_marked_failed(monkeypatch):
 
     monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
 
-    # 直接调用 search_news 验证前缀（端到端验证需要 LLM 调用，这里只验证工具层契约）
     result = tools_mod.search_news("nonexistent topic 12345")
     assert result.startswith("🚨"), \
         "search_news 无结果必须以 🚨 开头，否则子代理会误判为 completed"
 
 
-# ---------------------------------------------------------------------------
-# SSRF 防护双模式测试
-# ---------------------------------------------------------------------------
-# 参考 kimicode/opencode 的做法：默认宽松模式只拦截云元数据接口，
-# 不做 DNS 解析后的 IP 校验，避免误杀 Clash/V2Ray fake-ip 段（198.18.0.0/15）。
-# 严格模式（fetch_url_strict_ssrf=True）保留完整 IP 校验。
-
 def test_ssrf_default_mode_allows_fakeip_domain(monkeypatch):
-    """默认宽松模式：域名解析到 198.18.x.x（fake-ip 段）也放行，不查 IP"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: False)
     monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
-    # 即使 DNS 解析到 198.18.0.92（is_private=True），默认模式也不应该拦截
     monkeypatch.setattr(
         tools_mod.socket, "getaddrinfo",
         lambda host, *a, **k: [("AF_INET", "STREAM", "PROTO", None, ("198.18.0.92", 0))]
     )
-    # 不应抛异常
     tools_mod._check_ssrf_url("https://open-meteo.com/api")
 
 
 def test_ssrf_default_mode_allows_private_ip_literal(monkeypatch):
-    """默认宽松模式：直接访问私网 IP 字面量也放行（对齐 kimicode/opencode）"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: False)
@@ -2135,7 +1944,6 @@ def test_ssrf_default_mode_allows_private_ip_literal(monkeypatch):
 
 
 def test_ssrf_both_modes_block_cloud_metadata(monkeypatch):
-    """两种模式都拦截云元数据接口（SSRF 防护的核心价值）"""
     import core.tools as tools_mod
 
     for strict_mode in (False, True):
@@ -2148,14 +1956,12 @@ def test_ssrf_both_modes_block_cloud_metadata(monkeypatch):
 
 
 def test_ssrf_allowlist_bypasses_both_modes(monkeypatch):
-    """白名单优先级最高，两种模式都直接放行（不查 IP）"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(
         tools_mod, "_get_fetch_url_allow_hosts",
         lambda: {"open-meteo.com", "geocoding-api.open-meteo.com"}
     )
-    # 严格模式下，白名单域名即使解析到私网 IP 也应放行
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
     monkeypatch.setattr(
         tools_mod.socket, "getaddrinfo",
@@ -2166,7 +1972,6 @@ def test_ssrf_allowlist_bypasses_both_modes(monkeypatch):
 
 
 def test_ssrf_strict_mode_blocks_private_ip_literal(monkeypatch):
-    """严格模式：IP 字面量 198.18.0.92（fake-ip 段）被拦截"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
@@ -2178,7 +1983,6 @@ def test_ssrf_strict_mode_blocks_private_ip_literal(monkeypatch):
 
 
 def test_ssrf_strict_mode_blocks_dns_resolved_private_ip(monkeypatch):
-    """严格模式：DNS 解析到 198.18.x.x（fake-ip）被拦截"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
@@ -2192,7 +1996,6 @@ def test_ssrf_strict_mode_blocks_dns_resolved_private_ip(monkeypatch):
 
 
 def test_ssrf_strict_mode_blocks_dns_failure(monkeypatch):
-    """严格模式：DNS 解析失败保守拒绝"""
     import core.tools as tools_mod
     import socket as _socket
 
@@ -2207,24 +2010,19 @@ def test_ssrf_strict_mode_blocks_dns_failure(monkeypatch):
 
 
 def test_ssrf_strict_mode_allows_public_ip(monkeypatch):
-    """严格模式：公网 IP 正常放行"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
     monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
-    # 8.8.8.8 是 Google DNS，公网 IP，应放行
     tools_mod._check_ssrf_url("http://8.8.8.8/")
-    # 1.1.1.1 是 Cloudflare DNS，公网 IP，应放行
     tools_mod._check_ssrf_url("http://1.1.1.1/")
 
 
 def test_fetch_url_ssrf_error_hint_mentions_fakeip(monkeypatch):
-    """SSRF 拦截时错误提示应提到 fake-ip 可能性和解决方案"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
     monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
-    # 拦截 198.18.0.92 时，返回的错误信息应包含 fake-ip 提示
     result = tools_mod.fetch_url("http://198.18.0.92/")
     assert "🚨" in result
     assert "fake-ip" in result or "Clash" in result or "V2Ray" in result
@@ -2233,7 +2031,6 @@ def test_fetch_url_ssrf_error_hint_mentions_fakeip(monkeypatch):
 
 
 def test_fetch_url_ssrf_metadata_error_no_fakeip_hint(monkeypatch):
-    """云元数据接口拦截时不提示 fake-ip（这类目标绝不应该放行）"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
@@ -2241,7 +2038,6 @@ def test_fetch_url_ssrf_metadata_error_no_fakeip_hint(monkeypatch):
     result = tools_mod.fetch_url("http://169.254.169.254/latest/meta-data/")
     assert "🚨" in result
     assert "元数据接口" in result
-    # 元数据拦截不应提到 fake-ip（避免误导用户放行元数据接口）
     assert "fake-ip" not in result
 
 
@@ -2321,7 +2117,7 @@ def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
     assert item["status"] == "failed"
     assert "capacity" in item["error"]
 
-    assert scheduler.start_item("item-1") is False  # failed 状态不可直接重启
+    assert scheduler.start_item("item-1") is False
     assert "shared.py" not in scheduler._in_flight_files
 
 
@@ -2375,7 +2171,6 @@ def test_terminal_callback_fires_only_once_under_concurrent_termination():
 
 
 def test_execute_command_reports_nonzero_exit_code():
-    """回归：非零退出码必须如实上报，不得伪装成"执行成功"。"""
     import sys
     result = execute_command(f'{sys.executable} -c "import sys; sys.exit(3)"')
 
@@ -2384,7 +2179,6 @@ def test_execute_command_reports_nonzero_exit_code():
 
 
 def test_subagent_result_strips_advisor_tags():
-    """回归：子代理结果中的 Advisor 内部协议标记必须剔除，避免污染计划回写。"""
     manager = SubagentManager(
         runner=lambda record: (
             "[Advisor consultation #1]\n[Advisor review]\n"
@@ -2400,8 +2194,6 @@ def test_subagent_result_strips_advisor_tags():
 
 
 def test_subagent_result_strips_parenthesized_advisor_leak():
-    """回归：圆括号形式的 advisor 内部说明（如 "(advisor returned no content)"）
-    也必须从子代理结果中剔除。"""
     manager = SubagentManager(
         runner=lambda record: "(advisor returned no content)\n\n真正的结论。"
     )
@@ -2413,9 +2205,6 @@ def test_subagent_result_strips_parenthesized_advisor_leak():
 
 
 def test_subagent_result_strips_xml_junk_blocks():
-    """回归（软件识别会话事故）：模型把 <advisor-request> 求助文本和
-    <function_calls> XML 伪工具调用整块泄漏到正文时，必须从子代理结果中剔除。
-    未闭合的块（流被截断）也要剔到末尾。"""
     manager = SubagentManager(
         runner=lambda record: (
             "<advisor-request>\n我需要读取所有指定的核心文件。\n</advisor-request>\n"
@@ -2433,14 +2222,10 @@ def test_subagent_result_strips_xml_junk_blocks():
 
 
 def test_subagent_result_keeps_only_text_after_last_tool_call(monkeypatch):
-    """回归（软件识别会话事故）：子代理结果只保留最后一次工具调用之后的文本。
-
-    工具调用之前的过程叙述（"我先给你一版初步结论，继续补读…"）不是最终结论，
-    混入结果会让主 Agent 把中间思路当成事实汇总。"""
     from types import SimpleNamespace
     import core.llm as llm_module
 
-    final_text = "最终结论：" + "核心模块无阻塞性问题。" * 30  # >200 字，避免触发总结续写
+    final_text = "最终结论：" + "核心模块无阻塞性问题。" * 30
 
     def fake_events(*args, **kwargs):
         yield SimpleNamespace(kind="assistant_delta", payload={"text": "我先给你一版初步结论，继续补读文件。"})
@@ -2458,9 +2243,6 @@ def test_subagent_result_keeps_only_text_after_last_tool_call(monkeypatch):
 
 
 def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
-    """回归：未显式传 timeout_seconds 时按角色解析默认超时
-    （explore 300 / review 420 / test、implement、general 900）。
-    只读子代理的设计目标是快，预算仍明显低于写代码/跑测试角色。"""
     import core.tools as tools_module
 
     captured = {}
@@ -2483,7 +2265,6 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
         )
         assert captured["timeout_seconds"] == expected, role
 
-    # 后台任务不阻塞用户，默认预算按系数放宽（explore 300 × 1.5 = 450）
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
@@ -2491,7 +2272,6 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
     )
     assert captured["timeout_seconds"] == 450
 
-    # 显式传入时以显式值为准（后台不放大），但受前台硬上限约束
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
@@ -2507,8 +2287,6 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
 
 
 def test_run_subagent_surfaces_real_verification_error(monkeypatch):
-    """回归：验证失败时必须把真实错误（如验证命令 stderr）返回给主 Agent，
-    不得只报"不是 in_progress，无法验证完成"的误导信息导致 retry 死循环。"""
     import core.tools as tools_module
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
@@ -2520,7 +2298,6 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
         "subject": "验证失败任务",
         "stage": "build",
         "verification_type": "command",
-        # 必定失败的命令（cmd 与 sh 均支持 exit）
         "verification": "exit 1",
     }])
     monkeypatch.setattr(
@@ -2543,7 +2320,6 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
         timeout_seconds=30,
     )
 
-    # 失败结果为结构化文本，应包含验证失败的具体原因，而不是"不是 in_progress"的误导信息
     assert "失败" in result
     assert "不是 in_progress" not in result
     assert "验证" in result
@@ -2551,7 +2327,6 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
 
 
 def test_edit_file_fuzzy_match_minor_trailing_whitespace(tmp_path, monkeypatch):
-    """target_content 与原文仅有首尾空白差异时也能定位。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2564,7 +2339,6 @@ def test_edit_file_fuzzy_match_minor_trailing_whitespace(tmp_path, monkeypatch):
 
 
 def test_edit_file_fuzzy_match_minor_pollution(tmp_path, monkeypatch):
-    """target_content 存在轻微字符污染时，仍可通过模糊匹配定位并替换。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2578,7 +2352,6 @@ def test_edit_file_fuzzy_match_minor_pollution(tmp_path, monkeypatch):
     )
     target.write_text(original, encoding="utf-8")
 
-    # 模拟污染：把 null 写成 nul1，其余与原文完全一致
     polluted_target = (
         "public void HandleReturnResult(List<IEntryDataObject> result) {\n"
         "    if (result == nul1 || result.isEmpty()) {\n"
@@ -2600,24 +2373,20 @@ def test_edit_file_fuzzy_match_minor_pollution(tmp_path, monkeypatch):
 
 
 def test_write_file_refuses_to_overwrite_large_existing_file(tmp_path, monkeypatch):
-    """write_file 应拒绝覆盖超过 500 行 / 50KB 的已有大文件。"""
     from core.tools import write_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "large.txt"
-    # 构造 600 行的小文件，超过行数阈值
     target.write_text("\n".join(f"line {i}" for i in range(600)), encoding="utf-8")
 
     result = write_file("large.txt", "new content")
     assert isinstance(result, str)
     assert result.startswith("\U0001f6a8")
     assert "large.txt" in result
-    # 文件内容不应被覆盖
     assert "new content" not in target.read_text(encoding="utf-8")
 
 
 def test_write_file_allows_overwrite_small_existing_file(tmp_path, monkeypatch):
-    """write_file 允许覆盖小文件。"""
     from core.tools import write_file
 
     monkeypatch.chdir(tmp_path)
@@ -2631,16 +2400,9 @@ def test_write_file_allows_overwrite_small_existing_file(tmp_path, monkeypatch):
 
 
 def test_write_file_auto_creates_missing_parent_directory(tmp_path, monkeypatch):
-    """write_file 应自动创建不存在的父目录，而不是抛 FileNotFoundError。
-
-    复现场景：主 Agent 按系统提示词写 memory/feedback/xxx.md，
-    但 feedback/ 目录不存在 → 旧版 mkstemp(dir=...) 直接抛错，
-    Agent 陷入无效重试。修复后 write_file 应自动 mkdir parents=True。
-    """
     from core.tools import write_file
 
     monkeypatch.chdir(tmp_path)
-    # feedback/ 子目录不存在
     target = tmp_path / "memory" / "feedback" / "note.md"
     assert not target.parent.exists()
 
@@ -2650,12 +2412,10 @@ def test_write_file_auto_creates_missing_parent_directory(tmp_path, monkeypatch)
     assert result.startswith("\u2714"), f"应写入成功，实际：{result}"
     assert target.exists()
     assert target.read_text(encoding="utf-8") == "test content"
-    # 父目录应被自动创建
     assert target.parent.exists()
 
 
 def test_write_file_auto_creates_nested_parent_directories(tmp_path, monkeypatch):
-    """write_file 应自动创建多层嵌套的不存在父目录"""
     from core.tools import write_file
 
     monkeypatch.chdir(tmp_path)
@@ -2669,34 +2429,18 @@ def test_write_file_auto_creates_nested_parent_directories(tmp_path, monkeypatch
 
 
 def test_edit_file_auto_creates_missing_parent_directory(tmp_path, monkeypatch):
-    """edit_file 修改已存在文件时，若父目录被外部删除应能自动重建（防御性）。
-
-    注意：edit_file 本身要求文件已存在（先读后改），所以这个测试构造的场景是：
-    文件存在但其父目录被外部删除（极端情况），edit_file 应能自动重建父目录后写入。
-    实际上更常见的场景是 write_file 创建新文件到不存在的子目录，那已被前两个测试覆盖。
-    这里只验证 edit_file 的 mkdir 逻辑不会破坏正常编辑流程。
-    """
     from core.tools import write_file, edit_file
 
     monkeypatch.chdir(tmp_path)
-    # 先用 write_file 创建一个文件（同时自动建父目录）
     target = tmp_path / "sub" / "note.md"
     write_file(str(target), "old content")
 
-    # 正常 edit_file 应能工作（父目录已存在，mkdir 是 no-op）
     result = edit_file(str(target), "old content", "new content")
     assert "✔" in str(result) or "成功" in str(result), f"edit_file 应成功，实际：{result}"
     assert target.read_text(encoding="utf-8") == "new content"
 
 
-# ============================================================================
-# 行号路径测试（with_line_numbers + start_line/end_line）
-# 借鉴 Hashline 思想的轻量实现：read_file 返回行号 → edit_file 按行号切片替换
-# ============================================================================
-
-
 def test_read_file_with_line_numbers_returns_prefixed_format(tmp_path, monkeypatch):
-    """read_file(with_line_numbers=True) 应返回 'N: line' 格式（1-based）。"""
     from core.tools import read_file
     from core import tool_cache
     tool_cache.clear_all()
@@ -2711,41 +2455,34 @@ def test_read_file_with_line_numbers_returns_prefixed_format(tmp_path, monkeypat
 
 
 def test_read_file_with_line_numbers_respects_offset_and_limit(tmp_path, monkeypatch):
-    """with_line_numbers 与 offset/limit 配合时行号应反映原始位置。"""
     from core.tools import read_file
     from core import tool_cache
     tool_cache.clear_all()
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "paged.txt"
-    target.write_text("L1\nL2\nL3\n", encoding="utf-8")  # 3 行
+    target.write_text("L1\nL2\nL3\n", encoding="utf-8")
 
-    # 从第 2 行（0-based offset=1）开始读 2 行，行号应为 2, 3（读取剩余全部，不触发截断）
     result = read_file("paged.txt", offset=1, limit=2, with_line_numbers=True)
 
     assert result == "2: L2\n3: L3"
 
 
 def test_read_file_with_line_numbers_ignores_compress(tmp_path, monkeypatch):
-    """with_line_numbers=True 时 compress 参数应被忽略，保留原始行结构。"""
     from core.tools import read_file
     from core import tool_cache
     tool_cache.clear_all()
 
     monkeypatch.chdir(tmp_path)
-    # 含连续空行的文件，compress=True 时本应合并空行
     target = tmp_path / "spaced.txt"
     target.write_text("a\n\n\nb\n", encoding="utf-8")
 
-    # 同时开启 compress 和 with_line_numbers，行号路径应优先
     result = read_file("spaced.txt", compress=True, with_line_numbers=True)
 
-    # 应保留 4 行（含 2 个空行），不应被压缩
     assert result == "1: a\n2: \n3: \n4: b"
 
 
 def test_read_file_with_line_numbers_caches_separately_from_plain(tmp_path, monkeypatch):
-    """with_line_numbers=True 和 False 应分别缓存，不互相污染。"""
     from core.tools import read_file
     from core import tool_cache
     tool_cache.clear_all()
@@ -2760,7 +2497,6 @@ def test_read_file_with_line_numbers_caches_separately_from_plain(tmp_path, monk
     assert plain == "hello\nworld\n"
     assert numbered == "1: hello\n2: world"
 
-    # 再次读取应命中各自缓存
     plain2 = read_file("cache.txt")
     numbered2 = read_file("cache.txt", with_line_numbers=True)
     assert plain2 == plain
@@ -2768,14 +2504,12 @@ def test_read_file_with_line_numbers_caches_separately_from_plain(tmp_path, monk
 
 
 def test_edit_file_by_lines_basic_replacement(tmp_path, monkeypatch):
-    """行号路径：基本替换功能，应跳过字符串匹配直接按行号切片。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "code.py"
     target.write_text("def foo():\n    return 1\n\ndef bar():\n    return 2\n", encoding="utf-8")
 
-    # 替换第 2 行（return 1 → return 42）
     result = edit_file("code.py", replacement_content="    return 42", start_line=2, end_line=2)
 
     assert result.startswith("✔")
@@ -2784,7 +2518,6 @@ def test_edit_file_by_lines_basic_replacement(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_multi_line_range(tmp_path, monkeypatch):
-    """行号路径：多行范围替换。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2792,7 +2525,6 @@ def test_edit_file_by_lines_multi_line_range(tmp_path, monkeypatch):
     original = "a\nb\nc\nd\ne\n"
     target.write_text(original, encoding="utf-8")
 
-    # 替换第 2-4 行（b,c,d → X,Y）
     result = edit_file("multi.py", replacement_content="X\nY", start_line=2, end_line=4)
 
     assert result.startswith("✔")
@@ -2801,24 +2533,20 @@ def test_edit_file_by_lines_multi_line_range(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_end_line_exceeds_total_clamps_silently(tmp_path, monkeypatch):
-    """end_line 超过总行数时应自动收敛，不报错。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "short.txt"
-    target.write_text("only\none\nline\n", encoding="utf-8")  # 3 行
+    target.write_text("only\none\nline\n", encoding="utf-8")
 
-    # end_line=100 远超总行数，应自动收敛到 3
     result = edit_file("short.txt", replacement_content="replaced", start_line=2, end_line=100)
 
     assert result.startswith("✔")
-    # 实际替换了第 2-3 行
     assert "第 2-3 行替换成功" in result
     assert target.read_text(encoding="utf-8") == "only\nreplaced\n"
 
 
 def test_edit_file_by_lines_includes_replaced_preview_in_response(tmp_path, monkeypatch):
-    """成功响应中应包含被替换的原文预览（便于发现行号错误）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2828,31 +2556,28 @@ def test_edit_file_by_lines_includes_replaced_preview_in_response(tmp_path, monk
     result = edit_file("preview.py", replacement_content="NEW", start_line=2, end_line=2)
 
     assert "被替换原文预览" in result
-    assert "line2" in result  # 预览应包含被替换的原文
+    assert "line2" in result
 
 
 def test_edit_file_by_lines_preview_truncates_long_blocks(tmp_path, monkeypatch):
-    """被替换块超过 5 行时预览应省略中间，只显示前 3 后 2。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "long_block.txt"
-    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"  # 10 行
+    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"
     target.write_text(content, encoding="utf-8")
 
-    # 替换第 1-10 行
     result = edit_file("long_block.txt", replacement_content="REPLACED", start_line=1, end_line=10)
 
     assert result.startswith("✔")
     assert "省略中间部分" in result
-    assert "line1" in result  # 前 3 行之一
-    assert "line3" in result  # 前 3 行之一
-    assert "line10" in result  # 后 2 行之一
-    assert "line5" not in result  # 中间被省略
+    assert "line1" in result
+    assert "line3" in result
+    assert "line10" in result
+    assert "line5" not in result
 
 
 def test_edit_file_by_lines_rejects_start_line_below_one(tmp_path, monkeypatch):
-    """start_line < 1 应报错（1-based 行号）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2863,11 +2588,10 @@ def test_edit_file_by_lines_rejects_start_line_below_one(tmp_path, monkeypatch):
 
     assert result.startswith("🚨")
     assert "start_line 必须 >= 1" in result
-    assert target.read_text(encoding="utf-8") == "content\n"  # 文件未被修改
+    assert target.read_text(encoding="utf-8") == "content\n"
 
 
 def test_edit_file_by_lines_rejects_end_below_start(tmp_path, monkeypatch):
-    """end_line < start_line 应报错。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2881,41 +2605,36 @@ def test_edit_file_by_lines_rejects_end_below_start(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_rejects_start_exceeds_total(tmp_path, monkeypatch):
-    """start_line 超出文件总行数应报错（end_line 自动收敛，但 start_line 不会）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "x.txt"
-    target.write_text("only\none\n", encoding="utf-8")  # 2 行
+    target.write_text("only\none\n", encoding="utf-8")
 
     result = edit_file("x.txt", replacement_content="new", start_line=100, end_line=200)
 
     assert result.startswith("🚨")
     assert "超出文件总行数" in result
-    assert "read_file(with_line_numbers=True)" in result  # 应给出修复建议
+    assert "read_file(with_line_numbers=True)" in result
 
 
 def test_edit_file_by_lines_rejects_partial_line_args(tmp_path, monkeypatch):
-    """只提供 start_line 不提供 end_line（或反之）应报错。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "x.txt"
     target.write_text("a\nb\n", encoding="utf-8")
 
-    # 只提供 start_line
     result1 = edit_file("x.txt", replacement_content="new", start_line=1)
     assert result1.startswith("🚨")
     assert "同时提供" in result1
 
-    # 只提供 end_line
     result2 = edit_file("x.txt", replacement_content="new", end_line=1)
     assert result2.startswith("🚨")
     assert "同时提供" in result2
 
 
 def test_edit_file_by_lines_rejects_bool_arguments(tmp_path, monkeypatch):
-    """start_line/end_line 不能是布尔值（bool 是 int 子类，True==1 会被误用）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2929,7 +2648,6 @@ def test_edit_file_by_lines_rejects_bool_arguments(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_rejects_non_int_arguments(tmp_path, monkeypatch):
-    """start_line/end_line 必须是整数。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2943,7 +2661,6 @@ def test_edit_file_by_lines_rejects_non_int_arguments(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_rejects_empty_file(tmp_path, monkeypatch):
-    """空文件无法按行号编辑。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -2957,14 +2674,12 @@ def test_edit_file_by_lines_rejects_empty_file(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_no_change_returns_error(tmp_path, monkeypatch):
-    """替换后内容与原文相同时应报错（避免无意义写入）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "same.txt"
     target.write_text("identical\n", encoding="utf-8")
 
-    # replacement_content 与原行完全相同
     result = edit_file("same.txt", replacement_content="identical", start_line=1, end_line=1)
 
     assert result.startswith("🚨")
@@ -2972,7 +2687,6 @@ def test_edit_file_by_lines_no_change_returns_error(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_writes_undo_stack(tmp_path, monkeypatch):
-    """行号路径成功时应写入按回合撤销记录（与字符串路径行为一致）。"""
     import hashlib
 
     from core.memory import MemoryManager
@@ -2995,7 +2709,6 @@ def test_edit_file_by_lines_writes_undo_stack(tmp_path, monkeypatch):
     )
 
     target = tmp_path / "undo.py"
-    # 用 write_bytes 确保 LF 换行，避免 Windows write_text 默认转 CRLF
     target.write_bytes(b"original\n")
 
     try:
@@ -3015,22 +2728,19 @@ def test_edit_file_by_lines_writes_undo_stack(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_failed_validation_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    """行号路径校验失败时不应产生任何可撤销记录或文件改动。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "safe.txt"
     target.write_text("a\nb\n", encoding="utf-8")
 
-    # start_line 越界，应失败且不写撤销栈
     result = edit_file("safe.txt", replacement_content="new", start_line=100, end_line=200)
 
     assert result.startswith("🚨")
-    assert target.read_text(encoding="utf-8") == "a\nb\n"  # 文件未被修改
+    assert target.read_text(encoding="utf-8") == "a\nb\n"
 
 
 def test_edit_file_by_lines_preserves_gbk_encoding(tmp_path, monkeypatch):
-    """行号路径应保持 GBK 编码写回（与字符串路径一致）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -3038,7 +2748,6 @@ def test_edit_file_by_lines_preserves_gbk_encoding(tmp_path, monkeypatch):
     original = "第一行\r\n第二行\r\n第三行\r\n"
     target.write_bytes(original.encode("gbk"))
 
-    # 替换第 2 行
     result = edit_file("gbk_lines.txt", replacement_content="替换行", start_line=2, end_line=2)
 
     assert result.startswith("✔")
@@ -3046,31 +2755,27 @@ def test_edit_file_by_lines_preserves_gbk_encoding(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_adapts_crlf_replacement(tmp_path, monkeypatch):
-    """行号路径：replacement 含 LF 但文件是 CRLF 时应自动转换。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "crlf_lines.txt"
     target.write_bytes(b"alpha\r\nbeta\r\nomega\r\n")
 
-    # replacement 用 LF，应被转为 CRLF
     result = edit_file("crlf_lines.txt", replacement_content="line1\nline2", start_line=2, end_line=2)
 
     assert result.startswith("✔")
     raw = target.read_bytes()
     assert raw == b"alpha\r\nline1\r\nline2\r\nomega\r\n"
-    assert b"\r\r\n" not in raw  # 不应腐蚀
+    assert b"\r\r\n" not in raw
 
 
 def test_edit_file_by_lines_ignores_target_content(tmp_path, monkeypatch):
-    """行号路径下 target_content 即使提供也应被忽略（不参与匹配）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "ignore_target.py"
     target.write_text("actual_line\n", encoding="utf-8")
 
-    # target_content 与原文完全不同，但行号路径应忽略它
     result = edit_file(
         "ignore_target.py",
         target_content="this is wrong and should be ignored",
@@ -3084,14 +2789,12 @@ def test_edit_file_by_lines_ignores_target_content(tmp_path, monkeypatch):
 
 
 def test_edit_file_string_path_still_works_when_no_line_args(tmp_path, monkeypatch):
-    """未提供 start_line/end_line 时应回退到字符串匹配路径（兼容性）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "compat.py"
     target.write_text("def foo():\n    return 1\n", encoding="utf-8")
 
-    # 不提供 start_line/end_line，应走字符串匹配
     result = edit_file("compat.py", target_content="return 1", replacement_content="return 42")
 
     assert result.startswith("✔")
@@ -3099,21 +2802,16 @@ def test_edit_file_string_path_still_works_when_no_line_args(tmp_path, monkeypat
 
 
 def test_edit_file_only_replacement_triggers_smart_replace(tmp_path, monkeypatch):
-    """只传 replacement_content（无 target_content 和行号）时触发智能降级替换。
-    新语义：用 difflib 找最相似代码段进行替换，而非直接报错。
-    """
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "hint.py"
-    # 多行内容，让智能替换有足够上下文定位
     target.write_text("def old_func():\n    return 'old'\n", encoding="utf-8")
 
     replacement = "def new_func():\n    return 'new'\n"
 
     result = edit_file("hint.py", replacement_content=replacement)
 
-    # 智能替换应成功
     assert result.startswith("✔")
     assert "智能修改" in result
     new_content = target.read_text(encoding="utf-8")
@@ -3122,7 +2820,6 @@ def test_edit_file_only_replacement_triggers_smart_replace(tmp_path, monkeypatch
 
 
 def test_edit_file_only_replacement_rejects_when_no_similarity(tmp_path, monkeypatch):
-    """只传 replacement_content 但找不到相似代码段时，给出明确错误并提示行号路径。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -3138,7 +2835,6 @@ def test_edit_file_only_replacement_rejects_when_no_similarity(tmp_path, monkeyp
 
 
 def test_edit_file_by_lines_handles_duplicate_code_blocks_without_ambiguity(tmp_path, monkeypatch):
-    """行号路径核心优势：重复代码段无歧义定位（字符串路径会失败的场景）。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -3176,7 +2872,6 @@ def test_edit_file_by_lines_handles_duplicate_code_blocks_without_ambiguity(tmp_
 
 
 def test_read_file_with_line_numbers_then_edit_file_by_lines_end_to_end(tmp_path, monkeypatch):
-    """端到端：read_file(with_line_numbers) → edit_file(start_line, end_line) 完整流程。"""
     from core.tools import read_file, edit_file
     from core import tool_cache
     tool_cache.clear_all()
@@ -3196,11 +2891,9 @@ def test_read_file_with_line_numbers_then_edit_file_by_lines_end_to_end(tmp_path
         encoding="utf-8",
     )
 
-    # 步骤 1：读取带行号视图
     view = read_file("e2e.py", with_line_numbers=True)
     assert "5:     print('hello')" in view
 
-    # 步骤 2：用行号替换第 5 行
     result = edit_file(
         "e2e.py",
         replacement_content="    print('world')",
@@ -3213,17 +2906,12 @@ def test_read_file_with_line_numbers_then_edit_file_by_lines_end_to_end(tmp_path
 
 
 def test_edit_file_by_lines_replacement_appends_newline_when_needed(tmp_path, monkeypatch):
-    """行号路径：replacement 不带换行符时系统应自动补换行符，保持行结构。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "tail.txt"
-    # 用 write_bytes 确保 LF 换行，避免 Windows write_text 默认转 CRLF
     target.write_bytes(b"a\nb\nc\n")
 
-    # 替换第 3 行（"c\n"），replacement "C" 不带换行符
-    # 新语义：replacement 按行切分后每行自动补换行符，"C" → "C\n"
-    # 所以原 "c\n" 被替换为 "C\n"，文件保持 "a\nb\nC\n"
     result = edit_file("tail.txt", replacement_content="C", start_line=3, end_line=3)
 
     assert result.startswith("✔")
@@ -3231,14 +2919,12 @@ def test_edit_file_by_lines_replacement_appends_newline_when_needed(tmp_path, mo
 
 
 def test_edit_file_by_lines_empty_replacement_deletes_lines(tmp_path, monkeypatch):
-    """行号路径：replacement 为空字符串时应删除指定行范围。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "delete.txt"
     target.write_bytes(b"a\nb\nc\nd\n")
 
-    # 替换第 2-3 行为空字符串 → 删除这两行
     result = edit_file("delete.txt", replacement_content="", start_line=2, end_line=3)
 
     assert result.startswith("✔")
@@ -3246,14 +2932,12 @@ def test_edit_file_by_lines_empty_replacement_deletes_lines(tmp_path, monkeypatc
 
 
 def test_edit_file_by_lines_insert_at_start(tmp_path, monkeypatch):
-    """行号路径：替换第 1 行可实现"插入+替换"效果。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "head.py"
     target.write_text("old_first\nsecond\n", encoding="utf-8")
 
-    # 替换第 1 行为多行内容
     result = edit_file(
         "head.py",
         replacement_content="new_first\nnew_second",
@@ -3266,8 +2950,6 @@ def test_edit_file_by_lines_insert_at_start(tmp_path, monkeypatch):
 
 
 def test_execute_command_no_output_nonzero_exit_is_informational(monkeypatch):
-    """非零退出 + 完全无输出（如 findstr 无匹配）不按 🚨 失败返回，
-    避免 UI 红色失败刷屏；但必须如实说明退出码并给出区分提示。"""
     class FakeProcess:
         returncode = 1
 
@@ -3286,7 +2968,6 @@ def test_execute_command_no_output_nonzero_exit_is_informational(monkeypatch):
 
 
 def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
-    """非零退出但有输出：仍是 🚨 错误，输出内容原样带回。"""
     class FakeProcess:
         returncode = 2
 
@@ -3294,7 +2975,6 @@ def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
             return 2
 
     def fake_popen(*args, **kwargs):
-        # 新版 execute_command 把输出重定向到临时文件 sink，fake 直接写入
         kwargs["stdout"].write("爆炸了".encode("utf-8"))
         kwargs["stdout"].flush()
         return FakeProcess()
@@ -3309,8 +2989,6 @@ def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
 
 
 def test_list_directory_on_file_returns_soft_hint(tmp_path, monkeypatch):
-    """把文件路径误传给 list_directory：返回普通提示（非 🚨 错误级），
-    引导模型改用 read_file，UI 不再渲染成红色失败。"""
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "SflF400_mk.v"
     target.write_text("x", encoding="utf-8")
@@ -3321,13 +2999,7 @@ def test_list_directory_on_file_returns_soft_hint(tmp_path, monkeypatch):
     assert "read_file" in result
 
 
-# ---------------------------------------------------------------------------
-# 源码审计修复的回归测试（High3-5 / M1-M8 / Low）
-# ---------------------------------------------------------------------------
-
-
 def test_ssrf_strict_mode_is_default_when_config_missing(monkeypatch):
-    """High 4：未显式配置时默认严格模式（仅用户显式配置 false 才降级宽松）。"""
     import core.tools as tools_mod
     import config as config_mod
 
@@ -3338,7 +3010,6 @@ def test_ssrf_strict_mode_is_default_when_config_missing(monkeypatch):
 
 
 def test_ssrf_default_strict_blocks_loopback_and_private(monkeypatch):
-    """High 4：默认严格模式下 loopback/私网 IP 字面量被拒绝。"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
@@ -3352,7 +3023,6 @@ def test_ssrf_default_strict_blocks_loopback_and_private(monkeypatch):
 
 
 def test_redirect_revalidates_ssrf_per_hop(monkeypatch):
-    """High 5：302 重定向目标逐跳重新触发 SSRF 校验，跳到元数据接口被拦截。"""
     import core.tools as tools_mod
     from urllib.request import Request
 
@@ -3368,7 +3038,6 @@ def test_redirect_revalidates_ssrf_per_hop(monkeypatch):
 
 
 def test_redirect_to_safe_url_passes(monkeypatch):
-    """High 5：重定向到安全公网地址时正常构造新请求。"""
     import core.tools as tools_mod
     from urllib.request import Request
 
@@ -3381,7 +3050,6 @@ def test_redirect_to_safe_url_passes(monkeypatch):
 
 
 def test_execute_command_output_cap_terminates_verbose_command():
-    """M1：输出超过 1MB 上限时终止并截断，不再无限累积。"""
     import sys
     from core.tools import EXECUTE_COMMAND_MAX_OUTPUT_BYTES, execute_command
 
@@ -3391,12 +3059,10 @@ def test_execute_command_output_cap_terminates_verbose_command():
         timeout_seconds=60,
     )
     assert "截断" in result or "上限" in result
-    # 返回内容被限制在上限附近，不会把完整 1.5MB 带回
     assert len(result) < overflow
 
 
 def test_read_file_missing_file_returns_friendly_error(tmp_path, monkeypatch):
-    """M3：读已删除/不存在的文件返回友好错误文本，不抛异常栈。"""
     from core.tools import read_file
 
     monkeypatch.chdir(tmp_path)
@@ -3406,7 +3072,6 @@ def test_read_file_missing_file_returns_friendly_error(tmp_path, monkeypatch):
 
 
 def test_edit_file_detects_external_modification_between_read_and_write(tmp_path, monkeypatch):
-    """M4：读取后文件被外部修改时，edit_file 拒绝静默覆盖并要求重读。"""
     import core.tools as tools_mod
     from core.tools import edit_file
 
@@ -3417,10 +3082,7 @@ def test_edit_file_detects_external_modification_between_read_and_write(tmp_path
     original_fuzzy = tools_mod._fuzzy_replace
 
     def racing_fuzzy(content, match_target, match_replacement, replace_all=False):
-        # 模拟并发子代理：在 读→写 窗口内从外部改动同一文件
         target.write_text("alpha = 1\nbeta = 2\ngamma = 3\n", encoding="utf-8")
-        # Windows/NTFS mtime 粒度粗（实测相邻两次写入约半数概率 mtime 相同，
-        # 同片则检测窗口消失），显式推进 mtime 确定性地构造"读后被改"状态
         import os as _os
         st = target.stat()
         _os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
@@ -3432,12 +3094,10 @@ def test_edit_file_detects_external_modification_between_read_and_write(tmp_path
 
     assert result.startswith("🚨")
     assert "外部修改" in result
-    # 文件保持外部修改后的内容，未被本次编辑覆盖
     assert target.read_text(encoding="utf-8") == "alpha = 1\nbeta = 2\ngamma = 3\n"
 
 
 def test_write_file_detects_external_modification_before_replace(tmp_path, monkeypatch):
-    """M4：write_file 在写入前发现文件被外部创建/修改时中止。"""
     import core.tools as tools_mod
     from core.tools import write_file
 
@@ -3446,7 +3106,6 @@ def test_write_file_detects_external_modification_before_replace(tmp_path, monke
     original_mkstemp = tools_mod.tempfile.mkstemp
 
     def racing_mkstemp(*args, **kwargs):
-        # 模拟并发写入：目标文件在检查后、os.replace 前被外部创建
         (tmp_path / "new.txt").write_text("external", encoding="utf-8")
         return original_mkstemp(*args, **kwargs)
 
@@ -3459,7 +3118,6 @@ def test_write_file_detects_external_modification_before_replace(tmp_path, monke
 
 
 def test_smart_replace_all_replaces_every_high_score_block(tmp_path, monkeypatch):
-    """M5：智能替换 replace_all=True 时替换所有高评分候选块。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -3484,7 +3142,6 @@ def test_smart_replace_all_replaces_every_high_score_block(tmp_path, monkeypatch
 
 
 def test_smart_replace_rejects_low_similarity_candidate(tmp_path, monkeypatch):
-    """M5：最佳候选综合评分不足 0.7 时拒绝瞎猜替换，要求显式 target。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -3499,12 +3156,10 @@ def test_smart_replace_rejects_low_similarity_candidate(tmp_path, monkeypatch):
     assert result.startswith("🚨")
     assert "0.7" in result
     assert "target_content" in result
-    # 文件未被改动
     assert target.read_text(encoding="utf-8") == "alpha_keep\nbeta\nbeta\ngamma\n"
 
 
 def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    """Low：写入失败（os.replace 异常）时计划记录被回滚，文件不变。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
@@ -3523,7 +3178,6 @@ def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypat
 
 
 def test_search_code_respects_cancel_event(tmp_path, monkeypatch):
-    """M6：search_code 在取消后立即返回，不再阻塞等待 ripgrep。"""
     import core.tools as tools_mod
 
     monkeypatch.chdir(tmp_path)
@@ -3536,7 +3190,6 @@ def test_search_code_respects_cancel_event(tmp_path, monkeypatch):
 
 
 def test_glob_files_respects_cancel_event(tmp_path, monkeypatch):
-    """M6：glob_files 在取消后立即返回。"""
     import core.tools as tools_mod
 
     monkeypatch.chdir(tmp_path)
@@ -3549,7 +3202,6 @@ def test_glob_files_respects_cancel_event(tmp_path, monkeypatch):
 
 
 def test_fetch_url_respects_cancel_event(monkeypatch):
-    """M6：fetch_url 在发起请求前检查取消。"""
     import core.tools as tools_mod
 
     monkeypatch.setattr(tools_mod, "_check_ssrf_url", lambda url: None)
@@ -3562,7 +3214,6 @@ def test_fetch_url_respects_cancel_event(monkeypatch):
 
 
 def test_search_news_clamps_num_results(monkeypatch):
-    """Low：search_news 的 num_results 钳制上限，防止模型传超大值触发限流。"""
     import core.tools as tools_mod
 
     captured = {}
@@ -3587,7 +3238,6 @@ def test_search_news_clamps_num_results(monkeypatch):
 
 
 def test_glob_files_uses_search_timeout_constant(tmp_path, monkeypatch):
-    """Low：glob_files 的 rg 超时与 search_code 统一为 SEARCH_CODE_TIMEOUT_SECONDS。"""
     import subprocess as _subprocess
     import core.tools as tools_mod
 
@@ -3607,7 +3257,6 @@ def test_glob_files_uses_search_timeout_constant(tmp_path, monkeypatch):
 
 
 def test_subagent_approval_wait_over_limit_is_terminated():
-    """M7：审批等待超过独立上限（300s）即终止任务，不再无限悬挂。"""
     manager = SubagentManager(
         runner=lambda record: record.cancel_event.wait(1),
         monotonic=FakeMonotonic([0.0, 400.0]),
@@ -3624,7 +3273,6 @@ def test_subagent_approval_wait_over_limit_is_terminated():
 
 
 def test_background_subagent_approval_wait_over_limit_is_terminated():
-    """M7：后台看门狗同样执行审批等待上限。"""
     import core.tools as tools_mod
 
     release = threading.Event()
@@ -3645,7 +3293,6 @@ def test_background_subagent_approval_wait_over_limit_is_terminated():
 
 
 def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch):
-    """M8：后台任务启动回显中的内联凭据被脱敏。"""
     monkeypatch.setattr(
         "core.task_manager.start_background_task",
         lambda command, session_id="", turn_id="": "abc12345",
@@ -3661,7 +3308,6 @@ def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch)
 
 
 def test_manage_task_list_redacts_inline_credentials(monkeypatch):
-    """M8：manage_task list 返回的快照 JSON 不含命令字段，内联凭据无回显通道。"""
     import core.tools as tools_mod
     from core.task_manager import TaskStatusSnapshot
 
@@ -3688,13 +3334,8 @@ def test_manage_task_list_redacts_inline_credentials(monkeypatch):
     assert "hunter2" not in result
 
 
-# ---------------------------------------------------------------------------
-# 阶段 B：后台任务 revision 快照 + manage_task(wait) 条件等待
-# ---------------------------------------------------------------------------
-
 @pytest.fixture
 def isolated_task_manager(tmp_path, monkeypatch):
-    """隔离 task_manager 全局状态：日志目录/任务库指向 tmp_path，任务表清空。"""
     import core.task_manager as tm
 
     monkeypatch.setattr(tm, "LOG_DIR", str(tmp_path))
@@ -3713,7 +3354,6 @@ def isolated_task_manager(tmp_path, monkeypatch):
 
 
 def _py_cmd(script):
-    """构造经系统 shell 执行的 venv python 短脚本命令（解释器路径加双引号）。"""
     import sys as _sys
 
     return f'"{_sys.executable}" -c "{script}"'
@@ -3749,7 +3389,6 @@ def test_background_task_terminal_transition_bumps_revision_and_exit_code(isolat
     assert snap.status == "failed"
     assert snap.exit_code == 3
     assert snap.revision >= 1
-    # 终态任务保留在快照中，但不出现在 running 列表里
     assert tid in {s.task_id for s in tm.list_task_snapshots()}
     assert tid not in {t["task_id"] for t in tm.list_active_tasks()}
 
@@ -3823,7 +3462,7 @@ def test_wait_returns_terminal_snapshot_immediately(isolated_task_manager):
     rev = tm.get_task_snapshot(tid).revision
 
     started = time.monotonic()
-    snap = tm.wait_task_change(tid, rev, 10)  # revision 未超过 after 也应立即返回
+    snap = tm.wait_task_change(tid, rev, 10)
     elapsed = time.monotonic() - started
 
     assert snap is not None
@@ -3843,7 +3482,6 @@ def test_wait_cancel_event_interrupts_immediately(isolated_task_manager):
         with pytest.raises(KeyboardInterrupt):
             tm.wait_task_change(tid, 0, 30, cancel_event=cancel_event)
 
-        # 等待中途置位同样打断，不伪装超时
         cancel_event2 = threading.Event()
         timer = threading.Timer(0.3, cancel_event2.set)
         timer.start()
@@ -3859,11 +3497,6 @@ def test_wait_cancel_event_interrupts_immediately(isolated_task_manager):
 
 
 def test_background_command_attributes_launching_thread_session(isolated_task_manager):
-    """后台命令任务归属：发起回合的线程绑定优先于进程级"UI 当前查看的会话"。
-
-    回归：GUI 草稿会话首条消息流程不更新进程级 current_session，旧实现兜底
-    取它导致 A 会话发起的后台命令总结被误注入 B 会话（B 是切换前真实会话）。
-    """
     import re as _re
 
     import core.app_context as app_context
@@ -3892,7 +3525,6 @@ def test_background_command_attributes_launching_thread_session(isolated_task_ma
 
 
 def test_background_command_falls_back_to_visible_session(isolated_task_manager):
-    """无线程绑定时（CLI 主流程）保持原行为：兜底进程级当前会话。"""
     import re as _re
 
     import core.app_context as app_context
@@ -3933,7 +3565,7 @@ def test_manage_task_status_and_list_return_stable_json(isolated_task_manager):
         assert status_payload["terminal"] is False
         assert status_payload["exit_code"] is None
         assert "output" in status_payload
-        assert "changed" not in status_payload  # status 省略 changed 键（wait 必含）
+        assert "changed" not in status_payload
 
         list_payload = json.loads(manage_task("list"))
         entry = next(t for t in list_payload["tasks"] if t["task_id"] == tid)
@@ -3942,7 +3574,6 @@ def test_manage_task_status_and_list_return_stable_json(isolated_task_manager):
     finally:
         tm.kill_background_task(tid)
 
-    # 仅剩终态任务时保持旧文案
     assert manage_task("list") == "ℹ 当前没有任何运行中的后台异步任务。"
 
 
@@ -3953,7 +3584,6 @@ def test_manage_task_wait_validates_arguments(isolated_task_manager):
     tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
     try:
         assert manage_task("wait", after_revision=0).startswith("🚨")
-        # 缺省 after_revision 不再报错：按 0 处理（首次等待），无输出时超时返回
         result = manage_task("wait", task_id=tid, timeout_seconds=1)
         assert not result.startswith("🚨")
         assert json.loads(result)["changed"] is False
@@ -3966,7 +3596,6 @@ def test_manage_task_wait_validates_arguments(isolated_task_manager):
 
 
 def test_manage_task_wait_shell_defaults_after_revision_to_zero(isolated_task_manager):
-    """P0-2：shell wait 缺省 after_revision 按 0 处理，阻塞到首条输出出现。"""
     from core.tools import manage_task
 
     tm = isolated_task_manager
@@ -3984,7 +3613,6 @@ def test_manage_task_wait_shell_defaults_after_revision_to_zero(isolated_task_ma
 
 
 def _bridge_manager(monkeypatch, runner):
-    """构造隔离的 SubagentManager 并替换模块单例，供 manage_task 桥接测试使用。"""
     import core.tools as tools_module
 
     manager = SubagentManager(runner=runner, wait_interval=0.02)
@@ -3993,7 +3621,6 @@ def _bridge_manager(monkeypatch, runner):
 
 
 def test_manage_task_status_and_wait_route_subagent(monkeypatch):
-    """P0-1：subagent-* ID 路由到 SubagentManager，wait 终态返回 result 摘要。"""
     import core.tools as tools_module
     from core.tools import manage_task
 
@@ -4010,7 +3637,6 @@ def test_manage_task_status_and_wait_route_subagent(monkeypatch):
     )
     task_id = json.loads(start_result)["task_id"]
     try:
-        # run() 返回只代表启动线程已提交，工作线程置 running 是异步的，需轮询
         assert _wait_until(
             lambda: json.loads(
                 manage_task("status", task_id=task_id)
@@ -4022,7 +3648,7 @@ def test_manage_task_status_and_wait_route_subagent(monkeypatch):
         assert status_payload["status"] == "running"
         assert status_payload["terminal"] is False
         assert status_payload["subagent_type"] == "general"
-        assert "changed" not in status_payload  # status 省略 changed 键（wait 必含）
+        assert "changed" not in status_payload
 
         release.set()
         wait_payload = json.loads(manage_task("wait", task_id=task_id, timeout_seconds=10))
@@ -4037,7 +3663,6 @@ def test_manage_task_status_and_wait_route_subagent(monkeypatch):
 
 
 def test_manage_task_wait_subagent_ignores_after_revision_and_unknown(monkeypatch):
-    """子代理 wait 不要求 after_revision（传入则忽略）；未知 ID 返回未找到。"""
     from core.tools import manage_task
 
     manager = _bridge_manager(monkeypatch, lambda _record: "完成")
@@ -4049,7 +3674,6 @@ def test_manage_task_wait_subagent_ignores_after_revision_and_unknown(monkeypatc
 
 
 def test_manage_task_list_merges_shell_and_subagent(isolated_task_manager, monkeypatch):
-    """list 合并展示两类运行中任务，kind 字段区分 shell 与 subagent。"""
     from core.tools import manage_task
 
     tm = isolated_task_manager
@@ -4072,7 +3696,7 @@ def test_manage_task_list_merges_shell_and_subagent(isolated_task_manager, monke
         assert kinds[sub_tid] == "subagent"
         sub_entry = next(t for t in payload["tasks"] if t["task_id"] == sub_tid)
         assert sub_entry["terminal"] is False
-        assert "result" not in sub_entry  # list 不附结果，收割走 status/wait
+        assert "result" not in sub_entry
     finally:
         release.set()
         manager.shutdown(timeout=5)
@@ -4080,7 +3704,6 @@ def test_manage_task_list_merges_shell_and_subagent(isolated_task_manager, monke
 
 
 def test_manage_task_kill_subagent_uses_cooperative_cancel(monkeypatch):
-    """kill 子代理走协作式 cancel 且保留用户确认；拒绝路径不触碰任务。"""
     import core.tools as tools_module
     from core.tools import manage_task
 
@@ -4096,12 +3719,10 @@ def test_manage_task_kill_subagent_uses_cooperative_cancel(monkeypatch):
         run_in_background=True, timeout_seconds=30,
     ))["task_id"]
     try:
-        # 拒绝路径：不弹确认通过，任务保持运行
         monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *a, **k: False)
         assert manage_task("kill", task_id=task_id).startswith("🚨 用户拒绝")
         assert manager.task_snapshot(task_id).status == "running"
 
-        # 批准路径：协作式取消进入 cancelled 终态
         monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *a, **k: True)
         result = manage_task("kill", task_id=task_id)
         assert result.startswith("✔"), result
@@ -4153,11 +3774,9 @@ def test_background_tasks_fingerprint_tracks_task_state(isolated_task_manager):
     try:
         fp_running = tm.background_tasks_fingerprint()
         assert fp_running != fp_empty
-        # 无任何可观察变化时指纹稳定
         assert tm.background_tasks_fingerprint() == fp_running
     finally:
         tm.kill_background_task(tid)
-    # kill 置 cancelled + bump revision 后指纹变化
     assert tm.background_tasks_fingerprint() != fp_running
 
 
@@ -4321,7 +3940,6 @@ def test_watcher_sync_poll_error_stops_before_a_third_poll(
 
 
 def test_plan_finish_rejects_wrong_turn_non_active_and_queued(monkeypatch):
-    """plan_finish 只接受本回合 active 接管项；其余一律拒绝。"""
     from core.plan import PlanManager, plan_finish
     from core.task_scheduler import TaskScheduler
 
@@ -4351,18 +3969,14 @@ def test_plan_finish_rejects_wrong_turn_non_active_and_queued(monkeypatch):
     ) is not None
 
 
-    # 错误 turn：接管租约绑定 turn-1
     wrong_turn = plan_finish(
         "active", "done", parent_turn_id="turn-2",
     )
     assert wrong_turn.startswith("🚨")
-    # queued 项拒绝
     queued = plan_finish("queued", "done", parent_turn_id="turn-1")
     assert queued.startswith("🚨")
-    # 未接管的普通项拒绝
     plain = plan_finish("plain", "done", parent_turn_id="turn-1")
     assert plain.startswith("🚨")
-    # 缺少运行上下文拒绝
     no_turn = plan_finish("active", "done", parent_turn_id=None)
     assert no_turn.startswith("🚨")
 
@@ -4373,7 +3987,6 @@ def test_plan_finish_rejects_wrong_turn_non_active_and_queued(monkeypatch):
 
 
 def test_plan_finish_schema_hides_runtime_context():
-    """plan_finish 模型可见 schema 只暴露 item_id/result，运行上下文由 adapter 注入。"""
     from core.tool_registry import build_default_registry
 
     schema = (
@@ -4385,7 +3998,6 @@ def test_plan_finish_schema_hides_runtime_context():
 
 
 def test_run_subagent_rejects_oversized_description(monkeypatch):
-    """task_description 超过 6000 字符：明确失败，不截断、不静默改写。"""
     import core.tools as tools_module
 
     result = tools_module.run_subagent(
@@ -4397,7 +4009,6 @@ def test_run_subagent_rejects_oversized_description(monkeypatch):
 
 
 def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
-    """前台子代理硬上限 900 秒：内部调用传 901 返回参数错误，不启动子代理。"""
     import core.tools as tools_module
 
     class UnusedManager:
@@ -4415,7 +4026,6 @@ def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
 
 
 def test_internal_run_subagent_keeps_explicit_foreground_timeout(monkeypatch):
-    """内部 Python 调用仍可在硬上限内显式选择时间预算。"""
     import core.tools as tools_module
 
     received = {}
@@ -4439,7 +4049,6 @@ def test_internal_run_subagent_keeps_explicit_foreground_timeout(monkeypatch):
 
 
 def test_run_subagent_background_still_allows_long_timeout(monkeypatch):
-    """后台模式保留 3600 秒上限：确有长任务时不会误伤后台工作流。"""
     import core.tools as tools_module
 
     bg_manager = SubagentManager(runner=lambda record: "完成")
@@ -4500,14 +4109,6 @@ def test_foreground_waits_for_failed_terminal_callback_before_returning():
     assert len(results) == 1
 
 
-# ---------------------------------------------------------------------------
-# 子代理部分工具失败不应一票否决整任务
-# ---------------------------------------------------------------------------
-# 历史问题：_run_default_subagent 把 ok=False 的 tool_finished 记进 tool_errors，
-# _run_task 里 `elif task.tool_errors:` 直接把整任务判 failed 并丢弃 result。
-# 于是子代理只要有一个工具报错（如 edit_file 打在不存在的文件上返回 🚨），
-# 整任务失败、成果全丢。修复：有成功工具调用时降级为结果尾部告警。
-
 def test_subagent_partial_tool_failure_still_completes():
     conclusion = "已完成 core/tools.py 的改动，共修改 3 处，验证命令通过。" * 6
 
@@ -4539,16 +4140,8 @@ def test_edit_file_missing_file_suggests_write_file():
 
 
 def test_subagent_edit_file_missing_file_suggests_write_file():
-    """别名入口：让 `pytest -k subagent` 也能覆盖 edit_file 缺文件的提示。"""
     test_edit_file_missing_file_suggests_write_file()
 
-
-# ---------------------------------------------------------------------------
-# 子代理超时/取消不再丢弃已产出正文
-# ---------------------------------------------------------------------------
-# 历史问题：正文只写 task.result，_terminate 只写 error。子代理线程返回正文
-# 时若 cancel_event 已置位（超时/取消），result 被整块丢弃，主 Agent 只看到
-# "foreground timeout"，无法判断成果是否已落地（文件可能已经改完）。
 
 def test_subagent_timeout_salvages_partial_result():
     body = "已完成的现场：" + "改动 core/tools.py 并跑通验证。" * 12
@@ -4565,13 +4158,6 @@ def test_subagent_timeout_salvages_partial_result():
     assert body in snapshot.partial_result
     assert "已完成的部分" in result
 
-
-# ---------------------------------------------------------------------------
-# 回合级中止原因（无进展熔断/轮次上限）不再被静默吞掉
-# ---------------------------------------------------------------------------
-# 历史问题：熔断只走 _notify_event(..., "turn_error", ...) 后 return，不 yield
-# 正文；_run_default_subagent 的事件循环收到 turn_error 却不处理，最终只留下
-# "subagent returned no public answer"，真实原因丢失。
 
 def test_subagent_captures_turn_error_event(monkeypatch):
     import core.llm as llm_mod
@@ -4593,13 +4179,6 @@ def test_subagent_captures_turn_error_event(monkeypatch):
     assert "连续 12 轮" in result
 
 
-# ---------------------------------------------------------------------------
-# 熔断/轮次上限中止后不再白打一次总结续写请求
-# ---------------------------------------------------------------------------
-# 历史问题：summary_continuation 只查 cancel_event，而熔断不置位 cancel_event；
-# 修复前续写产出还有机会救回任务，修复后 turn_error 一律判 failed，
-# 这次续写请求的产出只能以截断 partial 出现在失败文本里，纯浪费。
-
 def test_subagent_turn_error_skips_summary_continuation(monkeypatch):
     import core.llm as llm_mod
     from core.turn_events import TurnEvent
@@ -4620,15 +4199,8 @@ def test_subagent_turn_error_skips_summary_continuation(monkeypatch):
 
     assert manager.snapshot()[0].status == "failed"
     assert "连续 12 轮" in result
-    # 正文为空必然满足续写长度条件：只允许主循环这一次请求
     assert len(calls) == 1
 
-
-# ---------------------------------------------------------------------------
-# 事件循环中途抛异常时尾部正文也要打捞
-# ---------------------------------------------------------------------------
-# 历史问题：runner 抛异常（如网络中断）会跳过事件循环后的最终打捞，
-# 周期 flush 只保到最后一个 2000 字符边界，尾部不足 2000 的正文丢失。
 
 def test_subagent_partial_salvaged_when_event_loop_raises(monkeypatch):
     import core.llm as llm_mod
@@ -4653,10 +4225,6 @@ def test_subagent_partial_salvaged_when_event_loop_raises(monkeypatch):
     assert "core/foo.py" in result
 
 
-# ---------------------------------------------------------------------------
-# 头截断保尾规则统一：_foreground_result 与 task_tool status 共用 helper
-# ---------------------------------------------------------------------------
-
 def test_truncate_subagent_result_keeps_warning_footer():
     from core.tools import SUBAGENT_WARNING_MARKER, _truncate_subagent_result
 
@@ -4673,10 +4241,8 @@ def test_truncate_subagent_result_keeps_warning_footer():
 
     assert "edit_file: 文件不存在：core/foo.py" in out
     assert "省略" in out and "字符]" in out
-    # 截断说明插在正文与告警块之间，不重复、不重叠
     assert out.index("... [子代理结果已截断") < out.index(SUBAGENT_WARNING_MARKER)
 
-    # 无告警尾时退化为普通头截断，省略数正确
     plain = _truncate_subagent_result(
         "y" * 20000, 16000, "\n\n... [省略 {omitted} 字符]"
     )
@@ -4684,47 +4250,34 @@ def test_truncate_subagent_result_keeps_warning_footer():
     assert "省略 4000 字符" in plain
     assert SUBAGENT_WARNING_MARKER not in plain
 
-    # 未超长原样返回
     assert _truncate_subagent_result("short", 16000, "省略 {omitted}") == "short"
 
-# ── 子代理时间预算：软着陆提醒与超时交付增强 ──────────────────────────────
-
-
 def test_subagent_budget_notice_thresholds_and_dedup():
-    """预算提醒按 25% / 10% 两级触发，同一级别只发一次；不越级重复轰炸。"""
     from core.tools import build_subagent_budget_notice
 
-    # 预算充足：不提醒
     assert build_subagent_budget_notice(600, 600, 0) == (0, None)
     assert build_subagent_budget_notice(151, 600, 0) == (0, None)
 
-    # 跨过 25%（max(90, 150) = 150）：收尾提醒，级别 1
     level, text = build_subagent_budget_notice(150, 600, 0)
     assert level == 1
     assert "时间预算提醒" in text and "600s" in text and "150s" in text
 
-    # 级别 1 已发：同一阈值不再重复
     assert build_subagent_budget_notice(140, 600, 1) == (1, None)
 
-    # 跨过 10%（max(45, 60) = 60）：终止提醒，级别 2
     level, text = build_subagent_budget_notice(60, 600, 1)
     assert level == 2
     assert "时间预算即将耗尽" in text
 
-    # 级别 2 已发：不再提醒
     assert build_subagent_budget_notice(20, 600, 2) == (2, None)
 
-    # 短预算任务：10% 阈值有 45s 下限，30s 直接进终止提醒
     level, text = build_subagent_budget_notice(30, 300, 0)
     assert level == 2 and "即将耗尽" in text
 
-    # 非法输入不抛异常
     assert build_subagent_budget_notice(0, 0, 0) == (0, None)
     assert build_subagent_budget_notice("bad", 600, 0) == (0, None)
 
 
 def test_subagent_timeout_failure_text_delivers_partial_and_progress():
-    """超时交付：部分产出按完整上限给到主 Agent，并附进度与"不要重做"指引。"""
     from core.tools import (
         SUBAGENT_PARTIAL_DELIVERY_MAX_CHARS,
         SubagentManager,
@@ -4752,7 +4305,6 @@ def test_subagent_timeout_failure_text_delivers_partial_and_progress():
     assert "预算 900s" in text
     assert "不要从头重做" in text
     assert "部分产出已截断" in text
-    # 交付量必须接近最终结果上限，而不是旧的 1500 字符
     assert len(text) > 10000
     assert len(text) < len(task.partial_result)
 
@@ -4774,6 +4326,5 @@ def test_subagent_timeout_without_partial_still_guides_direct_completion():
     )
     text = manager._format_failure_text(task)
 
-    # 无部分产出时引导直接用自身工具完成，而不是"接着 partial 做"
     assert "直接用自身工具完成" in text
     assert "不要从头重做" not in text

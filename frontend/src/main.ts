@@ -2,7 +2,6 @@ import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import './style.css';
 import './themes/field-notes.css';
-// 内置 QQ2009 皮肤的专属质感层（渐变标题栏/橙色悬停等平色 token 表达不了的效果）
 import './themes/qq2009.css';
 import App from './App.vue';
 import { applyBootTheme } from './themes/runtime';
@@ -17,7 +16,7 @@ import { loadChatLayoutWidth } from './composables/chatLayoutWidth';
 // 六位 HEX，不把片段内容作为 CSS 或 HTML 注入。
 try {
   applyBootTheme(location.hash, document.body);
-} catch { /* 保持默认深色 */ }
+} catch { }
 
 // 全屏玻璃层与对话栏宽偏好：必须在 mount 之前应用，避免首帧闪回旧尺寸/无玻璃。
 loadAppGlass();

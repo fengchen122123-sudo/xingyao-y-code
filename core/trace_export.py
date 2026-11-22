@@ -1,27 +1,3 @@
-"""core/trace_export.py — 审计/排障轨迹导出（T5，借鉴 Codex rollout-trace）。
-
-把 harness journal（turns/steps/events 的 ID 与元数据）、`/doctor` 聚合自检
-结果与 GUI 运行日志尾部打成一个 zip 诊断包，供报障与审计。
-
-设计约束（实施计划与验收清单 · T5）：
-- 默认"精简模式"不含任何消息正文；`full=True` 追加会话消息导出，且必须
-  配合显式确认参数（confirm=True），调用方（CLI）还须完成交互确认；
-  包内文本（messages / doctor.json / logs）统一经 `_redact_bundle_text` 脱敏：
-  复用 `core.share._redact_export_text` 的密钥规则，并把本机用户目录路径
-  替换为 `<HOME>`（审查报告 A2-02）；
-- harness 记录遵循 Harness 纪律：只含 ID 与元数据（sha256 / 计数 / 时长等），
-  不落消息正文；
-- 单项缺失/失败（无日志文件、无 MemoryManager、doctor 抛异常）优雅降级：
-  仍产出 zip，并把原因记入 manifest.errors；
-- 不引入第三方依赖（仅标准库 + 项目既有模块）。
-
-包结构：
-    manifest.json   版本/平台/时间范围/会话/文件清单/降级记录
-    journal.jsonl   harness turns/steps/events 逐行 JSON（含回合 ID）
-    doctor.json     core.doctor.run_checks 的结果（数组，schema 同 --json，已脱敏）
-    messages.jsonl  仅 full 模式：经脱敏的会话消息（role/content）
-    logs/           GUI 运行日志尾部（gui-runtime.log 存在才打包，已脱敏）
-"""
 from __future__ import annotations
 
 import json
@@ -43,7 +19,6 @@ BUNDLE_FORMAT_VERSION = 1
 
 
 def _gui_runtime_log_path() -> Path:
-    """GUI 运行日志路径（跟随 YCODE_DATA_DIR 覆盖，与既有日志约定一致）。"""
     try:
         import config
 
@@ -54,7 +29,6 @@ def _gui_runtime_log_path() -> Path:
 
 
 def _safe_fragment(value: str) -> str:
-    """把会话名等自由文本收敛为可放进文件名的片段。"""
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value or ""))
 
 
@@ -91,7 +65,6 @@ def _redact_bundle_text(value) -> str:
 
 
 def _collect_journal(session_name: str) -> tuple[list[dict], str]:
-    """收集 harness journal 记录；失败时返回 (空列表, 错误说明)。"""
     from core import app_context
 
     manager = app_context.get_manager()
@@ -104,7 +77,6 @@ def _collect_journal(session_name: str) -> tuple[list[dict], str]:
 
 
 def _collect_doctor() -> tuple[list[dict], str]:
-    """收集 doctor 检查结果（数组 schema 同 /doctor --json）；失败隔离。"""
     from core.doctor import run_checks
 
     try:
@@ -191,16 +163,6 @@ def export_diagnostics_bundle(
     full: bool = False,
     confirm: bool = False,
 ) -> str:
-    """导出一份诊断包 zip，返回 zip 路径。
-
-    参数：
-    - dest_dir：包输出目录（不存在时创建）。
-    - session_name：会话名；指定时 journal 只含该会话的回合轨迹，
-      为空时导出全部会话的 harness 轨迹。
-    - full：True 时追加 messages.jsonl（消息正文，经脱敏）；默认精简模式。
-    - confirm：full=True 必须显式确认（调用方完成交互确认后传入），
-      否则抛 ValueError —— 防止误把会话正文写进诊断包。
-    """
     if full and not confirm:
         raise ValueError(
             "full=True 需要显式确认（confirm=True）：诊断包将包含会话消息正文"

@@ -6,7 +6,6 @@
         <button class="rdb-close" data-test="rdb-close" @click="store.closeRemoteDirBrowser()">✕</button>
       </div>
 
-      <!-- 当前路径 + 返回上级 -->
       <div class="rdb-pathbar">
         <button
           v-if="!store.remoteDirBrowser.isRoot"
@@ -63,7 +62,6 @@ function enterDir(d: { name: string; path: string }) {
 }
 
 function goUp() {
-  // 取当前路径的父目录；盘符根（如 C:\）时回盘符列表
   const cur = store.remoteDirBrowser.current;
   if (!cur) return;
   const norm = cur.replace(/[\\/]+$/, '');
@@ -123,7 +121,7 @@ function onConfirm() {
 .rdb-path {
   font-size: 12px; color: var(--xy-text-3, #888);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  direction: rtl; text-align: left; /* 长路径时显示尾部（当前目录名） */
+  direction: rtl; text-align: left;
 }
 .rdb-list { flex: 1; overflow-y: auto; padding: 6px 10px; min-height: 200px; }
 .rdb-hint { padding: 24px 0; text-align: center; color: var(--xy-text-3, #999); font-size: 13px; }

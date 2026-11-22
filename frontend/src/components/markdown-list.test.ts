@@ -8,7 +8,6 @@ describe('renderMarkdown 有序列表', () => {
     expect(html).toContain('<li>方案A</li>');
     expect(html).toContain('<li>方案B</li>');
     expect(html).toContain('<li>方案C</li>');
-    // 连续列表只有一个 <ol>，浏览器自动递增编号
     expect(html.match(/<ol/g)?.length).toBe(1);
   });
 

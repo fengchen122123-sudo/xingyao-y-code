@@ -23,35 +23,12 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { ICON_PATHS } from './iconPaths';
 import { splitRefSegments, refDisplayName, type RefKind } from '../utils/composerRefs';
 
-/**
- * 富文本输入框：把 @ 引用、/ 技能与斜杠命令渲染成真正的胶囊（带图标、整块选中、退格一次全删）。
- *
- * 为什么不是 textarea：textarea 是纯文本控件，既不能给某几个字符加背景，
- * 也不能让「一个引用」成为不可分割的单元。所以这里用 contenteditable，
- * DOM 里只有两种节点——普通文本节点与 `contenteditable="false"` 的胶囊元素，
- * 对外（父组件的 composerText / 后端）始终是 `@{会话名}`、`@路径`、`/short_id`、`/命令` 这样的纯文本：
- *
- *   文本 → DOM：splitRefSegments 切段，引用段渲染成胶囊（data-cref 存原始 token）
- *   DOM → 文本：遍历子节点，文本节点取文本、胶囊取 data-cref，逐字符拼回
- *
- * 三条硬约束：
- * 1. 胶囊的原始 token 存在 data-cref 上，DOM 里显示的名字（refDisplayName）只是
- *    标签，任何改标签的行为都不能影响序列化结果。
- * 2. 输入法组词期间不写 DOM、不提交文本（compositionend 才提交），否则会把
- *    组词中的拼音/候选打断。
- * 3. 浏览器可能自己插入 <div>/<br>（例如未被拦截的回车），序列化时按换行兜底，
- *    并在 commit 时做一次「结构规范化」重建，避免脏结构越积越多。
- */
 const props = defineProps<{
   modelValue: string;
   placeholder?: string;
-  /** 固定高度（px）；null/undefined 走 CSS 最小高度 + 内容撑高 */
   height?: number | null;
-  /** 最小高度（px），默认 46（约两行） */
   minHeight?: number;
-  /** 已启用且未与内置命令重名的技能 short_id 列表，供识别技能胶囊 */
   skillIds?: string[];
-  /** 内置斜杠命令名称列表（如 goal / fix），供识别命令胶囊 */
   commandIds?: string[];
 }>();
 
@@ -60,13 +37,11 @@ const emit = defineEmits<{
   input: [];
   keydown: [event: KeyboardEvent];
   submit: [];
-  // 剪贴板里带文件（截图/图片）时交回父组件走附件流程，本组件只管纯文本
   paste: [event: ClipboardEvent];
 }>();
 
 const CHIP_CLASS = 'ce-chip';
 
-// 胶囊图标：复用项目图标库里的 path 数据（对话气泡 / 文档 / 技能星盘 / 斜杠命令）
 const CHIP_ICON: Record<RefKind, string> = {
   session: ICON_PATHS['message-square'],
   file: ICON_PATHS.file,
@@ -83,7 +58,6 @@ const CHIP_TITLE: Record<RefKind, string> = {
 
 const elRef = ref<HTMLElement | null>(null);
 const isEmpty = ref(!props.modelValue);
-// 输入法组词中：不重建 DOM、不提交文本，等 compositionend
 let composing = false;
 
 const rootStyle = computed(() => {
@@ -117,8 +91,6 @@ function collect(node: Node): string {
       out += '\n';
       return;
     }
-    // 浏览器在未拦截的回车下会插块级元素，按「换行 + 内容」处理并在下次
-    // 提交时规范化掉
     if (child.nodeName === 'DIV' || child.nodeName === 'P') {
       out += '\n' + collect(child);
       return;
@@ -156,7 +128,6 @@ function createChip(raw: string, kind: RefKind): HTMLElement {
   return chip;
 }
 
-/** 文本 → DOM（只由外部赋值/规范化调用，输入过程中不调用） */
 function render(text: string) {
   const el = elRef.value;
   if (!el) return;
@@ -170,7 +141,6 @@ function render(text: string) {
   isEmpty.value = text.length === 0;
 }
 
-/** 文本坐标（相对整个编辑内容）→ DOM 位置 */
 function locatePoint(root: HTMLElement, offset: number): { node: Node; offset: number } {
   let acc = 0;
   const kids = Array.from(root.childNodes);
@@ -182,7 +152,6 @@ function locatePoint(root: HTMLElement, offset: number): { node: Node; offset: n
         const max = (child.textContent || '').length;
         return { node: child, offset: Math.max(0, Math.min(offset - acc, max)) };
       }
-      // 落在胶囊/换行上：定位到该节点之前
       return { node: root, offset: i };
     }
     acc += len;
@@ -190,7 +159,6 @@ function locatePoint(root: HTMLElement, offset: number): { node: Node; offset: n
   return { node: root, offset: kids.length };
 }
 
-/** DOM 位置 → 文本坐标 */
 function offsetOfPoint(root: Node, container: Node, offset: number): number {
   let acc = 0;
   function walk(node: Node): boolean {
@@ -274,7 +242,6 @@ function selectNode(node: Node) {
   sel.addRange(range);
 }
 
-/** 在光标处插入纯文本（换行用 \n，pre-wrap 下正常成行） */
 function insertText(text: string) {
   const el = elRef.value;
   if (!el) return;
@@ -296,7 +263,6 @@ function insertText(text: string) {
   sel!.addRange(range);
 }
 
-/** 存在浏览器自插的块级/换行结构时重建一次，保持文本↔DOM 双向稳定 */
 function normalizeIfNeeded() {
   const el = elRef.value;
   if (!el) return;
@@ -332,8 +298,6 @@ function onInput() {
 
 function onCompositionStart() {
   composing = true;
-  // 占位文案是 .is-empty::before，会占在光标前面。组词一开始就收起，
-  // 不等 compositionend（回车确认候选）才消失；取消组词后由 commit 按实际内容恢复。
   isEmpty.value = false;
 }
 
@@ -348,7 +312,6 @@ function onBlur() {
     commit();
     return;
   }
-  // 失焦时把可能的脏结构一次性规范化（不影响输入过程）
   normalizeIfNeeded();
 }
 
@@ -360,7 +323,6 @@ function onPaste(e: ClipboardEvent) {
     emit('paste', e);
     return;
   }
-  // 纯文本粘贴：拒绝富文本，外部 span/style 会污染编辑器结构
   e.preventDefault();
   const text = e.clipboardData?.getData('text/plain') ?? '';
   if (!text) return;
@@ -368,20 +330,19 @@ function onPaste(e: ClipboardEvent) {
   commit();
 }
 
-/** 光标紧邻的胶囊（dir=-1 取光标前一个，dir=1 取后一个） */
 function adjacentChip(dir: -1 | 1): HTMLElement | null {
   const el = elRef.value;
   const sel = document.getSelection();
   if (!el || !sel || !sel.rangeCount) return null;
   const range = sel.getRangeAt(0);
-  if (!range.collapsed) return null; // 有选区交给其他处理或浏览器
+  if (!range.collapsed) return null;
 
   const node = dir === -1 ? range.startContainer : range.endContainer;
   const offset = dir === -1 ? range.startOffset : range.endOffset;
 
   if (node.nodeType === Node.TEXT_NODE) {
     const text = node.textContent || '';
-    if (dir === -1 && offset > 0) return null; // 光标在文本中间，正常删字
+    if (dir === -1 && offset > 0) return null;
     if (dir === 1 && offset < text.length) return null;
     let sibling: Node | null = dir === -1 ? node.previousSibling : node.nextSibling;
     while (sibling && sibling.nodeType === Node.TEXT_NODE && !(sibling.textContent || '')) {
@@ -406,7 +367,6 @@ function adjacentChip(dir: -1 | 1): HTMLElement | null {
   return null;
 }
 
-/** 点选整块胶囊后按退格/Delete：整块删除并收拢光标 */
 function deleteSelectedChip(): boolean {
   const el = elRef.value;
   const sel = document.getSelection();
@@ -433,7 +393,6 @@ function deleteSelectedChip(): boolean {
   return true;
 }
 
-/** 删掉胶囊并把光标放到它原来的位置；返回是否已处理 */
 function deleteAdjacentChip(dir: -1 | 1): boolean {
   const chip = adjacentChip(dir);
   const el = elRef.value;
@@ -457,7 +416,6 @@ function onKeydown(e: KeyboardEvent) {
   const isComposing = composing || e.isComposing || e.keyCode === 229;
   if (isComposing) return;
 
-  // 先让父组件跑补全导航与发送判定（Enter 发送由父组件 preventDefault 接管）
   emit('keydown', e);
   // 父组件接管按键时（如 Enter 发送清空 v-model、Tab/Enter 补全替换、方向键导航），
   // Vue 尚未把新 modelValue 刷回 DOM，此时绝不能再调 commit()，否则会把 DOM 里的
@@ -483,7 +441,6 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-/** 点胶囊 → 整块选中（再按退格/Delete 就是整个删掉） */
 function onMouseDown(e: MouseEvent) {
   const target = e.target as HTMLElement | null;
   const chip = target?.closest?.(`.${CHIP_CLASS}`) as HTMLElement | null;
@@ -498,7 +455,6 @@ watch(
   value => {
     const el = elRef.value;
     if (!el) return;
-    // 自己在 commit 里发出的值不该触发重建（重建会打断光标/输入法）
     if (collect(el) === value) return;
     if (composing) return;
     render(value || '');
@@ -542,8 +498,6 @@ watch(
 
 onMounted(() => render(props.modelValue || ''));
 
-// 供 useSuggest 与父组件使用的鸭子类型控件（与 HTMLTextAreaElement 的三个成员
-// 同名，本组件可以替换 textarea 而 useSuggest 一行都不用改）
 const control = {
   get value() {
     const el = elRef.value;
@@ -570,7 +524,6 @@ defineExpose({ el: elRef, control, insertText, focus: () => elRef.value?.focus()
   min-height: 46px;
   max-height: 100%;
   overflow-y: auto;
-  /* 隐藏滚动条：编辑器内滚动条会挤压内容宽度，与输入框视觉不符 */
   scrollbar-width: none;
   outline: none;
   white-space: pre-wrap;

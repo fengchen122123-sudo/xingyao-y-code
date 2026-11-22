@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""gui_path_access_allowed 的 edit 动作放行矩阵。
-
-edit 与 preview 的规则完全一致（凭据永久拒绝 / GLOBAL 放行 / 工作区内放行 /
-工作区外跟随沙盒开关），只有拒绝文案里的动词不同。
-"""
 import os
 import sys
 
@@ -56,7 +51,6 @@ def test_edit_allowed_outside_workspace_when_sandbox_on(tmp_path, monkeypatch):
 
 
 def test_edit_denied_on_dotdot_traversal(tmp_path, monkeypatch):
-    """工作区内路径经 .. 指向工作区外，realpath 归一化后必须拒绝。"""
     _inject(monkeypatch, tmp_path)
     monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: False)
     ws = tmp_path / "ws"
@@ -71,7 +65,6 @@ def test_edit_denied_on_dotdot_traversal(tmp_path, monkeypatch):
 
 
 def test_edit_credential_config_always_denied(tmp_path, monkeypatch):
-    """凭据文件即使沙盒开启、GLOBAL 会话也必须拒绝，且文案随动作变化。"""
     ydata = tmp_path / "ydata"
     ydata.mkdir()
     monkeypatch.setattr(gpp, "_ycode_dir_override", str(ydata))
@@ -84,7 +77,6 @@ def test_edit_credential_config_always_denied(tmp_path, monkeypatch):
 
 
 def test_preview_action_noun_unchanged(tmp_path, monkeypatch):
-    """回归：原有 preview / open 文案不能被改动。"""
     _inject(monkeypatch, tmp_path)
     monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: False)
     ws = tmp_path / "ws"

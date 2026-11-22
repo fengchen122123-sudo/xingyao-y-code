@@ -12,7 +12,6 @@ from core.memory import MemoryManager
 
 
 def _ts_of(date_str):
-    """把 YYYY-MM-DD 转成本地时区当天中午的秒级时间戳，避免凌晨/时区边界。"""
     return int(time.mktime(time.strptime(date_str + " 12:00:00", "%Y-%m-%d %H:%M:%S")))
 
 
@@ -87,7 +86,6 @@ def test_add_and_query_token_usage_grouped_by_model():
 
     rows = manager.query_token_usage_by_model("2026-08-05", "2026-08-05")
     assert len(rows) == 2
-    # 按合计降序：deepseek 在前
     assert rows[0]["model"] == "deepseek-v4-pro"
     assert rows[0]["provider"] == "openai"
     assert rows[0]["prompt"] == 4000
@@ -231,12 +229,10 @@ def test_query_token_usage_date_range_filter():
     manager.add_token_usage("openai", "m1", 200, 20, 0, 220, ts=_ts_of("2026-08-05"))
     manager.add_token_usage("openai", "m1", 300, 30, 0, 330, ts=_ts_of("2026-08-09"))
 
-    # 近 7 天口径：只含 08-05 与 08-09，不含 08-01
     rows = manager.query_token_usage_by_model("2026-08-03", "2026-08-09")
     assert len(rows) == 1
     assert rows[0]["total"] == 550
 
-    # 区间外无数据
     assert manager.query_token_usage_by_model("2026-09-01", "2026-09-30") == []
 
 
@@ -290,7 +286,6 @@ def test_persist_token_usage_splits_provider_and_model(monkeypatch):
 
 
 def test_persist_token_usage_without_manager_or_on_error(monkeypatch):
-    # 无 manager 时静默返回，不抛异常
     monkeypatch.setattr(app_context, "get_manager", lambda: None)
     _persist_token_usage("openai/m1", 1, 1, 0, 2)
 
@@ -345,24 +340,20 @@ def test_parse_usage_date_args_too_many():
 
 def test_term_display_width():
     assert main._term_display_width("k3-256k") == 7
-    assert main._term_display_width("模型") == 4   # 2 个中文字符 = 4 格
+    assert main._term_display_width("模型") == 4
     assert main._term_display_width("缓存命中") == 8
     assert main._term_display_width("a中b") == 4
 
 
 def test_pad_left_and_right_by_display_width():
-    # 中文表头右对齐到 14 格：8 格内容 + 6 格前导空格
     assert main._pad_left("缓存命中", 14) == "      缓存命中"
     assert main._pad_left("输入", 14) == "          输入"
-    # 左对齐补齐
     assert main._pad_right("模型", 12) == "模型        "
     assert main._pad_right("k3-256k", 12) == "k3-256k     "
-    # 超出目标宽度时不截断、不加空格
     assert main._pad_left("123456789012345", 14) == "123456789012345"
 
 
 def test_usage_model_label_shows_provider_and_model_only():
-    """用量表标签只显示 provider/model，不带接口域名/path 哈希/作用域后缀。"""
     assert main._usage_model_label({
         "provider": "openai",
         "model": "deepseek-v4-flash",
@@ -414,14 +405,10 @@ def test_query_cache_invalidation_events():
     manager = MemoryManager(":memory:")
     today = _ts_of("2026-08-05")
     main = {"api_base": "https://api.example/v1", "cache_scope": "main"}
-    # 大输入低命中 -> 失效事件
     manager.add_token_usage("openai", "m1", 50000, 100, 3000, 50100, ts=today, **main)
     manager.add_token_usage("openai", "m1", 80000, 100, 0, 80000, ts=today, **main)
-    # 大输入高命中 -> 不算
     manager.add_token_usage("openai", "m1", 60000, 100, 59000, 60100, ts=today, **main)
-    # 小输入低命中 -> 不算（低于 min_prompt_tokens 阈值）
     manager.add_token_usage("openai", "m1", 5000, 100, 0, 5100, ts=today, **main)
-    # 后台大输入低命中不得污染主链路失效数。
     manager.add_token_usage(
         "openai", "m1", 90000, 1, 0, 90001, ts=today,
         api_base="https://api.example/v1", cache_scope="keepalive",
@@ -433,7 +420,6 @@ def test_query_cache_invalidation_events():
     assert inv["count"] == 2
     assert inv["lost_tokens"] == (50000 - 3000) + (80000 - 0)
 
-    # 区间外无事件
     inv2 = manager.query_cache_invalidation_events(
         "2026-09-01", "2026-09-30", cache_scope="main"
     )
@@ -441,7 +427,6 @@ def test_query_cache_invalidation_events():
 
 
 def test_get_last_token_usage_returns_latest_per_session():
-    """取指定会话最近一次真实用量；无记录返回 None（供真实基线口径）。"""
     manager = MemoryManager(":memory:")
     assert manager.get_last_token_usage("s1") is None
 
@@ -548,14 +533,7 @@ def test_format_cache_diagnostic_summary_omits_empty_summary():
     }) == ""
 
 
-# —— 跨渠道缓存命中率修复 · Task 4：口径修复与展示 ——
-
 def test_status_cache_metrics_take_current_lane_hot_rate_not_process_mix():
-    """状态栏主指标 = 当前会话 × 当前车道的热命中率：跨渠道切换不串数。
-
-    阿里云车道 4 轮 950/1000 = 95%，基元律动车道 2 轮 100/1000 = 10%；
-    进程级累计混算会是 66.6%。这里断言两个具体数字，杜绝回到混算口径。
-    """
     import core.llm as llm
 
     session, model = "task4-lane-switch", "openai/deepseek-v4.1-flash"
@@ -576,7 +554,6 @@ def test_status_cache_metrics_take_current_lane_hot_rate_not_process_mix():
 
 
 def test_status_cache_metrics_keep_keepalive_scope_out_of_main():
-    """保活不污染 main：keepalive 低命中轮次绝不动 main 指标，且自身单独可得。"""
     import core.llm as llm
 
     session, model = "task4-keepalive-isolation", "openai/deepseek-v4.1-flash"
@@ -590,18 +567,15 @@ def test_status_cache_metrics_keep_keepalive_scope_out_of_main():
     after = main._status_cache_metrics(session, model, base)
 
     assert before["hot_rate"] == 95.0
-    # §1.7 的 11.5pp 假跌：保活 0 命中不得把 main 从 95% 拖下来
     assert after["hot_rate"] == 95.0
     assert after["hot_prompt"] == 4000
     assert after["hot_cached"] == 3800
-    # 保活自身指标单独可得
     assert after["keepalive_rate"] == 0.0
     assert after["keepalive_prompt"] == 60000
     assert after["keepalive_cached"] == 0
 
 
 def test_status_cache_metrics_unreported_lane_is_none_not_zero():
-    """铁律「未报告 ≠ 0」：usage_valid=0 的车道指标为 None，不冒充 0% 命中。"""
     import core.llm as llm
 
     session, model = "task4-unreported", "openai/local-vllm"
@@ -614,12 +588,10 @@ def test_status_cache_metrics_unreported_lane_is_none_not_zero():
 
     assert metrics["hot_rate"] is None
     assert metrics["session_rate"] is None
-    # 已报告的累计分母不因「最新一轮未报告」而丢失
     assert metrics["hot_prompt"] == 1000
 
 
 def test_usage_model_label_separates_routes_and_keepalive_scope():
-    """同一模型在不同渠道 / 不同 scope 必须产出不同标签，不再合并成一条。"""
     row = {
         "provider": "openai",
         "model": "deepseek-v4-flash",
@@ -643,14 +615,12 @@ def test_usage_model_label_separates_routes_and_keepalive_scope():
     assert tokenrhythm_label != aliyun_label
     assert keepalive_label != aliyun_label
     assert "[keepalive]" in keepalive_label
-    # 同 model + 同 api_base + 同 scope 标签稳定
     assert main._usage_model_label(
         row, row["api_base"], row["cache_scope"]
     ) == aliyun_label
 
 
 def test_token_usage_snapshot_exposes_per_scope_views_without_changing_cache_keys():
-    """快照新增按 scope 分离视图；现有 cache 键语义不变（仍是当前 scope 视图）。"""
     import core.llm as llm
 
     session, model = "task4-scope-views", "openai/deepseek-v4.1-flash"
@@ -667,13 +637,7 @@ def test_token_usage_snapshot_exposes_per_scope_views_without_changing_cache_key
     assert snapshot["cache_scopes"]["keepalive"]["hot"]["prompt_tokens"] == 1000
 
 
-# ---------------------------------------------------------------------------
-# Task 7（跨渠道缓存命中率修复）：缓存读 / 写分列记账——写入轮 ≠ 未命中
-# ---------------------------------------------------------------------------
-
-
 def test_persist_token_usage_forwards_cache_write_tokens(monkeypatch):
-    """写入量必须透传到落库层；未报告时传 None（绝不冒充 0）。"""
     recorded = {}
 
     class _FakeManager:
@@ -705,12 +669,10 @@ def test_persist_token_usage_forwards_cache_write_tokens(monkeypatch):
         api_base="https://relay.example/v1",
         cache_scope="main",
     )
-    # 未报告时不带该键（既有调用方对 kwargs 做精确断言），落库层默认 None。
     assert recorded.get("cache_write_tokens") is None
 
 
 def test_token_usage_cache_write_tokens_column_keeps_null_vs_zero(tmp_path):
-    """落库语义：未报告 → NULL，已报告 → 真实值（含 0），查询原样返回。"""
     from core.memory import MemoryManager
 
     manager = MemoryManager(str(tmp_path / "token-write.db"))
@@ -736,7 +698,6 @@ def test_token_usage_cache_write_tokens_column_keeps_null_vs_zero(tmp_path):
 
 
 def test_extract_cache_write_tokens_candidates_and_unreported():
-    """写入量候选名三形态；未报告 → None（写入轮 ≠ 未命中，绝不冒充 0）。"""
     from core.llm_diagnostics import _extract_cache_write_tokens
 
     assert _extract_cache_write_tokens(None) is None
@@ -746,20 +707,16 @@ def test_extract_cache_write_tokens_candidates_and_unreported():
     assert _extract_cache_write_tokens(
         {"prompt_tokens_details": {"cache_creation_tokens": 400}}
     ) == 400
-    # details 内嵌优先于直读与 Anthropic 形态
     assert _extract_cache_write_tokens({
         "prompt_tokens_details": {"cache_creation_tokens": 400},
         "cache_write_tokens": 300,
         "cache_creation_input_tokens": 700,
     }) == 400
-    # 报告了 0 是真实 0，与「未报告」严格区分
     assert _extract_cache_write_tokens({"cache_write_tokens": 0}) == 0
-    # 非法值按未报告处理，不猜、不夹断（拒绝口径与 cached_tokens 一致）
     assert _extract_cache_write_tokens({"cache_write_tokens": -1}) is None
 
 
 def test_cache_diagnostic_table_keeps_null_vs_zero_for_cache_write(tmp_path):
-    """诊断表写入量列：未报告 → NULL，已报告 → 真实值（含 0）。"""
     from core.memory import MemoryManager
 
     manager = MemoryManager(str(tmp_path / "diag-write.db"))
@@ -802,7 +759,6 @@ def test_cache_diagnostic_table_keeps_null_vs_zero_for_cache_write(tmp_path):
 
 
 def test_legacy_diagnostic_table_migrates_cache_write_column(tmp_path):
-    """老诊断库缺 cache_write_tokens 时自动补列；老行 NULL；重开幂等。"""
     import sqlite3
 
     from core.memory import MemoryManager
@@ -880,7 +836,6 @@ def test_legacy_diagnostic_table_migrates_cache_write_column(tmp_path):
 
 
 def test_account_server_usage_forwards_cache_write_from_anthropic_shape(monkeypatch):
-    """Anthropic 形态的写入量经记账链落到 persist kwargs；未报告则不带该键。"""
     import core.llm as llm
 
     persisted = []
@@ -930,12 +885,6 @@ def test_account_server_usage_forwards_cache_write_from_anthropic_shape(monkeypa
 
 
 def test_usage_table_keeps_numeric_columns_aligned_for_long_route_labels(monkeypatch):
-    """长渠道标签（模型 @ api_base [scope]）不得撑破列宽上限导致数字列错行。
-
-    本次改动把 api_base / scope 放回标签后，标签宽度可达 80+ 格，而模型列宽
-    上限是 60 且只补齐不压缩——超出的部分会把该行的数字列整体右推，
-    同一张表的表头/数据行/小计再也对不齐。
-    """
     import re
 
     rows = [
@@ -971,16 +920,13 @@ def test_usage_table_keeps_numeric_columns_aligned_for_long_route_labels(monkeyp
     main._render_usage_section(Manager(), "今日", "2026-08-09", "2026-08-09")
 
     lines = [re.sub(r"<[^>]+>", "", line) for line in captured]
-    table_lines = lines[1:]  # 跳过标题行
-    assert len(table_lines) >= 4, lines  # 表头 + 两条数据行 + 小计
-    # 列对齐的等价判据：所有表格行的显示宽度必须一致（列宽固定，
-    # 超宽标签若不压缩就会把该行撑开，于是行宽不再相等）。
+    table_lines = lines[1:]
+    assert len(table_lines) >= 4, lines
     widths = {main._term_display_width(line) for line in table_lines}
     assert len(widths) == 1, (widths, table_lines)
 
 
 def test_status_token_info_reports_process_scope_only():
-    """状态栏只报进程累计口径：「本车道命中」「全局」标签、保活段都已移除。"""
     text = main._compose_status_token_info(
         prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
         ctx_pct="3%", ctx_used="4K", ctx_max="128K",
@@ -994,7 +940,6 @@ def test_status_token_info_reports_process_scope_only():
 
 
 def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():
-    """列宽压缩保留首尾：渠道尾部与 [scope] 标记必须仍然可见。"""
     label = (
         "openai/deepseek-v4.1-flash @ "
         "https://cn-beijing.maas.aliyuncs.com/api/v1 [keepalive]"
@@ -1005,16 +950,13 @@ def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():
     assert cell.startswith("openai/deepseek-v4.1-flash @ h")
     assert cell.endswith("iyuncs.com/api/v1 [keepalive]")
     assert "…" in cell
-    # 不超宽时原样返回，不做任何压缩
     assert main._truncate_visible("a/b", 60) == "a/b"
 
 
 def test_get_token_usage_by_session_aggregates_conversation_and_keepalive_separately():
-    """本会话口径：main/legacy 聚合为主，保活单列；未报告行不进命中率分母。"""
     manager = MemoryManager(":memory:")
     assert manager.get_token_usage_by_session("s1")["prompt"] == 0
 
-    # main 轮次：一轮已报告缓存（cached=5），一轮未报告（cached=None）
     manager.add_token_usage(
         "openai", "m1", 300, 30, 5, 335, session_id="s1",
         api_base="https://a.example/v1", cache_scope="main", ts=1000,
@@ -1023,7 +965,6 @@ def test_get_token_usage_by_session_aggregates_conversation_and_keepalive_separa
         "openai", "m1", 200, 20, None, 220, session_id="s1",
         api_base="https://a.example/v1", cache_scope="main", ts=2000,
     )
-    # legacy 迁移行并入对话口径
     manager.add_token_usage(
         "openai", "m1", 100, 10, 50, 160, session_id="s1", cache_scope="legacy", ts=2500,
     )
@@ -1032,14 +973,12 @@ def test_get_token_usage_by_session_aggregates_conversation_and_keepalive_separa
         "openai", "m1", 10, 1, 10, 11, session_id="s1",
         api_base="https://a.example/v1", cache_scope="keepalive", ts=2600,
     )
-    # 其他会话不串数
     manager.add_token_usage("openai", "m1", 999, 99, 0, 1098, session_id="s2")
 
     totals = manager.get_token_usage_by_session("s1")
     assert totals["prompt"] == 600
     assert totals["completion"] == 60
     assert totals["cached"] == 55
-    # 命中率分母只含已报告缓存明细的行：300 + 100 = 400（200 那轮未报告 ≠ 0）
     assert totals["cache_prompt"] == 400
     assert totals["total"] == 715
     assert totals["requests"] == 3
@@ -1051,11 +990,9 @@ def test_get_token_usage_by_session_aggregates_conversation_and_keepalive_separa
 
 
 def test_list_token_usage_by_sessions_orders_by_total_and_skips_deleted():
-    """会话列表按合计降序、只列现存会话；全部合计不分会话不分 scope。"""
     manager = MemoryManager(":memory:")
     manager.create_session_explicit("live-a")
     manager.create_session_explicit("live-b")
-    # 残留流水行：sessions 表无同名会话（已删/从未存在），不应进列表
     manager.add_token_usage("openai", "m1", 10000, 100, 0, 10100, session_id="deleted")
 
     manager.add_token_usage("openai", "m1", 300, 30, 5, 335, session_id="live-a")
@@ -1069,14 +1006,12 @@ def test_list_token_usage_by_sessions_orders_by_total_and_skips_deleted():
     assert rows[0]["total"] == 335
     assert rows[0]["cache_prompt"] == 300
     assert rows[1]["total"] == 110
-    # 已删会话行不进列表，但进全部合计（真实计费）
     totals = manager.get_token_usage_totals()
     assert totals["prompt"] == 300 + 100 + 10000 + 10
     assert totals["requests"] == 4
 
 
 def test_rename_session_migrates_token_usage_rows_in_same_transaction():
-    """改名必须随迁 token_usage.session_id，否则按会话统计静默丢历史。"""
     manager = MemoryManager(":memory:")
     manager.create_session_explicit("old-name")
     manager.add_token_usage("openai", "m1", 300, 30, 5, 335, session_id="old-name")

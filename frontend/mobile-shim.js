@@ -1,24 +1,5 @@
-/**
- * mobile-shim.js —— 局域网手机远程控制的 transport shim
- *
- * 桌面上 pywebview 注入 window.pywebview.api（RPC）与 window.onBridgeEvent（事件）。
- * 手机上无 pywebview，本 shim 用 WebSocket 模拟这两者，使手机加载同一个 dist 前端、
- * 复用全部组件与主题。
- *
- * 约定（与 core/lan_server.py 对齐）：
- * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验。新服务端会先回
- *   hello，再按 boot_id 决定 seq_reset 或补发。重连附带 last_boot_id 与 last_seq。
- *   hello / seq_reset 不交给 onBridgeEvent。
- * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
- * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
- *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
- * - 配对 token：首次从 URL 参数取并写入 localStorage，随后立即用 history.replaceState
- *   清理地址栏 query（保留 path/hash），token 不残留于浏览器历史/截图/分享链接；
- *   之后刷新/重开（URL 无 token）回退读 localStorage，直到服务端 TTL 过期或被
- *   轮换（4401）才失效。
- */
 (function () {
-  if (window.pywebview) return; // 桌面环境不注入，防御性
+  if (window.pywebview) return;
 
   var STORAGE_KEY = 'yc-pair-token';
   var urlToken = new URLSearchParams(window.location.search).get('token') || '';
@@ -42,7 +23,7 @@
       }
     } catch (_) {}
   }
-  var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
+  var usedToken = token;
   // 云中转的完整桌面 UI / 独立移动端：服务器注入 __ycRelayDevice，直接连网关 relay。
   // 注入值有一个坑：SPA 子路由刷新时服务端会把路由名当设备号注入（/m/convo）。
   // 设备号是 UUID，注入值不像 UUID 就回退到上次记住的 UUID，否则刷新后连接的是假设备。
@@ -91,7 +72,7 @@
 
   var ws = null;
   var seq = 0;
-  var lastSeq = 0;        // 最后收到的补发事件 seq（服务器侧单调递增）
+  var lastSeq = 0;
   var bootId = '';
   var sawHello = false;
   var legacy = false;
@@ -100,8 +81,8 @@
   var held = [];
   var seen = {};
   var refetchOnce = false;
-  var hadConnection = false; // 是否发生过连接：区分全新页面与断线重连
-  var pending = new Map(); // id -> {resolve, reject}
+  var hadConnection = false;
+  var pending = new Map();
 
   function isCapacitor() {
     return !!(window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform());
@@ -265,7 +246,6 @@
         return;
       }
       if (msg && typeof msg.id !== 'undefined') {
-        // RPC 响应
         var p = pending.get(msg.id);
         if (p) {
           pending.delete(msg.id);
@@ -362,7 +342,7 @@
         } catch (_) {}
         return;
       }
-      setTimeout(connect, 2000); // 基础断线重连
+      setTimeout(connect, 2000);
     };
     ws.onerror = function () {};
   }

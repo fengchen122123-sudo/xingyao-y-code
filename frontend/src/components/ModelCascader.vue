@@ -3,7 +3,6 @@
        （composer 分区 z=5，否则往上弹时被 workspace(6)/会话工具栏(10) 盖住） -->
   <Teleport to="body">
     <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
-    <!-- 二级子面板：具体模型列表（窄屏为主面板左侧的独立方盒） -->
     <div ref="subPanelEl" class="cascader-sub-panel" :class="{ show: activeProviderName, 'narrow-side': narrowMode }" :style="subPanelStyle">
       <div
         v-for="m in currentSubModels"
@@ -18,7 +17,6 @@
       </div>
     </div>
 
-    <!-- 一级主面板：供应商列表（窄屏顶部内联当前供应商的模型，ZCode 式） -->
     <div class="cascader-main-panel" :style="mainPanelStyle">
       <template v-if="hasAnyModel">
         <template v-if="narrowMode && currentProviderName">
@@ -79,17 +77,13 @@ const mainPanelStyle = ref<Record<string, string>>({});
 const subPanelStyle = ref<Record<string, string>>({});
 const subPanelEl = ref<HTMLElement | null>(null);
 const opensUp = ref(false);
-// 窄屏（ZCode 式）：主面板窄版靠右、当前供应商模型内联，二级模型列表为
-// 主面板左侧的独立方盒；打开菜单时判定一次
 const narrowMode = ref(false);
-// 记住上次悬停的供应商行：主面板跟随锚点移动时同步重算二级面板位置
 const lastProviderRow = ref<HTMLElement | null>(null);
 let rafId = 0;
 
 const MENU_GAP = 8;
 const VIEWPORT_PADDING = 12;
 const SUB_PANEL_MIN_WIDTH = 240;
-// 1px border + 6px panel padding: aligns the first model row with the provider row.
 const SUB_PANEL_ITEM_INSET = 7;
 
 const groupedModels = computed(() => store.modelsByProvider);
@@ -104,8 +98,6 @@ function isNarrowViewport(): boolean {
   );
 }
 
-// 窄屏双列宽度：左方盒不超 200px（45% 视口），主面板吃掉剩余宽度；
-// 10px 屏边距 x2 + 6px 列间距，两列恰好铺满且永不重叠
 const NARROW_MARGIN = 10;
 const NARROW_GAP = 6;
 function narrowLayout(): { subW: number; mainW: number } {
@@ -115,7 +107,6 @@ function narrowLayout(): { subW: number; mainW: number } {
   return { subW, mainW };
 }
 
-// 当前供应商（按激活模型归属）：窄屏下其模型内联在主面板顶部
 const currentProviderName = computed(() => {
   const current = store.models.find(m => m.id === store.activeModelId);
   return current?.provider_name || null;
@@ -143,8 +134,6 @@ function hasCurrentModel(modelsList: ModelInfo[]) {
   return modelsList.some(m => m.id === store.activeModelId);
 }
 
-// 按当前供应商最长模型名估算子面板宽度（中文按全角 2 倍计），
-// 用于右側放不下时的左翻判断；实测宽度渲染后由 offsetWidth 校正
 function estimateSubPanelWidth(): number {
   let maxUnits = 0;
   for (const m of currentSubModels.value) {
@@ -165,7 +154,6 @@ function positionSubPanel(providerRow: HTMLElement) {
   const mainPanelRect = mainPanel.getBoundingClientRect();
   const top = Math.max(VIEWPORT_PADDING, Math.floor(rowRect.top - SUB_PANEL_ITEM_INSET));
 
-  // 窄屏：主面板左侧的独立方盒（ZCode 式），垂直方向与主面板同侧对齐
   if (narrowMode.value) {
     const { subW } = narrowLayout();
     const left = Math.max(NARROW_MARGIN, Math.floor(mainPanelRect.left - NARROW_GAP - subW));
@@ -203,10 +191,8 @@ function positionSubPanel(providerRow: HTMLElement) {
   let left: number;
   let maxWidth = 0;
   if (panelWidth <= rightSpace) {
-    // 右侧放得下：照常向右展开
     left = rightLeft;
   } else if (panelWidth <= leftSpace) {
-    // 右侧放不下、左侧够宽：翻到主面板左边
     left = Math.floor(mainPanelRect.left - MENU_GAP - panelWidth);
   } else if (rightSpace >= leftSpace) {
     // 两侧都不够：放更宽的一侧并限宽，条目省略号兜底
@@ -258,7 +244,6 @@ function positionMainPanel() {
 
   let left: number;
   if (narrowMode.value) {
-    // 窄屏：主面板窄版靠右（ZCode 式，左侧留给二级方盒）
     const { mainW } = narrowLayout();
     left = Math.max(NARROW_MARGIN, Math.floor(window.innerWidth - NARROW_MARGIN - mainW));
     mainPanelStyle.value = { width: `${mainW}px`, minWidth: '0' };
@@ -288,8 +273,6 @@ function positionMainPanel() {
   }
 }
 
-// 菜单打开期间逐帧跟随锚点：收起/展开右侧面板等布局变化（含 0.25s 过渡动画）
-// 会让锚点持续移动，一次性快照必然过期，导致主/子面板错位层叠
 function trackAnchor() {
   positionMainPanel();
   if (activeProviderName.value && lastProviderRow.value) {
@@ -301,11 +284,9 @@ function trackAnchor() {
 watch(() => props.visible, (newVal) => {
   cancelAnimationFrame(rafId);
   if (newVal && props.anchorEl) {
-    // 先定窄屏模式再定位：主面板宽度/靠右都依赖该标记
     narrowMode.value = isNarrowViewport();
     positionMainPanel();
 
-    // 二级模型列表只在悬停/点选供应商后展开，保持一级列表简洁。
     activeProviderName.value = null;
     subPanelStyle.value = {};
     lastProviderRow.value = null;
@@ -336,8 +317,6 @@ onUnmounted(() => {
   flex-direction: row;
   align-items: flex-start;
   gap: 8px;
-  /* 入场动画在面板上而不在容器：容器动画的 transform 会创建 containing block，
-     使 fixed 定位的二级面板在动画期间相对容器而非视口，表现为短暂错位 */
 }
 #model-cascader.show {
   display: flex;
@@ -347,8 +326,6 @@ onUnmounted(() => {
 }
 .cascader-main-panel,
 .cascader-sub-panel {
-  /* 半透明毛玻璃：以主题浮窗色为基准混入 20% 透明，配合下方 blur 透出
-     全局背景图/分区层（Teleport 后位于所有图层之上，可读性由模糊保证） */
   background: color-mix(in srgb, var(--theme-float-background) 80%, transparent);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -377,7 +354,6 @@ onUnmounted(() => {
 .cascader-sub-panel.narrow-side {
   z-index: 1;
 }
-/* 窄屏主面板顶部内联的当前供应商标题（ZCode 式） */
 .cascader-provider-header {
   padding: 8px 12px 3px;
   font-size: 12px;

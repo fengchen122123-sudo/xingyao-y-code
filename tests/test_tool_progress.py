@@ -148,8 +148,6 @@ def test_finish_without_start_is_visible_as_an_independent_result():
 
 
 def test_background_command_reports_started_not_completed():
-    """D8：run_in_background 启动成功时必须显示"后台任务已启动"，
-    不能显示"命令执行完成"让用户误以为同步执行已结束。"""
     progress = ToolProgressAggregator(clock=lambda: 5.0)
     payload = command_payload("bg-1", "python -c \"import time; time.sleep(60)\"", ok=True)
     payload["display"]["background"] = True
@@ -161,7 +159,6 @@ def test_background_command_reports_started_not_completed():
 
 
 def test_foreground_command_keeps_completed_summary():
-    """前台命令的完成文案不受后台分支影响。"""
     progress = ToolProgressAggregator(clock=lambda: 5.0)
     output = plain(progress.finish(command_payload("fg-1", "pytest -q", ok=True)))
 

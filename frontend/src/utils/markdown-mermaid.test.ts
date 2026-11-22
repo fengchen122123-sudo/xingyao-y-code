@@ -10,7 +10,6 @@ describe('renderMarkdown mermaid 块', () => {
     expect(html).toMatch(/data-state="pending"/);
     expect(html).toContain('<pre class="mermaid-src">flowchart TD');
     expect(html).toContain('mermaid-copy');
-    // 占位容器不进入普通代码块分支
     expect(html).not.toContain('class="code-block"');
   });
 

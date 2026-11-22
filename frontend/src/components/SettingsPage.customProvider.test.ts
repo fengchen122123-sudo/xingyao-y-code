@@ -6,7 +6,6 @@ import SettingsPage from './SettingsPage.vue';
 import { useAppStore } from '../stores/appStore';
 import type { ProviderInfo } from '../types/pywebview';
 
-// 只关心厂商新增表单自身行为，子组件全部 stub
 const stubs = {
   AppIcon: true,
   TokenUsageSettings: true,
@@ -37,7 +36,6 @@ function fieldValue(wrapper: VueWrapper, testId: string) {
 }
 
 function submitCustomForm(wrapper: VueWrapper) {
-  // 左侧展开按钮文本同为「添加厂商」，这里按提交按钮的 class 精确定位
   const submit = wrapper.find('button.primary-button');
   expect(submit.exists(), '「添加厂商」提交按钮应存在').toBeTruthy();
   return submit.trigger('click');
@@ -59,7 +57,6 @@ it('保存自定义厂商后再次打开表单，不残留上一次填写的名�
   await submitCustomForm(wrapper);
   await wrapper.vm.$nextTick();
 
-  // 保存成功后视图切到该厂商详情；再次点「添加自定义厂商」应拿到空白表单
   await openCustomForm(wrapper);
 
   expect(fieldValue(wrapper, 'custom-name')).toBe('');
@@ -77,7 +74,6 @@ it('填写后切到其它视图再回来，表单同样为空', async () => {
   await wrapper.find('[data-test="custom-name"]').setValue('半途填写的网关');
   await wrapper.find('[data-test="custom-api-key"]').setValue('sk-halfway');
 
-  // 切到副模型视图，再回到「添加自定义厂商」
   await wrapper.find('[data-test="secondary-entry"]').trigger('click');
   await openCustomForm(wrapper);
 

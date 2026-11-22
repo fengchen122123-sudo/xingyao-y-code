@@ -1,17 +1,13 @@
 <template>
-  <!-- 触发本轮的用户消息。data-msg-id 经 attrs 透传到 MessageBubble 根元素
-       （.msg-user）：红点导航按消息 id 精确定位用；本地新消息无 _msg_id 时不渲染 -->
   <MessageBubble v-if="group.userMsg" :msg="group.userMsg" :data-msg-id="group.userMsg?._msg_id ?? undefined" />
 
   <div v-if="hasAssistant || group.tail.length" class="xy-turn-wrap">
-    <!-- 身份抬头：整个助手回合顶部显示一次，位于执行过程与正文之上 -->
     <div v-if="hasAssistant" class="assistant-name">
       <b class="an-agent">{{ store.agentName }}</b>
       <span class="an-model">{{ turnModelName }}</span>
       <span v-if="turnCancelled" class="cancel-badge">已取消</span>
     </div>
 
-    <!-- 方案A · 轻量原生流：运行态默认展开（可收起成流光胶囊），完成态默认折叠（可点开） -->
     <template v-if="hasProcess">
       <div v-if="group.running" class="xy-run-process">
         <div v-if="runningExpanded" class="xy-process-card">
@@ -89,7 +85,6 @@
       </div>
     </template>
 
-    <!-- 组尾：总结轮 assistant 正文 + 其后的 error 消息，始终可见 -->
     <MessageBubble
       v-for="m in group.tail"
       :key="msgKey(m)"
@@ -100,8 +95,6 @@
       :show-process="false"
     />
 
-    <!-- 回合结束且有文件改动时：底部展示可折叠的"文件更改"面板
-         （含按回合撤销按钮：按权威 turnId 绑定状态） -->
     <ChangedFilesPanel
       v-if="!group.running && fileChanges.length"
       class="turn-changes"
@@ -110,7 +103,6 @@
       :turn-id="group.turnId"
     />
 
-    <!-- 回合底部：运行中显示当前输出速度；结束后左工作时长 + 右速率/耗时/tokens -->
     <div v-if="(!group.running && totalDurationText) || tailMetricsText || liveSpeedText" class="xy-turn-footer">
       <span v-if="!group.running && totalDurationText" class="working-indicator done" data-test="turn-total-duration">
         <AppIcon name="check" :size="13" :stroke-width="2.2" class="wi-check" />
@@ -159,9 +151,7 @@ const props = withDefaults(defineProps<{
 
 const store = useAppStore();
 
-// 回合结束时默认收起，只留一行摘要；点击可展开回看完整过程。
 const expanded = ref(false);
-// 回合运行中默认展开，点击可收起为单行流光胶囊。
 const runningExpanded = ref(true);
 
 const STATE_LABELS: Record<TurnGroupInfo['state'], string> = {
@@ -220,7 +210,6 @@ const runningTitle = computed(() => {
   return `${store.agentName}执行过程 · 正在处理`;
 });
 
-// 运行中的瞬时输出速度。只挂在回合头部和底部各一处，不在每个气泡上重复刷。
 const liveSpeedText = computed(() => {
   if (!props.group.running) return '';
   const speed = Number(store.streamingSpeed) || 0;
@@ -245,10 +234,8 @@ const runningCollapsedText = computed(() => {
   return parts.join(' · ');
 });
 
-// 回合文件更改摘要（无改动则空数组，面板不渲染）
 const fileChanges = computed(() => collectFileChanges(props.group));
 
-// 按回合撤销：本回合的权威检查点状态（按 turnId 绑定；无关联回合为 null）
 const undoState = computed(() => {
   const turnId = props.group.turnId;
   return turnId ? (store.turnUndoStates[turnId] ?? null) : null;
@@ -299,7 +286,6 @@ const tailMetricsText = computed(() => {
   if (!total && (!m || (!m.token_speed && !m.duration_s))) return '';
   const parts: string[] = [];
   if (m?.token_speed) parts.push(`${m.token_speed} t/s`);
-  // 右下角的时间是整段任务的墙钟时长；没有总时长时才退回最后一次模型请求的耗时
   if (total) parts.push(total);
   else if (m?.duration_s) parts.push(formatDuration(m.duration_s));
   if (m?.completion_tokens) parts.push(`${m.completion_tokens.toLocaleString()} tokens`);
@@ -359,7 +345,6 @@ const tailMetricsTooltip = computed(() => {
   padding: 1px 7px;
 }
 
-/* 方案A 过程容器（运行中展开态 & 完成后展开态共用同一通透卡片外观） */
 .xy-process-card,
 .turn-fold.is-open {
   border-radius: 12px;
@@ -414,7 +399,6 @@ const tailMetricsTooltip = computed(() => {
   margin: 0;
 }
 
-/* 运行中折叠态：流光文字轻一行 */
 .xy-process-collapsed {
   display: inline-flex;
   align-items: center;

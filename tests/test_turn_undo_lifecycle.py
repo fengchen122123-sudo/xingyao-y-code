@@ -1,10 +1,3 @@
-"""message_turn_links 与回合生命周期集成测试（规格 7.7 / 25.3）。
-
-- 用户消息显式携带 checkpoint；Harness 原子提交路径同事务写关联。
-- 消息正文与关联行同事务提交或回滚。
-- Provider 历史构造（get_history）不读取关联元数据，字节不变。
-"""
-
 import pytest
 
 from core.memory import MemoryManager
@@ -67,7 +60,6 @@ def test_harness_commit_path_links_messages(env):
     assert message_ids[0] in links
     assert links[message_ids[0]]["position_kind"] \
         == PositionKind.ASSISTANT_INTERMEDIATE.value
-    # TLS 绑定线程兜底（同线程显式传参与按 turn_id 查库等价）
     assert links[message_ids[0]]["checkpoint_id"] == env["checkpoint"].checkpoint_id
 
 
@@ -78,8 +70,6 @@ def test_mark_final_assistant_updates_position(env):
     manager.heartbeat_harness_owner("owner-1", 0)
     manager.create_harness_turn("turn-link-1", "link-sess", "owner-1", 0)
     manager.create_harness_step("step-1", "turn-link-1", 0, 0)
-
-    # 两条 assistant：中间轮 + 最终轮
 
     drafts = [
         JournalEventDraft(kind=HarnessEventKind.ASSISTANT_COMMITTED, step_id="step-1", message_index=i)
@@ -99,7 +89,6 @@ def test_mark_final_assistant_updates_position(env):
 
 
 def test_link_failure_rolls_back_message_batch(env):
-    """非法 position_kind 显式失败：消息正文与关联行一起回滚。"""
     from core.turn_undo.models import TurnUndoError
 
     manager = env["manager"]
@@ -114,7 +103,6 @@ def test_link_failure_rolls_back_message_batch(env):
 
 
 def test_provider_history_bytes_unchanged_by_links(env):
-    """关联元数据是纯界面信息：get_history 返回值与未启用撤销时一致。"""
     manager = env["manager"]
     manager.add_message(
         "link-sess", "user", "问题A",
@@ -130,7 +118,6 @@ def test_provider_history_bytes_unchanged_by_links(env):
 
 
 def test_links_scoped_to_session(env, tmp_path):
-    """load_session_turn_links 只返回当前会话检查点的关联。"""
     manager = env["manager"]
     manager.ensure_session("other-sess")
     manager.add_message(

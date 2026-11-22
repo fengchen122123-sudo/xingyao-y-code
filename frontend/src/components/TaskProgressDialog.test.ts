@@ -36,7 +36,6 @@ it('渲染计划全景：标题、完成比、状态计数、完整文本与接�
   expect(statsText).toContain('已完成1');
   expect(statsText).toContain('待执行1');
 
-  // 长文本完整渲染，不被截断；接管提示单独渲染且不覆盖条目正文
   expect(wrapper.find('[data-test="plan-item-done"] .p-text').text()).toBe(longText);
   const inProgressCard = wrapper.find('[data-test="plan-item-in_progress"]');
   expect(inProgressCard.find('.p-text').text()).toBe('改核心代码');
@@ -106,7 +105,6 @@ it('支持按状态筛选条目，异常状态（failed/blocked/cancelled）单�
   expect(wrapper.findAll('li.plan-card')).toHaveLength(1);
   expect(wrapper.find('[data-test="plan-item-failed"]').exists()).toBe(true);
 
-  // 再次点击同一筛选按钮复位为全部
   await issueBtn.trigger('click');
   expect(wrapper.findAll('li.plan-card')).toHaveLength(4);
   wrapper.unmount();
@@ -154,12 +152,10 @@ it('点击条目可展开/收起详情（依赖、文件、验收标准、结果
   expect(detail.text()).toContain('npm test -- validator');
   expect(detail.text()).toContain('subagent-1');
 
-  // 点击查看子代理直达右侧子代理面板，且不误触折叠卡片
   await wrapper.find('[data-test="plan-item-subagent"]').trigger('click');
   expect(openSubagentSpy).toHaveBeenCalledWith('subagent-1');
   expect(wrapper.findAll('[data-test="plan-item-detail"]')).toHaveLength(1);
 
-  // 底部一键展开全部
   await wrapper.find('[data-test="task-pop-toggle-all"]').trigger('click');
   expect(wrapper.findAll('[data-test="plan-item-detail"]')).toHaveLength(2);
   expect(wrapper.find('[data-test="task-pop-toggle-all"]').text()).toContain('收起详情');
@@ -212,7 +208,6 @@ it('单行省略时悬停条目弹出完整内容气泡，移出后收起', asyn
     const card = wrapper.find('[data-test="plan-item-in_progress"]');
     const textEl = card.find('.p-text').element as HTMLElement;
 
-    // 模拟单行内容超出容器宽度被省略
     Object.defineProperty(textEl, 'clientWidth', { value: 220, configurable: true });
     Object.defineProperty(textEl, 'scrollWidth', { value: 520, configurable: true });
 

@@ -1,5 +1,3 @@
-"""C5：HookRunner 编排测试（H-T5 / H-T14 / H-T15 / H-T17）。"""
-
 from __future__ import annotations
 
 import json
@@ -55,7 +53,6 @@ def _make_runner(tmp_path, hooks_payload, *, full_input=False):
 
 
 def _grant_all(runner, proj, trust) -> None:
-    """把项目级全部 hook 置为 trusted（模拟用户在 GUI 里确认）。"""
     identity = normalize_workspace_identity(str(proj))
     for reg in runner.registry.load(workspace_root=str(proj)):
         trust.grant(
@@ -67,7 +64,6 @@ def _grant_all(runner, proj, trust) -> None:
 
 
 def test_merge_deny_wins_and_contexts_accumulate(tmp_path):
-    """H-T5：多 hook 合并——contexts 累加、permission 向最严格收敛。"""
     script_a = _script(
         tmp_path,
         "a.py",
@@ -99,7 +95,6 @@ def test_merge_deny_wins_and_contexts_accumulate(tmp_path):
 
 
 def test_revoke_during_execution_affects_later_hooks(tmp_path):
-    """H-T14：前序 hook 运行期间撤销信任 → 后续 hook 不执行（不缓存 admission）。"""
     trust_path = tmp_path / "hook_trust.json"
     revoke_body = (
         "import json, pathlib\n"
@@ -126,13 +121,11 @@ def test_revoke_during_execution_affects_later_hooks(tmp_path):
     result = runner.run(
         HookEvent.PRE_TOOL_USE, _hook_input(proj, tool_input={"file_path": "a.py"})
     )
-    # A 执行时撤销了全部信任 → B 变为 revoked → 不再执行
     assert result.executed_count == 1
     assert any("未获信任" in failure for failure in result.failures)
 
 
 def test_cancel_event_stops_subsequent_hooks(tmp_path, monkeypatch):
-    """H-T15：cancel_event 生效 → 停止后续 hook，已执行结果保留。"""
     script_a = _script(
         tmp_path,
         "a.py",
@@ -157,7 +150,7 @@ def test_cancel_event_stops_subsequent_hooks(tmp_path, monkeypatch):
 
     def fake_run_hook(registration, hook_input, **kwargs):
         outcome = real_run_hook(registration, hook_input, **kwargs)
-        cancel.set()  # 第一个 hook 执行完立即取消
+        cancel.set()
         return outcome
 
     monkeypatch.setattr(runner_module, "run_hook", fake_run_hook)
@@ -171,7 +164,6 @@ def test_cancel_event_stops_subsequent_hooks(tmp_path, monkeypatch):
 
 
 def test_project_hook_input_redacted_by_default(tmp_path):
-    """H-T17：项目级 hook 默认只拿到键名（值转占位符），防数据窃取。"""
     spy = _script(
         tmp_path,
         "spy.py",
@@ -197,7 +189,6 @@ def test_project_hook_input_redacted_by_default(tmp_path):
 
 
 def test_project_hook_full_input_when_explicitly_enabled(tmp_path):
-    """显式开启 project_hook_full_input 后，项目级 hook 才收到完整入参。"""
     spy = _script(
         tmp_path,
         "spy.py",
@@ -219,7 +210,6 @@ def test_project_hook_full_input_when_explicitly_enabled(tmp_path):
 
 
 def test_untrusted_project_hook_is_not_executed(tmp_path):
-    """H-T11 集成：未信任的项目级 hook 不执行（fail-closed 到 pending）。"""
     marker = tmp_path / "executed.marker"
     script = _script(
         tmp_path,
@@ -230,7 +220,6 @@ def test_untrusted_project_hook_is_not_executed(tmp_path):
     )
     payload = {"PreToolUse": [{"matcher": "*", "command": script}]}
     runner, proj, trust = _make_runner(tmp_path, payload)
-    # 不调用 _grant_all：未信任
     result = runner.run(
         HookEvent.PRE_TOOL_USE, _hook_input(proj, tool_input={"file_path": "a.py"})
     )

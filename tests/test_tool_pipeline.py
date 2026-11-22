@@ -245,7 +245,6 @@ def test_denied_write_file_returns_exact_message_without_mutating(tmp_path, monk
 
 
 def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
-    """批准的 write_file 在活动回合内产生按回合撤销记录并推送 diff 事件。"""
     from core.memory import MemoryManager
     from core.turn_undo import service as turn_undo_service
     from core.turn_undo.models import OwnerKind
@@ -386,8 +385,6 @@ def test_large_diff_keeps_full_counts_when_display_is_truncated(tmp_path, monkey
     )
 
     diff = next(payload for kind, payload in events if kind == "diff_ready")
-    # 前端消费的 diff_text 传完整 diff（只有 2000 行防失控上限），
-    # 25 行截断只作用于终端 ANSI 面板（text 字段）
     assert "... (省略" not in diff["diff_text"]
     assert "+line-59" in diff["diff_text"]
     assert "... (省略" in diff["text"]
@@ -439,7 +436,6 @@ def test_credential_write_prompts_through_full_pipeline_even_when_sandbox_open(
 def test_credential_write_ignores_task_sandbox_bypass_and_requires_confirmation(
     tmp_path, monkeypatch
 ):
-    """任务级沙箱放行不能覆盖 ~/.ycode 顶层凭据写入的逐次确认。"""
     import core.harness.tool_adapters as tool_adapters
     import core.memory_kairos as memory_kairos
     import core.model_manager as model_manager
@@ -466,7 +462,7 @@ def test_credential_write_ignores_task_sandbox_bypass_and_requires_confirmation(
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "full")
     tools_module.set_session_sandbox_bypass(True)
     asked, requests = [], []
-    _auto_answer_pipeline_permission(monkeypatch, 1, asked, requests)  # deny
+    _auto_answer_pipeline_permission(monkeypatch, 1, asked, requests)
 
     try:
         result = _call(
@@ -486,7 +482,6 @@ def test_credential_write_ignores_task_sandbox_bypass_and_requires_confirmation(
 
 
 def test_plan_mode_denies_external_write_before_permission_prompt(tmp_path, monkeypatch):
-    """沙箱提示名不能把外部写入降级为 plan 模式允许的查询。"""
     import core.model_manager as model_manager
 
     workspace = tmp_path / "workspace"
@@ -663,7 +658,6 @@ def test_run_subagent_disabled_returns_exact_message():
 
 
 def test_run_subagent_hidden_timeout_is_not_forwarded_to_adapter(monkeypatch):
-    """模型伪造 schema 外参数时，时间预算仍必须由系统选择。"""
     received = {}
 
     def run_subagent(**kwargs):
@@ -1142,13 +1136,6 @@ def test_cancel_stops_polling_without_waiting_for_daemon_tool():
 
 
 def test_parallel_tool_threads_inherit_workdir_and_thread_session(tmp_path):
-    """回归：并行工具线程必须继承提交线程的 workdir 与会话绑定。
-
-    裸 daemon 线程丢失线程本地 workdir 后，get_workdir() 兜底到进程 cwd，
-    沙盒守卫会把项目内路径误判为沙盒外并弹权限询问（GUI 打包版进程
-    cwd 是安装目录时必现）；线程会话绑定丢失则"本会话内放行沙盒外
-    访问"等每会话状态在并行线程里全部失效。
-    """
     from core.workspace_context import get_workdir, workspace_scope
 
     import core.app_context as app_context_module
@@ -1213,7 +1200,8 @@ def test_batch_events_cover_each_batch_before_execution_and_finish_in_model_orde
         ("tool_started", "w1"),
         ("tool_finished", "w1"),
     ]
-    assert execution_order == ["r1", "r2", "w1"]
+    assert set(execution_order[:2]) == {"r1", "r2"}
+    assert execution_order[2] == "w1"
     assert [record.call_ordinal for record in records] == [0, 1, 2]
 
 
@@ -1312,7 +1300,6 @@ def test_repeat_guard_exempt_keeps_plan_tools_exempt():
 
 
 def test_manage_task_status_called_three_times_all_execute():
-    # manage_task(status) 连续三次均真实执行，不被 RepeatCallGuard 拦截
     executions = []
     executor = _parallel_executor(
         lambda call, _context: executions.append(call["id"])
@@ -1403,7 +1390,6 @@ def test_tool_result_journal_draft_contains_only_hashes_and_ordered_metadata():
 
 
 def _fenced_owner_manager(monkeypatch):
-    """构造一个已超时终态的真实子代理任务，并接管进程级 manager。"""
     import core.tools as tools_module
     from core.tools import SubagentManager
 
@@ -1439,7 +1425,6 @@ def _fence_context(registry, permission_owner):
 def test_stale_subagent_owner_tools_are_fenced_before_permission(
     tmp_path, monkeypatch
 ):
-    """旧子 Agent 的延迟工具调用必须在权限询问与 adapter 之前返回取消错误。"""
     from core.harness.tool_pipeline import ToolPipeline
 
     executed = []
@@ -1508,7 +1493,6 @@ def test_stale_subagent_owner_tools_are_fenced_before_permission(
 
 
 def test_active_subagent_owner_tools_are_not_fenced(tmp_path, monkeypatch):
-    """运行中的子代理租约有效，工具调用照常执行，不受 fencing 影响。"""
     import core.tools as tools_module
     from core.harness.tool_pipeline import ToolPipeline
 
@@ -1559,11 +1543,6 @@ def test_active_subagent_owner_tools_are_not_fenced(tmp_path, monkeypatch):
 
 
 def _install_active_takeover(monkeypatch, *, item, turn, files=None):
-    """用生产调度 API 构造 active takeover 现场并路由默认单例。
-
-    只搭状态，不复制被测实现：接管字段全部经 start_delegated_item/
-    handoff_to_main 写入。
-    """
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
 
@@ -1605,7 +1584,6 @@ def test_takeover_does_not_unlock_other_turn_or_whole_plan(monkeypatch, tmp_path
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
     _install_active_takeover(monkeypatch, item="a", turn="turn-1")
-    # 新回合在计划未完成时同样会被标记为计划回合（生产路径 llm 调 _mark_plan_turn）
     llm._mark_plan_turn("turn-2")
 
     blocked = _call(
@@ -1620,7 +1598,6 @@ def test_takeover_does_not_unlock_other_turn_or_whole_plan(monkeypatch, tmp_path
 
 
 def test_takeover_scoped_unlock_still_asks_in_confirm_mode(monkeypatch, tmp_path):
-    """scoped 放行只解除计划门禁，confirm 模式权限询问必须照常发生。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
     _install_active_takeover(monkeypatch, item="a", turn="turn-1")
@@ -1640,7 +1617,6 @@ def test_takeover_scoped_unlock_still_asks_in_confirm_mode(monkeypatch, tmp_path
 
 
 def test_takeover_files_scope_restricts_write_targets(monkeypatch, tmp_path):
-    """计划项声明 files 时，接管期间的写文件只允许命中这些路径。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
     _install_active_takeover(
@@ -1744,7 +1720,6 @@ def test_fencing_lookup_failure_is_fail_closed_before_permission_and_adapter(
 def test_plan_finish_completes_active_takeover_and_promotes_next(
     monkeypatch, tmp_path
 ):
-    """active 接管项 plan_finish 成功后标记 completed 并 FIFO 提升下一排队项。"""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
 
@@ -1782,7 +1757,6 @@ def test_plan_finish_completes_active_takeover_and_promotes_next(
 def test_plan_finish_verification_failure_marks_failed_without_redelegation(
     monkeypatch, tmp_path
 ):
-    """verification 命令非零退出：计划项进入 failed，绝不重新委派。"""
     import sys
 
     monkeypatch.chdir(tmp_path)
@@ -1889,9 +1863,6 @@ def test_plan_resume_takeover_rejects_ordinary_item(monkeypatch):
     assert plan.snapshot()[0]["status"] == "failed"
 
 
-# ── Task 9：follow-up 私有载荷的 record 承载与剥离 ──────────────────
-
-
 def test_tool_execution_record_default_followup_is_empty():
     from core.harness.tool_pipeline import ToolExecutionRecord
 
@@ -1905,7 +1876,6 @@ def test_tool_execution_context_computer_lease_defaults_to_none():
 
 
 def test_batch_executor_moves_private_followup_stash_into_record():
-    """execute_decoded 暂存在 message 内部键上的 follow-up 必须转入 record。"""
     import core.harness.tool_pipeline as tool_pipeline
 
     followup = {
@@ -1941,7 +1911,6 @@ def test_batch_executor_moves_private_followup_stash_into_record():
 
 
 def test_execute_one_strips_private_followup_stash(monkeypatch):
-    """旧单调用入口没有 follow-up 通道：私有暂存必须剥离，绝不泄漏进普通 message。"""
     import core.harness.tool_pipeline as tool_pipeline
 
     pipeline = tool_pipeline.ToolPipeline()

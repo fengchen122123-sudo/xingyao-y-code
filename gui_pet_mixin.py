@@ -1,26 +1,3 @@
-"""GUI 桌面宠物桥接 Mixin。
-
-把设置页「桌面宠物」的开关/路径/重启指令转发给 core.pet_manager 的进程管理，
-并把最终状态回推前端：每个方法都返回 dict，方法名即前端 JS 侧 API 名
-（pet_get_status / pet_set_enabled / pet_set_electron_path / pet_restart /
-pet_list_skins / pet_set_skin）。
-
-另有一条「Electron 运行时按需安装」的支路（pet_get_runtime_status /
-pet_install_runtime，运行时细节在 core/pet_runtime.py）：Electron 解压后约
-368MB，不随安装包分发，改为用户首次启用桌宠时后台下载。这里只负责把
-detect() + status() 合并成前端好用的结构、并给高频轮询加一层探测缓存。
-
-分工：core/pet_manager 只管 Electron 进程生命周期（拉起、探活、优雅退出、
-单实例与 pid 记录），这里只做「配置持久化 + 参数校验 + 异常兜底」，不重复
-实现进程细节。
-
-顶层只 import 轻量模块；pet_manager / pet_runtime 与 config 都在方法内惰性导入
-——设置页
-点开才碰进程管理，桌面宠物未使用时不给启动路径添任何负担。所有异常一律转成
-{'ok': False, 'msg': ...}，绝不穿透 pywebview 的 js_api 线程（那会让界面失去
-响应）。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -29,17 +6,11 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# 配置键名：与 config.py 已登记的键名保持一致
-# （pet_enabled / pet_electron_path / pet_notify_enabled / pet_skin_id）
 _KEY_ENABLED = "pet_enabled"
 _KEY_ELECTRON_PATH = "pet_electron_path"
 _KEY_NOTIFY = "pet_notify_enabled"
-# 当前宠物形象 id（与 core/pet_skins 的 active_skin_id 读的是同一个键）
 _KEY_SKIN = "pet_skin_id"
 
-# 桌宠闲聊（core/pet_chat）空闲时长的合法区间（秒）。与 pet_chat 内部的钳制范围
-# 保持一致：太快会变成不停自言自语，太慢（>1 天）等于永远不说话，都不是用户想要
-# 的「偶尔说一句」。桥这一层先钳一次，是为了能给出明确提示而不是静默改值。
 _CHAT_IDLE_MIN = 60
 _CHAT_IDLE_MAX = 86400
 
@@ -51,19 +22,9 @@ _NOTIFY_BUBBLE_MS = 4500
 # 将来加回高频事件时兜底用。
 _NOTIFY_THROTTLE_SECONDS = 1.5
 
-# turn_error 与 error 在 _emit_owned_error 中会连续发出同一条报错文案：
-# 窗口内同文案的 error 去重，但独立发出的 error（如未激活模型/提问超时）仍正常提示。
 _ERROR_DEDUP_SECONDS = 2.0
 _last_error_notify = (0.0, "")
 
-# 白名单 = 全部「值得打断用户」的事件（外加 permission_dismiss 用于收起待确认气泡）：
-#   permission_request  要你确认权限 / 模型有事问你——不提示就会一直干等
-#   permission_dismiss  用户已确认或取消，收起桌宠上对应的待确认提示
-#   turn_finish         任务完成
-#   turn_error / error  任务出错或执行前报错
-#   turn_cancelled      任务被取消
-# 工具级事件（turn_start / tool_start）一律不冒泡：一个任务要读几十个文件、敲十几次
-# 命令，每步都说话等于全程在打扰；用户真正需要的只有「卡住我了」「结束了」「失败了」。
 _NOTIFY_EVENTS = frozenset({
     "permission_request",
     "permission_dismiss",
@@ -73,7 +34,6 @@ _NOTIFY_EVENTS = frozenset({
     "turn_cancelled",
 })
 
-# 关键节点一律不节流：漏掉一次"等你确认/出错/完成"，用户就会一直干等。
 _NOTIFY_ALWAYS_EVENTS = _NOTIFY_EVENTS
 
 # 需要权限的常见工具 → 简短易懂的提示后缀（气泡最多两行，要一眼看懂）
@@ -86,12 +46,10 @@ _PERMISSION_TOOL_LABELS = {
     "undo_turn": "撤销回合",
 }
 
-# 文案 → 上次发送时刻（time.monotonic）。模块级：星瑶单进程，多会话共用一个节流表。
 _notify_last_sent: Dict[str, float] = {}
 
 
 def _clip_notify_snippet(raw: Any, limit: int = 12) -> str:
-    """把错误或问题摘要压成单行短语，确保能完整放进桌宠两行气泡里。"""
     text = " ".join(str(raw or "").split()).strip()
     if not text:
         return ""
@@ -101,12 +59,6 @@ def _clip_notify_snippet(raw: Any, limit: int = 12) -> str:
 
 
 def _notify_bubble_spec(event_type: str, data: Any) -> Optional[Dict[str, Any]]:
-    """事件 → 桌宠气泡完整规格（text / ms / kind / emote / sticky）。
-
-    permission_request 要分两种：ask_user 是模型给出选项等你做决定；
-    其它是工具要权限、点一下同意就继续。两者都意味着「任务停在这儿等你」，
-    所以加长/常驻显示并配上动作反应，直到用户在界面操作后由 permission_dismiss 收起。
-    """
     payload = data if isinstance(data, dict) else {}
     if event_type == "permission_request":
         name = str(payload.get("function_name") or "")
@@ -169,8 +121,6 @@ def _notify_bubble_text(event_type: str, data: Any) -> Optional[str]:
     return spec["text"] if spec else None
 
 
-# get_status() 异常时的最小骨架：形状与 pet_manager.get_status() 对齐，
-# 前端不必为"后端炸了"另写一套字段判断。
 _EMPTY_STATUS = {
     "running": False,
     "pid": None,
@@ -188,7 +138,6 @@ _EMPTY_RUNTIME_DETECT = {
     "size": 0,
 }
 
-# 合并后的结构：detect 的四个字段 + status() 的进度字段，前端一个对象画完整个卡片。
 _EMPTY_RUNTIME = {
     "installed": False,
     "exe": None,
@@ -201,37 +150,17 @@ _EMPTY_RUNTIME = {
     "msg": "",
 }
 
-# detect() 会递归统计 dist 目录大小（~368MB / 几十万文件），而 pet_get_status 被前端
-# 高频轮询，每次轮询都扫一遍盘会明显拖慢界面。缓存 = 模块级单变量元组
-# (检测时刻 time.monotonic(), 当时的运行时 state, detect 结果)：
-#   - state 未变（轮询常态）→ 复用，不碰磁盘；
-#   - state 变了（idle→downloading→verifying→done/failed）→ 立即重测，
-#     装完/装失败后前端下一次轮询就能看到新结果，不会被旧缓存骗住；
-#   - 已装好且刚测过 → 也复用（dist 大小不会自己变，没必要重扫）。
-# 线程安全：整体只做「整个元组」的读取与赋值，靠 GIL 的原子性，绝不原地改；
-# 两个线程同时刷新最多多测一次，不会读到半截数据。
 _RUNTIME_DETECT_TTL = 600.0
 _runtime_detect_cache = (0.0, None, None)
 
 
 def _pet_manager():
-    """惰性导入 core.pet_manager。
-
-    导入失败（打包缺文件等）时抛给调用方，由各桥方法统一转成 ok=False；
-    不在模块级导入是为了让未使用桌宠的启动路径完全不碰进程管理依赖。
-    """
     from core import pet_manager
 
     return pet_manager
 
 
 def _pet_runtime_module():
-    """惰性导入 core.pet_runtime（Electron 运行时的下载/安装）。
-
-    与 _pet_manager 同样的降级策略：导入失败抛给调用方，由桥方法统一转
-    ok=False；模块级导入会让没用桌宠的启动路径白拉 urllib/zipfile 等依赖。
-    兼容以 core 目录为工作目录的调用（此时只有顶层 pet_runtime）。
-    """
     try:
         from core import pet_runtime
 
@@ -244,12 +173,6 @@ def _pet_runtime_module():
 
 
 def _pet_skins_module():
-    """惰性导入 core.pet_skins（宠物库：列列表 / 校验 / 激活项读写）。
-
-    与 _pet_manager 同样的降级策略：导入失败抛给调用方，由桥方法统一转
-    ok=False；模块级导入会让没用桌宠的启动路径白扫一遍用户皮肤目录。
-    兼容以 core 目录为工作目录的调用（此时只有顶层 pet_skins）。
-    """
     try:
         from core import pet_skins
 
@@ -262,13 +185,6 @@ def _pet_skins_module():
 
 
 def _pet_chat_module():
-    """惰性导入 core.pet_chat（桌宠「无聊时自己说一句」的调度线程与设置读写）。
-
-    与 _pet_manager / _pet_skins_module 同样的降级策略：导入失败抛给调用方，由桥
-    方法统一转 ok=False；模块级导入会让完全没用桌宠的启动路径也跟着拉起调度线程、
-    读写人类活动检测（GetLastInputInfo）那一套依赖。
-    兼容以 core 目录为工作目录的调用（此时只有顶层 pet_chat）。
-    """
     try:
         from core import pet_chat
 
@@ -281,14 +197,6 @@ def _pet_chat_module():
 
 
 def _pet_chat_available_models() -> list:
-    """枚举全部已配置模型（providers[].models[]），供设置页下拉与 model_id 校验。
-
-    为什么整个函数吞异常、脏数据跳一条而不是抛：配置来自用户手改的 config.json，
-    models 写成 dict、条目缺 id、provider 不是对象都可能出现。这里的目的只是「给
-    下拉填选项」，坏一条就少一条，归零也就是下拉只剩「自动」——仍然可用。若为了
-    一处脏字段把整个设置页打成 ok=False，用户反而连关掉这个功能都点不了。
-    返回项只保留前端需要的三列：id 写回配置、name 给人看、provider_name 分组用。
-    """
     models: list = []
     try:
         from core import model_manager
@@ -305,8 +213,6 @@ def _pet_chat_available_models() -> list:
             for model in provider.get("models") or []:
                 if not isinstance(model, dict):
                     continue
-                # id 有就优先用；个别历史配置写成 model_id 也认，缺了就没法写回配置、
-                # 也没法按 id 解析请求，直接跳过。
                 model_id = str(model.get("id") or model.get("model_id") or "").strip()
                 if not model_id:
                     continue
@@ -338,11 +244,6 @@ def _chat_minutes_text(seconds: int) -> str:
 
 
 def _runtime_detect_cached(module, state: str) -> Dict[str, Any]:
-    """带缓存的 module.detect()：理由见 _runtime_detect_cache 上方的说明。
-
-    任何异常都不外抛——探测失败退化成「上一次结果」或空骨架，
-    不能让一次磁盘错误把整个 pet_get_status 打成 ok=False。
-    """
     global _runtime_detect_cache
     prev: Optional[Dict[str, Any]] = None
     cached_state = None
@@ -353,7 +254,6 @@ def _runtime_detect_cached(module, state: str) -> Dict[str, Any]:
         fresh = (time.monotonic() - float(ts)) < _RUNTIME_DETECT_TTL
     except Exception:
         fresh = False
-    # 复用条件：状态没变（轮询常态），或「已装 + 刚测过」（dist 大小不会自己变）。
     if prev is not None and (cached_state == state or (fresh and prev.get("installed"))):
         return dict(prev)
     try:
@@ -369,12 +269,6 @@ def _runtime_detect_cached(module, state: str) -> Dict[str, Any]:
 
 
 def _config_value(key: str, default=None):
-    """读单个配置项：先看模块级属性，再回落 config.json 的载荷。
-
-    config 模块的 __getattr__ 对未登记名字会抛 AttributeError（pet_enabled 就是
-    这种"只登记键名、不设模块属性"的键），所以两级都要吞异常：读不到配置只影响
-    "开关显示"，不该让整个状态查询失败。
-    """
     try:
         import config
     except Exception:
@@ -392,7 +286,6 @@ def _config_value(key: str, default=None):
 
 
 def _config_bool(key: str, default: bool = False) -> bool:
-    """把配置项读成布尔值：未设置/读失败/异常值一律回落 default。"""
     try:
         return bool(_config_value(key, default))
     except Exception:
@@ -408,7 +301,6 @@ def _safe_int(value, default: int = 0) -> int:
 
 
 def _save_config(key: str, value) -> bool:
-    """写配置项；失败返回 False（save_config_value 内部已留告警日志）。"""
     try:
         from config import save_config_value
 
@@ -421,20 +313,9 @@ def _save_config(key: str, value) -> bool:
 class PetBridgeMixin:
     """为 ApiBridge 提供 pet_* 系列桥方法（桌宠开关 / Electron 路径 / 重启）。"""
 
-    # ---------- 公共小工具 ----------
     def pet_get_status(self) -> Dict[str, Any]:
-        """查询桌宠状态，并附带配置里的开关值 enabled。
-
-        status 里 running/available/pid/electron_path/pet_dir 全部来自
-        pet_manager.get_status()（只读，最多跑一次 tasklist 探活）；enabled 是
-        config.toml/config.json 里 pet_enabled 的当前值——"开关打开但进程没起来"
-        和"开关关闭"在前端是两种提示，必须能分辨。notify_enabled 是任务气泡提示
-        开关（pet_notify_enabled，缺省视为开启）。
-        """
         enabled = _config_bool(_KEY_ENABLED, False)
         notify_enabled = _config_bool(_KEY_NOTIFY, True)
-        # 运行时快照先算好（内部已兜住所有异常），失败路径也要带上这个字段，
-        # 前端不必为"后端炸了"另写一套字段判断。
         runtime = self._pet_runtime_snapshot_safe()
         try:
             status = _pet_manager().get_status()
@@ -458,13 +339,7 @@ class PetBridgeMixin:
         payload["runtime"] = runtime
         return payload
 
-    # ---------- 内部：Electron 运行时快照 ----------
     def _pet_runtime_snapshot(self) -> Dict[str, Any]:
-        """把 pet_runtime.detect() 与 status() 合并成一个扁平结构（异常外抛）。
-
-        detect 给「装没装、装在哪、多大」，status 给「下载进度、当前状态机状态」，
-        前端只想要一个对象画整个卡片。detect 走缓存（见 _runtime_detect_cached）。
-        """
         module = _pet_runtime_module()
         raw = module.status()
         if not isinstance(raw, dict):
@@ -510,13 +385,6 @@ class PetBridgeMixin:
             return {"ok": False, "msg": f"查询 Electron 运行时状态失败：{exc}"}
 
     def pet_install_runtime(self) -> Dict[str, Any]:
-        """点「下载运行时」时调用：起后台下载线程并立刻返回当前进度。
-
-        不阻塞：core/pet_runtime.install() 本身只置状态 + 起 daemon 线程就返回，
-        151MB 的下载在后台跑，前端轮询 pet_get_runtime_status 画进度条。
-        幂等：已装好直接 done、正在装返回当前状态，所以下载失败后用户再点一次
-        就是重试，这里不做任何"只能点一次"的限制。
-        """
         try:
             module = _pet_runtime_module()
             module.install()
@@ -536,12 +404,6 @@ class PetBridgeMixin:
         return {"ok": True, "runtime": runtime, "msg": msg}
 
     def pet_set_notify_enabled(self, enabled: bool) -> Dict[str, Any]:
-        """打开/关闭「执行任务时桌宠冒泡提示」，并持久化开关。
-
-        与 pet_set_enabled 的区别：这个开关只管气泡（emit_event 的轻量转发），
-        不碰 Electron 进程；写盘失败时 ok=False 并在 msg 里说明配置没写进去，
-        避免用户重启后发现开关自己回弹。
-        """
         want = bool(enabled)
         saved = _save_config(_KEY_NOTIFY, want)
         if saved:
@@ -553,18 +415,7 @@ class PetBridgeMixin:
             )
         return {"ok": saved, "msg": msg, "status": self.pet_get_status()}
 
-    # ---------- 内部：事件 → 气泡提示 ----------
     def _pet_notify_event(self, event_type: str, data: Any = None) -> None:
-        """把一次前端事件转成桌宠气泡与动作提醒。
-
-        由 ApiBridge.emit_event 在事件派发后顺带调用，属于高频路径，所以：
-        1) 先按白名单挡掉绝大多数事件（token_delta / pty_data / round_started…），
-           再做读配置、算文案这些稍重的动作；
-        2) 白名单里剩下的节点都是「用户必须知道」的状态（待选选项 / 待批权限 /
-           完成 / 出错 / 取消），不节流；其中 turn_error 与随后的同文案 error 去重；
-        3) 整个方法体包 try/except，任何异常只 logger.debug——桌宠出任何问题都
-           不允许影响事件派发链路。
-        """
         global _last_error_notify
         try:
             if event_type not in _NOTIFY_EVENTS:
@@ -606,18 +457,9 @@ class PetBridgeMixin:
             logger.debug("桌宠气泡提示失败 event=%s", event_type, exc_info=True)
 
     def _pet_failed(self, msg: str) -> Dict[str, Any]:
-        """统一失败返回：带上最新状态，前端不必二次拉取。"""
         return {"ok": False, "msg": msg, "status": self.pet_get_status()}
 
-    # ---------- 前端 API ----------
     def pet_set_enabled(self, enabled: bool) -> Dict[str, Any]:
-        """打开/关闭桌面宠物，并按"实际结果"持久化开关。
-
-        enabled 为真拉起桌宠、为假关闭它。落盘顺序是**先动作、再按实际结果写配置**：
-        早期版本先写盘再启动，于是"没有运行时 → 启动失败 → 配置却已是 true"，用户
-        看到开关亮着、桌面却没有宠物，重启后依旧，是最难自查的坑。现在启动失败会把
-        配置回归 false，与桌面实际状态保持一致。
-        """
         want = bool(enabled)
         notes = []
 
@@ -653,12 +495,6 @@ class PetBridgeMixin:
         return {"ok": ok, "msg": "；".join(notes), "status": self.pet_get_status()}
 
     def pet_set_electron_path(self, path: str) -> Dict[str, Any]:
-        """保存 Electron 可执行文件路径（空字符串表示"用桌宠内置的那份"）。
-
-        路径只在启动时被 pet_manager._resolve_electron 读取，所以正在运行时必须
-        stop→start 才能让新路径生效；重启失败如实回报 ok=False（路径已存但没跑起来
-        是真实状态，不能因为"配置保存成功"就报成功）。
-        """
         raw = str(path or "").strip()
         saved = _save_config(_KEY_ELECTRON_PATH, raw)
         notes = []
@@ -722,14 +558,6 @@ class PetBridgeMixin:
         return {"ok": ok, "msg": "；".join(notes), "status": self.pet_get_status()}
 
     def pet_list_skins(self) -> Dict[str, Any]:
-        """列出全部可用宠物（内置星瑶 + 用户宠物包），供设置页一次性渲染选择列表。
-
-        每项都带 thumbnail（后端已编码好的 PNG data URI 字符串），前端直接塞进
-        img.src 即可，不必逐只再发请求——列表通常只有几只，一次给全比「先拿 id
-        再逐个取图」少一轮往返，也不会出现缩略图陆续跳出来的闪烁。
-        active 是收敛过的当前形象 id（配置里的脏值已被 active_skin_id 换成内置），
-        user_dir 告诉用户宠物包该放哪个目录。
-        """
         try:
             pet_skins = _pet_skins_module()
             active = pet_skins.active_skin_id()
@@ -745,7 +573,6 @@ class PetBridgeMixin:
             try:
                 active = _pet_skins_module().BUILTIN_SKIN_ID
             except Exception:
-                # 连 pet_skins 都导不进来：退回内置 id 字面量，前端至少知道"只有星瑶"。
                 active = "xingyao"
             return {
                 "ok": False,
@@ -756,14 +583,6 @@ class PetBridgeMixin:
             }
 
     def pet_set_skin(self, skin_id: str) -> Dict[str, Any]:
-        """切换桌面宠物形象：写配置，必要时重启桌宠让新形象立刻生效。
-
-        为什么要重启：形象目录是桌宠进程启动时通过 YCODE_PET_* 环境变量传进去的，
-        Electron 只在启动那一刻读一次，运行中改配置它根本看不见，所以正在运行时
-        只能 stop→start。重启不丢东西：窗口位置/尺寸/开关等状态都持久化在桌宠自己
-        的 userData 里，重启后会照旧恢复。
-        返回形状与 pet_set_enabled 一致（ok/msg/status），前端 PetMutationResult 直接复用。
-        """
         want = str(skin_id or "").strip()
         try:
             pet_skins = _pet_skins_module()
@@ -940,7 +759,6 @@ class PetBridgeMixin:
             if not res.get("ok"):
                 return res
             if res.get("was_active"):
-                # 若删掉的是当前使用中的桌宠且桌宠正在运行，重启使其切回默认星瑶
                 try:
                     manager = _pet_manager()
                     if manager.get_status().get("running"):
@@ -979,16 +797,6 @@ class PetBridgeMixin:
             return {"ok": False, "msg": f"发送气泡失败：{exc}"}
 
     def pet_chat_get_settings(self) -> Dict[str, Any]:
-        """读取「桌宠闲聊」设置：开关 / 空闲间隔 / 指定模型 + 可选模型下拉。
-
-        一次返回全部：设置页打开只发一条请求，models 直接喂给下拉，前端不必再问
-        「有哪些模型」。models 故意容错成空数组（理由见 _pet_chat_available_models），
-        模型库坏掉时闲聊仍可用「自动」选模型说话，不该让整个设置页变成读取失败。
-        status 原样透出，里面的 thread_alive / last_spoken_at / today_count 是诊断
-        用的（用户问「它怎么一直不说话」时看这几个值最快）。
-
-        返回形状固定，失败分支也补齐同样字段：前端不做额外判空。
-        """
         try:
             state = _pet_chat_module().status()
             return {
@@ -1013,19 +821,6 @@ class PetBridgeMixin:
             }
 
     def pet_chat_set_settings(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """保存「桌宠闲聊」设置，只改 payload 里真正出现过的字段。
-
-        为什么按「键是否出现」而不是「值是不是 None」判断：前端会把整张表单原样
-        提交，三个字段一直是齐的，只看 None 就没法表达「这次只想换模型」。缺省的键
-        一律不动，正好对上 update_settings 的 None 语义。
-        为什么两种校验力度不同：idle_seconds 越界/非数值只提示、其余照常保存——用户
-        改完开关顺手点保存，不该因为一个数字把整次操作打回；越界时钳到边界（而不是
-        丢掉）是因为丢掉会让界面看起来「点了没反应」。model_id 找不到则整体失败：
-        写进去只会让调度线程每轮解析失败，不如当场说清楚模型没了。
-
-        返回形状统一 ok/msg/status；status 就是 update_settings 回的那份（比
-        status() 多一个 saved，写盘失败时能顺带提示「重启后可能丢失」）。
-        """
         data = payload if isinstance(payload, dict) else {}
         kwargs: Dict[str, Any] = {}
         notes = []
@@ -1068,7 +863,6 @@ class PetBridgeMixin:
                             "status": pet_chat.status(),
                         }
                     model_name = match["name"]
-                # 空串是合法值，语义是「自动选模型」，照传
                 kwargs["model_id"] = model_id
 
             result = pet_chat.update_settings(**kwargs)
@@ -1131,7 +925,6 @@ class PetBridgeMixin:
             notes.append("重启桌宠失败：未取得启动结果")
         return {"ok": ok, "msg": "；".join(notes), "status": self.pet_get_status()}
 
-    # ---------- 内部：启动时自动恢复 ----------
     def _pet_auto_restore(self) -> None:
         """星瑶启动时的延迟自动恢复入口（由 ApiBridge.__init__ 的 Timer 调用）。
 

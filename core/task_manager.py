@@ -15,7 +15,6 @@ from core.workspace_context import get_workdir
 
 _logger = logging.getLogger("py.warnings")
 
-# 任务管理器全局内存状态（所有读写由 _TASKS_LOCK 保护）
 ACTIVE_TASKS = {}
 _TASKS_LOCK = threading.RLock()
 
@@ -25,7 +24,6 @@ _REMOVED_TIDS = set()
 _REMOVED_TIDS_FIFO = deque()
 _REMOVED_TIDS_CAP = 512
 
-# 任务生命周期状态：running 之外均为终态（terminal）
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
@@ -55,7 +53,6 @@ class TaskStatusSnapshot:
 
 
 def _record_removed_locked(task_id: str) -> None:
-    """记录本进程移除的任务 ID，并以 FIFO 保留有界墓碑。"""
     if task_id in _REMOVED_TIDS:
         return
     while len(_REMOVED_TIDS) >= _REMOVED_TIDS_CAP:
@@ -70,11 +67,7 @@ _LOADED = False
 
 # get_task_output 只从日志尾部读取的字节数上限，避免 GB 级日志撑爆内存
 _TAIL_READ_BYTES = 256 * 1024
-# 日志"仅有启动标记、尚无实际命令输出"的判定阈值：turn 标记行约 30 字节，
-# 低于该值说明命令还没有任何输出落盘（list_active_tasks 据此给 GUI 面板
-# 提供 no_output_yet 字段，运行中提示由前端渲染）
 _STARTUP_MARKER_MAX_BYTES = 64
-# 最多保留的历史任务日志数量（超出后按修改时间滚动清理）
 _MAX_TASK_LOGS = 50
 
 # get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件；
@@ -91,21 +84,15 @@ from core.command_policy import (
 # 兼容已有内部调用和测试；策略实现集中在 command_policy。
 _is_dangerous_command = is_dangerous_command
 
-# 后台命令任务完成回调（GUI 注册，用于任务退出后向前端推送通知）
 _on_task_finished = None
 
 
 def set_task_finished_callback(callback):
-    """注册后台命令任务完成回调。
-
-    签名：callback(task_id, command, returncode, session_id, log_tail)。
-    """
     global _on_task_finished
     _on_task_finished = callback
 
 
 def _read_log_tail(task_id, max_chars=2000):
-    """读取后台任务日志尾部（供 LLM 简短总结用），失败返回空串。"""
     try:
         log_file_path = os.path.join(LOG_DIR, f"task_{task_id}.log")
         if not os.path.exists(log_file_path):
@@ -116,7 +103,6 @@ def _read_log_tail(task_id, max_chars=2000):
             f.seek(max(0, size - max_chars))
             raw = f.read()
         from core.process_io import decode_process_output, platform_console_encoding
-        # 日志是子进程原始字节，可能带 ANSI 颜色码；log_tail 直接进 LLM 上下文，先清洗
         return strip_ansi_escapes(
             decode_process_output(raw, platform_console_encoding())
         )
@@ -125,16 +111,6 @@ def _read_log_tail(task_id, max_chars=2000):
 
 
 def _watch_task_completion(task_id, process, command, session_id):
-    """监听线程：自适应节拍同步任务状态（日志大小/进程退出），退出后触发完成回调（仅一次）。
-
-    每拍在 _TASKS_COND 内执行 _sync_task_locked：日志 size 变化或进程退出都会
-    bump revision 并 notify_all，manage_task(wait) 的等待方据此即时被唤醒。
-
-    节拍按任务已运行时长自适应：前 10s 用 0.5s 节拍快速捕捉短命任务退出，之后
-    降到 2.0s，避免长期驻留服务（如 dev server）永久高频空转轮询。代价是这类
-    任务退出最晚约 2s 才被发现，终态通知相应延后（预期行为）。
-    """
-    # 节拍基准时间戳：优先取任务 info 里的 start_time，缺失/异常时回落本地时钟
     started_at = time.time()
     with _TASKS_COND:
         _initial_info = ACTIVE_TASKS.get(task_id)
@@ -170,11 +146,9 @@ def _watch_task_completion(task_id, process, command, session_id):
                     if returncode is None:
                         returncode = -1
                 if returncode is not None:
-                    # 进程退出后落盘一次：磁盘库只保留 running 任务
                     _save_tasks()
         if returncode is not None:
             break
-        # 自适应节拍：运行不足 10s 的任务用 0.5s 快速响应，长跑任务降到 2.0s
         if time.time() - started_at < 10.0:
             time.sleep(0.5)
         else:
@@ -195,7 +169,6 @@ def _watch_task_completion(task_id, process, command, session_id):
 
 
 def _ensure_paths():
-    """按需解析日志目录与任务库路径（首次使用时按当前线程工作目录确定）。"""
     global LOG_DIR, TASK_DB_PATH
     if LOG_DIR is None:
         LOG_DIR = os.path.abspath(os.path.join(get_workdir(), ".ycode_tasks"))
@@ -208,7 +181,6 @@ def _ensure_paths():
 
 
 def _ensure_loaded():
-    """首次使用时从磁盘接管历史任务，替代模块导入期的立即读盘。"""
     global _LOADED
     # 整个加载过程持锁（_TASKS_LOCK 为 RLock，_load_tasks 内可重入），
     # 避免置位 _LOADED 后锁外加载期间其他线程读到未完成的状态
@@ -220,7 +192,6 @@ def _ensure_loaded():
 
 
 def is_pid_running(pid):
-    """检查 PID 对应的进程是否仍在系统后台运行"""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -246,7 +217,6 @@ def is_pid_running(pid):
                         return True
                 return False
             else:
-                # Unix kill -0 信号检测
                 os.kill(pid, 0)
                 return True
         except Exception:
@@ -254,7 +224,6 @@ def is_pid_running(pid):
 
 
 def _process_create_time(pid):
-    """返回进程启动时间戳；无法获取时返回 None（用于 PID 复用校验）。"""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -280,7 +249,6 @@ def _process_cmdline(pid):
 
 
 def _load_tasks():
-    """从本地 JSON 文件中反序列化加载任务记录，用于跨 Y-code 重启的生命周期接管"""
     _ensure_paths()
     if not os.path.exists(TASK_DB_PATH):
         return
@@ -311,7 +279,7 @@ def _load_tasks():
                 "start_time": start_time,
                 "create_time": info.get("create_time"),
                 "log_file_path": os.path.join(LOG_DIR, f"task_{tid}.log"),
-                "process": None,     # 重建的任务 Popen 对象为 None，依赖 PID 检测
+                "process": None,
                 "log_handle": None,  # 文件句柄在需要时懒加载/写入时关闭
                 "output_encoding": (
                     info.get("output_encoding")
@@ -333,7 +301,6 @@ def _save_tasks():
         with _TASKS_LOCK:
             data = {}
             for tid, info in ACTIVE_TASKS.items():
-                # 只落盘仍在运行的任务；终态任务仅保留在内存供快照/wait 查询（磁盘格式不变）
                 if info.get("status", TASK_STATUS_RUNNING) != TASK_STATUS_RUNNING:
                     continue
                 pid = info.get("pid") or (info["process"].pid if info.get("process") else None)
@@ -385,28 +352,18 @@ def _save_tasks():
 
 
 def turn_short_code(turn_id: str | None) -> str:
-    """回合短码：turn_id 前 8 位（与 turn_undo prompt_context 的展示惯例一致）。
-
-    用于 /tasks 展示与任务日志标注；无值返回空串。
-    """
     return str(turn_id or "")[:8]
 
 
 def start_background_task(
     command: str, session_id: str = "", shell_id: str = "", turn_id: str = ""
 ) -> str:
-    """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出。
-
-    session_id 记录发起该任务所属的会话，完成回调据此触发 LLM 总结。
-    turn_id 记录发起该任务的父回合（T4 回合关联：/tasks 展示与日志标注）。
-    """
     _ensure_paths()
     _ensure_loaded()
     if _is_dangerous_command(command):
         raise RuntimeError(f"拒绝执行包含危险模式的后台命令：{command}")
     from core.command_shell import build_command_invocation
     invocation = build_command_invocation(command, shell_id=shell_id)
-    # 8 位 uuid 有碰撞可能，若目标日志已存在则重新生成
     for _ in range(10):
         task_id = str(uuid.uuid4())[:8]
         log_file_path = os.path.join(LOG_DIR, f"task_{task_id}.log")
@@ -417,13 +374,8 @@ def start_background_task(
 
     log_file = None
     try:
-        # 打开日志文件
         log_file = open(log_file_path, "wb")
 
-        # 注入环境变量，强制让 Python 的输出不进行缓冲，实时写入日志文件
-        # T1 安全默认：后台子进程默认不继承敏感环境变量（*KEY*/*SECRET*/*TOKEN*/*PASSWORD*），
-        # 逃生门 config.json "shell_env_policy": {"exclude_sensitive": false}；
-        # 实时日志所需的注入在 build_child_env 结果之上显式叠加。
         env = build_child_env(os.environ, policy=load_shell_env_policy())
         output_encoding = platform_console_encoding()
         env["PYTHONUNBUFFERED"] = "1"
@@ -439,8 +391,6 @@ def start_background_task(
         # stdout 和 stderr 都合并写入日志文件
         # 命令由系统设置选择的解释器承载；auto 保持平台默认 Shell 兼容行为。
         try:
-            # cwd 跟随发起任务的会话工作目录（多会话并行时命令跑在各自项目下），
-            # 不再隐式继承进程启动目录
             popen_kwargs = {
                 "shell": invocation.use_system_shell,
                 "stdout": log_file,
@@ -462,7 +412,6 @@ def start_background_task(
             log_file = None
             raise
 
-        # T4 回合关联：任务日志首行标注父回合短码（副作用任务日志可追溯到回合）
         if turn_id:
             try:
                 log_file.write(
@@ -509,7 +458,6 @@ def start_background_task(
         except Exception as reg_error:
             _logger.warning("后台任务登记进程注册表失败 %s: %s", task_id, reg_error)
         _prune_old_logs()
-        # 启动完成监听线程：进程退出后触发完成回调，向前端推送通知
         _watcher = threading.Thread(
             target=_watch_task_completion,
             args=(task_id, process, command, session_id),
@@ -528,7 +476,6 @@ def start_background_task(
 
 
 def _prune_old_logs():
-    """滚动清理历史任务日志，只保留最近 _MAX_TASK_LOGS 个（活跃任务日志除外）。"""
     try:
         names = [
             name for name in os.listdir(LOG_DIR)
@@ -564,7 +511,6 @@ def _bump_revision_locked(info):
 
 
 def _transition_terminal_locked(task_id, info, status, exit_code) -> bool:
-    """将 running 任务一次性转换为终态，并执行终态记录容量淘汰。"""
     if info.get("status") in _TERMINAL_STATUSES:
         return False
     info["status"] = status
@@ -575,7 +521,6 @@ def _transition_terminal_locked(task_id, info, status, exit_code) -> bool:
 
 
 def _sync_task_locked(tid, info):
-    """锁内同步单个任务：日志大小变化/进程退出 → 状态与 revision。返回是否变化。"""
     changed = False
     log_file_path = info.get("log_file_path")
     if log_file_path:
@@ -607,7 +552,7 @@ def _sync_task_locked(tid, info):
                 dead = True
         elif info.get("pid") is not None:
             if not is_pid_running(info["pid"]):
-                dead = True  # 重建任务无法取退出码，exit_code 保持 None
+                dead = True
             else:
                 # PID 复用防护：磁盘重建任务需校验进程启动时间，
                 # 否则无关进程复用 PID 会让死任务永远挂在活跃列表里
@@ -679,11 +624,6 @@ def list_task_snapshots():
 
 
 def wait_task_change(task_id, after_revision, timeout_seconds, cancel_event=None):
-    """条件等待任务变化：revision 超过 after_revision、进入终态或超时后返回快照。
-
-    任务不存在返回 None；超时返回当前快照（是否变化由调用方比较 revision 得出），
-    超时不是错误；cancel_event 置位抛 KeyboardInterrupt（不伪装超时）。
-    """
     _ensure_paths()
     _ensure_loaded()
     deadline = time.monotonic() + timeout_seconds
@@ -734,7 +674,6 @@ def background_tasks_fingerprint() -> str:
 
 
 def _evict_terminal_locked():
-    """终态任务超过 _TERMINAL_KEEP_CAP 时淘汰最旧终态（按 start_time），并记墓碑。"""
     terminal = [
         (tid, info) for tid, info in ACTIVE_TASKS.items()
         if info.get("status", TASK_STATUS_RUNNING) in _TERMINAL_STATUSES
@@ -749,15 +688,8 @@ def _evict_terminal_locked():
 
 
 def list_active_tasks():
-    """返回当前所有仍在运行的任务列表（返回值结构与历史一致，只含 running 任务）。
-
-    每行附带 session_id（发起会话名）：GUI 执行条据此只显示当前会话的任务。
-    死亡任务不再直接删除，而是标记终态保留在 ACTIVE_TASKS 供快照/wait 查询；
-    终态记录超过 _TERMINAL_KEEP_CAP 时淘汰最旧；磁盘库只保存 running 任务。
-    """
     _ensure_paths()
     results = []
-    # 强制重新从本地加载以接管外部常驻进程
     _load_tasks()
 
     dirty = False
@@ -776,9 +708,6 @@ def list_active_tasks():
             proc = info.get("process")
             pid = info.get("pid")
             running_time = int(time.time() - info["start_time"])
-            # 输出心跳：日志字节数 + 距最后一次写入的秒数。GUI 任务面板据此在
-            # 运行期区分"仍在运行只是暂无输出"与"面板失联"（缓冲管道命令的
-            # 运行期日志天然只有启动标记一行，size 长期停在几十字节）
             log_file_path = info.get("log_file_path")
             try:
                 output_size = os.path.getsize(log_file_path) if log_file_path else 0
@@ -820,7 +749,6 @@ def get_task_output(task_id: str, tail_lines: int = 30) -> str:
             info = ACTIVE_TASKS.get(task_id) or {}
             handle = info.get("log_handle")
             output_encoding = info.get("output_encoding") or platform_console_encoding()
-        # 强制刷盘以确保读取到最新内容
         if handle:
             try:
                 handle.flush()
@@ -835,13 +763,9 @@ def get_task_output(task_id: str, tail_lines: int = 30) -> str:
             f.seek(max(0, size - _TAIL_READ_BYTES))
             raw = f.read()
         output = decode_process_output(raw, output_encoding)
-        # 子进程写文件的原始字节常带 ANSI 颜色码（vitest 在 CI/FORCE_COLOR 下
-        # 非 TTY 也上色），日志尾部同时供 GUI 面板、CLI /tasks 与任务快照消费，
-        # 统一在此清洗成纯文本；CSI 序列不含换行，剥离不影响分行截断逻辑
         output = strip_ansi_escapes(output)
         lines = output.splitlines(keepends=True)
         if truncated and lines:
-            # 丢弃被截断的首行残片
             lines = lines[1:]
         tail = lines[-tail_lines:] if len(lines) > tail_lines else lines
         result = "".join(tail)
@@ -901,7 +825,6 @@ def _kill_posix_tree(pid: int, proc=None) -> bool:
 
 
 def _confirm_process_stopped(pid, proc=None, timeout_seconds=2.0) -> bool:
-    """在发出终止请求后有限等待，并以真实进程状态确认是否已退出。"""
     deadline = time.monotonic() + max(0.0, float(timeout_seconds))
     while True:
         if proc is not None:
@@ -919,11 +842,11 @@ def _confirm_process_stopped(pid, proc=None, timeout_seconds=2.0) -> bool:
 
 # kill_background_task_detailed 结果分类：调用方按类别给出准确反馈，
 # 避免把"进程已自然结束"这类无害结果误报为"终止失败"。
-KILL_RESULT_KILLED = "killed"                      # 已实际执行终止且确认进程退出
-KILL_RESULT_NATURAL_DEATH = "natural_death"        # 终止前进程已自行结束（终态按自然退出落定）
-KILL_RESULT_NOT_FOUND = "not_found"                # 无该任务记录
-KILL_RESULT_IDENTITY_UNVERIFIABLE = "identity_unverifiable"  # 无法校验进程身份，保守拒绝 kill
-KILL_RESULT_FAILED = "failed"                      # 终止动作已执行但进程未确认退出
+KILL_RESULT_KILLED = "killed"
+KILL_RESULT_NATURAL_DEATH = "natural_death"
+KILL_RESULT_NOT_FOUND = "not_found"
+KILL_RESULT_IDENTITY_UNVERIFIABLE = "identity_unverifiable"
+KILL_RESULT_FAILED = "failed"
 
 
 def kill_background_task(task_id: str) -> bool:
@@ -933,7 +856,6 @@ def kill_background_task(task_id: str) -> bool:
 
 def kill_background_task_detailed(task_id: str) -> str:
     """终止后台任务并返回结果分类（KILL_RESULT_* 常量之一）。"""
-    # 刷新状态，确保最新的 tasks.json 已被同步
     list_active_tasks()
 
     with _TASKS_LOCK:
@@ -945,12 +867,11 @@ def kill_background_task_detailed(task_id: str) -> str:
     pid = info.get("pid")
 
     killed = False
-    natural_death = False  # 进程在 kill 之前已自行结束（终态按自然退出落定）
+    natural_death = False
     identity_unverifiable = False
     try:
         if pid:
             pid = int(pid)
-            # PID 复用防护：进程启动时间与记录不一致，说明原进程已死、PID 被无关进程复用
             recorded_create_time = info.get("create_time")
             current_create_time = _process_create_time(pid)
             pid_reused = (
@@ -970,13 +891,11 @@ def kill_background_task_detailed(task_id: str) -> str:
                     if cmdline is None or str(info.get("command", ""))[:30] not in cmdline:
                         identity_unverifiable = True
             if pid_reused:
-                # 视为任务已结束，只清理记录，不执行 taskkill
                 killed = False
                 natural_death = True
             elif identity_unverifiable:
                 killed = False
             elif not is_pid_running(pid):
-                # 进程已自行结束
                 killed = False
                 natural_death = True
             elif os.name == 'nt':
@@ -1016,14 +935,12 @@ def kill_background_task_detailed(task_id: str) -> str:
         current = ACTIVE_TASKS.get(task_id)
         if current is not None:
             if natural_death:
-                # 进程在 kill 之前已自行结束：按自然终态落定，不覆盖为 cancelled
                 _sync_task_locked(task_id, current)
             elif identity_unverifiable and current.get("status") == TASK_STATUS_RUNNING:
                 _transition_terminal_locked(
                     task_id, current, TASK_STATUS_FAILED, None
                 )
             elif killed and current.get("status") == TASK_STATUS_RUNNING:
-                # 保留记录为终态（快照/wait 可继续查询），不再立即删除
                 _transition_terminal_locked(
                     task_id, current, TASK_STATUS_CANCELLED, None
                 )

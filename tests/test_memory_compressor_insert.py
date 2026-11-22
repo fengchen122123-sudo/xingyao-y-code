@@ -1,12 +1,3 @@
-"""插入式压缩（Insert-then-Compress）回归。
-
-保活服务存有会话最后一次主请求的完整字节（ledger 消息 + tools + 亲和参数）。
-插入式压缩在该字节尾部追加一条压缩指令：前缀与上次真实请求完全一致 → 命中
-热前缀缓存，只付指令与摘要输出的增量。本文件锁定：请求继承快照字节
-（model/tools/messages 原样 + 恰好多一条指令）、CAS 落库、条件不满足或请求
-失败时静默回退分段路径、insert_mode 开关生效。
-"""
-
 import pytest
 
 import core.memory_compressor as mc
@@ -45,7 +36,6 @@ def manager():
 
 
 def _seed_history(manager, count, filler=200):
-    """写入 count 条 user/assistant 交替消息，每条填充 filler 个内容词。"""
     for i in range(count):
         manager.add_message(
             "insert-session",
@@ -56,7 +46,6 @@ def _seed_history(manager, count, filler=200):
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
-    """禁用副模型、固定主模型窗口、禁 tiktoken、注入保活快照。"""
     monkeypatch.setattr(
         "core.model_manager.get_secondary_roles", lambda: {"compression": False}
     )
@@ -93,14 +82,13 @@ def test_insert_path_reuses_snapshot_bytes_and_commits(manager, monkeypatch):
     assert len(calls) == 1
     req = calls[0]
     assert req["model"] == "fake/compress-model"
-    assert req["tools"] == FAKE_SNAPSHOT["tools"]              # tools 原样继承
-    assert req["messages"][:-1] == FAKE_SNAPSHOT["messages"]   # 前缀字节一致
+    assert req["tools"] == FAKE_SNAPSHOT["tools"]
+    assert req["messages"][:-1] == FAKE_SNAPSHOT["messages"]
     assert req["messages"][-1]["role"] == "user"
     assert "记忆压缩" in req["messages"][-1]["content"]
     assert req["stream"] is False
     assert req["max_tokens"] == mc.INSERT_SUMMARY_MAX_TOKENS
 
-    # topics 已剥离进归档表、摘要与边界已落库
     cursor = manager.conn.cursor()
     cursor.execute(
         "SELECT memory_summary, summarized_until_msg_id FROM sessions WHERE session_name = ?",
@@ -118,7 +106,7 @@ def test_insert_path_reuses_snapshot_bytes_and_commits(manager, monkeypatch):
 
 
 def test_missing_snapshot_falls_back_to_chunked_path(manager, monkeypatch):
-    _seed_history(manager, 60)  # 远超单段预算，强制多段
+    _seed_history(manager, 60)
     monkeypatch.setattr(mc, "_get_keepalive_snapshot", lambda s: None)
     seen = []
 
@@ -134,7 +122,7 @@ def test_missing_snapshot_falls_back_to_chunked_path(manager, monkeypatch):
     ) is True
 
     assert len(seen) >= 2
-    assert all(len(kw["messages"]) == 1 for kw in seen)  # 分段路径单条 user 消息形态
+    assert all(len(kw["messages"]) == 1 for kw in seen)
     cursor = manager.conn.cursor()
     cursor.execute(
         "SELECT memory_summary FROM sessions WHERE session_name = ?", ("insert-session",)
@@ -171,7 +159,7 @@ def test_insert_request_failure_falls_back(manager, monkeypatch):
 
     def fake_completion(**kwargs):
         seen.append(kwargs)
-        if len(kwargs["messages"]) > 1:  # 插入式请求（快照 + 指令）失败
+        if len(kwargs["messages"]) > 1:
             raise RuntimeError("insert boom")
         return _Resp("回退摘要")
 
@@ -182,7 +170,6 @@ def test_insert_request_failure_falls_back(manager, monkeypatch):
         output_callback=lambda m: None,
     ) is True
 
-    # 恰好一次插入式尝试 + 回退成功
     assert len(seen) == 2
     assert len(seen[0]["messages"]) > 1 and len(seen[1]["messages"]) == 1
     cursor = manager.conn.cursor()
@@ -222,7 +209,7 @@ def test_snapshot_over_window_budget_falls_back(manager, monkeypatch):
         "litellm_model": "fake/compress-model",
         "api_key": "k",
         "base_url": "",
-        "context_window": 512,  # 远小于快照体量 → 预算不满足
+        "context_window": 512,
     }
     monkeypatch.setattr("core.model_manager.get_active_model", lambda *a, **kw: tiny_window)
     seen = []

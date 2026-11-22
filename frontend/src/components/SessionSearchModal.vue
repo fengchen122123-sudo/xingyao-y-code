@@ -6,7 +6,6 @@
     @mousedown.self="close()"
   >
     <div class="session-search-modal" data-test="session-search-modal">
-      <!-- 顶部搜索输入区 -->
       <div class="search-head">
         <span class="search-icon">
           <AppIcon name="search" :size="18" />
@@ -33,7 +32,6 @@
         <span class="esc-badge" title="按 ESC 键退出">ESC</span>
       </div>
 
-      <!-- 搜索范围过滤条 -->
       <div class="filter-bar">
         <div class="scope-tabs">
           <span class="filter-label">目标:</span>
@@ -72,7 +70,6 @@
             </option>
             <option value="global">通用对话 (自由)</option>
           </select>
-          <!-- 归档会话默认不参与检索（与侧栏主列表口径一致），需要时手动打开 -->
           <label class="archive-toggle" title="同时检索已归档会话（默认不检索）">
             <input
               v-model="includeArchived"
@@ -85,29 +82,24 @@
         </div>
       </div>
 
-      <!-- 搜索结果列表区 -->
       <div ref="resultsContainerRef" class="results-container custom-scrollbar" data-test="search-results">
-        <!-- 加载中指示 -->
         <div v-if="loading" class="state-box">
           <span class="loading-spinner"></span>
           <span>正在检索会话历史…</span>
         </div>
 
-        <!-- 空输入引导 -->
         <div v-else-if="!query.trim()" class="state-box">
           <span class="empty-ico"><AppIcon name="search" :size="28" /></span>
           <p class="empty-title">输入关键词搜索会话</p>
           <p class="empty-desc">支持即时模糊匹配会话标题、用户提问与助手回复内容</p>
         </div>
 
-        <!-- 无匹配结果 -->
         <div v-else-if="results.length === 0" class="state-box">
           <span class="empty-ico">🔍</span>
           <p class="empty-title">未找到与 "{{ query }}" 相关的会话</p>
           <p class="empty-desc">请尝试调整关键词、缩短搜索词或切换搜索目标范围</p>
         </div>
 
-        <!-- 结果列表 -->
         <template v-else>
           <div
             v-for="(item, index) in results"
@@ -118,7 +110,6 @@
             @click="jumpToSession(item)"
             @mouseenter="selectedIndex = index"
           >
-            <!-- 头部：角色徽章 + 会话标题 + 所属目录/时间 -->
             <div class="item-head">
               <div class="head-left">
                 <span
@@ -137,7 +128,6 @@
               </div>
             </div>
 
-            <!-- 命中上下文切片（内容匹配时呈现） -->
             <div
               v-if="item.snippet"
               class="item-snippet"
@@ -147,7 +137,6 @@
         </template>
       </div>
 
-      <!-- 底部快捷键与汇总条 -->
       <div class="search-foot">
         <div class="foot-keys">
           <span><kbd>↑</kbd><kbd>↓</kbd> 导航</span>
@@ -173,7 +162,6 @@ const store = useAppStore();
 const query = ref('');
 const currentScope = ref<'all' | 'title' | 'content'>('all');
 const projectScope = ref<'all' | 'current' | 'global'>('all');
-// 是否把已归档会话纳入检索（默认关闭，与侧栏主列表口径一致）
 const includeArchived = ref(false);
 const results = ref<any[]>([]);
 const loading = ref(false);
@@ -408,7 +396,6 @@ watch(
   }
 }
 
-/* 顶部搜索条 */
 .search-head {
   display: flex;
   align-items: center;
@@ -466,7 +453,6 @@ watch(
   font-family: monospace;
 }
 
-/* 过滤栏 */
 .filter-bar {
   display: flex;
   align-items: center;
@@ -522,7 +508,6 @@ watch(
   cursor: pointer;
 }
 
-/* 「包含已归档」开关：与范围选择器同排，弱化为次级过滤项 */
 .archive-toggle {
   display: flex;
   align-items: center;
@@ -544,7 +529,6 @@ watch(
   color: var(--text);
 }
 
-/* 结果区 */
 .results-container {
   max-height: 390px;
   min-height: 120px;
@@ -597,7 +581,6 @@ watch(
   to { transform: rotate(360deg); }
 }
 
-/* 结果条目 */
 .result-item {
   padding: 10px 12px;
   border-radius: 10px;
@@ -665,7 +648,6 @@ watch(
   font-size: 10.5px;
 }
 
-/* 徽章样式 */
 .type-badge {
   font-size: 10px;
   padding: 1px 6px;
@@ -693,7 +675,6 @@ watch(
   border: 1px solid rgba(46, 204, 113, 0.3);
 }
 
-/* 消息切片 */
 .item-snippet {
   font-size: 11.5px;
   line-height: 1.5;
@@ -713,7 +694,6 @@ watch(
   font-weight: 600;
 }
 
-/* 底部操作条 */
 .search-foot {
   display: flex;
   align-items: center;
@@ -743,7 +723,6 @@ watch(
 </style>
 
 <style>
-/* 浅色主题（白色主题）专项适配：解决浅色底色下高亮文字变白看不清的问题 */
 :root.light .session-search-modal mark,
 body.light .session-search-modal mark {
   background: #fef08a !important;

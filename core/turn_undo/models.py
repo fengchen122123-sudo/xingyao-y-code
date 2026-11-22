@@ -1,28 +1,9 @@
-"""星瑶按回合撤销：严格枚举、值对象与结构化错误。
-
-本包是"按回合撤销文件修改"功能的唯一语义层：
-- models.py     枚举、状态迁移表、值对象、DTO、错误（本模块）
-- storage.py    SQLite 元数据 DAO、内容寻址快照仓库与 GC
-- recorder.py   受控文件修改前后的记录与验证
-- coordinator.py 规范化工作区互斥锁与活跃回合判定
-- transaction.py 多文件恢复事务
-- recovery.py   崩溃中断检测、路径冻结与显式恢复
-- prompt_context.py 模型动态纠正上下文
-- service.py    GUI、CLI、模型工具共用的编排入口
-
-铁律：未知枚举、非法状态迁移必须显式失败；快照失败时文件修改必须失败。
-"""
-
 from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
 from typing import Optional
 
-
-# ---------------------------------------------------------------------------
-# 严格枚举
-# ---------------------------------------------------------------------------
 
 class TurnUndoStatus(str, enum.Enum):
     """回合撤销生命周期状态（严格枚举，非法迁移显式失败）。"""
@@ -128,13 +109,12 @@ class RecoveryAction(str, enum.Enum):
 class RollbackKind(str, enum.Enum):
     """单文件恢复动作。"""
 
-    RESTORE_CONTENT = "restore_content"      # 用 before blob 恢复普通文件内容
-    DELETE_CREATED = "delete_created"        # 本轮新建文件 → 移入事务隔离区
+    RESTORE_CONTENT = "restore_content"
+    DELETE_CREATED = "delete_created"
     RESTORE_DELETED = "restore_deleted"      # 本轮删除文件 → 从快照原子就位
-    RESTORE_PATH_STATE = "restore_path_state"  # 重命名等路径状态恢复
+    RESTORE_PATH_STATE = "restore_path_state"
 
 
-# 状态机迁移表（规格 5.5）：未列出的迁移必须显式失败。
 CHECKPOINT_TRANSITIONS: dict[TurnUndoStatus, frozenset[TurnUndoStatus]] = {
     TurnUndoStatus.RECORDING: frozenset({
         TurnUndoStatus.READY,
@@ -172,7 +152,6 @@ CHECKPOINT_TRANSITIONS: dict[TurnUndoStatus, frozenset[TurnUndoStatus]] = {
     }),
 }
 
-# 生命周期终态：只允许 SnapshotAvailability 更新，不允许状态迁移。
 CHECKPOINT_TERMINAL_STATUSES: frozenset[TurnUndoStatus] = frozenset({
     TurnUndoStatus.NO_CHANGES,
     TurnUndoStatus.UNAVAILABLE,
@@ -236,10 +215,6 @@ def require_operation_transition(current: OperationStatus, target: OperationStat
         )
 
 
-# ---------------------------------------------------------------------------
-# 结构化错误
-# ---------------------------------------------------------------------------
-
 class TurnUndoError(Exception):
     """携带稳定错误码的显式失败；GUI/CLI 不得从人类文本解析业务状态。"""
 
@@ -254,7 +229,6 @@ class TurnUndoError(Exception):
 
 
 class UndoErrorCode:
-    """稳定错误码常量（规格 19.2）。"""
 
     CHECKPOINT_NOT_FOUND = "checkpoint_not_found"
     CHECKPOINT_UNAVAILABLE = "checkpoint_unavailable"
@@ -272,34 +246,19 @@ class UndoErrorCode:
     RECOVERY_REQUIRED = "recovery_required"
     RECOVERY_OPERATION_CYCLE = "recovery_operation_cycle"
     INVALID_STATE_TRANSITION = "invalid_state_transition"
-    # 补充码：仅用于内部判别，语义同样稳定。
     WORKSPACE_IDENTITY_MISMATCH = "workspace_identity_mismatch"
     IO_ERROR = "io_error"
     INVALID_INPUT = "invalid_input"
     SNAPSHOT_UNAVAILABLE = "snapshot_unavailable"
     CHECKPOINT_CLOSED = "checkpoint_closed"
-    # 线程未绑定任何检查点上下文（回合外调用）：与"上下文存在但检查点已封闭"
-    # 严格区分——前者允许工具降级为不可撤销写入，后者必须在触盘前拒绝（规格 9.2）
     NO_ACTIVE_CHECKPOINT = "no_active_checkpoint"
 
 
-# 文件级撤销结果（turn_undo_files.undo_result）：skipped 表示该文件在回合内
-# 被外部修改，已退出本回合撤销范围，但回合本身仍可继续写入。
 UNDO_RESULT_SKIPPED = "skipped"
 
 
-# ---------------------------------------------------------------------------
-# 值对象
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class NodeState:
-    """一次受控修改前/后的精确结点状态。
-
-    identity 为可靠获取时的卷/设备号与 File ID（Windows 用 st_dev+st_ino，
-    POSIX 用 st_dev+st_ino）；link_count 为硬链接计数；symlink_target 仅用于
-    冲突识别，不跟随链接读取内容。
-    """
 
     kind: NodeKind
     exists: bool
@@ -326,11 +285,6 @@ class NodeState:
 
 @dataclass(frozen=True)
 class PlannedPathMutation:
-    """受控工具在真正写文件前声明的完整计划修改。
-
-    after_content 是计划写入的完整字节（删除时为 None 且 after.kind=missing）。
-    before 由记录器自行从磁盘捕获，不信任工具转述。
-    """
 
     canonical_path: str
     display_path: str
@@ -358,12 +312,6 @@ class PlannedPathMutation:
 
 @dataclass(frozen=True)
 class MutationHandle:
-    """写入句柄：before/after blob 与数据库记录全部持久化成功后签发。
-
-    不可伪造（由记录器内部签发）；封闭检查点不再签发新句柄，迟到写入在
-    触盘前失败。previous_after 保存被本次计划替换前的已验证 after 状态，
-    供写入失败时回滚恢复记录完整性。
-    """
 
     handle_id: str
     checkpoint_id: str
@@ -439,7 +387,6 @@ class TurnUndoPreview:
     restore_path_state_count: int
     created_files: tuple[str, ...]
     conflicts: tuple[FileConflict, ...] = ()
-    # 因回合内被外部修改而退出撤销范围的文件（display_path）；撤销时跳过
     skipped_files: tuple[str, ...] = ()
     has_uncovered_command_effects: bool = False
     subsequent_completed_turns: int = 0

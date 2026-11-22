@@ -1,9 +1,3 @@
-"""Hunk/行级 Patch 的生成、预检与应用（规格 §5.3/§5.13）。
-
-铁律：Patch 必须从当前快照生成精确 diff，先 `git apply --check` 预检再应用；
-快照过期或上下文不匹配时直接拒绝（patch_check_failed），绝不模糊应用或三方补救。
-"""
-
 from __future__ import annotations
 
 from typing import List, Optional, Sequence
@@ -62,7 +56,6 @@ def _run_apply_with_stdin(
     args: List[str],
     patch_text: str,
 ):
-    """--check 预检通过后才真正应用（两次进程调用，均经 stdin 传 patch）。"""
     check_args = [*args, "--check", "-"]
     check = runner.run(
         check_args,
@@ -95,11 +88,6 @@ def build_stage_hunk_patch(
     selected_hunk_indexes: Sequence[int],
     hunks,
 ) -> str:
-    """从完整 diff 文本中抽取选中的 Hunk 构成可暂存 patch（纯函数）。
-
-    hunks 为 query_refs.parse_unified_diff 的产物；保留 diff 头部（diff --git/
-    index/---/+++ 行）以生成合法 patch。
-    """
     if not selected_hunk_indexes:
         raise GitError(GitErrorCode.INVALID_STATE, "未选择任何 Hunk")
     header_lines: List[str] = []

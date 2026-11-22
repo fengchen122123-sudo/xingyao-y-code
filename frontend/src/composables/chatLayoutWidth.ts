@@ -1,13 +1,5 @@
 import { ref, watch } from 'vue';
 
-/**
- * 对话内容区宽度模式（通过 html[data-chat-width] 驱动 style.css 中的
- * --chat-col-width / --empty-col-width，在 #center 容器内按 cqw 自适应计算）。
- *
- * - wide（默认）：对话保持 960–1060px 舒适阅读宽，宽屏或最大化时联动展开右侧工作台。
- * - full：单栏铺满（max(820px, calc(100cqw - 116px))），适合查看长代码/表格/Diff。
- * - compact：经典居中（820px），不自动展开右侧工作台。
- */
 const STORAGE_KEY = 'ycode.chatLayoutWidth';
 
 export type ChatLayoutWidthMode = 'wide' | 'full' | 'compact';
@@ -37,7 +29,6 @@ function persist() {
   try {
     localStorage.setItem(STORAGE_KEY, chatLayoutWidth.value);
   } catch {
-    /* 隐私模式等写不进去时仅在当前会话生效 */
   }
 }
 

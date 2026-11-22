@@ -1,6 +1,5 @@
 <template>
   <div id="topbar" data-theme-region="app_header">
-    <!-- 手机端显式会话/侧栏抽屉按钮：桌面端隐藏，手机端固定在左上角一眼可见 -->
     <button
       type="button"
       class="icon-btn no-drag mobile-sidebar-btn"
@@ -11,8 +10,6 @@
     >
       <AppIcon name="menu" :size="16" :stroke-width="2" />
     </button>
-    <!-- 侧栏开合入口：桌面端点击左上角星瑶图标收起/展开左侧栏
-         （热区只覆盖图标本身，右侧文字标题不参与；桌面端不显示额外汉堡按钮） -->
     <div class="logo no-drag" :title="logoTitle">
       <img
         class="mark"
@@ -29,16 +26,12 @@
       <div><span class="name">星瑶Code</span></div>
     </div>
 
-    <!-- 标题栏拖拽区：mousedown 延迟进原生移动循环（SC_MOVE+HTCAPTION），
-         连续点击的偶数次按下交给 dblclick，奇数次按下仍可开始新拖动；
-         避免 SC_MOVE 移动循环吞掉双击序列。 -->
     <div
       class="titlebar-drag"
       @mousedown.left="beginDrag"
       @dblclick="toggleMaximizeNative"
     ></div>
 
-    <!-- 软件更新提示按钮：发现新版本或下载就绪时展示 -->
     <button
       v-if="store.updateState.hasUpdate"
       class="update-topbar-btn no-drag"
@@ -65,7 +58,6 @@
       <AppIcon name="panel-right" :size="16" :stroke-width="2.25" />
     </button>
 
-    <!-- 自绘窗口控制按钮（frameless）：矢量图标，避免 12px 字符发虚 -->
     <div class="window-controls no-drag">
       <button class="win-btn" title="最小化" data-test="win-min" @click="winMinimize">
         <AppIcon name="minus" :size="15" :stroke-width="2.5" />
@@ -115,7 +107,6 @@ async function toggleMaximizeNative() {
   await toggleMaximize();
 }
 
-// 双击判定窗口（毫秒）：超过则按拖拽处理；连续点击的偶数次按下交给 dblclick。
 const DBLCLICK_MS = 400;
 let dragTimer: ReturnType<typeof setTimeout> | null = null;
 let dragArmed = false;
@@ -135,15 +126,12 @@ function enterNativeMoveLoop() {
   const shouldStart = dragArmed;
   cancelPendingDrag();
   if (!shouldStart) return;
-  // 系统原生移动循环：Snap / 动画原生。桥调用阻塞到拖拽结束，不 await。
   void api()?.window_begin_drag?.();
 }
 
-// 位移超过该阈值视为拖拽意图，立即进入移动循环（不傻等双击判定窗口）
 const DRAG_THRESHOLD_PX = 4;
 
 async function beginDrag(event: MouseEvent) {
-  // 连续点击序列中的偶数次按下交给 dblclick；第三次等奇数按下可开始新拖动。
   if (event.detail > 0 && event.detail % 2 === 0) {
     cancelPendingDrag();
     return;
@@ -174,7 +162,6 @@ async function winMinimize() {
   await api()?.window_minimize?.();
 }
 function winClose() {
-  // 关闭走 destroy 触发 closing 事件，由后端生命周期层做退出确认
   void api()?.window_close?.();
 }
 
@@ -183,14 +170,12 @@ onMounted(async () => {
     const result = await api()?.window_is_maximized?.();
     if (result?.ok) maximized.value = !!result.maximized;
   } catch {
-    // 桥未就绪（浏览器开发态）时忽略
   }
 });
 onBeforeUnmount(() => {
   cancelPendingDrag();
 });
 
-// logo 文字区域的悬停提示：显示版本信息（侧栏开合提示挂在星瑶图标上）
 const logoTitle = computed(() =>
   store.version ? `星瑶Code ${store.agentName} v${store.version}` : `星瑶Code ${store.agentName}`
 );
@@ -228,7 +213,6 @@ function handleUpdateClick() {
   user-select: none;
 }
 
-/* 顶栏图标按钮（终端 / 主题 / 面板）：28×28 rounded-lg */
 #topbar .icon-btn {
   width: 28px;
   height: 28px;
@@ -259,7 +243,6 @@ function handleUpdateClick() {
   border-radius: 6px;
   object-fit: cover;
   display: block;
-  /* 兼作侧栏开合入口：热区只在图标本身 */
   cursor: pointer;
   transition: transform 0.12s, filter 0.12s;
 }
@@ -294,7 +277,6 @@ function handleUpdateClick() {
   min-width: 40px;
 }
 
-/* 自绘窗口控制按钮：颜色随主题文字色，关闭 hover 用危险色 */
 .window-controls {
   display: flex;
   align-items: center;
@@ -326,8 +308,6 @@ function handleUpdateClick() {
   color: #fff;
 }
 
-/* 更新提示按钮 */
-/* 更新提示按钮 */
 .update-topbar-btn {
   display: flex;
   align-items: center;

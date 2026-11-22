@@ -50,15 +50,12 @@ def test_tool_finished_records_failure_stage_with_summary(monkeypatch):
         _event(3, "assistant_delta", {"text": "结论" * 150}),
     ])
 
-    # 唯一工具调用失败：任务按产品语义判 failed，不影响阶段历史断言
     assert snapshot.status == "failed"
     details = [stage.detail for stage in snapshot.stages]
-    # 换行折叠为空格，摘要进阶段详情
     assert "edit_file ✗ 权限被拒绝 第二行" in details
 
 
 def test_tool_stage_history_capped_length_summary(monkeypatch):
-    """超长失败摘要截断到 120 字符，不把阶段历史撑爆。"""
     long_summary = "错" * 500
     snapshot = _run_with_default_runner(monkeypatch, [
         _event(1, "tool_started", {"name": "execute_command"}),

@@ -1,5 +1,3 @@
-"""工作区项目感知推荐提示词单元测试。"""
-
 from __future__ import annotations
 
 import json

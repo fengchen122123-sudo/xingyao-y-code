@@ -2,12 +2,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { useAppStore } from './appStore';
 
-// 红点导航刷新时机：新用户消息落库后，红点索引必须随之更新。
-// 真实故障（2026-09-18 截图）：会话「有用户反馈想让文件夹可以」最后一条用户消息
-// 「修改更新记录」（库中 id 20788）没有红点——截图像素分析数出 8 个红点
-// （5 个 dim + 2 个普通 + 1 个 active），而库里该会话有 9 条 role='user' 消息。
-// 根因：索引刷新只认 currentSessionName，且切回有内存缓存的会话时完全不刷新。
-
 beforeEach(() => {
   setActivePinia(createPinia());
   (window as any).pywebview = undefined;
@@ -63,7 +57,6 @@ it('后台会话 turn_finish：不在该会话时，其自身红点索引也要�
   (window as any).pywebview = { api: apiWith(index) };
   await store.refreshNavIndex();
 
-  // B 在后台跑完一回合，多了一条用户消息（用户此时正在看 A）
   const rtB = (store as any)._getSessionRuntime('B');
   rtB.navItems = [{ id: 11, preview: 'B1' }];
   rtB.messages = [{ role: 'user', content: 'B 的历史' }];
@@ -73,7 +66,6 @@ it('后台会话 turn_finish：不在该会话时，其自身红点索引也要�
   await tick();
 
   expect(rtB.navItems).toHaveLength(2);
-  // 当前显示会话的红点不受影响
   expect(store.navItems).toHaveLength(1);
 });
 
@@ -86,7 +78,6 @@ it('切回已有内存缓存的会话时，红点索引也要刷新（避免缺�
   };
   (window as any).pywebview = { api: apiWith(index) };
 
-  // A 有内存缓存（曾经进入过且消息非空），navItems 是当时的快照
   store.currentSessionName = 'A';
   store.messages = [{ role: 'user', content: 'A 的历史' }] as any;
   const rtA = (store as any)._getSessionRuntime('A');
@@ -94,7 +85,6 @@ it('切回已有内存缓存的会话时，红点索引也要刷新（避免缺�
   rtA.navItems = [{ id: 1, preview: 'A1' }];
 
   await store.switchSession('B');
-  // A 在后台/别端又新增了一条用户消息
   index.A = [...index.A, { id: 2, preview: 'A 的最后一条' }];
   await store.switchSession('A');
   await tick();

@@ -1,13 +1,3 @@
-"""星瑶按回合撤销：SQLite 元数据、内容寻址快照仓库与 GC。
-
-- 表结构 DDL 由 :func:`create_turn_undo_tables` 提供，由 ``MemoryManager.create_tables``
-  幂等调用（与现有迁移同事务、同锁规范）。
-- 所有 DAO 写入函数显式 ``commit()``；参与外部事务的 ``*_locked`` 变体只拿游标，
-  由调用方统一提交（message_turn_links 必须与消息正文同事务）。
-- 文件字节保存在内容寻址仓库（YCODE_DATA_DIR 优先的 ``undo_blobs/``），
-  数据库只保存 SHA-256 引用；长时间文件 I/O 期间不持有 SQLite 连接锁。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -41,16 +31,12 @@ from core.turn_undo.models import (
 
 logger = logging.getLogger(__name__)
 
-# 检查点/操作行的 schema 版本；未知版本显式失败。
 TURN_UNDO_SCHEMA_VERSION = 1
 
-# 每会话保留的完整检查点数量（与旧内存检查点上限保持一致，可配置）。
 DEFAULT_CHECKPOINT_RETENTION = 50
 
-# 确认令牌默认有效期（毫秒）。
 DEFAULT_TOKEN_TTL_MS = 5 * 60 * 1000
 
-# 当前进程随机 boot_id：重启后旧令牌全部失效。
 BOOT_ID = secrets.token_hex(16)
 
 _BLOB_GC_LOCK = threading.Lock()
@@ -250,10 +236,6 @@ def create_turn_undo_tables(cursor: sqlite3.Cursor) -> None:
         cursor.execute(statement)
 
 
-# ---------------------------------------------------------------------------
-# 内容寻址快照仓库
-# ---------------------------------------------------------------------------
-
 def _default_data_dir() -> Path:
     data_dir = os.environ.get("YCODE_DATA_DIR")
     if data_dir:
@@ -304,7 +286,6 @@ class BlobStore:
             sha256 = digest.hexdigest()
             final_path = self.blob_path(sha256)
             if final_path.exists():
-                # 内容去重：同哈希已存在，丢弃临时文件即可。
                 staging_path.unlink(missing_ok=True)
                 return sha256
             final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -330,10 +311,6 @@ class BlobStore:
             )
         return data
 
-
-# ---------------------------------------------------------------------------
-# DAO 行对象（存储层内部表示）
-# ---------------------------------------------------------------------------
 
 class CheckpointRow:
     __slots__ = (
@@ -508,18 +485,12 @@ def _stage_value(value: FileStageStatus) -> str:
     return value.value
 
 
-# ---------------------------------------------------------------------------
-# 存储 DAO
-# ---------------------------------------------------------------------------
-
 class TurnUndoStorage:
     """回合撤销元数据 DAO。持有 MemoryManager，复用其连接与可重入锁。"""
 
     def __init__(self, manager, blob_root: Optional[Path] = None):
         self._manager = manager
         self.blob_store = BlobStore(blob_root)
-
-    # -- 基础 --
 
     @property
     def conn(self):
@@ -540,8 +511,6 @@ class TurnUndoStorage:
                 f"会话不存在: {session_name!r}",
             )
         return int(row[0])
-
-    # -- 检查点 --
 
     def create_checkpoint(
         self,
@@ -812,8 +781,6 @@ class TurnUndoStorage:
                 f"当前 status={row[0]!r} record_version={row[1]}",
             )
 
-    # -- 文件记录 --
-
     def insert_file_locked(self, cursor, *, checkpoint_id: str, values: dict) -> str:
         """在调用方事务内插入文件记录；返回 file_id。"""
         file_id = new_id("file")
@@ -923,11 +890,6 @@ class TurnUndoStorage:
     def refresh_after_identity_locked(
         self, cursor, *, file_id: str, identity: str, mode, link_count,
     ) -> None:
-        """自身恢复操作验证通过后，把 after 身份刷新为当前磁盘实际值。
-
-        内容已验证等于已验证 after 快照；File ID/硬链接计数因我方原子替换而
-        变化属于正常事实，不应在后续预检中被误判为外部同字节替换。
-        """
         cursor.execute(
             "UPDATE turn_undo_files SET after_file_identity = ?, after_mode = ?, "
             "after_link_count = ?, verified_at_ms = ? WHERE file_id = ?",
@@ -985,8 +947,6 @@ class TurnUndoStorage:
             rows = cursor.fetchall()
         return [FileRow(row) for row in rows]
 
-    # -- 撤销操作 --
-
     def create_operation(
         self,
         *,
@@ -1029,7 +989,6 @@ class TurnUndoStorage:
                             UndoErrorCode.OPERATION_SCOPE_MISMATCH,
                             "父操作不处于未解决状态，拒绝建立恢复链",
                         )
-                    # 循环链防御：沿 resolved_by 链回溯，禁止引用自己的祖先。
                     seen = {parent_operation_id}
                     cursor_cursor = parent_operation_id
                     while cursor_cursor:
@@ -1230,8 +1189,6 @@ class TurnUndoStorage:
             rows = cursor.fetchall()
         return [OperationRow(row) for row in rows]
 
-    # -- 操作文件 --
-
     def insert_operation_file_locked(self, cursor, *, operation_id: str, values: dict) -> str:
         operation_file_id = new_id("opfile")
         cursor.execute(
@@ -1288,8 +1245,6 @@ class TurnUndoStorage:
             )
             rows = cursor.fetchall()
         return [OperationFileRow(row) for row in rows]
-
-    # -- 确认令牌 --
 
     def create_confirmation(
         self,
@@ -1414,8 +1369,6 @@ class TurnUndoStorage:
             )
             return cursor.fetchone() is not None
 
-    # -- 纠正记录 --
-
     def insert_correction(
         self,
         *,
@@ -1501,8 +1454,6 @@ class TurnUndoStorage:
             row = cursor.fetchone()
         return int(row[0]) if row else 0
 
-    # -- 会话列表 / 批量状态 --
-
     def list_checkpoints_for_session(self, session_id: int, limit: int = 100) -> list[dict]:
         with self._manager._lock:
             cursor = self.conn.cursor()
@@ -1551,17 +1502,11 @@ class TurnUndoStorage:
             rows = cursor.fetchall()
         return [CheckpointRow(row) for row in rows]
 
-    # -- 保留策略与 GC --
-
     def expire_retained_checkpoints(
         self,
         session_id: int,
         keep: int = DEFAULT_CHECKPOINT_RETENTION,
     ) -> list[str]:
-        """超限旧检查点的快照标记 expired（不覆盖生命周期事实），返回过期列表。
-
-        不触碰 interrupted/recovering 等未终态检查点与仍被未消费令牌持有的检查点。
-        """
         protected = (
             TurnUndoStatus.RECORDING,
             TurnUndoStatus.REVERTING,
@@ -1630,7 +1575,6 @@ class TurnUndoStorage:
         """删除磁盘上已无任何数据库有效引用的内容块；专门锁 + 二次确认引用。"""
         with _BLOB_GC_LOCK:
             referenced = self.referenced_blob_hashes(include_expired=False)
-            # 二次确认：在删除前重查一次引用集（两个查询之间可能有新写入）。
             referenced |= self.referenced_blob_hashes(include_expired=False)
             removed = 0
             if not self.blob_store.root.exists():
@@ -1648,16 +1592,7 @@ class TurnUndoStorage:
             return removed
 
 
-# ---------------------------------------------------------------------------
-# message_turn_links（参与外部事务的 locked 写入）
-# ---------------------------------------------------------------------------
-
 def insert_message_turn_links_locked(cursor, links: Iterable[tuple[int, str, str]]) -> None:
-    """在调用方消息写入事务内写入 message_turn_links。
-
-    links: [(message_id, checkpoint_id, position_kind), ...]
-    未知 position_kind 显式失败；同事务提交或回滚由调用方负责。
-    """
     for message_id, checkpoint_id, position_kind in links:
         try:
             kind = PositionKind(position_kind)
@@ -1688,10 +1623,6 @@ def update_message_link_position_locked(
     message_id: int,
     position_kind: str,
 ) -> None:
-    """回合封闭时把最后一条 assistant 关联更新为 assistant_final。
-
-    这是显式按 message_id 的更新，不属于按时间范围回填。
-    """
     try:
         kind = PositionKind(position_kind)
     except ValueError as exc:

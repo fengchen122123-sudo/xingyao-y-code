@@ -1,12 +1,3 @@
-"""云中转客户端：注册帧、有界出站队列、序号缓冲。
-
-真正的套接字由调用方注入。本模块不在导入时拨号。
-
-补发只承诺「窗口内去重」：本地 128 帧窗口或 500 条出站队列一旦丢帧，
-注册成功后立刻发 relay_lost 告诉网关，让网关给 App 发 resync_required
-整态自愈——不能无条件声称不重不漏。
-"""
-
 from __future__ import annotations
 
 import json
@@ -26,9 +17,6 @@ OUTBOUND_LIMIT = 500
 MIRROR_LIMIT = 128
 RPC_WORKERS = 8
 
-# 高频流式 / 体积大且可由终态或快照自愈的事件：不进入 128 帧 seq 重放窗口，
-# 避免单回合内数百条 token_delta 挤掉关键控制事件（turn_start / permission_request 等）
-# 或把环形窗口溢出误记为丢帧。
 EPHEMERAL_EVENT_TYPES = frozenset({
     "token_delta", "thinking_delta", "step_metrics", "round_started",
     "subagent_progress", "tool_start", "tool_finish",
@@ -37,7 +25,6 @@ EPHEMERAL_EVENT_TYPES = frozenset({
     "file_tree_loaded", "skills_loaded", "mcp_status",
 })
 
-# 纯桌面窗口 / 安装包 / 背景图转换进度事件：公网手机端不需要，不占带宽与队列。
 DESKTOP_ONLY_EVENT_TYPES = frozenset({
     "window_maximize_state", "close_requested",
     "bg_convert_progress", "bg_convert_done", "bg_convert_error",
@@ -122,7 +109,6 @@ class CloudRelayClient:
             if replayable:
                 if len(self.buffer.items) >= MIRROR_LIMIT:
                     oldest_seq = self.buffer.items[0][0]
-                    # 只有未送达网关的帧被环形窗口挤出时才算真丢帧；正常在线送达不计入 lost。
                     if oldest_seq > self._last_sent_seq:
                         self.lost += 1
                 wire_payload = self.buffer.stamp(payload)
@@ -189,7 +175,6 @@ class CloudRelayClient:
             if sent_seqs:
                 self._last_sent_seq = max(self._last_sent_seq, sent_seqs[-1])
             if not failed and self.buffer.items and (sent_seqs or self._last_sent_seq > 0):
-                # 已发送的旧帧无需在重复注册时重放；保留最新帧做状态对齐。
                 self._replayed_seqs.update(
                     seq for seq, _payload in list(self.buffer.items)[:-1]
                     if seq <= self._last_sent_seq

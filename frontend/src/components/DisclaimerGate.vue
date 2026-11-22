@@ -88,8 +88,6 @@ async function accept() {
   if (submitting.value) return;
   submitting.value = true;
   error.value = '';
-  // 成功后 store.disclaimerAcceptedVersion 就地更新，父级 v-if 失效，
-  // 本组件随之卸载——无需向上 emit 事件。
   error.value = await store.acceptDisclaimer();
   submitting.value = false;
 }
@@ -98,7 +96,6 @@ async function decline() {
   if (submitting.value) return;
   submitting.value = true;
   const bridge = api();
-  // 未接受条款则不提供服务：走完整退出序列（取消回合 → drain → 销毁窗口）
   try {
     if (bridge?.window_confirm_close) {
       await bridge.window_confirm_close('exit');

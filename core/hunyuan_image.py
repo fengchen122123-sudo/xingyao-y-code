@@ -1,17 +1,3 @@
-"""腾讯混元生图核心实现（CloudBase 网关接口）。
-
-本模块位于 core 包内。Server API Key 仅从本机环境变量 HUNYUAN_API_KEY
-读取，代码中不存储任何 Key；未配置环境变量时工具返回明确报错提示，
-不再有内置回退。请求仍通过 CloudBase 生图网关完成。
-
-接口约定（2026-08-31 实测可用）：
-- POST 请求体参数必须放顶层（{"prompt": ..., "size": ...}，不要包 {"data": ...}）；
-- 鉴权头 Authorization: Bearer <API_KEY>；
-- 生成耗时约 10~60 秒，HTTP 客户端超时必须设 300 秒；
-- 响应 imageUrl 24 小时内有效，拿到后需立即下载；
-- 实际返回的是 JPEG 数据（即使 URL 以 .png 结尾），按文件头判断扩展名。
-"""
-
 from __future__ import annotations
 
 import base64
@@ -27,27 +13,21 @@ from core.tool_protocol import ToolResult
 
 _API_URL = os.environ.get("HUNYUAN_IMAGE_ENDPOINT", "")
 
-# Server API Key 仅从本机环境变量读取，不写入发布包。
 VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
 
 def _resolve_api_key() -> str:
-    """解析生图 Server API Key：仅从环境变量 HUNYUAN_API_KEY 读取。"""
     return os.environ.get("HUNYUAN_API_KEY", "").strip()
 
 
 def _resolve_api_url() -> str:
-    """解析生图接口地址：优先取调用时的 HUNYUAN_IMAGE_ENDPOINT，其次导入时的值。"""
     return os.environ.get("HUNYUAN_IMAGE_ENDPOINT", _API_URL).strip()
 
-# 图生图（垫图）模式使用的模型；传入 image 参数时自动切换，文生图不指定模型
 _I2I_MODEL = "HY-Image-v3.0-I2I-ToB-v1.0.1"
 
-# 垫图限制（CloudBase 文档）：最多 1 张，不超过 10MB，支持 jpg/jpeg/png
 _I2I_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _detect_ext(head: bytes) -> str:
-    """按文件头判断真实图片格式（混元实际返回 JPEG，即使 URL 以 .png 结尾）。"""
     if head.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if head.startswith(b"\x89PNG"):
@@ -56,16 +36,6 @@ def _detect_ext(head: bytes) -> str:
 
 
 def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = None, footnote: str = " ", image: str = "") -> ToolResult:
-    """调用混元生图接口生成图片并下载保存，返回本地路径等信息。
-
-    作为插件工具 hunyuan_generate_image 的执行体被注册。
-
-    footnote：自定义水印文字（CloudBase 生图模型 footnote 能力），
-    默认一个空格（等效无可见水印）；传具体文字则作为水印内容。
-
-    image：垫图本地路径（可选）。传入后启用图生图（HY-Image-v3.0-I2I），
-    以该图为基础按 prompt 修改画面；仅支持 1 张、≤10MB 的 jpg/jpeg/png。
-    """
     prompt = (prompt or "").strip()
     if not prompt:
         return ToolResult("缺少 prompt 参数：请提供图片描述文字。", is_error=True)
@@ -135,14 +105,9 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = 
             is_error=True,
         )
 
-    # imageUrl 仅 24 小时有效，立即下载保存。
-    # 未传 save_dir → AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）；
-    # 显式传值（含 "."）→ 尊重原参数，不做隐式改道。
-    if save_dir is None:
-        from core.ai_output_paths import resolve_ai_output_dir
+    from core.ai_output_paths import resolve_ai_output_save_dir
 
-        save_dir = str(resolve_ai_output_dir())
-    save_dir = os.path.abspath(save_dir or ".")
+    save_dir = resolve_ai_output_save_dir(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     base = os.path.join(save_dir, "hunyuan_%s" % time.strftime("%Y%m%d_%H%M%S"))
     tmp = base + ".part"
@@ -151,7 +116,6 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = 
         with open(tmp, "rb") as f:
             head = f.read(8)
         path = base + _detect_ext(head)
-        # 按回合撤销：插件声明的受控文件修改同样先快照后落盘（规格 9.5）
         from core.turn_undo import coordinator as _tu_coordinator
         from core.turn_undo import recorder as _tu_recorder
         from core.turn_undo.models import NodeKind, TurnUndoError

@@ -1,5 +1,3 @@
-"""第二批写代码工具与上下文工程升级的综合回归测试。"""
-
 from __future__ import annotations
 
 import json
@@ -16,7 +14,6 @@ from core.workspace_bootstrap import build_workspace_bootstrap_context, load_wor
 
 
 def test_coding_tool_profile_slims_schema_and_keeps_core():
-    """coding 档位只保留核心研发工具，显著压缩 schema 字符体积且通过撤销覆盖校验。"""
     full_reg = build_default_registry("full")
     coding_reg = build_default_registry("coding")
 
@@ -34,7 +31,6 @@ def test_coding_tool_profile_slims_schema_and_keeps_core():
 
 
 def test_cli_flavor_uses_coding_and_gui_keeps_coding_plus_office(monkeypatch):
-    """CLI 默认走 coding 极速档并禁用桌面操控；GUI 保留全部 coding 能力与办公/自动化工具。"""
     import config
     from core import app_context
     from core.computer.capability import resolve_computer_capability
@@ -72,7 +68,6 @@ def test_cli_flavor_uses_coding_and_gui_keeps_coding_plus_office(monkeypatch):
     assert cap.enabled is False
     assert cap.error_code == "computer_cli_disabled"
 
-    # coding 模式下 windows_tools 插件同样跳过注册
     from core.tool_registry import ToolRegistry
     import plugins.windows_tools.plugin as wt_plugin
 
@@ -82,7 +77,6 @@ def test_cli_flavor_uses_coding_and_gui_keeps_coding_plus_office(monkeypatch):
 
 
 def test_workspace_bootstrap_loads_rules_and_first_turn_context(tmp_path, monkeypatch):
-    """自动加载 AGENTS.md / .ycode/rules 且只在具名会话首轮注入，不影响无会话稳态哈希。"""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "AGENTS.md").write_text("始终运行 pytest 验证改动。", encoding="utf-8")
     rules_dir = tmp_path / ".ycode" / "rules"
@@ -99,11 +93,9 @@ def test_workspace_bootstrap_loads_rules_and_first_turn_context(tmp_path, monkey
     assert "Python" in snap
     assert "src/" in snap
 
-    # 无 session_name 时不注入工作区规则（保障 SHA-256 稳定性）
     no_sess = agent_service.build_stable_system_message()["content"]
     assert "始终运行 pytest 验证改动" not in no_sess
 
-    # 具名会话：首轮注入规则（system）与首轮概览（user），第二轮不再重复概览
     agent_service._SESSION_STABLE_SECTIONS.clear()
     try:
         sess = "ws-boot-test"
@@ -124,7 +116,6 @@ def test_workspace_bootstrap_loads_rules_and_first_turn_context(tmp_path, monkey
 
 
 def test_read_file_rejects_binary_and_write_preserves_bom_and_diagnostics(tmp_path, monkeypatch):
-    """read_file 拦截 NUL 二进制文件；write_file 保留 BOM 并附带即时语法提示。"""
     monkeypatch.chdir(tmp_path)
     tool_cache.clear_all()
     with fresh_read_guard._LOCK:
@@ -146,7 +137,6 @@ def test_read_file_rejects_binary_and_write_preserves_bom_and_diagnostics(tmp_pa
 
 
 def test_edit_file_indent_shift_closest_match_and_diagnostics(tmp_path, monkeypatch):
-    """edit_file 支持统一缩进偏移匹配、失败给最接近行号预览，以及即时 JSON/Python 诊断。"""
     monkeypatch.chdir(tmp_path)
     tool_cache.clear_all()
     with fresh_read_guard._LOCK:
@@ -160,7 +150,6 @@ def test_edit_file_indent_shift_closest_match_and_diagnostics(tmp_path, monkeypa
         "        return value + 1\n",
         encoding="utf-8",
     )
-    # 模型少写了 4 个空格外层缩进，依然命中并自动补回外层缩进
     res = edit_file(
         str(py_file),
         target_content="    value = compute_old(1)\n    return value + 1",
@@ -170,7 +159,6 @@ def test_edit_file_indent_shift_closest_match_and_diagnostics(tmp_path, monkeypa
     text = py_file.read_text(encoding="utf-8")
     assert "        value = compute_new(2)\n        return value * 2\n" in text
 
-    # 故意传不匹配的片段，验证返回最接近片段预览与行号
     res_fail = edit_file(
         str(py_file),
         target_content="        value = compute_typo(999)\n        return value * 2",
@@ -179,7 +167,6 @@ def test_edit_file_indent_shift_closest_match_and_diagnostics(tmp_path, monkeypa
     assert res_fail.startswith("🚨")
     assert "最接近的代码段" in res_fail
 
-    # JSON 语法错误即时诊断
     cfg = tmp_path / "cfg.json"
     cfg.write_text('{\n  "ok": true\n}\n', encoding="utf-8")
     res_json = edit_file(str(cfg), target_content='"ok": true', replacement_content='"ok": true,')
@@ -188,7 +175,6 @@ def test_edit_file_indent_shift_closest_match_and_diagnostics(tmp_path, monkeypa
 
 
 def test_multi_edit_atomic_and_adapter_single_read(tmp_path, monkeypatch):
-    """multi_edit 原子成功/回滚 + ToolAdapterSet 复用内存 diff 不重复读盘。"""
     monkeypatch.chdir(tmp_path)
     tool_cache.clear_all()
     with fresh_read_guard._LOCK:
@@ -200,7 +186,6 @@ def test_multi_edit_atomic_and_adapter_single_read(tmp_path, monkeypatch):
         mod.write_bytes(original.encode("utf-8"))
         read_file(str(mod))
 
-        # 任一项失败整批中止，文件不被改动
         fail_res = multi_edit(
             str(mod),
             [
@@ -211,7 +196,6 @@ def test_multi_edit_atomic_and_adapter_single_read(tmp_path, monkeypatch):
         assert fail_res.startswith("🚨")
         assert mod.read_text(encoding="utf-8") == original
 
-        # 通过 ToolAdapterSet 执行批量修改：验证未触发 read_text 重复读盘且 Diff 内容准确
         read_text_calls = 0
         captured_diffs = []
 

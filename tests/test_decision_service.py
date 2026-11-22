@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""JEV 决策服务核心测试：配置 / Key 策略 / 影子 / 审计 / 探针（全部 mock HTTP）。
-
-隔离策略：``tests/conftest.py`` 收集阶段已把 ``YCODE_DATA_DIR`` 指向临时目录；
-本文件再把 ``config.YCODE_DIR`` monkeypatch 到每个用例的 tmp_path，绝不触碰
-真实 ~/.ycode。HTTP 层统一 monkeypatch ``decision_service._post`` / ``_get``，
-不真实联网（对齐设计文档第 9 节 1~6）。
-"""
 import json
 import os
 import sys
@@ -100,10 +93,6 @@ def data_dir(tmp_path, monkeypatch):
     svc._reset_runtime_state()
 
 
-# ---------------------------------------------------------------------------
-# 1. 配置读写：默认值 / 非法值拒绝 / 损坏回落 / 原子写
-# ---------------------------------------------------------------------------
-
 def test_default_config_full_table(data_dir):
     cfg = svc.load_decision_config()
     assert cfg["enabled"] is False
@@ -144,7 +133,7 @@ def test_save_rejects_invalid_values(data_dir):
         svc.save_decision_config({"endpoint_style": "chat"})
     with pytest.raises(ValueError):
         svc.save_decision_config({"key_mode": "index:-1"})
-    assert not (data_dir / "decision.json").exists()  # 非法值拒绝保存、不落盘
+    assert not (data_dir / "decision.json").exists()
 
 
 def test_save_valid_config_roundtrip_with_atomic_write(data_dir):
@@ -155,7 +144,7 @@ def test_save_valid_config_roundtrip_with_atomic_write(data_dir):
     assert raw["enabled"] is True
     assert raw["model_id"] == "NeoHorse-Jev-4B"
     assert svc.load_decision_config()["timeout_ms"] == 900
-    assert list(data_dir.glob("*.tmp")) == []  # 原子写不残留临时文件
+    assert list(data_dir.glob("*.tmp")) == []
 
 
 def test_load_falls_back_when_file_corrupted(data_dir):
@@ -166,10 +155,6 @@ def test_load_falls_back_when_file_corrupted(data_dir):
     (data_dir / "decision.json").write_text("[1, 2]", encoding="utf-8")
     assert svc.load_decision_config()["enabled"] is False
 
-
-# ---------------------------------------------------------------------------
-# 2. ask_decision：请求体形状 / 题数限制 / 开关零请求
-# ---------------------------------------------------------------------------
 
 def test_ask_request_shape_and_result(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
@@ -260,10 +245,6 @@ def test_missing_provider_audits_no_key(data_dir, monkeypatch):
     assert _last_audit(data_dir)["fallback_reason"] == "no_key"
 
 
-# ---------------------------------------------------------------------------
-# 3. Key 策略：403 轮换与记忆 / 401 / 429 冷却 / 超时 / 全失败
-# ---------------------------------------------------------------------------
-
 def test_403_switches_key_then_success_and_remembers(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir)
@@ -279,7 +260,6 @@ def test_403_switches_key_then_success_and_remembers(data_dir, monkeypatch):
         "Bearer sk_key_one",
         "Bearer sk_key_two",
     ]
-    # 记忆可用 Key：下一次粘性走 Key#2，不再碰 403 的 Key#1
     assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
     assert len(calls) == 3
     assert calls[2]["headers"]["Authorization"] == "Bearer sk_key_two"
@@ -294,7 +274,6 @@ def test_all_keys_403_reports_no_permission(data_dir, monkeypatch):
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
     assert len(calls) == 2
     assert _last_audit(data_dir)["fallback_reason"] == "no_permission"
-    # 拒绝已记忆：下一次零请求直接回落
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
     assert len(calls) == 2
 
@@ -332,10 +311,8 @@ def test_429_all_keys_cools_down_then_recovers(data_dir, monkeypatch):
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
     assert len(all_429) == 2
     assert _last_audit(data_dir)["fallback_reason"] == "rate_limited"
-    # 冷却期内（60s）：零请求直接回落
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
     assert len(all_429) == 2
-    # 冷却期过后恢复尝试
     clock["now"] += 61.0
     ok_calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
     assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
@@ -353,7 +330,7 @@ def test_timeout_returns_none_without_retry(data_dir, monkeypatch):
 
     monkeypatch.setattr(svc, "_post", fake)
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
-    assert len(calls) == 1  # 超时不重试、不换 Key
+    assert len(calls) == 1
     assert _last_audit(data_dir)["fallback_reason"] == "upstream_error"
 
 
@@ -373,7 +350,7 @@ def test_network_error_and_5xx_return_none_without_retry(data_dir, monkeypatch):
 
     calls2 = _mock_post(monkeypatch, lambda i, call: _resp(502))
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
-    assert len(calls2) == 1  # 5xx 不换 Key、不重试
+    assert len(calls2) == 1
     assert _last_audit(data_dir)["fallback_reason"] == "upstream_error"
 
 
@@ -385,10 +362,6 @@ def test_key_mode_fixed_index_uses_only_that_key(data_dir, monkeypatch):
     assert calls[0]["headers"]["Authorization"] == "Bearer sk_key_two"
 
 
-# ---------------------------------------------------------------------------
-# 4. 影子与开关
-# ---------------------------------------------------------------------------
-
 def test_shadow_sends_request_writes_audit_and_returns_none(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir, shadow=True)
@@ -396,7 +369,7 @@ def test_shadow_sends_request_writes_audit_and_returns_none(data_dir, monkeypatc
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 1.0}}})
     )
     assert svc.ask_decision("s", NOUL_Q, scene="router") is None
-    assert len(calls) == 1  # 影子仍发请求
+    assert len(calls) == 1
     record = _last_audit(data_dir)
     assert record["shadow"] is True
     assert record["answers"] == {"q": {"noul": 1.0}}
@@ -421,10 +394,6 @@ def test_non_shadow_returns_answers(data_dir, monkeypatch):
     assert result is not None
     assert result["answers"]["q"]["noul"] == 0.9
 
-
-# ---------------------------------------------------------------------------
-# 5. 审计：字段完整 / 按天切分 / 不含 Key
-# ---------------------------------------------------------------------------
 
 AUDIT_FIELDS = [
     "ts",
@@ -465,7 +434,7 @@ def test_audit_record_fields_and_no_key_leak(data_dir, monkeypatch):
     assert "sk_key_one" not in content
     assert "sk_key_two" not in content
     for line in content.splitlines():
-        assert len(line.encode("utf-8")) < 2048  # 单条 <2KB
+        assert len(line.encode("utf-8")) < 2048
 
 
 def test_audit_splits_by_day(data_dir, monkeypatch):
@@ -488,12 +457,8 @@ def test_mark_adopted_updates_record(data_dir, monkeypatch):
     assert result is not None
     svc.mark_adopted(result["trace_id"])
     assert _last_audit(data_dir)["adopted"] is True
-    svc.mark_adopted("不存在的trace")  # 不存在时静默无副作用
+    svc.mark_adopted("不存在的trace")
 
-
-# ---------------------------------------------------------------------------
-# 6. 探针分类：200 / 403 / 401 / 超时 / 网络失败
-# ---------------------------------------------------------------------------
 
 def test_probe_classifies_each_key_once(data_dir, monkeypatch):
     provider = dict(PROVIDER, api_key="k0\nk1\nk2\nk3\nk4")
@@ -528,10 +493,9 @@ def test_probe_classifies_each_key_once(data_dir, monkeypatch):
     assert [item["key_index"] for item in result["results"]] == [0, 1, 2, 3, 4]
     assert result["results"][0]["latency_ms"] is not None
     assert result["results"][0]["error"] == ""
-    assert len(calls) == 5  # 每把 Key 至多 1 次
+    assert len(calls) == 5
     assert calls[0]["payload"]["questions"]["probe"]["type"] == "noul"
     assert calls[0]["payload"]["model"] == "NeoHorse-Jev-4B"
-    # 探针结果进入运行时快照，可用 Key 被记忆
     snap = svc.get_decision_settings_snapshot()
     assert snap["runtime"]["last_probe"]["results"][0]["status"] == "available"
     assert snap["runtime"]["active_key_index"] == 0
@@ -546,10 +510,6 @@ def test_probe_without_keys_reports_message(data_dir, monkeypatch):
     assert result["msg"]
     assert calls == []
 
-
-# ---------------------------------------------------------------------------
-# 7. 上游模型列表：过滤 type=="decision" / 失败路径
-# ---------------------------------------------------------------------------
 
 def test_list_decision_models_filters_decision_type(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
@@ -583,7 +543,7 @@ def test_list_decision_models_filters_decision_type(data_dir, monkeypatch):
 
 
 def test_list_decision_models_failure_paths(data_dir, monkeypatch):
-    result = svc.list_decision_models()  # 无 provider
+    result = svc.list_decision_models()
     assert result["ok"] is False
     assert result["models"] == []
     assert result["msg"]
@@ -604,17 +564,11 @@ def test_list_decision_models_failure_paths(data_dir, monkeypatch):
     assert "500" in result["msg"]
 
 
-# ---------------------------------------------------------------------------
-# 8. 桥层（gui_bridge.ApiBridge）：校验 / 委托 / 审计尾部
-# ---------------------------------------------------------------------------
-
 def _make_bridge():
-    """裸桥实例：五个决策桥方法只委托 decision_service，不依赖桥内部状态。"""
     return ApiBridge.__new__(ApiBridge)
 
 
 def _has_chinese(text):
-    """断言文本含中文字符（错误原因须为中文）。"""
     return any("一" <= ch <= "鿿" for ch in text)
 
 
@@ -627,7 +581,6 @@ def test_bridge_set_decision_settings_rejects_invalid_without_writing(data_dir):
     assert _has_chinese(result["msg"])
     assert not (data_dir / "decision.json").exists()
 
-    # 显式清空 model_id：默认值本就非空，只有置空才能触发"启用时必须给模型"的校验
     result = bridge.set_decision_settings({"enabled": True, "model_id": ""})
     assert result["ok"] is False
     assert "model_id" in result["msg"]
@@ -782,7 +735,6 @@ def test_bridge_decision_methods_never_raise(data_dir, monkeypatch):
 
 
 def test_list_decision_providers_lists_channels_without_key_text(data_dir, monkeypatch):
-    """通道列表：报 Key 数量但不含 Key 内容；tokenrhythm 通道标记 auto_match。"""
     monkeypatch.setattr(
         svc,
         "_load_user_config",
@@ -839,7 +791,6 @@ def test_bridge_list_decision_providers_delegates(data_dir, monkeypatch):
 
 
 def test_audit_summary_counts_and_recent(data_dir):
-    """审计汇总：今日计数（含影子/采纳/回退）+ 最近记录按时间升序。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     rows = [
@@ -867,7 +818,6 @@ def test_audit_summary_counts_and_recent(data_dir):
 
 
 def test_audit_summary_ignores_probe_only(data_dir):
-    """只有探针记录时 has_business_records 必须为 False：探针不算真实决策。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     row = {"ts": "2026-10-18T19:47:09", "scene": "probe", "shadow": False,
@@ -883,7 +833,6 @@ def test_audit_summary_ignores_probe_only(data_dir):
 
 
 def test_audit_summary_marks_business_records(data_dir):
-    """任意一天出现过业务场景记录（非 probe）就算真的做过决策，跨文件也要扫到。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     (audit / "20261017.jsonl").write_text(
@@ -902,7 +851,6 @@ def test_audit_summary_marks_business_records(data_dir):
 
 
 def test_audit_summary_session_ignores_other_session_records(data_dir):
-    """按会话判定：只有别的会话做过业务决策时，本会话 has_business_records 为 False。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     (audit / f"{svc._today()}.jsonl").write_text(
@@ -913,15 +861,12 @@ def test_audit_summary_session_ignores_other_session_records(data_dir):
     scoped = svc.get_decision_audit_summary(session_id="当前会话")
     assert scoped["ok"] is True
     assert scoped["has_business_records"] is False
-    # 不传 session_id 保持全局口径（设置页面板依赖）
     assert svc.get_decision_audit_summary()["has_business_records"] is True
-    # 空串 / 纯空白等同不传
     assert svc.get_decision_audit_summary(session_id="")["has_business_records"] is True
     assert svc.get_decision_audit_summary(session_id="   ")["has_business_records"] is True
 
 
 def test_audit_summary_session_marks_own_business_records(data_dir):
-    """本会话存在业务记录时，按会话查询也为 True（跨文件同样要扫到）。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     (audit / "20261017.jsonl").write_text(
@@ -936,11 +881,10 @@ def test_audit_summary_session_marks_own_business_records(data_dir):
     )
     result = svc.get_decision_audit_summary(limit=10, session_id="当前会话")
     assert result["has_business_records"] is True
-    assert result["today_count"] == 1  # today_* 保持全局口径
+    assert result["today_count"] == 1
 
 
 def test_audit_summary_session_filter_still_ignores_probe(data_dir):
-    """即便 session_id 匹配，探针记录也不算业务记录。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     (audit / f"{svc._today()}.jsonl").write_text(
@@ -953,11 +897,6 @@ def test_audit_summary_session_filter_still_ignores_probe(data_dir):
 
 
 def test_audit_summary_session_only_filters_recent_and_today(data_dir):
-    """session_only=True：today_* 与 recent 只算本会话，别会话的记录一律不出现。
-
-    会话头部面板用这个口径（否则会把别的会话的「判的是什么事」显示在当前会话下）；
-    不传 session_only 时保持全局口径，设置页面板依赖它。
-    """
     audit = data_dir / "decision_audit"
     audit.mkdir()
     today = svc._today()
@@ -979,7 +918,6 @@ def test_audit_summary_session_only_filters_recent_and_today(data_dir):
     assert scoped["today_shadow_count"] == 1
     assert [item["scene"] for item in scoped["recent"]] == ["router", "router"]
 
-    # 全局口径不受影响：设置页面板照旧看到所有会话的记录
     glob = svc.get_decision_audit_summary(limit=10)
     assert glob["session_scoped"] is False
     assert glob["today_count"] == 3
@@ -994,7 +932,6 @@ def test_audit_summary_missing_dir_returns_zeros(data_dir):
 
 
 def test_probe_writes_audit_record(data_dir, monkeypatch):
-    """探针也是真实调用：必须落一条 scene=probe 审计（面板可见性的基础）。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({"enabled": True, "audit_enabled": True})
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"probe": 1.0}}))
@@ -1019,7 +956,6 @@ def test_bridge_get_decision_audit_summary_delegates(data_dir, monkeypatch):
 
 
 def test_audit_listener_receives_brief(data_dir):
-    """审计写入成功 → 监听器收到精简条目（前端实时徽章/面板的数据源）。"""
     received = []
     svc.add_audit_listener(received.append)
     try:
@@ -1046,7 +982,6 @@ def test_audit_listener_receives_brief(data_dir):
 
 
 def test_audit_listener_exception_is_isolated(data_dir):
-    """监听器崩溃不得影响审计落盘（异常隔离是实时转发的底线）。"""
 
     def boom(brief):
         raise RuntimeError("listener 崩溃")
@@ -1061,7 +996,6 @@ def test_audit_listener_exception_is_isolated(data_dir):
 
 
 def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
-    """audit_extra 落进审计原始记录（影子模式一致性对比的基线数据）。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({
         "enabled": True,
@@ -1077,19 +1011,14 @@ def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
         scene="router",
         audit_extra={"baseline_tier": "c0", "message_chars": 8},
     )
-    assert result is None  # 影子模式：只记录不返回
+    assert result is None
     record = _last_audit(data_dir)
     assert record["extra"] == {"baseline_tier": "c0", "message_chars": 8}
     assert record["shadow"] is True
     assert record["answers"] == {"tier": "c1"}
 
 
-# ---------------------------------------------------------------------------
-# 会话标识：审计记录带 session_id + 按会话判定是否做过业务决策
-# ---------------------------------------------------------------------------
-
 def _stub_session(monkeypatch, thread_value, current_value):
-    """打桩 app_context 的两个会话来源（延迟 import，故打桩模块属性即可）。"""
     from core import app_context
 
     monkeypatch.setattr(app_context, "get_thread_session", lambda: thread_value)
@@ -1098,7 +1027,6 @@ def _stub_session(monkeypatch, thread_value, current_value):
 
 
 def test_ask_decision_records_session_id(data_dir, monkeypatch):
-    """审计落盘记录带 session_id，且优先取线程会话、其次进程当前会话。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({
         "enabled": True,
@@ -1108,24 +1036,20 @@ def test_ask_decision_records_session_id(data_dir, monkeypatch):
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
 
-    # 两种来源都有：线程会话优先
     _stub_session(monkeypatch, "线程会话", "进程会话")
     svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
     assert _last_audit(data_dir)["session_id"] == "线程会话"
 
-    # 线程会话为空：回落到进程当前会话
     _stub_session(monkeypatch, None, "进程会话")
     svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
     assert _last_audit(data_dir)["session_id"] == "进程会话"
 
-    # 都取不到：空串（字段始终存在，便于按会话过滤时判定）
     _stub_session(monkeypatch, None, "")
     svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
     assert _last_audit(data_dir)["session_id"] == ""
 
 
 def test_ask_decision_session_id_survives_app_context_failure(data_dir, monkeypatch):
-    """app_context 取会话抛异常时不影响决策主流程，session_id 退化为空串。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({
         "enabled": True,
@@ -1148,7 +1072,6 @@ def test_ask_decision_session_id_survives_app_context_failure(data_dir, monkeypa
 
 
 def test_audit_brief_carries_session_id(data_dir):
-    """实时推送的精简条目也要带会话标识。"""
     brief = svc._audit_brief({"ts": "2026-10-18T10:00:00", "scene": "router",
                              "session_id": "会话A"})
     assert brief["session_id"] == "会话A"
@@ -1156,7 +1079,6 @@ def test_audit_brief_carries_session_id(data_dir):
 
 
 def test_ask_decision_explicit_session_id_overrides_context(data_dir, monkeypatch):
-    """调用方显式传入 session_id 时，必须优先于 get_thread_session/get_current_session。"""
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({
         "enabled": True,
@@ -1172,7 +1094,6 @@ def test_ask_decision_explicit_session_id_overrides_context(data_dir, monkeypatc
 
 
 def test_rename_session_audit_migrates_records_across_files(data_dir):
-    """会话改名后历史审计记录的 session_id 跟着迁移，不影响其他会话。"""
     from core.memory import MemoryManager
 
     audit = data_dir / "decision_audit"
@@ -1205,7 +1126,6 @@ def test_rename_session_audit_migrates_records_across_files(data_dir):
 
 
 def test_audit_summary_reports_session_total_and_global_today_counts(data_dir):
-    """session_only=True 返回本会话跨日累计 session_total_count，同时返回 global_today_count 消歧。"""
     audit = data_dir / "decision_audit"
     audit.mkdir()
     today = svc._today()
@@ -1227,6 +1147,6 @@ def test_audit_summary_reports_session_total_and_global_today_counts(data_dir):
 
     scoped = svc.get_decision_audit_summary(1, "当前会话", session_only=True)
     assert scoped["today_count"] == 2
-    assert scoped["session_total_count"] == 3  # 昨天 1 + 今天 2
-    assert scoped["global_today_count"] == 3   # 今日全部会话共 3 条
+    assert scoped["session_total_count"] == 3
+    assert scoped["global_today_count"] == 3
     assert len(scoped["recent"]) == 1

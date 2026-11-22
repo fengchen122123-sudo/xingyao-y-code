@@ -116,8 +116,6 @@ function setRegionVariables(
     `${prefix}-bg-opacity-pct`,
     suppressBackground ? '0%' : `${Math.round(region.background_opacity * 100)}%`,
   );
-  // 图片遮罩透明度（1 - image_opacity）：滚动容器分区用元素自身 background 时，
-  // 无法用独立伪元素控制图片 opacity，改用一层背景色遮罩罩淡图片
   values.set(`${prefix}-image-mask-pct`, `${Math.round((1 - region.image_opacity) * 100)}%`);
   values.set(`${prefix}-image`, imageValue);
   values.set(`${prefix}-image-opacity`, String(region.image_opacity));
@@ -150,15 +148,12 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
       }
       return `url("${objectUrl}")`;
     };
-    // 全局背景图：垫在所有分区之下（body::before 消费 --theme-app-image-*）
     const appImage = theme.app_image;
     const hasAppImage = appImage.image !== null;
     const appImageValue = hasAppImage ? await loadAsset(appImage.image!) : 'none';
     setAppImageVariables(values, appImage, appImageValue);
     for (const regionId of Object.keys(REGION_VARIABLE_PREFIXES) as ThemeRegionId[]) {
       const region = theme.regions[regionId];
-      // 全局图优先：设置全局背景图后，分区自己的背景图与背景色全部失效
-      // （背景透明让全局图透出），窗口统一显示全局图；移除全局图后恢复分区设置。
       const imageValue = (!hasAppImage && region.image !== null)
         ? await loadAsset(region.image)
         : 'none';
@@ -180,8 +175,6 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
   // body 上的 light 继续服务既有 body.light 后代选择器（代码高亮等）。
   document.documentElement.classList.toggle('light', theme.appearance === 'light');
   document.body.classList.toggle('light', theme.appearance === 'light');
-  // 主题身份钩子：主题专属 CSS（如 qq2009.css）用 html[data-gui-theme-id="..."]
-  // 作为作用域选择器，仅当该主题激活时生效；切换主题时本函数重新执行会覆盖该属性。
   document.documentElement.dataset.guiThemeId = theme.id;
 
   let disposed = false;
@@ -212,8 +205,6 @@ export function applyBootTheme(hash: string, body: HTMLElement): void {
     body.style.backgroundColor = `#${background}`;
   }
 
-  // Win10 frameless 窗口无 DWM 阴影边线（gui_main fragment 注入 os=win10）：
-  // 加 class 让 style.css 的 1px 主题内边框生效，勾勒窗口边界
   if (literalFragmentValue(fragment, 'os') === 'win10') {
     body.ownerDocument.documentElement.classList.add('os-win10');
   }

@@ -1,19 +1,3 @@
-"""Hooks 配置加载与 matcher 匹配（面向 ZCode 能力借鉴 · 规格 01 · C2）。
-
-两级配置（规格 §3.1）：
-
-- ``~/.ycode/hooks.json``：用户级，默认信任（用户自己写的）；
-- ``<project>/.ycode/hooks.json``：项目级，默认不信任（需用户确认）。
-
-所有路径可注入（``user_hooks_path`` / ``project_hooks_path`` / ``workspace_root``），
-测试绝不触碰真实用户目录；生产默认走 ``YCODE_DATA_DIR``（与 config.YCODE_DIR
-口径一致），便于测试/多实例隔离。
-
-容错原则（规格 §7）：文件不存在静默跳过；文件级问题（JSON 非法/顶层结构非法）
-warning 后跳过该文件、不影响另一个；条目级问题（缺 command/字段非法）warning 后
-跳过该条、不影响同文件其他条目。绝不因坏配置让主流程感知异常。
-"""
-
 from __future__ import annotations
 
 import json
@@ -35,11 +19,6 @@ _logger = logging.getLogger("ycode.hooks")
 
 
 def _ycode_dir() -> Path:
-    """用户数据目录：与 config.YCODE_DIR 口径一致（YCODE_DATA_DIR 优先）。
-
-    直接读环境变量而不 import config，避免仅为取一个目录而触发 config 模块级
-    初始化（复制默认配置等副作用）；两处解析规则保持一致。
-    """
     env_dir = os.environ.get("YCODE_DATA_DIR")
     if env_dir:
         return Path(env_dir)
@@ -57,11 +36,6 @@ def default_project_hooks_path(workspace_root) -> Path:
 
 
 def matches_tool(matcher: str, tool_name: str) -> bool:
-    """工具名匹配（规格 §3.2）：``"*"`` 通配 / ``"a|b"`` 多值 / 精确名。
-
-    大小写敏感（工具名是固定的蛇形小写标识）；``|`` 分段两侧空白容忍，
-    方便用户写 ``"write_file | edit_file"`` 这类可读形式。
-    """
     if matcher == "*":
         return True
     if not tool_name:
@@ -85,12 +59,6 @@ def registration_matches(
 
 
 class HookRegistry:
-    """两级 hook 配置的加载器。
-
-    为什么每次 ``load()`` 都重新读文件、重算 digest（不缓存）：
-    配置变更必须立即反映为新 digest（信任失效的触发条件，规格 §4.3），
-    缓存会让「改了 command 仍在用旧指纹」的窗口出现。文件很小，成本可忽略。
-    """
 
     def __init__(
         self,
@@ -127,16 +95,6 @@ class HookRegistry:
     def load(
         self, *, workspace_root=None, include_disabled: bool = False
     ) -> list[HookRegistration]:
-        """加载全部有效注册项。
-
-        顺序约定：用户级在前、项目级在后。理由：用户自己的配置更可信，
-        其注入上下文应更早出现；阻断/权限合并不受顺序影响（向最严格收敛）。
-
-        ``include_disabled`` 默认 False = 执行侧口径（disabled 条目被跳过，
-        行为与改造前完全一致）。管理列表（``trust.list_hooks_with_status``）
-        传 True 让被禁用的钩子仍可见、可重新启用——否则「停用」在管理页上
-        等同于条目消失，成为不可逆操作。
-        """
         registrations = self._load_file(
             self._user_hooks_path, scope="user", include_disabled=include_disabled
         )
@@ -149,11 +107,8 @@ class HookRegistry:
             )
         return registrations
 
-    # ── 内部实现 ────────────────────────────────────────────────
-
     @staticmethod
     def _stat_signature(path: Path) -> tuple[int, int, int] | None:
-        """返回文件存在性及 (mtime_ns, size, ctime_ns) 签名；不存在时返回 None。"""
         try:
             st = path.stat()
             return (
@@ -167,7 +122,6 @@ class HookRegistry:
     def _load_file(
         self, path: Path, *, scope: str, include_disabled: bool = False
     ) -> list[HookRegistration]:
-        """按文件 stat 签名缓存解析结果，文件未变化时直接返回副本。"""
         cache_key = (str(path), scope, bool(include_disabled))
         sig = self._stat_signature(path)
         with self._cache_lock:
@@ -183,7 +137,6 @@ class HookRegistry:
         regs = self._load_file_uncached(
             path, scope=scope, include_disabled=include_disabled
         )
-        # 仅在成功读盘解析后更新缓存（读后立刻再 stat 确认未在读盘瞬间被并发修改）
         post_sig = self._stat_signature(path)
         if post_sig == sig:
             with self._cache_lock:
@@ -194,7 +147,7 @@ class HookRegistry:
         self, path: Path, *, scope: str, include_disabled: bool = False
     ) -> list[HookRegistration]:
         if not path.exists():
-            return []  # 文件不存在是正常情况（规格 §7），静默跳过
+            return []
         try:
             raw = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -254,7 +207,6 @@ class HookRegistry:
         path: Path,
         include_disabled: bool = False,
     ) -> HookRegistration | None:
-        """解析单条 hook；任何字段非法都 warning 并返回 None（跳过该条）。"""
         where = f"{path} · {event.value}[{index}]"
         if not isinstance(entry, dict):
             self._logger.warning("hook 配置项不是对象，已跳过（%s）", where)
@@ -295,23 +247,15 @@ class HookRegistry:
 
         status_message = entry.get("status_message", "")
         if not isinstance(status_message, str):
-            # 纯展示字段：非法值忽略即可，不值得为它丢弃一条可执行 hook；
-            # 它也不参与信任指纹（规格 §4.3），这里怎么处理都不影响安全。
             status_message = ""
 
         disabled = entry.get("disabled", False)
         if not isinstance(disabled, bool):
-            # 非法 disabled 值两种模式都跳过：无法判断用户启停意图时既不执行、
-            # 也不让管理页把它当成可启停的条目（用户需先修好文件里的坏值）。
             self._logger.warning("hook 配置项 disabled 非法，已跳过（%s）", where)
             return None
         if disabled and not include_disabled:
-            # 执行侧（默认口径）：disabled 条目直接跳过，与改造前行为一致；
-            # 管理列表（include_disabled=True）：保留并带 disabled 标记。
             return None
 
-        # digest 计算逻辑不变：disabled 不参与指纹（启停不改变执行内容，
-        # digest 只绑定 event/command/matcher/timeout_ms/source_path）。
         digest = compute_hook_digest(
             {
                 "event": event.value,

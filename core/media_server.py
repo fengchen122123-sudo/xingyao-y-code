@@ -1,17 +1,3 @@
-"""core/media_server.py
-=====================
-受控媒体 HTTP 服务：向 GUI 前端提供媒体仓库 Blob 的只读访问。
-
-设计见 docs/superpowers/specs/2026-08-30-media-display-design.md。
-要点：
-- 仅绑定 127.0.0.1，随机端口；每次启动生成随机能力令牌，错令牌返回 404
-  （不区分 401/404，避免探测）。
-- 只服务 ``<sha256hex>.<白名单扩展名>`` 形式的文件名（media_store.blob_name_is_safe），
-  不存在任何路径成分，配合 blob_path_for 的 realpath 越界校验双保险。
-- 内容寻址不可变：Cache-Control immutable；视频拖动依赖 Range → 206/416。
-- 进程内单例惰性启动（首个媒体 URL 生成时拉起），随进程销毁。
-"""
-
 from __future__ import annotations
 
 import hmac
@@ -33,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 def _mime_for_ext(ext: str) -> str | None:
-    """扩展名（不含点）反查白名单 MIME；未登记返回 None。"""
     return next((m for m, e in SUPPORTED_MIME.items() if e.lstrip(".") == ext), None)
 
 
@@ -45,9 +30,6 @@ class MediaServer:
         self._server: ThreadingHTTPServer | None = None
         self._token: str = ""
 
-    # ------------------------------------------------------------------
-    # 生命周期
-    # ------------------------------------------------------------------
     def ensure_started(self) -> bool:
         """惰性启动；返回服务是否可用。启动失败只记日志并返回 False。"""
         with self._lock:
@@ -89,13 +71,6 @@ class MediaServer:
         return f"{self.base_url()}/m/{digest}.{ext}?t={self._token}"
 
     def local_path_for_url(self, url: str) -> str | None:
-        """把本服务签发的媒体 URL 反解回本地 Blob 绝对路径。
-
-        "另存为"需要把原文件复制给用户，因此必须先确认 URL 确实指向本进程
-        仓库里的 Blob：只接受 127.0.0.1/localhost、端口与本服务一致、令牌
-        校验通过、文件名过白名单且 Blob 实际存在的地址；其余一律返回 None
-        （不抛异常，由调用方给出可读提示）。
-        """
         if not url or self._server is None:
             return None
         try:
@@ -123,7 +98,6 @@ class MediaServer:
         return path if os.path.isfile(path) else None
 
 
-# 进程内单例；gui_bridge 直接复用，保证令牌与端口全进程一致
 media_server = MediaServer()
 
 
@@ -131,7 +105,6 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "YCodeMedia/1"
 
-    # ------------------------------------------------------------------
     def log_message(self, fmt, *args):  # noqa: N802 (BaseHTTPRequestHandler 约定)
         logger.debug("media http: " + fmt, *args)
 
@@ -154,7 +127,6 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
         server: MediaServer = self.server.media_server_ref  # type: ignore[attr-defined]
         parsed = urlparse(self.path)
         parts = parsed.path.split("/")
-        # 只接受 /m/<digest>.<ext>
         if len(parts) != 3 or parts[1] != "m" or not blob_name_is_safe(parts[2]):
             self._not_found()
             return
@@ -239,7 +211,6 @@ def _parse_range(spec: str, size: int):
         first = first.strip()
         last = last.strip()
         if not first:
-            # bytes=-N：末尾 N 字节
             suffix = int(last)
             if suffix <= 0 or size == 0:
                 return None, None

@@ -1,6 +1,4 @@
 <template>
-  <!-- 直接平铺工具行：不再有"执行过程 · N 项"外壳，也没有折叠开关。
-       状态变化仍通过视觉隐藏的 aria-live 区域礼貌播报（行内耗时不在 live 区内） -->
   <div class="exec-trace">
     <p class="sr-only" aria-live="polite">{{ title }}</p>
     <ToolExecutionRow
@@ -39,14 +37,12 @@ const STATE_LABELS: Record<ExecutionState, string> = {
   error: '异常结束',
 };
 
-// 只用于视觉隐藏的无障碍播报（"执行过程 · N 项 · 状态"），界面上不再渲染这层标题
 const title = computed(
   () => `执行过程 · ${props.calls.length} 项 · ${STATE_LABELS[props.state] ?? props.state}`,
 );
 
 const rows = computed(() => buildToolTraceRows(props.calls, props.legacyDiffs, props.state));
 
-// 运行期间用唯一定时器刷新 now，驱动运行中行的实时时长徽标
 const now = ref(Date.now());
 let timer: number | undefined;
 
@@ -75,7 +71,6 @@ watch(
 );
 onUnmounted(stopTimer);
 
-// 活动耗时：取最早一个仍在运行的调用的 started_at_ms
 const activeElapsedMs = computed(() => {
   let earliest: number | undefined;
   for (const call of props.calls) {
@@ -89,7 +84,6 @@ const activeElapsedMs = computed(() => {
 });
 </script>
 <style scoped>
-/* 平铺的工具行：行间距交给每行自己的 padding */
 .exec-trace {
   display: flex;
   flex-direction: column;
@@ -97,7 +91,6 @@ const activeElapsedMs = computed(() => {
   margin: 4px 0 2px;
 }
 
-/* 无障碍播报专用：视觉隐藏但仍在可访问树里 */
 .sr-only {
   position: absolute;
   width: 1px;

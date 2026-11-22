@@ -26,7 +26,6 @@ it('notifyModal opens a single-button notice modal that stays until confirmed', 
   expect(store.confirmModal.message).toBe('当前已是最新版本');
   expect(store.confirmModal.confirmLabel).toBe('确定');
 
-  // 用户点击确定后才关闭
   store.resolveConfirm(false);
   expect(store.confirmModal.show).toBe(false);
 });
@@ -36,7 +35,6 @@ it('notice modal resolves a pending confirm as cancel instead of leaving it dang
   let answer: boolean | null = null;
   store.askConfirm('删除模型', '删除后需重新添加', '确定删除？').then((ok) => { answer = ok; });
 
-  // 确认框 pending 期间弹 notice：确认框按"取消"安全收尾（promise 不悬置），再显示提示
   store.notifyModal('提示', '后台任务已完成');
   expect(store.confirmModal.notice).toBe(true);
   // promise reaction 需要宏任务 tick 后才落定（单微任务 tick 不可靠）
@@ -126,8 +124,6 @@ it('decision_settings_changed 事件同步 decisionEnabled，关闭时将 auto_d
   expect(store.decisionEnabled).toBe(false);
   expect(store.permissionMode).toBe('confirm');
 });
-
-// ---- 双端同步提示（post_notice 广播 + notice 桥事件回环插入）----
 
 it('桥可用时 notifyChat 经 post_notice 广播，本地不直接插入（等事件回环）', () => {
   const postNotice = vi.fn(async () => ({ ok: true }));

@@ -1,8 +1,4 @@
 <template>
-  <!-- 画笔截图覆盖层：铺满整个 #rightbar。底层是宿主捕获的冻结帧（进入模式
-       前原生浏览器表面尚可见，故快照含其像素），其上压暗 + 画笔 canvas +
-       选区红框 + 浮动工具条。所有坐标均为覆盖层 CSS px，裁剪时按快照物理
-       分辨率等比放大回源，保证导出像素与冻结帧逐一对齐 -->
   <div ref="rootRef" class="snip-root" data-test="snip-overlay">
     <img ref="imgRef" class="snip-frame" :src="snapshot" alt="" draggable="false" />
     <div class="snip-dim"></div>
@@ -85,14 +81,12 @@ const emit = defineEmits<{ (e: 'close'): void }>();
 const store = useAppStore();
 const { addPaths } = useAttachments();
 
-// 画笔只影响笔迹显示，不影响裁剪内容（圈的是范围不是涂鸦）
 const PEN_COLORS = [
   { label: '红', value: '#ef4444' },
   { label: '蓝', value: '#3b82f6' },
   { label: '黑', value: '#1f2328' },
 ] as const;
 const PEN_WIDTH = 3;
-// 笔画外扩：画笔中心线一半在包围盒外，外扩保证圈选轮廓完整落在导出图内
 const BBOX_INFLATE = PEN_WIDTH / 2 + 2;
 const MIN_SELECTION = 4;
 
@@ -112,8 +106,6 @@ const rootH = ref(0);
 let drawing = false;
 let current: Stroke | null = null;
 let ctx: CanvasRenderingContext2D | null = null;
-
-// ---------------------------------------------------------------- 选区与工具条
 
 const selection = computed(() => {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -149,8 +141,6 @@ const toolbarStyle = computed(() => {
   return { left: left + 'px', top: top + 'px' };
 });
 
-// ---------------------------------------------------------------- 画笔绘制
-
 function canvasPoint(e: PointerEvent): Point {
   const el = rootRef.value;
   const rect = el ? el.getBoundingClientRect() : { left: 0, top: 0 };
@@ -183,7 +173,7 @@ function redrawCanvas(): void {
 function onPointerDown(e: PointerEvent): void {
   if (busy.value || e.button !== 0) return;
   e.preventDefault();
-  try { (e.target as HTMLElement).setPointerCapture(e.pointerId); } catch { /* jsdom */ }
+  try { (e.target as HTMLElement).setPointerCapture(e.pointerId); } catch { }
   drawing = true;
   current = { color: penColor.value, points: [canvasPoint(e)] };
 }
@@ -203,10 +193,9 @@ function onPointerUp(e: PointerEvent): void {
   drawing = false;
   const finished = current;
   current = null;
-  // 单击（无拖动）视为误触丢弃；有效笔画入库并统一重绘
   if (finished.points.length >= 2) strokes.value.push(finished);
   redrawCanvas();
-  try { (e.target as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* jsdom */ }
+  try { (e.target as HTMLElement).releasePointerCapture(e.pointerId); } catch { }
 }
 
 function redrawAll(): void {
@@ -214,13 +203,10 @@ function redrawAll(): void {
   redrawCanvas();
 }
 
-// ---------------------------------------------------------------- 裁剪与动作
-
 function cropSelection(): string | null {
   const sel = selection.value;
   const img = imgRef.value;
   if (!sel || !img || !img.naturalWidth || !rootW.value) return null;
-  // 冻结帧物理分辨率 / 覆盖层 CSS 尺寸：DPI 缩放比可能不是 devicePixelRatio
   const ratio = img.naturalWidth / rootW.value;
   const sx = Math.max(0, Math.round(sel.x * ratio));
   const sy = Math.max(0, Math.round(sel.y * ratio));
@@ -245,8 +231,6 @@ async function withBusy(action: () => Promise<void>): Promise<void> {
   }
 }
 
-// 插入输入框：复用剪贴板粘贴的落盘通道（save_clipboard_image 会把文件登记为
-// 受信粘贴路径，模型可直接读取），拿到路径后加入当前会话附件列表
 function insertToComposer(): void {
   void withBusy(async () => {
     const dataUrl = cropSelection();
@@ -309,8 +293,6 @@ function saveSelection(): void {
   });
 }
 
-// ---------------------------------------------------------------- 生命周期
-
 function onKeydown(e: KeyboardEvent): void {
   if (e.key === 'Escape') {
     e.preventDefault();
@@ -318,14 +300,10 @@ function onKeydown(e: KeyboardEvent): void {
   }
 }
 
-// 窗口尺寸/DPI 变化会让冻结帧与布局错位：直接退出最安全
 function onWindowResize(): void {
   emit('close');
 }
 
-// 拖拽右面板宽度手柄只改 store.rightPanelWidth，不会派发 window.resize：
-// 面板尺寸一变，冻结帧与覆盖层按 naturalWidth/rootW 的反算就错位、导出区域
-// 与所见不符——与窗口 resize 同策略，尺寸变化即退出（下次进入重拍冻结帧）
 watch(
   () => [store.rightPanelWidth, store.rightPanelCollapsed],
   () => { emit('close'); },
@@ -348,7 +326,6 @@ onMounted(() => {
   setupCanvas();
   window.addEventListener('keydown', onKeydown, true);
   window.addEventListener('resize', onWindowResize);
-  // 快照是大 dataURL：等 <img> 解码完成再清一次画布尺寸（防御布局迟到）
   void nextTick(setupCanvas);
 });
 
@@ -368,7 +345,6 @@ onUnmounted(() => {
   overflow: hidden;
   user-select: none;
 }
-/* 冻结帧 1:1 铺回覆盖层：宽高即进入模式时量到的面板矩形，像素逐一对齐 */
 .snip-frame {
   position: absolute;
   inset: 0;

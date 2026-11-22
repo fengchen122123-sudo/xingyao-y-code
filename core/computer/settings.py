@@ -1,10 +1,3 @@
-"""电脑操控设置：严格配置读取、显式浏览器探测、专用 profile 路径与内存 generation。
-
-本模块只提供静态设置快照（设计第 8.2 节）：配置值、generation、浏览器探测和
-profile 展示路径。不得导入 controller 或 hotkey，不得执行任何运行时副作用。
-错误码使用稳定英文 code（设计第 21 节 + brief 固定 computer_invalid_config）。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -30,21 +23,88 @@ DEFAULT_COMPUTER_BROWSER = "edge"
 # 缺省值必须是 chromium（设计 M07「从空 config.json 验收」）。
 DEFAULT_SERVER_BROWSER = "chromium"
 
-# 进程内内存设置 generation：任何成功写入的设置变更都递增；
-# 关闭开关的路径固定为「先持久化 false → 递增 generation → 返回快照」，
-# 通知 controller 停止由调用方负责（设计 8.1）。
 _GENERATION_LOCK = threading.Lock()
 _settings_generation = 0
 
-# 公共设置只保存浏览器身份；可执行文件名与安装位置由平台层负责。
-# "embedded" 是 GUI 内置 WebView2（CDP 直连），不是独立安装的浏览器：
-# 无可执行文件探测，profile 即内嵌控件的 UserDataFolder。
 _BROWSER_DEFINITIONS = {
     "edge": "Microsoft Edge",
     "chrome": "Google Chrome",
     "chromium": "Chromium",
     "embedded": "星瑶内置浏览器",
 }
+
+
+def get_browser_label(browser: object) -> str:
+    key = str(browser or "").strip()
+    return _BROWSER_DEFINITIONS.get(key, key or "未配置")
+
+
+def is_external_browser(browser: object) -> bool:
+    key = str(browser or "").strip()
+    return key in ("edge", "chrome", "chromium")
+
+
+def describe_runtime_browser_preference(
+    settings: ComputerSettingsSnapshot,
+    computer_capability=None,
+    *,
+    ui_profile: str = "",
+) -> str:
+    """生成给模型的浏览器系统设置优先说明；只反映当前设置事实。"""
+    browser = str(getattr(settings, "computer_browser", "") or "").strip()
+    if not browser:
+        return ""
+    label = get_browser_label(browser)
+    targets = tuple(getattr(computer_capability, "targets", ()) or ()) if computer_capability else ()
+    browser_cap_enabled = bool(
+        computer_capability is not None
+        and getattr(computer_capability, "enabled", False)
+        and "browser" in targets
+    )
+    profile = str(ui_profile or "").strip().lower()
+    gui_pane_available = profile not in ("cli", "coding", "server")
+
+    if browser == "embedded":
+        if browser_cap_enabled:
+            return (
+                f"默认浏览器：{label}（{browser}；「浏览器操控」已开启）\n"
+                "浏览器网页打开、导航与交互操作必须优先使用 computer_action"
+                "（target=browser），直接在 GUI 右侧内置浏览器中可交互呈现；"
+                "仅关闭/查看/调整面板或打开本地 HTML 预览时才使用 browser_pane。"
+            )
+        if not gui_pane_available:
+            return (
+                f"默认浏览器：{label}（{browser}；当前运行模式不提供 GUI 浏览器操作）\n"
+                "读取静态网页正文请使用 fetch_url。"
+            )
+        status_note = (
+            "当前模型或运行通道未启用 computer_action 浏览器操控"
+            if getattr(settings, "browser_control_enabled", False)
+            else "「浏览器操控」开关未开启"
+        )
+        return (
+            f"默认浏览器：{label}（{browser}；{status_note}）\n"
+            "仅可使用 browser_pane 在右侧星瑶内置浏览器面板打开或导航网页"
+            "（无法点击或输入页内元素）；需要完整交互操控时请提示用户检查「设置 → 电脑与浏览器操控」。"
+        )
+
+    if browser_cap_enabled:
+        return (
+            f"默认浏览器：{label}（{browser}，外部浏览器；「浏览器操控」已开启）\n"
+            f"所有浏览器操作必须优先并严格使用 computer_action（target=browser）驱动 {label}，"
+            "禁止改用 browser_pane 打开内置浏览器绕开系统设置。"
+        )
+    if getattr(settings, "browser_control_enabled", False):
+        return (
+            f"默认浏览器：{label}（{browser}；当前模型或运行通道未启用 computer_action 浏览器操控）\n"
+            f"必须尊重系统设置选择的 {label}，禁止改用 browser_pane 打开内置浏览器代替；"
+            "读取静态网页正文请使用 fetch_url，或提示用户切换到支持视觉能力的模型。"
+        )
+    return (
+        f"默认浏览器：{label}（{browser}；「浏览器操控」开关未开启）\n"
+        f"必须尊重系统设置选择的 {label}，禁止改用 browser_pane 打开内置浏览器代替；"
+        f"读取静态网页正文请使用 fetch_url，如需操作 {label} 请提示用户在「设置 → 电脑与浏览器操控」开启「浏览器操控」。"
+    )
 
 # 进程级默认浏览器：GUI 入口在启动时注入 "embedded"（未显式配置过的用户
 # 默认走内置浏览器）；CLI 不注入，保持 "edge" 回落。只影响"配置缺省"，
@@ -116,7 +176,6 @@ def resolve_headless() -> bool:
 
 def _read_bool(data: dict, key: str) -> bool:
     if key not in data:
-        # serve 空配置默认只开浏览器。桌面开关缺省仍是关。
         if key == BROWSER_CONTROL_CONFIG_KEY and _server_profile():
             return True
         return False
@@ -183,22 +242,12 @@ def _detect_browser(browser: str, platform: str) -> BrowserOption:
 def list_browser_options(*, platform: str | None = None) -> tuple[BrowserOption, ...]:
     platform = platform or sys.platform
     names = ["edge", "chrome", "embedded"]
-    # chromium 是 serve 档的 headless 选择，不混入桌面 GUI 的浏览器下拉框。
     if _server_profile() or platform != "win32":
         names.append("chromium")
     return tuple(_detect_browser(browser, platform) for browser in names)
 
 
 def get_browser_profile_dir(browser: str) -> Path:
-    """浏览器 profile 目录。
-
-    edge/chrome：Path(config.YCODE_DIR) / "browser-profiles" / browser，
-    resolve 后确认仍在专用根之下，拒绝任何路径逃逸；
-    embedded：面板控件与自动化共用 core.embedded_browser.profile_dir()——
-    面板 WebView2 控件从创建起就带 CDP 调试端口，自动化直接接管用户看到的
-    那个浏览器（共享登录态），不再有第二个 WebView2 环境，因此原先"同目录
-    二次带参建环境必失败（0x8007139F）"的分离约束不再成立。
-    """
     if type(browser) is not str or browser not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
@@ -296,8 +345,6 @@ def set_computer_browser(value: object, active_run: bool) -> ComputerSettingsSna
     return load_computer_settings()
 
 
-# ---------------- 项目级浏览器视口（每项目分辨率） ----------------
-
 BROWSER_VIEWPORT_CONFIG_KEY = "browser_viewport"
 BROWSER_VIEWPORT_MIN = 120
 BROWSER_VIEWPORT_MAX = 8192
@@ -306,7 +353,6 @@ DEFAULT_BROWSER_VIEWPORT_HEIGHT = 900
 
 
 def normalize_browser_viewport(width: object, height: object) -> tuple[int, int]:
-    """校验/夹取逻辑视口尺寸；非法输入抛稳定错误码。"""
     def _clamp(value: object, minimum: int, label: str) -> int:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ComputerControlError(
@@ -333,11 +379,6 @@ def normalize_browser_viewport(width: object, height: object) -> tuple[int, int]
 
 
 def get_project_browser_viewport(workdir: str | None) -> tuple[int, int]:
-    """读取项目级浏览器逻辑视口；未设置/非法一律回落默认（1440×900）。
-
-    workdir 为 None（GLOBAL 自由会话）时同样回落默认——分辨率是"每项目"
-    概念，无项目即无个性化。
-    """
     if not workdir:
         return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
     from core import workspace_settings
@@ -371,7 +412,6 @@ def set_project_browser_viewport(workdir: str | None, width: object, height: obj
             workdir, BROWSER_VIEWPORT_CONFIG_KEY, list(viewport)
         )
     except ValueError as error:
-        # 相对路径 / 目录不存在：折算为稳定错误码，上层工具可据此自纠
         raise ComputerControlError(
             "computer_invalid_config",
             f"项目分辨率保存失败：{error}",
@@ -380,8 +420,6 @@ def set_project_browser_viewport(workdir: str | None, width: object, height: obj
     return viewport
 
 
-# 项目分辨率变更通知：GUI 入口注册（把事件推给前端面板即时应用）；
-# 工具层触发，listener 异常只留痕不传播。
 _VIEWPORT_LISTENERS: list[Callable[[str | None, tuple[int, int]], None]] = []
 
 

@@ -10,7 +10,6 @@
     @click.stop="toggleMenu"
   >
     <AppIcon name="brain" :size="13.5" :stroke-width="1.8" class="reasoning-icon" />
-    <!-- compact 变体也显示文字标签（等级），方便用户一眼看到当前思考强度 -->
     <span class="reasoning-label">{{ currentLabel }}</span>
     <span
       v-if="!store.reasoning.disabled"
@@ -165,7 +164,6 @@ defineExpose({ close });
 .reasoning-icon {
   display: none;
 }
-/* 手机端：思考按钮只显示脑子图标，隐藏等级文字与展开箭头 */
 @media (max-width: 768px) {
   .reasoning-icon {
     display: inline-block;

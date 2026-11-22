@@ -35,7 +35,7 @@ describe('buildMarkdownPreviewHtml', () => {
 
     expect(html).toContain('<!DOCTYPE html>');
     expect(html).toContain('<title>a.md</title>');
-    expect(html).toContain('<h'); // 标题已渲染（级别由渲染器决定）
+    expect(html).toContain('<h');
     expect(html).toContain('标题');
     expect(html).toContain('.md-preview');
   });

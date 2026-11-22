@@ -259,7 +259,6 @@ describe('validateOps', () => {
     expect(issues).toHaveLength(1);
     expect(issues[0]).toContain('文本长度');
 
-    // 正好 4000 字合法
     expect(validateOps([text(1, { text: '字'.repeat(4000) })])).toEqual([]);
   });
 
@@ -340,7 +339,6 @@ describe('EditHistory', () => {
     const size = h.size;
     h.push([annot(1)]);
     expect(h.size).toBe(size);
-    // 结构相同但对象不同，也算相同快照
     h.push([annot(1, { rect: rect(10, 10, 40, 12) })]);
     expect(h.size).toBe(size);
     expect(h.canUndo).toBe(true);
@@ -354,7 +352,6 @@ describe('EditHistory', () => {
     expect(HISTORY_LIMIT).toBe(200);
     expect(h.size).toBe(200);
 
-    // 一路 undo 到底：最旧快照应是第 51 次 push（page=51）
     let steps = 0;
     while (h.canUndo) {
       h.undo();
@@ -369,7 +366,6 @@ describe('EditHistory', () => {
     const h = new EditHistory();
     const pushIn: EditOp[] = [annot(1)];
     h.push(pushIn);
-    // 外部改入参数组不影响已入栈快照
     pushIn.push(annot(2));
     expect(h.current).toHaveLength(1);
 
@@ -379,7 +375,6 @@ describe('EditHistory', () => {
     expect(h.current).toEqual([]);
     expect(h.redo()).toEqual([annot(1)]);
 
-    // 改 current 返回的数组同样不影响内部
     const cur = h.current;
     cur.push(annot(3));
     expect(h.current).toHaveLength(1);

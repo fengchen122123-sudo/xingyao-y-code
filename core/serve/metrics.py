@@ -1,5 +1,3 @@
-"""serve 进程的 /metrics。GUI 不注册这条路由。"""
-
 from __future__ import annotations
 
 import sqlite3

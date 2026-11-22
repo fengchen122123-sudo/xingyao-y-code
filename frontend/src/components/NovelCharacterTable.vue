@@ -1,5 +1,4 @@
 <template>
-  <!-- 角色快照卡片：窄面板里一角色一卡，空字段整行不渲染，避免出现大量空标签 -->
   <div v-if="cards.length === 0" class="novel-char-empty" data-test="novel-character-empty">
     追踪里还没有角色快照
   </div>
@@ -36,7 +35,6 @@ import { computed } from 'vue';
 import type { NovelWorkbenchCharacterDto } from '../types/pywebview.d';
 
 const props = defineProps<{
-  /** 角色表单项：来自 get_novel_workbench 的 characters 数组（缺失时父组件传空数组） */
   rows: NovelWorkbenchCharacterDto[];
 }>();
 
@@ -48,8 +46,6 @@ function text(value: unknown): string {
   return String(value ?? '').trim();
 }
 
-// 数组字段缺失时后端给空数组，这里再做一次防御：空串项过滤掉，
-// 整组为空则整行不渲染（前端不补造内容）
 function items(list: unknown): string[] {
   if (!Array.isArray(list)) return [];
   return list.map((item) => text(item)).filter((item) => item !== '');
@@ -70,7 +66,6 @@ const cards = computed<CharCard[]>(() =>
     if (knowledge.length > 0) lists.push({ label: '已知', text: knowledge.join('，') });
     const abilities = items(row.abilities_resources);
     if (abilities.length > 0) lists.push({ label: '能力资源', text: abilities.join('，') });
-    // 未决线索用黄色强调：它决定下一章该收哪条线
     const threads = items(row.open_threads);
     if (threads.length > 0) lists.push({ label: '未决线索', text: threads.join('，'), warn: true });
     const relations = items(row.relationships);
@@ -87,7 +82,6 @@ const cards = computed<CharCard[]>(() =>
 </script>
 
 <style scoped>
-/* 颜色/字号只用全局 CSS 变量，跟随主题切换 */
 .novel-char-empty {
   padding: 10px 2px;
   color: var(--text-faint);

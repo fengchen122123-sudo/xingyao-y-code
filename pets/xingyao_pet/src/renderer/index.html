@@ -10,10 +10,7 @@
       cursor: grab;
     }
     body.dragging { cursor: grabbing; }
-    /* 外层不做任何缩放或过渡：窗口尺寸已锁定，交互缩放会被误读成角色忽大忽小 */
     #stage { position: relative; width: 100%; height: 100%; transform-origin: center bottom; }
-    /* 角色区：贴底的正方形，边长 = 窗口宽度；上方整条 BUBBLE_BAND 留给气泡。
-       aspect-ratio 让托盘换尺寸时自动跟随，不需要 JS 传值。 */
     #breath {
       position: absolute; left: 0; bottom: 0; width: 100%;
       aspect-ratio: 1 / 1; transform-origin: center bottom;
@@ -39,8 +36,6 @@
     }
     .layer.flipped { transform: scaleX(-1); }
     #stage.grab-hint .layer { filter: drop-shadow(0 0 6px rgba(255,150,40,0.9)); }
-    /* 气泡完整落在顶部 56px 留白带内：top 4px + 最多 48px = 52px < 56px，
-       角色区从 y=56px 才开始，任何台词都不会压到丸子头或脸。 */
     #bubble {
       position: absolute; left: 50%; top: 4px; transform: translateX(-50%);
       width: 94%; max-height: 48px; box-sizing: border-box;

@@ -1,18 +1,3 @@
-"""全局子代理开关（设置页「子代理」）的读写与统一判定。
-
-用途：给「子代理」一个进程级单点开关，关闭后核心链路（运行上下文注入、
-工具注册、编排入口）统一按关闭处理，而不是各处自己拼条件判断。
-
-设计约束：
-- 配置键固定 ``subagent_enabled``，值必须是布尔：缺省 = True（保持既有行为），
-  读到非布尔（手改 config.json 写成 "false"/0 之类）也按 True 处理——
-  非法值不得静默改变既有行为；
-- 读取路径绝不抛异常：配置文件损坏/读失败一律兜底为 True；
-- 写入路径真正落盘（config.save_config_value），失败抛 SubagentSettingError，
-  由设置页/工具层转成可见错误；
-- 本模块不得 import gui_bridge / main / pywebview（与 core 层其它设置模块一致）。
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -20,7 +5,6 @@ from typing import Any
 CONFIG_KEY = "subagent_enabled"
 DEFAULT_SUBAGENT_ENABLED = True
 
-# 写入时接受的字符串写法（大小写不敏感）；其它任何取值都视为非法入参。
 _TRUE_STRINGS = frozenset({"true", "1", "yes", "on", "enable", "enabled"})
 _FALSE_STRINGS = frozenset({"false", "0", "no", "off", "disable", "disabled"})
 
@@ -30,11 +14,6 @@ class SubagentSettingError(Exception):
 
 
 def _normalize_bool(value: Any) -> bool:
-    """把入参规范化为布尔；无法确定时抛 SubagentSettingError。
-
-    只接受：布尔、整数 0/1、常见真/假字符串。不做真值语义猜测
-    （None、空串、2、任意对象都算非法），避免"看起来成功了却写反"。
-    """
     if isinstance(value, bool):
         return value
     if isinstance(value, int):  # 注意 bool 是 int 子类，已在上一行拦下
@@ -72,10 +51,6 @@ def subagent_enabled() -> bool:
 
 
 def set_subagent_enabled(value: bool) -> bool:
-    """写入全局子代理开关并持久化到 config.json。
-
-    成功返回写入的布尔值；入参非法或写入失败抛 SubagentSettingError（中文原因）。
-    """
     bool_value = _normalize_bool(value)
     try:
         import config as _config
@@ -91,8 +66,4 @@ def set_subagent_enabled(value: bool) -> bool:
 
 
 def orchestration_allowed(base_allowed: bool = True) -> bool:
-    """子代理与计划编排是否可用：base_allowed 且全局开关开启。
-
-    核心链路的统一判定入口（禁止各处自己拼 ``x and subagent_enabled()``）。
-    """
     return bool(base_allowed) and subagent_enabled()

@@ -2,9 +2,6 @@
 <html lang="zh-CN">
 <head>
     <meta name="application-name" content="Y-CODE">
-    <!-- img-src/media-src 放行 127.0.0.1 任意端口：助手消息媒体经 core/media_server
-         的随机端口受控服务加载（内容寻址 Blob + 令牌鉴权，与 connect-src 的
-         LAN 远程放行同一安全边界）；仅限本机回环，不放宽到任意主机 -->
     <!-- CSP：默认只信任自身；仅额外放行阿里云人机验证（sms 登录的滑块）所需域名——
          SDK 主入口在 o.alicdn.com，加载后还会动态拉 g./x.alicdn.com 上的子脚本与样式，
          故 script/style 统一按 *.alicdn.com 放行；验证码接口与设备指纹走 aliyun.com /

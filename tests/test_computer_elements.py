@@ -1,5 +1,3 @@
-"""UIA 元素定位与元素引用动作（提速计划阶段二 Task 9-12）。"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +16,6 @@ class FakeUIAElement:
 
 
 class FakeComHost:
-    """绕过真实 COM：直接以 dict 模拟元素表（ref → FakeUIAElement）。"""
 
     def __init__(self):
         self._elements = {}
@@ -28,7 +25,6 @@ class FakeComHost:
 
     def collect_impl(self, hwnd):
         self.collect_calls += 1
-        # 第 2 代起只返回 el-1：模拟窗口变化后 el-2/el-3 过期。
         top = 1 if self.collect_calls >= 2 else 3
         self._elements = {f"el-{n}": FakeUIAElement(f"控件{n}") for n in range(1, top + 1)}
         listing = [
@@ -65,9 +61,6 @@ def _locator_with_fake():
     return locator, host
 
 
-# ---------------- Task 9：locator ----------------
-
-
 def test_collect_and_click_roundtrip():
     locator, host = _locator_with_fake()
     elements = locator.collect(hwnd=0)
@@ -86,13 +79,10 @@ def test_set_value_roundtrip():
 def test_stale_ref_after_recollect():
     locator, _host = _locator_with_fake()
     locator.collect(hwnd=0)
-    locator.collect(hwnd=0)  # 重新收集：fake 第 2 代起只返回 el-1，el-2 过期
+    locator.collect(hwnd=0)
     with pytest.raises(ComputerControlError) as exc:
         locator.click("el-2")
     assert exc.value.code == "computer_element_stale"
-
-
-# ---------------- Task 10：解析与 schema ----------------
 
 
 def test_parse_element_actions():
@@ -117,12 +107,6 @@ def test_parse_element_actions():
 
 
 def test_element_actions_allow_browser_except_list_elements():
-    """E2 有意协议变更：click_element / set_value_element 支持 browser target。
-
-    变更前这两个动作是 desktop 专属；E2 后浏览器 observe 携带元素列表（el-N），
-    元素动作按 ref 走 Playwright locator 通路。list_elements 仍为桌面专属：
-    浏览器版职责由 observe 直接承担（设计 3.1），不提供独立动作。
-    """
     from core.computer.actions import parse_computer_action
 
     click = parse_computer_action(
@@ -141,7 +125,6 @@ def test_element_actions_allow_browser_except_list_elements():
 
 
 def test_desktop_only_kinds_reflect_e2_protocol_change():
-    """白名单断言：click/set_value 已移除（双 target），list_elements 仍桌面专属。"""
     from core.computer.actions import _DESKTOP_ONLY_KINDS
 
     assert "click_element" not in _DESKTOP_ONLY_KINDS
@@ -156,9 +139,6 @@ def test_summary_includes_element_ref():
         {"kind": "click_element", "target": "desktop", "element_ref": "el-3"}
     )
     assert sanitized_action_summary(a)["element_ref"] == "el-3"
-
-
-# ---------------- Task 11：backend 接线 ----------------
 
 
 def _backend_with_locator(locator):
@@ -189,7 +169,7 @@ def test_backend_click_element_dispatches_to_locator():
     backend.start()
     run_id = "run-el2"
     backend.execute(run_id, ComputerAction(kind="list_elements", target="desktop"))
-    backend.observe(run_id)  # 清空 pending elements，建立画面基线
+    backend.observe(run_id)
     backend.execute(
         run_id, ComputerAction(kind="click_element", target="desktop", element_ref="el-2")
     )
@@ -237,9 +217,6 @@ def test_backend_list_elements_without_locator_is_stable_error():
     backend.close()
 
 
-# ---------------- Task 12：文本观察 followup ----------------
-
-
 def test_followup_text_observation_when_elements_present():
     from core.computer.models import ComputerObservation
     from core.computer.provider_generic import _observation_followup_message
@@ -264,7 +241,6 @@ def test_followup_text_observation_when_elements_present():
 
 
 def test_followup_image_path_unchanged_when_no_elements(tmp_path):
-    """无元素时维持既有截图路径字节（回归保护）。"""
     from io import BytesIO
 
     from PIL import Image
@@ -301,11 +277,7 @@ def test_generic_prompt_mentions_elements():
     assert "set_value_element" in prompt
 
 
-# ---------------- Task A：元素能力生产接线（惰性启动） ----------------
-
-
 def test_locator_lazy_start_defers_com_thread(monkeypatch):
-    """生产路径构造绝不创建 RealUIAHost（不起 COM 线程），close 前也未构造。"""
     import core.computer.platforms.windows_elements_uia as uia_module
 
     def _boom(*args, **kwargs):
@@ -313,11 +285,10 @@ def test_locator_lazy_start_defers_com_thread(monkeypatch):
 
     monkeypatch.setattr(uia_module, "RealUIAHost", _boom)
     locator = WindowsElementLocator()
-    locator.close()  # 未使用即关闭：全程未触碰 COM
+    locator.close()
 
 
 def test_locator_lazy_start_constructs_on_first_collect(monkeypatch):
-    """首次 collect 才惰性构造 RealUIAHost（专用 COM 线程）。"""
     import core.computer.platforms.windows_elements_uia as uia_module
 
     constructed = []
@@ -344,7 +315,6 @@ def test_locator_lazy_start_constructs_on_first_collect(monkeypatch):
 
 
 def test_create_default_wires_element_locator():
-    """create_default 生产构造挂接元素定位器；backend 关闭时释放定位器。"""
     from core.computer.windows_backend import WindowsComputerBackend
 
     backend = WindowsComputerBackend.create_default()
@@ -356,7 +326,6 @@ def test_create_default_wires_element_locator():
 
 
 def test_backend_close_releases_element_locator():
-    """backend.close() 在 release_inputs 之后调用元素定位器 close（幂等留痕）。"""
     from core.computer.windows_backend import WindowsComputerBackend
     from tests.computer_fakes import FakeImage, FakeWin32Adapter
 
@@ -375,11 +344,8 @@ def test_backend_close_releases_element_locator():
     )
     backend.close()
     assert locator.close_calls == 1
-    backend.close()  # backend 关闭幂等：不重复释放定位器
+    backend.close()
     assert locator.close_calls == 1
-
-
-# ---------------- Task B：SoM 编号标注截图与元素表代数 ----------------
 
 
 def test_invalidate_clears_ref_mapping():
@@ -393,7 +359,6 @@ def test_invalidate_clears_ref_mapping():
 
 
 def _pil_backend(locator, adapter=None):
-    """真实 PIL 白屏 grab：让 SoM 标注真实执行（FakeImage 字节无法被 PIL 打开）。"""
     from PIL import Image as PILImage
 
     from core.computer.windows_backend import WindowsComputerBackend
@@ -410,11 +375,6 @@ def _pil_backend(locator, adapter=None):
 
 
 def test_list_elements_observe_refreshes_table_and_annotation():
-    """显式 list_elements 后紧邻 observe：元素表刷新为新一代并重新标注。
-
-    观察本身已自动携带元素（见自动补表用例），这里验证 list_elements 的显式
-    结果优先——新表只含 el-1，与自动补的首个观察（3 个控件）不同，PNG 随之变化。
-    """
     from pathlib import Path
 
     locator, _host = _locator_with_fake()
@@ -436,7 +396,6 @@ def test_list_elements_observe_refreshes_table_and_annotation():
 
 
 def test_elements_reused_while_generation_stable():
-    """后续 observe（无新 list_elements）：代数未变时元素表仍附加且继续标注。"""
     from pathlib import Path
 
     locator, _host = _locator_with_fake()
@@ -456,11 +415,6 @@ def test_elements_reused_while_generation_stable():
 
 
 def test_generation_change_invalidates_old_table_and_recollects():
-    """画面代数变化：旧元素表作废（locator ref 失效）、观察重新收集当前表。
-
-    旧契约是"代数变化即清空元素表"，自动补表后观察始终携带当前窗口元素：
-    旧表绝不沿用（invalidate + 缓存清零），改为重新收集一次。
-    """
     from pathlib import Path
 
     from tests.computer_fakes import FakeWin32Adapter
@@ -468,7 +422,6 @@ def test_generation_change_invalidates_old_table_and_recollects():
     locator, _host = _locator_with_fake()
 
     class _RecordingLocator:
-        """包一层记录 invalidate 调用（旧 ref 失效的唯一入口）。"""
 
         def __init__(self, inner):
             self.inner = inner
@@ -496,27 +449,21 @@ def test_generation_change_invalidates_old_table_and_recollects():
         first = backend.observe(run_id)
         assert [item["ref"] for item in first.elements] == ["el-1", "el-2", "el-3"]
         first_bytes = Path(first.png_path).read_bytes()
-        # 用户切走窗口：前台身份变化 → 代数递增 → 旧表作废并重新收集
         adapter.foreground_id = 2002
         switched = backend.observe(run_id)
         assert switched.surface_generation == first.surface_generation + 1
         assert recording.invalidate_calls == 1
-        # 第 2 代收集只剩 el-1：旧表不沿用，PNG 按新表重新标注
         assert [item["ref"] for item in switched.elements] == ["el-1"]
         assert Path(switched.png_path).read_bytes() != first_bytes
         with pytest.raises(ComputerControlError) as exc:
             locator.click("el-2")
         assert exc.value.code == "computer_element_stale"
-        locator.click("el-1")  # 新表 ref 立即可用
+        locator.click("el-1")
     finally:
         backend.close()
 
 
-# ---------------- 桌面 observe 自动携带 UIA 元素表 ----------------
-
-
 def test_observe_auto_collects_elements_without_list_elements():
-    """首次 observe 无需 list_elements 即携带元素表，且 ref 可直接点击。"""
     locator, host = _locator_with_fake()
     backend = _pil_backend(locator)
     backend.start()
@@ -539,7 +486,6 @@ def test_observe_auto_collects_elements_without_list_elements():
 
 
 def test_observe_auto_collect_failure_does_not_block_observation(caplog):
-    """元素提取失败：吞掉异常、留日志，观察照常成功且退回普通截图。"""
 
     class _BrokenLocator:
         def collect(self, hwnd):
@@ -565,7 +511,6 @@ def test_observe_auto_collect_failure_does_not_block_observation(caplog):
 
 
 def test_observe_auto_collect_caps_element_count():
-    """自动补表按上限截断，避免超大树把一次观察拖成数百条控件。"""
     from core.computer.windows_backend import _MAX_OBSERVE_ELEMENTS
 
     listing = [
@@ -597,7 +542,6 @@ def test_observe_auto_collect_caps_element_count():
 
 
 def test_observe_without_locator_has_empty_elements():
-    """未挂元素定位器：观察元素表仍为空（保持既有契约）。"""
     backend = _backend_with_locator(None)
     backend.start()
     try:
@@ -605,3 +549,103 @@ def test_observe_without_locator_has_empty_elements():
         assert observation.elements == ()
     finally:
         backend.close()
+
+
+def test_real_uia_collect_filters_offscreen_and_zero_area_and_reverifies_identity():
+    import time
+    from core.computer.platforms import windows_elements_uia as uia_module
+
+    class _Rect:
+        def __init__(self, left, top, right, bottom):
+            self.left, self.top, self.right, self.bottom = left, top, right, bottom
+
+    class _Node:
+        def __init__(
+            self,
+            name,
+            *,
+            control_type=50000,
+            bounds=(10, 10, 100, 40),
+            offscreen=False,
+            enabled=True,
+            runtime_id=(42, 1),
+            children=(),
+        ):
+            self.CurrentName = name
+            self.CurrentControlType = control_type
+            self.CurrentBoundingRectangle = _Rect(*bounds)
+            self.CurrentIsOffscreen = offscreen
+            self.CurrentIsEnabled = enabled
+            self._runtime_id = runtime_id
+            self.parent = None
+            self.children = []
+            for ch in children:
+                ch.parent = self
+                self.children.append(ch)
+
+        def GetRuntimeId(self):
+            return self._runtime_id
+
+        def GetCurrentPattern(self, pattern_id):
+            return None
+
+        def next_sibling(self):
+            if self.parent is None:
+                return None
+            idx = self.parent.children.index(self) + 1
+            return self.parent.children[idx] if idx < len(self.parent.children) else None
+
+    hidden = _Node("隐藏按钮", offscreen=True, bounds=(10, 10, 80, 30), runtime_id=(42, 2))
+    zero_area = _Node("零面积按钮", offscreen=False, bounds=(10, 10, 10, 40), runtime_id=(42, 3))
+    visible_btn = _Node("确认", offscreen=False, bounds=(20, 50, 120, 90), runtime_id=(42, 4))
+    root = _Node("根窗", control_type=50032, children=[hidden, zero_area, visible_btn])
+
+    class _Walker:
+        def GetFirstChildElement(self, node):
+            return node.children[0] if node.children else None
+
+        def GetNextSiblingElement(self, node):
+            return node.next_sibling()
+
+    class _FakeUIA:
+        def __init__(self):
+            self.ControlViewWalker = _Walker()
+
+        def ElementFromHandle(self, hwnd):
+            return root
+
+        def GetProgrammaticName(self, type_id):
+            return "ControlType.Button"
+
+    class _InlineCom:
+        def call(self, fn, *, deadline=None, cancel_event=None, timeout_code=None):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise ComputerControlError(timeout_code or "computer_wait_timeout", "已到期")
+            return fn(_FakeUIA())
+
+    host = uia_module.RealUIAHost.__new__(uia_module.RealUIAHost)
+    host._com = _InlineCom()
+    host._elements = {}
+    host._element_meta = {}
+
+    listing, mapping = host.collect(1001)
+    assert [item["name"] for item in listing] == ["确认"]
+    assert list(mapping) == ["el-1"]
+
+    # 控件位置发生迁移时必须判为 stale，绝不继续执行 Pattern 或坐标点击
+    visible_btn.CurrentBoundingRectangle = _Rect(220, 250, 320, 290)
+    with pytest.raises(ComputerControlError) as raised_moved:
+        host.click("el-1")
+    assert raised_moved.value.code == "computer_element_stale"
+
+    # 恢复位置但控件被禁用 -> 报 computer_element_unsupported（不支持 Invoke/disabled），不回退其它操作
+    visible_btn.CurrentBoundingRectangle = _Rect(20, 50, 120, 90)
+    visible_btn.CurrentIsEnabled = False
+    with pytest.raises(ComputerControlError) as raised_disabled:
+        host.click("el-1")
+    assert raised_disabled.value.code == "computer_element_unsupported"
+
+    # 到期 deadline 直接拒绝 collect
+    with pytest.raises(ComputerControlError) as raised_dl:
+        host.collect(1001, deadline=time.monotonic() - 0.1)
+    assert raised_dl.value.code in ("computer_wait_timeout", "computer_surfaces_unavailable")

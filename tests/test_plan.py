@@ -3,8 +3,6 @@ import pytest
 
 
 def test_storage_path_sanitizes_session_id_with_illegal_chars(tmp_path):
-    r"""会话 ID 派生自用户消息时可能含 Windows 非法文件名字符（`:` `\` 等）；
-    计划落盘前必须清洗，否则持久化抛 WinError 123 并卡死计划门禁。"""
     bad_session_id = "位置：C:\\Users\\feng"
     plan = PlanManager(storage_dir=tmp_path, session_id=bad_session_id)
     plan.replace([{"id": "1", "subject": "test", "status": "pending"}])
@@ -19,7 +17,6 @@ def test_storage_path_sanitizes_session_id_with_illegal_chars(tmp_path):
 
 
 def test_storage_path_keeps_legal_session_id(tmp_path):
-    """合法会话名保持原文件名，既有计划文件不受清洗影响。"""
     plan = PlanManager(storage_dir=tmp_path, session_id="session-1")
     assert plan.storage_path() == tmp_path / "session-1.json"
 
@@ -83,8 +80,6 @@ def test_plan_tracks_dependencies_and_persists_across_manager_restart(tmp_path):
 
 
 def test_crashed_delegated_item_reload_clears_dead_lease(tmp_path):
-    """普通委派在进程崩溃后只能恢复为可重新调度的 pending，
-    不能凭非空 handoff_task_id 伪造“已超时接管”事实。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager(storage_dir=tmp_path, session_id="delegated-crash")
@@ -105,7 +100,6 @@ def test_crashed_delegated_item_reload_clears_dead_lease(tmp_path):
 
 
 def test_failed_delegated_item_remains_retryable_after_reload(tmp_path):
-    """普通子 Agent 失败不是超时接管，重启后仍必须能 plan_retry。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager(storage_dir=tmp_path, session_id="delegated-failed")
@@ -175,11 +169,8 @@ def test_public_plan_update_cannot_forge_runtime_completion():
     manager.clear()
     manager.replace([{"id": "runtime", "subject": "真实执行"}])
 
-    # plan_update 对受管状态（completed/in_progress 等）静默忽略，
-    # 不再返回错误，但状态字段不会被伪造
     message = plan_update("runtime", status="completed")
 
-    # 状态仍保持 pending，不会被 plan_update 伪造
     assert manager.snapshot()[0]["status"] == "pending"
     manager.clear()
 
@@ -239,7 +230,6 @@ def test_corrupt_plan_file_is_backed_up_and_starts_empty(tmp_path, caplog):
     assert not plan_file.exists()
     assert (storage / "broken.json.corrupt").exists()
 
-    # 损坏文件被隔离后可以正常写入新计划
     plan.replace([{"id": "a", "subject": "新任务"}])
     assert plan.snapshot()[0]["id"] == "a"
 
@@ -248,7 +238,6 @@ def test_non_list_plan_json_is_backed_up_and_starts_empty(tmp_path, caplog):
     storage = tmp_path / "plans"
     storage.mkdir()
     plan_file = storage / "dict.json"
-    # 合法 JSON 但不是计划项列表
     plan_file.write_text('{"id": "a", "subject": "任务"}', encoding="utf-8")
 
     with caplog.at_level("WARNING", logger="core.plan"):
@@ -286,7 +275,6 @@ def test_plan_update_rejects_negative_attempts_without_partial_mutation():
 
 
 def test_retry_does_not_increment_attempt_until_next_start():
-    """重置 retry 不得伪造新的真实执行次数。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -303,7 +291,6 @@ def test_retry_does_not_increment_attempt_until_next_start():
 
 
 def test_plan_retry_after_two_attempts_requires_explicit_force(monkeypatch):
-    """失败两次后的重试必须由调用方显式确认。"""
     from core.plan import plan_retry
     from core.task_scheduler import TaskScheduler
 
@@ -326,7 +313,6 @@ def test_plan_retry_after_two_attempts_requires_explicit_force(monkeypatch):
 
 
 def test_handoff_keeps_item_in_progress_and_same_attempt():
-    """子代理超时移交主 Agent：状态保持 in_progress，attempts 不变。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -347,7 +333,6 @@ def test_handoff_keeps_item_in_progress_and_same_attempt():
 
 
 def test_takeover_required_survives_failure_retry_and_reload(tmp_path):
-    """超时是不可逆业务事实：失败、普通 retry 和重载都不能重新开放子代理。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager(storage_dir=tmp_path, session_id="takeover-history")
@@ -371,7 +356,6 @@ def test_takeover_required_survives_failure_retry_and_reload(tmp_path):
 
 
 def test_claim_takeover_for_new_turn_rebinds_orphaned_active_item():
-    """新主回合必须能认领绑定已死亡 turn 的 active takeover。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -396,7 +380,6 @@ def test_claim_takeover_for_new_turn_rebinds_orphaned_active_item():
 
 
 def test_release_takeover_requeues_or_cancels_by_turn_outcome():
-    """未收尾的系统退出要排队续接；用户取消必须保持 cancelled。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -429,7 +412,6 @@ def test_release_takeover_requeues_or_cancels_by_turn_outcome():
 
 
 def test_resume_takeover_rebinds_failed_item_without_new_attempt():
-    """验证失败后的恢复仍由主 Agent 执行，且不增加原子代理尝试次数。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -455,7 +437,6 @@ def test_resume_takeover_rebinds_failed_item_without_new_attempt():
 
 
 def test_handoff_does_not_jump_a_preexisting_takeover_queue():
-    """无 active 但已有 queued 时，新超时项不得越过更早的 FIFO 项。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -488,7 +469,6 @@ def test_handoff_does_not_jump_a_preexisting_takeover_queue():
 
 
 def test_multiple_handoffs_queue_and_promote_fifo():
-    """同会话多个同时超时项：第一个 active，其余 FIFO 排队，完成后按序提升。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -513,7 +493,6 @@ def test_multiple_handoffs_queue_and_promote_fifo():
 
 
 def test_plan_finish_emits_handoff_for_promoted_fifo_item(monkeypatch):
-    """plan_finish 提升下一项时必须发送可展示的统一接管事件。"""
     from core.plan import plan_finish
     from core.task_scheduler import TaskScheduler
 
@@ -555,7 +534,6 @@ def test_plan_finish_emits_handoff_for_promoted_fifo_item(monkeypatch):
 
 
 def test_handoff_rejects_mismatched_source_task_id():
-    """handoff 必须校验真实执行租约 id，防止伪造接管。"""
     from core.task_scheduler import TaskScheduler
 
     plan = PlanManager()
@@ -573,7 +551,6 @@ def test_handoff_rejects_mismatched_source_task_id():
 
 
 def test_loaded_main_takeover_downgrades_to_queued_for_next_turn(tmp_path):
-    """崩溃恢复：遗留 main_takeover 降级为 queued 并清空旧 turn id，可被重新认领。"""
     import json
 
     storage = tmp_path / "plans"
@@ -619,12 +596,10 @@ def test_plan_write_rejects_missing_id_and_subject_with_clear_errors():
     bind_default_plan_session("missing-fields-test")
     manager.clear()
     try:
-        # 缺少 id
         message = plan_write([{"subject": "没有id", "status": "pending"}])
         assert "missing required field 'id'" in message
         assert manager.snapshot() == []
 
-        # 缺少 subject
         message = plan_write([{"id": "no-subject", "status": "pending"}])
         assert "missing required field 'subject'" in message
         assert "no-subject" in message
@@ -653,7 +628,6 @@ def test_plan_write_rejects_non_list_items():
 
 
 def test_plan_auto_continue_suppression_lifecycle():
-    """用户取消 → suppress；恢复执行/计划清空 → clear；空会话名是 no-op。"""
     from core.plan import (
         clear_plan_auto_continue_suppression,
         plan_auto_continue_suppressed,
@@ -665,7 +639,7 @@ def test_plan_auto_continue_suppression_lifecycle():
         assert not plan_auto_continue_suppressed(session)
         suppress_plan_auto_continue(session)
         assert plan_auto_continue_suppressed(session)
-        suppress_plan_auto_continue("")  # no-op，不抛异常
+        suppress_plan_auto_continue("")
         clear_plan_auto_continue_suppression(session)
         assert not plan_auto_continue_suppressed(session)
     finally:
@@ -673,7 +647,6 @@ def test_plan_auto_continue_suppression_lifecycle():
 
 
 def test_maybe_clear_completed_plan_clears_when_all_terminal(tmp_path, monkeypatch):
-    """显式 session_id 路由：全部终态时清空并返回 True。"""
     import core.plan as plan
     manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-all-terminal")
     manager.replace([
@@ -687,7 +660,6 @@ def test_maybe_clear_completed_plan_clears_when_all_terminal(tmp_path, monkeypat
 
 
 def test_maybe_clear_completed_plan_keeps_pending(tmp_path, monkeypatch):
-    """仍有 pending 项时不清空（跨回合任务不能被提前抹掉）。"""
     import core.plan as plan
     manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-has-pending")
     manager.replace([
@@ -701,7 +673,6 @@ def test_maybe_clear_completed_plan_keeps_pending(tmp_path, monkeypatch):
 
 
 def test_maybe_clear_completed_plan_noop_when_empty(tmp_path, monkeypatch):
-    """无计划项时返回 False，不误报清空。"""
     import core.plan as plan
     manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-empty")
     monkeypatch.setattr(plan, "_PLAN_MANAGERS", {"clear-empty": manager})
@@ -711,7 +682,6 @@ def test_maybe_clear_completed_plan_noop_when_empty(tmp_path, monkeypatch):
 
 
 def test_maybe_clear_completed_plan_noarg_routes_default_manager(tmp_path, monkeypatch):
-    """不传 session_id（CLI 路径）：走 get_default_plan_manager 默认路由。"""
     import core.plan as plan
     manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-noarg")
     manager.replace([
@@ -724,9 +694,6 @@ def test_maybe_clear_completed_plan_noarg_routes_default_manager(tmp_path, monke
 
 
 def test_maybe_clear_completed_plan_does_not_create_registry_entry(monkeypatch):
-    """显式 session_id 且注册表无条目（早退回合场景）：no-op 返回 False，
-    且绝不惰性创建条目——get_plan_manager_for 会以当前线程 workdir 推导
-    storage_dir，早退路径 workdir 未绑定会创建指向进程 cwd 的污染条目。"""
     import core.plan as plan
     monkeypatch.setattr(plan, "_PLAN_MANAGERS", {})
     assert plan.maybe_clear_completed_plan("never-seen-session") is False
@@ -758,8 +725,6 @@ def test_plan_state_fingerprint_changes_on_status_change(tmp_path, monkeypatch):
 
 
 def test_plan_state_fingerprint_changes_on_retry_reset(tmp_path, monkeypatch):
-    # retry 重置 failed→pending 时指纹必须变化，attempts 仅在下一次真实 start 时增加：
-    # TurnProgressGuard 据此清零停滞计数。
     plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
     assert manager.update("b", status="failed", attempts=1, error="boom") is True
     before = plan.plan_state_fingerprint(session)
@@ -768,7 +733,6 @@ def test_plan_state_fingerprint_changes_on_retry_reset(tmp_path, monkeypatch):
 
 
 def test_plan_state_fingerprint_ignores_attempt_only_changes(tmp_path, monkeypatch):
-    """attempts 是诊断计数，不得伪装成可调度状态进展。"""
     plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
     before = plan.plan_state_fingerprint(session)
 
@@ -778,7 +742,6 @@ def test_plan_state_fingerprint_ignores_attempt_only_changes(tmp_path, monkeypat
 
 
 def test_plan_state_fingerprint_ignores_display_text(tmp_path, monkeypatch):
-    # subject/result/error 等展示文案变化不算业务状态变化，指纹保持稳定
     plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
     before = plan.plan_state_fingerprint(session)
     assert manager.update("a", subject="改写后的任务标题") is True
@@ -803,13 +766,10 @@ def test_plan_state_fingerprint_tracks_in_progress_item(tmp_path, monkeypatch):
     after = plan.plan_state_fingerprint(session)
     assert after != before
     assert manager.update("a", status="completed") is True
-    # in_progress 从 a 变回 None：与 before 不同（a 的 status 已变），
-    # 与"in_progress 为 a"的状态也不同
     assert plan.plan_state_fingerprint(session) != after
 
 
 def test_plan_state_fingerprint_unknown_session_is_stable_and_clean(tmp_path, monkeypatch):
-    # 未知会话：不惰性创建注册表条目（早退回合场景），返回稳定空态指纹
     import core.plan as plan
     monkeypatch.setattr(plan, "_PLAN_MANAGERS", {})
     first = plan.plan_state_fingerprint("never-planned")
@@ -818,7 +778,6 @@ def test_plan_state_fingerprint_unknown_session_is_stable_and_clean(tmp_path, mo
 
 
 def test_plan_finish_completes_takeover_via_shared_verification(monkeypatch):
-    """接管项经 plan_finish 完成：验证共用、状态回写、不重新委派。"""
     from core.plan import plan_finish
     from core.task_scheduler import TaskScheduler
 
@@ -844,7 +803,6 @@ def test_plan_finish_completes_takeover_via_shared_verification(monkeypatch):
     item = plan.snapshot()[0]
     assert item["status"] == "completed"
     assert item["result"] == "现场核查完成，结果有效"
-    # 完成后无排队项，接管流程结束
     assert scheduler.active_takeover("turn-1") is None
 
 
@@ -896,7 +854,6 @@ def test_public_plan_update_cannot_edit_execution_locked_item():
 def test_public_plan_update_rejects_metadata_edit_when_lease_starts_after_snapshot(
     monkeypatch,
 ):
-    """计划项在读取快照后被认领时，旧快照不得绕过执行租约保护。"""
     from core.plan import get_default_plan_manager, plan_update
 
     manager = get_default_plan_manager()
@@ -958,14 +915,12 @@ def test_public_plan_update_allows_metadata_edit_outside_execution_lease():
         },
     ])
 
-    # 普通 pending 项允许更新元数据
     message = plan_update("plain", subject="改名", files=["b.py"])
     assert "已更新" in message
     plain = next(i for i in manager.snapshot() if i["id"] == "plain")
     assert plain["subject"] == "改名"
     assert plain["files"] == ["b.py"]
 
-    # failed 接管项已释放运行租约：允许先修改元数据，再走 plan_resume_takeover
     message = plan_update("takeover", subject="修正描述", files=["c.py"])
     assert "已更新" in message
     takeover = next(i for i in manager.snapshot() if i["id"] == "takeover")
@@ -974,7 +929,6 @@ def test_public_plan_update_allows_metadata_edit_outside_execution_lease():
     assert takeover["status"] == "failed"
     assert takeover["takeover_required"] is True
 
-    # 但仍拒绝任何运行字段写入；接管项只能走 plan_resume_takeover
     before = manager.snapshot()
     message = plan_update("takeover", status="pending")
     assert "状态变更由调度器自动管理" in message

@@ -58,7 +58,6 @@ describe('App 宽屏 / 最大化侧边联动分栏', () => {
     expect(store.rightPanelCollapsed).toBe(true);
     expect(store.rightPanelWidth).toBe(RIGHT_PANEL_DEFAULT_WIDTH);
 
-    // 模拟最大化到 1920px 宽屏
     setViewportWidth(1920);
     window.dispatchEvent(new Event('resize'));
     await nextTick();
@@ -67,7 +66,6 @@ describe('App 宽屏 / 最大化侧边联动分栏', () => {
     expect(store.rightPanelActiveTab).toBe('files');
     expect(store.rightPanelWidth).toBe(538);
 
-    // 模拟还原回 1178px 普通窗口：联动打开的面板自动收起并还原默认宽度
     setViewportWidth(1178);
     window.dispatchEvent(new Event('resize'));
     await nextTick();
@@ -88,17 +86,14 @@ describe('App 宽屏 / 最大化侧边联动分栏', () => {
     await nextTick();
     expect(store.rightPanelCollapsed).toBe(false);
 
-    // 用户主动关闭右侧栏
     store.toggleRightPanel();
     await nextTick();
     expect(store.rightPanelCollapsed).toBe(true);
 
-    // 切会话时尊重用户本次宽屏内的隐藏意图，不强行弹回
     store.currentSessionName = 's2';
     await nextTick();
     expect(store.rightPanelCollapsed).toBe(true);
 
-    // 退出宽屏再重新最大化，联动机制重新生效
     setViewportWidth(1178);
     window.dispatchEvent(new Event('resize'));
     await nextTick();

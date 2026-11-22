@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""星瑶官网本地后台。
-
-只监听本机。公告的上架/下架、下载地址和版本号写进
-website/data/site.json，首页和公告页读取这份文件。
-
-账号和密码哈希保存在 site_admin/admin.db。第一次没有账号时写入初始账号，
-之后在后台修改密码，重启不会把密码改回去。
-
-用法（在项目根目录）::
-
-    venv\\Scripts\\python site_admin\\server.py
-"""
 
 from __future__ import annotations
 

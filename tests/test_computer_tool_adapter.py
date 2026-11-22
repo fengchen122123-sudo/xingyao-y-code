@@ -1,9 +1,3 @@
-"""Task 9：固定 computer_action 适配器、follow-up 剥离与保留名语义。
-
-测试全部经 fake 注入（FakeController + 虚拟 PNG 字节），
-绝不真实移动鼠标/发送键盘/截屏/启动浏览器，也绝不调用真实 Provider。
-"""
-
 import base64
 import json
 import threading
@@ -72,10 +66,6 @@ def _computer_pipeline():
 
 def execute_one_computer_action(controller, context, *, target="browser",
                                 call_id="call-1", arguments=None):
-    """经生产 ToolBatchExecutor 路径执行一个 computer_action，返回 record 包装。
-
-    错误结果没有 follow-up：observation_data_url 为 None。
-    """
     lease = getattr(context, "computer_lease", None)
     assert lease is None or lease.controller is controller
     payload = arguments if arguments is not None else {"kind": "observe", "target": target}
@@ -161,8 +151,6 @@ def test_computer_result_adds_tool_then_user_observation(fake_controller, contex
         "role": "user",
         "content": [
             {"type": "text", "text": "【电脑观察】请只依据这张最新截图决定下一步。"},
-            # E3：定位提示按 target 区分——browser 没有 observe_region，
-            # 只能给出坐标语义提示（旧文案会让模型调用 desktop 专属动作）
             {"type": "text", "text": "【定位提示】本页没有可用的元素引用，请依据这张整屏截图判断位置，坐标以截图左上角为 (0,0)，不要凭记忆复用旧坐标。"},
             {"type": "image_url", "image_url": {"url": record.observation_data_url}},
         ],
@@ -329,10 +317,6 @@ def test_missing_png_returns_error_without_stale_image(fake_controller, context)
 
 
 def test_forged_non_computer_name_stays_on_normal_resolution_path(context):
-    # Task 11a 起 computer_select_target 由固定 adapter 拦截（无原生双 target
-    # 上下文时返回 computer_disabled，见 test_computer_provider_openai 的
-    # test_selector_without_selection_context_fails）；本测试的意图是"非保留名
-    # 走普通解析路径"，故改用真正非保留的伪造名。
     forged = "computer_select_browser"
     message = _computer_pipeline().execute_one(_call(forged), context)
     assert message == {
@@ -355,7 +339,6 @@ def test_computer_action_tool_spec_semantics():
     assert spec.cancellable is True
     assert spec.parallel_safe is False
     assert spec.mutates_files is False
-    # 规格 03 §3.2：computer_action 归 system（A 阶段评审补修缺口）。
     assert spec.side_effect_scope == "system"
 
 

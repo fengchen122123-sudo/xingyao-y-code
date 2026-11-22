@@ -1,14 +1,3 @@
-"""云中转公网入口：把桌面二维码从局域网地址换成网关公网地址。
-
-云中转是纯消息通道（桌面主动外连 ``/relay/device``），既不是 HTTP 反代也没有
-端口映射，所以公网页面必须由网关自己托管（``/desktop/<device_id>`` 或
-``/m/<device_id>``）。手机要打开这些页面，需要的是一张网关签发的只读 remote
-JWT；桌面手里只有长期 device token，因此先拿它去换票。
-
-任何一步不可用（未开启、未连上、换票失败、网关没挂移动端页面）都返回 None，
-调用方回落局域网二维码——这个模块绝不把异常抛给界面。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -22,7 +11,6 @@ logger = logging.getLogger(__name__)
 # 换票与页面探测都在用户点「二维码」的同步路径上，超时必须短。
 _TIMEOUT_SECONDS = 6.0
 _RELAY_SUFFIX = "/relay/device"
-# 换票缓存：device_id -> 网关签发的票据；剩余有效期低于余量就重新换一张。
 _TICKET_CACHE: dict[str, dict] = {}
 _CACHE_MARGIN_SECONDS = 300
 
@@ -109,14 +97,6 @@ def mobile_page_available(base: str, device_id: str) -> bool:
 def build_pair_url(
     bridge, *, mobile: bool, ttl_seconds: int = 0, reason: dict | None = None
 ) -> dict | None:
-    """云中转可用时返回公网二维码信息，否则返回 None 由调用方回落局域网。
-
-    返回 ``{"url", "token", "expires_in"}``；``expires_in=0`` 表示不过期，
-    与局域网配对 token 的 TTL 语义保持一致。
-
-    回落原因写进 ``reason``（``code`` + 面向用户的 ``message``）：本模块只提供事实，
-    是否在界面上提示由调用方决定，避免二维码路径里塞界面判断。
-    """
 
     def fail(code: str, message: str) -> None:
         if reason is not None:
@@ -151,7 +131,6 @@ def build_pair_url(
         if payload is None:
             return fail("ticket", f"云中转换票失败，{hint}")
         jwt_token = str(payload.get("token") or "")
-        # 移动端包没部署时退回桌面响应式页：同样能扫，只是不是专属移动端界面。
         if mobile and not mobile_page_available(base, device_id):
             page = f"/desktop/{device_id}"
         elif mobile:

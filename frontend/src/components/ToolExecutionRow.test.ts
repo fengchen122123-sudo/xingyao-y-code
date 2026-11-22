@@ -5,7 +5,6 @@ import ToolExecutionRow from './ToolExecutionRow.vue';
 import { useAppStore } from '../stores/appStore';
 import type { ToolDisplay, ToolTraceRow } from '../utils/toolTrace';
 
-// 组件内 openSubagentDetail 依赖 pinia store
 beforeEach(() => {
   setActivePinia(createPinia());
 });
@@ -122,7 +121,6 @@ describe('ToolExecutionRow', () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: mutationRowWithDiff() } });
     expect(wrapper.get('.trace-kind').text()).toBe('编辑');
     expect(wrapper.get('.trace-diff-badge').text()).toContain('+1');
-    // 收起态不渲染 diff 行，点开整行才展开
     expect(wrapper.find('.diff-line').exists()).toBe(false);
     await wrapper.get('[data-row-toggle]').trigger('click');
     expect(wrapper.findAll('.diff-line.add')).toHaveLength(1);
@@ -212,7 +210,6 @@ it('labels a run_subagent row as 星舰 instead of 工具', async () => {
 });
 
 
-// ── 电脑操控行（2026-10-21）：动作动词 + 目标，展开看当帧截图 ────────────
 describe('computer action row', () => {
   const shotSha = 'a'.repeat(64);
 
@@ -336,5 +333,87 @@ describe('computer action row', () => {
     expect(wrapper.text()).toContain('src/b.ts');
     expect(wrapper.text()).toContain('src/c.ts');
     wrapper.unmount();
+  });
+
+  it('draws SVG coordinate overlay only when frame_id and dimensions match, and falls back to text trace when missing', async () => {
+    const store = useAppStore();
+    const frameSha = 'b'.repeat(64);
+    store.computerShots[frameSha] = '/computer-preview/tok/shot-frame.png';
+    store.computerFrameShots = {
+      ...(store.computerFrameShots || {}),
+      [frameSha]: {
+        url: '/computer-preview/tok/shot-frame.png',
+        frame_id: 'frame-42',
+        image_width: 1280,
+        image_height: 800,
+      },
+    } as any;
+
+    const matchedRow: ToolTraceRow = {
+      id: 'computer:c-match',
+      kind: 'computer',
+      status: 'completed',
+      action: '点击',
+      detail: '640, 400',
+      command: '',
+      errorSummary: '',
+      count: 1,
+      durationMs: 120,
+      metrics: {},
+      calls: [{
+        id: 'c-match',
+        name: 'computer_action',
+        label: '点击 (640, 400)',
+        result: {
+          ok: true,
+          summary: '点击',
+          result: JSON.stringify({
+            ok: true,
+            target: 'browser',
+            action: 'click',
+            screen_sha256: frameSha,
+            frame_id: 'frame-42',
+            image_width: 1280,
+            image_height: 800,
+            action_geometry: { kind: 'point', x: 640, y: 400 },
+          }),
+        },
+      }],
+    };
+    const wMatch = mount(ToolExecutionRow, { props: { row: matchedRow } });
+    await wMatch.get('.trace-line').trigger('click');
+    const svg = wMatch.find('[data-test="computer-svg-overlay"]');
+    expect(svg.exists()).toBe(true);
+    expect(svg.attributes('viewBox')).toBe('0 0 1280 800');
+    expect(svg.find('circle').attributes('cx')).toBe('640');
+    expect(svg.find('circle').attributes('cy')).toBe('400');
+    wMatch.unmount();
+
+    // 缺少几何或 frame_id 不匹配时不猜位置，回退纯文本轨迹说明
+    const noGeomRow: ToolTraceRow = {
+      ...matchedRow,
+      id: 'computer:c-nogeom',
+      calls: [{
+        id: 'c-nogeom',
+        name: 'computer_action',
+        label: '点击 el-3',
+        result: {
+          ok: true,
+          summary: '点击',
+          result: JSON.stringify({
+            ok: true,
+            target: 'browser',
+            action: 'click_element',
+            screen_sha256: frameSha,
+            frame_id: 'frame-99',
+          }),
+        },
+      }],
+    };
+    const wFallback = mount(ToolExecutionRow, { props: { row: noGeomRow } });
+    await wFallback.get('.trace-line').trigger('click');
+    expect(wFallback.find('[data-test="computer-svg-overlay"]').exists()).toBe(false);
+    expect(wFallback.get('[data-test="computer-trace-fallback"]').text()).toContain('无匹配帧几何');
+    wFallback.unmount();
   });
 });

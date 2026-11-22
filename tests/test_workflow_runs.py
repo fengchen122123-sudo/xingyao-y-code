@@ -1,5 +1,3 @@
-"""星流工作流运行台账测试（create/finish/list/recover/clear + 进程级句柄）。"""
-
 from __future__ import annotations
 
 import pytest
@@ -48,7 +46,6 @@ def test_finish_run_only_from_running_and_idempotent(storage):
     assert stored["status"] == "completed"
     assert stored["summary"] == "2 处发现"
     assert stored["finished_at"]
-    # 已终态：再收尾不改写（幂等）
     assert storage.finish_run(run["id"], "failed", "迟到") is False
     assert storage.get_run(run["id"])["status"] == "completed"
 
@@ -74,8 +71,8 @@ def test_list_runs_filters_and_orders(storage):
     storage.finish_run(first["id"], "completed", "ok")
 
     names = [r["workflow_name"] for r in storage.list_runs("a")]
-    assert names == ["a", "a"]  # 过滤 + 倒序（最新在前）
-    assert len(storage.list_runs()) == 3  # 空 name = 全部
+    assert names == ["a", "a"]
+    assert len(storage.list_runs()) == 3
 
 
 def test_recover_stale_runs_marks_interrupted_only(storage):
@@ -87,9 +84,8 @@ def test_recover_stale_runs_marks_interrupted_only(storage):
     assert recovered == 1
     assert storage.get_run(running["id"])["status"] == "interrupted"
     assert storage.get_run(running["id"])["finished_at"]
-    assert storage.get_run(done["id"])["status"] == "completed"  # 终态不动
+    assert storage.get_run(done["id"])["status"] == "completed"
 
-    # 无遗留时幂等
     assert storage.recover_stale_runs() == 0
 
 
@@ -105,5 +101,5 @@ def test_process_level_handle_injection(manager):
     assert get_run_storage() is storage
     run = storage.create_run("via-handle")
     assert get_run_storage().get_run(run["id"])["workflow_name"] == "via-handle"
-    runs_module._storage = None  # 测试收尾：不泄漏到其他用例
+    runs_module._storage = None
     assert get_run_storage() is None

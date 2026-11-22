@@ -1,13 +1,3 @@
-"""installer_common.py
-安装向导 (ycode_setup.py) 与卸载向导 (ycode_uninstall.py) 共享的基础工具函数。
-
-独立成模块的目的：卸载向导只需要这几个零依赖函数（os/winreg/ctypes），
-历史上它从 ycode_setup.py 导入，会把安装向导整棵依赖树（tkinter 界面、
-PIL 横幅处理等）一起拖进卸载器二进制。改从本模块导入后，卸载器不再
-链接 ycode_setup，体积显著缩小。
-
-约束：本模块只允许导入标准库，且不得反向导入 ycode_setup / ycode_uninstall。
-"""
 import os
 import winreg
 
@@ -69,7 +59,6 @@ def is_user_an_admin():
 
 
 def _is_reparse_path(path):
-    """Return whether an existing path redirects filesystem traversal."""
     if os.path.islink(path):
         return True
     isjunction = getattr(os.path, "isjunction", None)

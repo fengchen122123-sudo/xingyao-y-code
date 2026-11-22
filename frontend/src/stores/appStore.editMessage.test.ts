@@ -31,7 +31,6 @@ it('rewinds local history and resends the edited text', async () => {
   const ok = await store.editUserMessage(store.messages[2], '改过的第二条');
 
   expect(ok).toBe(true);
-  // 不传 interrupt：后端签名第 4 参默认 True（编辑即打断）
   expect(api.edit_user_message).toHaveBeenCalledWith('s1', 3, '改过的第二条');
   expect(store.messages.map(m => m.content)).toEqual(['第一条', '回答一']);
   expect(sendSpy).toHaveBeenCalledWith('改过的第二条', []);
@@ -57,10 +56,8 @@ it('keeps local history untouched when backend rejects', async () => {
 it('switching session during the edit await must not resend into the new session', async () => {
   const store = useAppStore();
   seedHistory(store);
-  // 用户正在看 s1：顶层 messages 与 s1 runtime 是同一个数组（switchSession 绑定所致）
   store._captureRuntime('s1');
   const sendSpy = vi.spyOn(store, 'sendMessage').mockResolvedValue(undefined);
-  // 后端截断期间用户切到 s2：switchSession 会捕获 s1 再绑定 s2 的 runtime
   api.edit_user_message.mockImplementation(async () => {
     store.currentSessionName = 's2';
     store.messages = [{ role: 'user', content: '另一个会话的历史', _msg_id: 9 }] as ChatMessage[];
@@ -76,7 +73,6 @@ it('switching session during the edit await must not resend into the new session
   const rt = store._getSessionRuntime('s1');
   expect(rt.messages.filter(m => m.role !== 'error' && m.role !== 'notice').map(m => m.content))
     .toEqual(['第一条', '回答一']);
-  // 提示写回原会话：用户切回 s1 才看到，不污染 s2
   expect(rt.messages.some(m => m.role === 'error')).toBe(true);
   expect(store.messages.map(m => m.content)).toEqual(['另一个会话的历史']);
 });
@@ -91,7 +87,6 @@ it('refreshes the nav rail index after truncating locally', async () => {
   const ok = await store.editUserMessage(store.messages[2], '改过的第二条');
 
   expect(ok).toBe(true);
-  // 红点导航索引是后端按库重建的：本地截断后不刷新，被删的消息还留在导轨里
   expect(navSpy).toHaveBeenCalledWith('s1');
 });
 
@@ -104,7 +99,6 @@ it('keeps the edit and asks for a manual resend when the resend throws', async (
   // 编辑已落库，重发失败不能整体算失败（否则用户会以为改动丢了）
   await expect(store.editUserMessage(store.messages[2], '改过的第二条')).resolves.toBe(false);
 
-  // 提示以 error 气泡追加在同一条历史流里，比较正文时先剔除提示角色
   expect(store.messages.filter(m => m.role !== 'error' && m.role !== 'notice').map(m => m.content))
     .toEqual(['第一条', '回答一']);
   const notices = store.messages.filter(m => m.role === 'error').map(m => m.content || '');

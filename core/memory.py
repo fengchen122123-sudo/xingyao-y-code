@@ -37,12 +37,10 @@ _TOKEN_USAGE_TOMBSTONE_PREFIX = "deleted::"
 
 
 def _token_usage_tombstone_name(session_name):
-    """已删会话流水的墓碑名：保留原名便于追溯，同时与活会话名天然隔离。"""
     return f"{_TOKEN_USAGE_TOMBSTONE_PREFIX}{session_name}"
 
 
 def _canonicalize_api_base(value):
-    """规范 endpoint 身份并移除 userinfo/query/fragment，避免分桶漂移或泄密。"""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -90,7 +88,6 @@ def canonicalize_api_base(value):
 
 
 def _normalize_workdir(path):
-    """规范化工作目录路径（真实磁盘物理大小写），用于会话归属目录比较。"""
     try:
         p = pathlib.Path(path)
         if p.exists():
@@ -100,18 +97,14 @@ def _normalize_workdir(path):
         return str(path or "")
 
 
-# 首条用户消息尾部常被追加运行时上下文/附件清单（【当前运行上下文】、
-# [附带文件] 等）。这些系统块会把「模型」「当前时间」这类词带进检索文本，
-# 让 @ 补全命中一堆无关会话，所以生成会话检索文本时要在第一个块之前截断。
 _SESSION_SEARCH_CUT_MARKERS = (
-    "\n\n【\u200b当前运行上下文】",  # 带零宽空格的版本（GUI 注入）
+    "\n\n【\u200b当前运行上下文】",
     "\n\n【当前运行上下文】",
     "\n\n[附带",
 )
 
 
 def _session_search_text(content, limit: int = 2000) -> str:
-    """把首条用户消息压成 @ 提及检索用的文本（去系统注入块 + 限制长度）。"""
     text = str(content or "")
     cut = len(text)
     for marker in _SESSION_SEARCH_CUT_MARKERS:
@@ -121,18 +114,11 @@ def _session_search_text(content, limit: int = 2000) -> str:
     return text[:cut].strip()[:limit]
 
 
-# 消息全文检索的归一化取「字符 bigram」而非 FTS5 内置 trigram/unicode61：
-# - trigram 分词器要求查询 ≥3 字符，中文两字词（"缓存""路由"）会搜不到；
-# - unicode61 会把一整串连续汉字当成单个 token，同样搜不到子串。
-# 因此索引与查询两侧都走同一套自建归一化（零第三方依赖）：CJK 段切成相邻
-# 两字的 bigram（单字段保留单字），非 CJK 按非字母数字切分、转小写、长度
-# ≥2 保留。索引侧把结果存成空格连接的 token 串，查询侧把每个 token 加双引号
-# 后用 AND 连接（双引号既做短语化也防 FTS5 语法注入）。
 _CJK_CHAR_CLASS = (
-    "\u3040-\u30ff"  # 日文假名
-    "\u3400-\u4dbf"  # CJK 扩展 A
-    "\u4e00-\u9fff"  # CJK 基本区
-    "\uac00-\ud7af"  # 谚文音节
+    "\u3040-\u30ff"
+    "\u3400-\u4dbf"
+    "\u4e00-\u9fff"
+    "\uac00-\ud7af"
     "\uf900-\ufaff"  # CJK 兼容表意文字
 )
 _CJK_RUN_RE = re.compile(f"[{_CJK_CHAR_CLASS}]+")
@@ -140,7 +126,6 @@ _NON_ALNUM_RE = re.compile(r"[^0-9A-Za-z]+")
 
 
 def _fts_normalize(text) -> str:
-    """把任意文本归一化成 FTS 索引/查询共用的 token 串（空格连接）。"""
     raw = str(text or "")
     if not raw:
         return ""
@@ -159,21 +144,11 @@ def _fts_normalize(text) -> str:
 
 
 def _fts_match_expression(normalized: str) -> str:
-    """把归一化 token 串转成 FTS5 MATCH 表达式（每个 token 短语化后 AND）。"""
     tokens = [tok for tok in str(normalized or "").split() if tok]
     return " AND ".join(f'"{tok}"' for tok in tokens)
 
 
 def _fts_snippet(text, query, radius=45):
-    """从消息原文里截取命中位置附近的可读片段。
-
-    索引列存的是 bigram token 串，FTS5 的 snippet() 只会在该列上取片段，
-    结果会变成 `stable 《prefix》` 这类 token 串而不通读。因此索引只用于
-    命中定位，片段一律回到 messages.content 原文上截取。
-
-    定位策略：按查询里的字符逐个在原文中查找，取第一个命中的位置（中文
-    不依赖分词边界，英文同样适用）；找不到则退化为原文开头。
-    """
     body = str(text or "")
     if not body:
         return ""
@@ -197,7 +172,6 @@ def _fts_snippet(text, query, radius=45):
 
 
 def _try_parse_json(text):
-    """仅对形如 JSON 对象/数组的字符串尝试解析，避免把 '123'、'true' 等纯文本曲解为标量。"""
     if not isinstance(text, str):
         return None, False
     stripped = text.lstrip()
@@ -213,7 +187,6 @@ _FOLDED_MEDIA_TEXT = "[图片/媒体内容已折叠以节省 Token；如需再�
 
 
 def _folded_media_text(block):
-    """折叠占位文本：带来源路径（如有），便于用户按路径找回原图。"""
     src = block.get("source_path") if isinstance(block, dict) else None
     if src:
         return f"[图片已折叠以节省 Token；原图路径: {src}]"
@@ -221,12 +194,6 @@ def _folded_media_text(block):
 
 
 def _content_has_media(content):
-    """判断消息内容是否含图片/视频块；同时识别两种持久化形态（Task 10）。
-
-    1. content 列表（普通多模态消息）；
-    2. 含 content 列表的完整消息 dict（带 _computer_v1 私有元数据的
-       follow-up 观察消息，以完整 dict 入库）。
-    """
     if isinstance(content, dict):
         content = content.get("content")
     return (
@@ -239,10 +206,6 @@ def _content_has_media(content):
 
 
 def message_content_to_text(raw_content):
-    """把入库的消息 content 提取为纯文本（多模态数组只拼接 text 块）。
-
-    供记忆压缩归纳等只需要文本的场景复用，避免各处重复 JSON 解析逻辑。
-    """
     parsed, ok = _try_parse_json(raw_content)
     if not ok:
         return str(raw_content)
@@ -256,13 +219,6 @@ def message_content_to_text(raw_content):
 
 
 def _tool_call_is_replayable(tc) -> bool:
-    """判定历史里的 assistant tool call 是否可原样回放给 provider。
-
-    严格网关（如 Agnes AI）对 name 为空或 arguments 不是合法 JSON 的
-    tool call 直接 400 整个请求，坏记录落库后该会话每轮复现。此判定
-    只读不改：不可回放的调用连同其 tool 结果在回放历史中剔除，
-    DB 原文不动，会话即可自愈。
-    """
     if not isinstance(tc, dict):
         return False
     function = tc.get("function") or {}
@@ -281,22 +237,6 @@ def _tool_call_is_replayable(tc) -> bool:
 
 
 def _sanitize_tool_call_pairing(history):
-    """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
-
-    四种损坏形态：
-    1. 孤儿 tool 消息：tool_call_id 未在前面任何 assistant.tool_calls 中声明，
-       API 会报 "tool_call_id is not found" → 直接丢弃该 tool 消息。
-    2. assistant 声明了 tool_calls 但历史中缺少对应 tool 结果，
-       API 会报 "assistant message with tool_calls must be followed by tool messages"
-       → 移除该 assistant 的 tool_calls 字段（保留文本内容）。
-    3. tool call 本身不可回放（函数名为空 / arguments 非法 JSON，
-       典型成因：上游网关流式吐出残缺调用被原样落库）→ 从回放历史
-       中剔除该调用，其 tool 结果按形态 1 连带丢弃。
-    4. tool 结果与应答它的 assistant 之间被注入了别的消息（典型成因：
-       编排提醒等 notice 消息在旧版落库顺序里插到了工具结果之前），严格
-       网关同样报 "must be followed by tool messages" → 按 tool_call_id 把
-       结果搬回对应 assistant 之后；正文一字不动，只调整位置。
-    """
     announced = set()
     for msg in history:
         if msg.get("role") != "assistant":
@@ -358,7 +298,6 @@ def _sanitize_tool_call_pairing(history):
         reordered = []
         for msg in sanitized:
             if msg.get("role") == "tool":
-                # 结果统一由所属 assistant 就地安置，此处不再原样输出
                 continue
             reordered.append(msg)
             for tool_call in msg.get("tool_calls") or []:
@@ -372,12 +311,6 @@ def _sanitize_tool_call_pairing(history):
 
 
 def _position_kind_for_role(role: str) -> str:
-    """消息角色 → message_turn_links 位置种类的显式映射（规格 7.7）。
-
-    回合内持久化的 user 角色消息（压缩摘要请求、接管通知等系统注入内容）
-    归类为 notice；回合的发起用户消息由调用方显式传 'user'。
-    未知角色显式失败，不塞默认值。
-    """
     mapping = {
         "assistant": "assistant_intermediate",
         "tool": "tool",
@@ -395,21 +328,14 @@ def _position_kind_for_role(role: str) -> str:
     return value
 
 
-# ── 工具结果归档层：编码策略 / 内容寻址句柄 / 落库行加工 ──────────────────────
-# 超过该字节数的原文改用 gzip+base64 落库（文本类工具结果通常能压到 1/5 以下），
-# 省下的是磁盘与 WAL 体积；解码在读取路径完成，调用方无感知。
 COMPRESS_THRESHOLD_BYTES = 256 * 1024
-# 单条归档上限：超过则只保留头尾各 4MB 并在中间插省略提示；bytes 仍记真实长度
 SINGLE_RECORD_LIMIT_BYTES = 8 * 1024 * 1024
-# 归档层总预算与 TTL：供闲时维护的 sweep_tool_result_archive 淘汰
 ARCHIVE_BUDGET_BYTES = 256 * 1024 * 1024
 ARCHIVE_TTL_DAYS = 7
 
-# 单条归档保留了头尾各这么多字节（= SINGLE_RECORD_LIMIT_BYTES 的一半）
 _TRUNCATE_HEAD_BYTES = SINGLE_RECORD_LIMIT_BYTES // 2
 _TRUNCATE_TAIL_BYTES = SINGLE_RECORD_LIMIT_BYTES // 2
 
-# 归档表的唯一写入口：11 列与 build_archive_row 的输出一一对应
 _TOOL_RESULT_ARCHIVE_INSERT_SQL = (
     "INSERT OR IGNORE INTO tool_result_archive "
     "(handle, session_id, msg_id, tool_name, bytes, content, created_at, "
@@ -422,7 +348,6 @@ def encode_payload(raw: bytes) -> tuple[str, str, int]:
     """把原始工具结果字节编码成 (落库文本, 编码标记, 原始字节数)。"""
     size = len(raw)
     if size > SINGLE_RECORD_LIMIT_BYTES:
-        # 超大结果：头尾各留 4MB，中间只留一句省略提示（原始长度照样记全）
         head = raw[:_TRUNCATE_HEAD_BYTES].decode("utf-8", "replace")
         tail = raw[-_TRUNCATE_TAIL_BYTES:].decode("utf-8", "replace")
         hint = f"\n\n[... {size} 字节超过单条归档上限，中间部分未归档 ...]\n\n"
@@ -463,7 +388,6 @@ def content_handle(cursor, text: str) -> str:
             "SELECT sha256 FROM tool_result_archive WHERE handle = ?", (candidate,)
         ).fetchone()
     except Exception:
-        # 表/列缺失（极端旧库）：退回一次性随机句柄，不阻断改写流程
         return new_handle()
     # 已有同句柄记录：sha 相同说明同一段内容（复用）；不同（含旧行 sha 为 NULL）
     # 说明是真碰撞，必须换随机句柄，否则 marker 会指向别人的原文
@@ -473,11 +397,6 @@ def content_handle(cursor, text: str) -> str:
 
 
 def build_archive_row(record) -> tuple:
-    """把 7 字段归档元组加工成 11 字段落库行（编码 + 内容寻址 + 容量统计列）。
-
-    record = (handle, session_id, msg_id, tool_name, bytes, content, created_at)。
-    bytes 列仍写原始字节数（对外语义不变），stored_bytes 是实际落库文本长度。
-    """
     handle, session_id, msg_id, tool_name, _bytes, content, created_at = record
     raw = str(content).encode("utf-8")
     sha = hashlib.sha256(raw).hexdigest()
@@ -499,23 +418,16 @@ def build_archive_row(record) -> tuple:
 
 class MemoryManager:
     def __init__(self, db_path="ycode.db"):
-        # 1. 连接数据库（check_same_thread=False 允许多线程访问，timeout=30.0 防止多窗口并发挂起）
         self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
         self.conn.execute("PRAGMA foreign_keys=ON")
-        # 2. 启用 WAL 模式与 busy_timeout，提升多进程多窗口并发读写性能，彻底解决锁死卡顿
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         # 3. 读写序列化锁（可重入，允许方法间互调），防止多线程共享单连接游标并发竞态
         self._lock = threading.RLock()
-        # 4. 新建会话的归属工作目录（默认取启动时的 cwd，可用 set_workdir 修改）
         self.workdir = _normalize_workdir(os.getcwd())
-        # 4.1 消息全文检索索引可用性标志：CREATE VIRTUAL TABLE 失败（该 SQLite
-        # 未编译 FTS5）时保持 False 并静默降级，检索返回 None 而非抛异常。
         self._fts_available = False
-        # 建表失败过一次后不再重试（缺模块是永久性的），也保证 warning 只记一次。
         self._fts_disabled = False
-        # 5. 立刻建表
         self.create_tables()
         self.interrupt_stale_harness_runs(time.time_ns() // 1_000_000 - 10_000)
 
@@ -532,13 +444,6 @@ class MemoryManager:
             cursor = self.conn.cursor()
 
             try:
-                # 兼容性恢复：检测并丢弃与当前版本不兼容的遗留 sessions 表。
-                # 当 ~/.ycode/ycode.db 由更旧的星瑶版本创建、缺少核心 session_name
-                # 列时，CREATE TABLE IF NOT EXISTS 不会重建它，SQLite 也无法通过
-                # ALTER ADD COLUMN 添加带 UNIQUE 约束的列，从而导致首次运行就崩在
-                # get_history 的 "no such column: session_name"。该遗留库无
-                # session_name 标识符、其消息均为孤儿，本身已无法使用，因此直接清表
-                # 重建是最稳的恢复（同时记一条 runtime-warnings 日志便于事后追溯）。
                 cursor.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
                 )
@@ -562,7 +467,6 @@ class MemoryManager:
                 # 若将来恢复持久化，CREATE TABLE 会按新 schema 重建。
                 cursor.execute("DROP TABLE IF EXISTS session_diffs")
 
-                # 创建一个叫 sessions 的表，加入摘要字段
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS sessions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -580,7 +484,6 @@ class MemoryManager:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN memory_summary TEXT")
                 if "summarized_until_msg_id" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN summarized_until_msg_id INTEGER")
-                # 会话归属工作目录与时间戳（按目录隔离会话列表，NULL 表示历史遗留的全局会话）
                 if "workdir" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN workdir TEXT")
                 if "created_at" not in columns:
@@ -589,10 +492,8 @@ class MemoryManager:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
                 if "source" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'GUI'")
-                # 会话级主模型绑定：不继承全局 active_model_id，不同会话/不同界面互不干扰
                 if "active_model_id" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN active_model_id TEXT")
-                # 会话最后一次终态错误（如余额不足/接口超时），供 UI 多端与重载恢复
                 if "last_error" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN last_error TEXT")
                 # 会话级权限档位（confirm/accept_edits/plan/full）：NULL = 跟随全局默认，
@@ -615,17 +516,12 @@ class MemoryManager:
                 # 星瑶人设互不影响；同样只走 ALTER ADD COLUMN 幂等添加。
                 if "secretary_persona" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_persona TEXT")
-                # @ 提及检索用的会话全文：存「首条用户消息」的前 2000 字。
-                # 会话名只是首条消息截断到 12 字，用户记住的往往是后面的内容，
-                # 只按名字匹配会永远搜不到（例如名字是「我感觉我现在@对话这个功」，
-                # 想搜「功能」就命中不了）。新增列时顺带回填存量会话。
                 if "search_text" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN search_text TEXT")
                     backfill_search_text = True
                 else:
                     backfill_search_text = False
 
-                # 创建一个叫 messages 的表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS messages (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -634,12 +530,6 @@ class MemoryManager:
                         content TEXT
                     )
                 ''')
-                # 会话维度的消息索引：会话列表/计数（get_all_sessions 的
-                # LEFT JOIN + COUNT）、@ 提及对话检索、按会话取历史都按
-                # session_id 过滤。缺索引时 SQLite 只能 SCAN messages 全表
-                # （真机 900MB 库单次约 95ms），@ 补全每敲一个字都要跑一遍，
-                # 叠加 keyup 重复触发后输入明显卡顿。幂等建索引，只在首次
-                # 启动时为存量库补齐（53k 行实测数秒内完成）。
                 cursor.execute('''
                     CREATE INDEX IF NOT EXISTS idx_messages_session
                     ON messages(session_id)
@@ -666,10 +556,6 @@ class MemoryManager:
                                 "UPDATE sessions SET search_text = ? WHERE id = ?",
                                 (text, sid),
                             )
-                # 多代摘要归档：每次压缩成功后追加一代（摘要/topics/边界）。
-                # 只存边界元数据与摘要文本，原始消息永久保留在 messages 表——
-                # history[0] 摘要块据此注入回溯索引，recall_history 工具据此
-                # 按需取回更早被压缩掉的原始消息。
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS session_summary_generations (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -918,7 +804,6 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_deepseek_prompt_messages_generation "
                     "ON deepseek_prompt_messages(generation_id, ordinal)"
                 )
-                # 创建一个叫 workspaces 的表持久化记录引入过的项目文件夹
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS workspaces (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -926,10 +811,6 @@ class MemoryManager:
                         created_at TEXT
                     )
                 ''')
-                # 秘书派活台账：一条派活一行，派活时落库、回合收尾回写终态。
-                # 读写走 core/secretary_dispatches.py 的 DispatchStore（复用本连接
-                # 与 _lock，不开第二个写句柄）。字段名与
-                # docs/superpowers/specs/2026-11-04-secretary-upgrade-design.md 3.1 一致。
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS secretary_dispatches (
                         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -963,8 +844,6 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_secretary_dispatches_secretary "
                     "ON secretary_dispatches(secretary_session, status)"
                 )
-                # token 用量统计表：每次流式响应结束后追加一条真实用量记录，
-                # 供 /usage 按模型与日期区间聚合（今日/近7天/近30天）
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS token_usage (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -994,7 +873,6 @@ class MemoryManager:
                         "ALTER TABLE token_usage "
                         "ADD COLUMN cache_scope TEXT NOT NULL DEFAULT 'legacy'"
                     )
-                # 读写分列（Task 7）：为 NULL 表示未报告（未报告 ≠ 0），不加默认值。
                 if "cache_write_tokens" not in token_usage_columns:
                     try:
                         cursor.execute(
@@ -1010,7 +888,6 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_route "
                     "ON token_usage(model, api_base, cache_scope, date)"
                 )
-                # 按会话聚合（GUI 状态栏本会话口径 / 会话弹层）的查询走此索引
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_session "
                     "ON token_usage(session_id, cache_scope)"
@@ -1076,7 +953,6 @@ class MemoryManager:
                         )
                     except Exception:
                         pass
-                # 读写分列（Task 7）：写入量单列，NULL 语义与 cached 一致。
                 if "cache_write_tokens" not in cache_diag_columns:
                     try:
                         cursor.execute(
@@ -1099,7 +975,6 @@ class MemoryManager:
                 from core.turn_undo.storage import create_turn_undo_tables
 
                 create_turn_undo_tables(cursor)
-                # 保存修改
                 self.conn.commit()
             except Exception:
                 # DDL 失败时回滚，避免遗留未提交事务阻塞后续写操作
@@ -1341,14 +1216,6 @@ class MemoryManager:
             return None if row is None else dict(zip(columns, row))
 
     def export_harness_journal(self, session_name: str = "", since_ms: int = 0) -> list[dict]:
-        """只读导出 harness 三表（turns/steps/events）为逐行 JSON 记录（T5）。
-
-        - 仅含 ID 与元数据（Harness 纪律：journal 不落消息正文，只有 sha256/
-          计数/时长/状态等），供诊断包与审计使用；
-        - session_name 为空时导出全部会话；since_ms > 0 时只导出
-          started_at_ms >= since_ms 的回合及其 steps/events；
-        - 不新增写路径、不改 schema：本方法只做 SELECT。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             if session_name:
@@ -1508,11 +1375,9 @@ class MemoryManager:
 
     @staticmethod
     def _serialize_prompt_value(value):
-        """Serialize a provider request value once, preserving insertion order."""
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     def get_deepseek_prompt_generation(self, generation_id):
-        """Return one immutable DeepSeek prompt generation and its ordered messages."""
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute(
@@ -1542,11 +1407,6 @@ class MemoryManager:
         self, session_name, model, api_base, cache_scope, seed_messages, tools,
         *, force_new=False
     ):
-        """Return the route generation, seeding it exactly once.
-
-        The route identity deliberately excludes request-header fields. Callers compare
-        system/tools and create a fresh generation when that stable header changes.
-        """
         identity = (
             str(session_name), str(model).lower(), str(api_base).rstrip("/").lower(),
             str(cache_scope),
@@ -1649,7 +1509,6 @@ class MemoryManager:
                 raise
 
     def _delete_deepseek_prompt_generations_locked(self, cursor, session_names):
-        """Delete ledger messages before their generations inside caller transaction."""
         names = [str(name) for name in session_names if str(name)]
         if not names:
             return
@@ -1674,12 +1533,6 @@ class MemoryManager:
         )
 
     def get_last_token_usage(self, session_id):
-        """查询指定会话最近一次真实 token 用量，无记录返回 None。
-
-        供窗口占用显示与压缩触发判断使用主链路真实基线（下一轮请求的
-        prompt 必然包含上一轮的 prompt + completion），避免保活/子代理的
-        独立上下文覆盖主会话基线。legacy 用于兼容迁移前记录。
-        """
         with self._lock:
             cursor = self.conn.execute(
                 "SELECT t.prompt_tokens, t.completion_tokens, t.total_tokens, "
@@ -1707,12 +1560,6 @@ class MemoryManager:
         }
 
     def query_token_usage_by_model(self, start_date, end_date):
-        """按模型聚合指定日期区间（含端点，格式 YYYY-MM-DD）的 token 用量。
-
-        返回按合计 token 降序排列的字典列表:
-        [{"provider", "model", "prompt", "completion", "cached",
-          "cache_prompt", "total"}, ...]
-        """
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -1776,13 +1623,6 @@ class MemoryManager:
             ]
 
     def get_token_usage_by_session(self, session_name):
-        """按会话聚合真实 token 用量：对话口径（main/legacy）为主，保活单列。
-
-        命中率分母 cache_prompt 只统计已报告缓存明细的行（未报告 ≠ 0）。
-        返回 {"prompt", "completion", "cached", "cache_prompt", "total",
-        "requests", "last_ts", "keepalive_prompt", "keepalive_cached",
-        "keepalive_requests"}；无记录时数值项为 0、last_ts 为 None。
-        """
         with self._lock:
             cursor = self.conn.execute(
                 f"""
@@ -1824,13 +1664,6 @@ class MemoryManager:
         }
 
     def list_token_usage_by_sessions(self, limit=20):
-        """按会话聚合 token 用量并按合计降序排列，供会话弹层选择查看。
-
-        只列 sessions 表中仍存在的会话；已删会话的残留行不进列表，
-        但仍计入 get_token_usage_totals() 的全部会话合计。
-        返回 [{"session_id", "prompt", "completion", "cached", "cache_prompt",
-        "total", "requests", "last_ts"}, ...]
-        """
         with self._lock:
             cursor = self.conn.execute(
                 f"""
@@ -1864,12 +1697,6 @@ class MemoryManager:
             ]
 
     def get_token_usage_totals(self):
-        """全部会话的总计（不分 scope，与状态行旧口径同源的落库版）。
-
-        保活/压缩轮次也是真实计费，全部合计必须包含；命中率分母同样
-        只取已报告缓存明细的行。返回 {"prompt", "completion", "cached",
-        "cache_prompt", "total", "requests"}。
-        """
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -1960,12 +1787,6 @@ class MemoryManager:
         self, start_ts=None, end_ts=None, session_id=None, cache_scope=None,
         with_prev_prompt=False,
     ):
-        """按时间/会话读取诊断行；NULL 与真实 0 保持原样。
-
-        `with_prev_prompt=True` 时每行额外带 `prev_prompt`：同一
-        (session_id, model, api_base, cache_scope) 内按 id 排序的上一行 prompt_tokens
-        （设计 §Task3 口径）。上一行未报告缓存明细、或本行已是该链首行 → NULL。
-        """
         clauses = []
         params = []
         if start_ts is not None:
@@ -2025,18 +1846,6 @@ class MemoryManager:
         return result
 
     def query_keepalive_lane_evidence(self, before_ts=None, since_ts=None):
-        """按车道聚合「已落库且报告了缓存明细」的保活轮次，供止损证据跨进程续用。
-
-        只取 cache_scope='keepalive' 且 cached_tokens IS NOT NULL 的行：未报告的保活
-        轮次连入分母的资格都没有（未报告 ≠ 0），绝不把 NULL 当 0 参与加权。
-
-        before_ts 把窗口钉在「本进程启动之前」——本进程自己记的轮次已经在内存证据桶里，
-        再算一遍会双计（轮次翻倍 → 判定门槛被提前跨过）；since_ts 排除久远到不该再
-        压制复活的过去（亏损是稳态特征，但车道好转时不能被陈旧数据永久判死）。
-
-        返回 `{(模型小写全串, 归一化 api_base): (轮次, prompt 合计, cached 合计)}`，
-        键口径与 core.llm_diagnostics._cache_usage_key 一致（小写 + 去尾斜杠）。
-        """
         clauses = ["cache_scope = 'keepalive'", "cached_tokens IS NOT NULL"]
         params = []
         if before_ts is not None:
@@ -2066,16 +1875,6 @@ class MemoryManager:
         return {key: tuple(value) for key, value in lanes.items()}
 
     def query_lane_cache_health(self, start_ts=None, end_ts=None, lane=None, window=200):
-        """按时间窗口汇总各 lane 的健康度；lane=(model, api_base, cache_scope) 可选过滤。
-
-        复用 query_cache_request_diagnostics（idx_cache_diag_ts 走时间过滤），按 lane
-        分组、组内按 id 升序，再交给 core.cache_health.classify_lanes_health 派生。
-        查询层不把 NULL 转成 0——「未报告 ≠ 真实 0」由派生层继续区分。
-
-        prev_prompt 由查询层按 (会话, lane) 分链算好后随行带上（设计 §Task3 口径）：
-        时间范围只决定「取哪些行做样本」，不切断 prev 链——否则切点正好落在某个会话
-        中间时，区间首行会白白丢掉一个可判定样本。
-        """
         rows = self.query_cache_request_diagnostics(
             start_ts, end_ts, with_prev_prompt=True
         )
@@ -2287,7 +2086,6 @@ class MemoryManager:
         serialized = []
         has_new_media = False
         for role, content in messages:
-            # 注意：媒体判断必须用原始 list（json.dumps 之前就判定）
             if str(role) == "user" and _content_has_media(content):
                 has_new_media = True
             content = self._serialize_message_content(content)
@@ -2374,13 +2172,6 @@ class MemoryManager:
         return tuple(message_ids)
     def add_messages(self, session_name, messages, *, turn_checkpoint_id=None,
                      turn_position_kinds=None):
-        """Atomically append one ordered batch of conversation messages.
-
-        turn_checkpoint_id/turn_position_kinds：按回合撤销的消息关联（规格 7.7）。
-        传入时消息正文与 message_turn_links 在同一事务提交或回滚；position_kind
-        未知值显式失败。未显式传入时，若当前线程绑定了活动回合检查点上下文
-        （回合内非 Harness 持久化路径，如压缩摘要回写），同样自动关联。
-        """
         serialized, has_new_media = self._serialize_message_batch(messages)
         if not serialized:
             return
@@ -2411,9 +2202,6 @@ class MemoryManager:
                     session_id = row[0]
                 else:
                     target_wdir = self.workdir
-                    # 并发首写防御：两个连接同时 SELECT 均未命中时会双双 INSERT，
-                    # session_name UNIQUE 约束让后提交者整批消息 IntegrityError 丢失。
-                    # INSERT OR IGNORE + 重新 SELECT：冲突时采用已存在的会话行。
                     cursor.execute('''
                         INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
                         VALUES (?, ?, ?, ?, 'GUI')
@@ -2435,10 +2223,8 @@ class MemoryManager:
                             links.append((message_id, turn_checkpoint_id, kind))
                     if links:
                         insert_message_turn_links_locked(cursor, links)
-                # 新媒体入库的同一事务内折叠旧媒体：请求路径不再改写历史中间字节
                 if has_new_media:
                     self._fold_stale_media_locked(cursor, session_id)
-                # 更新最近活跃时间，供会话列表按时间展示
                 cursor.execute('UPDATE sessions SET updated_at = ? WHERE id = ?', (now, session_id))
                 self.conn.commit()
             except Exception:
@@ -2464,9 +2250,6 @@ class MemoryManager:
         if not serialized:
             return ()
 
-        # message_turn_links（规格 7.7）：Harness 原子提交路径同事务写入关联。
-        # checkpoint 解析顺序：显式参数 → 回合线程 TLS 上下文 → 按 harness turn_id
-        # （与回合 turn_id 同值，全局唯一）查库兜底（取消打捞等异线程路径）。
         link_checkpoint_id = turn_checkpoint_id
         if link_checkpoint_id is None:
             try:
@@ -2575,17 +2358,6 @@ class MemoryManager:
                 raise
 
     def _fold_stale_media_locked(self, cursor, session_id):
-        """把会话中除最新一条外的含媒体 user 消息折叠为文本占位符（入库时一次性）。
-
-        在含媒体的新 user 消息写入的同一事务内调用，替代请求时改写历史的旧路径；
-        折叠后字节永久冻结（占位符是 text block，不再匹配媒体折叠条件）。
-
-        含媒体的行有两种持久化形态（Task 10）：content 列表（普通多模态消息）
-        与含 content 列表的完整消息 dict（带 _computer_v1 的 follow-up 观察）。
-        折叠只把媒体块替换为文本占位符：dict 形态的其余键（_computer_v1 私有
-        元数据）原样保留，不删除不改写；普通列表形态的折叠结果字节与历史
-        版本完全一致。
-        """
         cursor.execute(
             "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
             "ORDER BY id ASC",
@@ -2597,9 +2369,8 @@ class MemoryManager:
             if ok and _content_has_media(parsed):
                 media_rows.append((msg_id, parsed))
         folded = 0
-        for msg_id, payload in media_rows[:-1]:  # 最新一条保留原样
+        for msg_id, payload in media_rows[:-1]:
             if isinstance(payload, dict):
-                # 完整消息 dict：只折叠 content 内的媒体块，保留 _computer_v1 等键
                 blocks = payload.get("content")
                 if not isinstance(blocks, list):
                     continue
@@ -2626,14 +2397,6 @@ class MemoryManager:
         return folded
 
     def fold_session_computer_media(self, session_id):
-        """回合收尾后折叠本会话全部电脑操控观察图（含最新一条）；幂等。
-
-        与 _fold_stale_media_locked 的区别：只处理带 _computer_v1 私有元数据的
-        user 消息 dict 形态，折叠其 content 内全部图片块（普通多模态消息与
-        _fold_stale_media_locked 的「保留最新一条」语义均不触碰——两者职责
-        互斥：前者保运行中滚动上下文，后者清回合结束后的全部截图）。
-        铁律：一次性、幂等、DB 层完成，改写后字节永久冻结。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             try:
@@ -2671,12 +2434,6 @@ class MemoryManager:
                 raise
 
     def iter_assistant_media_migration_rows(self):
-        """媒体清单迁移候选行：无 media_v1 的 JSON dict 形态 assistant 消息。
-
-        返回 [(message_id, session_workdir, parsed_content_dict), ...]。
-        纯文本旧格式消息不迁移（保持展示层文件链接兜底，避免改写消息结构）；
-        已带 media_v1 的消息跳过（迁移幂等的关键）。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute(
@@ -2699,12 +2456,6 @@ class MemoryManager:
             return rows
 
     def iter_referenced_media_digests(self):
-        """全库媒体清单引用的 Blob 摘要集合（供闲时孤儿 Blob 回收，只读）。
-
-        粗筛 ``content LIKE '%media_v1%'`` 后解析 JSON，提取
-        ``_display.media_v1.items[*].digest``；解析失败/结构异常的行跳过
-        （回收侧另有宽限期兜底，缺引用最坏只是少回收，不会误删在用 Blob）。
-        """
         digests = set()
         with self._lock:
             cursor = self.conn.cursor()
@@ -2760,11 +2511,6 @@ class MemoryManager:
                 raise
 
     def ensure_session(self, session_name, workdir=None, source="GUI"):
-        """确保会话记录存在（不存在则创建），返回是否为本次新建。
-
-        与 create_session_explicit 的区别：本方法会明确告知调用方会话是否已存在，
-        供 GUI 启动时"准备当前会话"这类幂等场景使用。
-        """
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
         with self._lock:
             cursor = self.conn.cursor()
@@ -2806,11 +2552,6 @@ class MemoryManager:
                 raise
 
     def get_session_workdir(self, session_name):
-        """取会话绑定的工作目录；会话不存在 / 字段为空返回空串。
-
-        供「项目状态注入」等按会话解析项目画像的调用方使用：只读、不加锁写、
-        任何异常都回落空串（调用方据此自行兜底到当前工作目录）。
-        """
         name = str(session_name or "").strip()
         if not name:
             return ""
@@ -2932,11 +2673,6 @@ class MemoryManager:
             self.conn.commit()
 
     def clear_session_messages(self, session_name):
-        """清空指定会话的全部消息，但保留会话本身（供 GUI "清空历史" 使用）。
-
-        同时重置记忆摘要与压缩游标，避免清空后仍向大模型注入旧摘要。
-        返回被删除的消息条数；会话不存在时返回 0。
-        """
         deleted = 0
         with self._lock:
             cursor = self.conn.cursor()
@@ -2971,14 +2707,6 @@ class MemoryManager:
 
     def create_session_explicit(self, session_name, workdir=None, source="GUI", secretary_name=None,
                                 secretary_persona=None):
-        """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。
-
-        secretary_name 仅秘书会话创建路径传入（NULL/空 = 非秘书会话）。名字合法性
-        由调用方（core.secretary.validate_secretary_name）先行校验，本层不再静默
-        截断或改写，只把空值统一落 NULL，避免"空串"与"未设置"两套口径并存。
-
-        secretary_persona 同上：仅秘书会话使用，NULL/空 = 走内置默认秘书人设。
-        """
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
         sec_name = str(secretary_name).strip() if secretary_name else None
         sec_persona = str(secretary_persona).strip() if secretary_persona else None
@@ -2996,11 +2724,6 @@ class MemoryManager:
                 raise
 
     def get_session_secretary_name(self, session_name) -> str:
-        """取会话的秘书名；无记录 / 未命名 / 查询异常一律返回空串。
-
-        秘书名是显示与提示词的输入，读取处在每轮请求的高频路径上，不能因查询
-        异常打断整轮，故异常回落空串而非向上抛。
-        """
         try:
             with self._lock:
                 cursor = self.conn.cursor()
@@ -3013,11 +2736,6 @@ class MemoryManager:
         return str(row[0]).strip() if row and row[0] else ""
 
     def set_session_secretary_name(self, session_name, name) -> bool:
-        """写入会话的秘书名，返回是否有匹配行被更新。
-
-        传 None/空字符串落 NULL（= 非秘书 / 未命名）；合法性由调用方校验，本层
-        不做静默截断。异常回滚并返回 False，不向上抛。
-        """
         sec_name = str(name).strip() if name else None
         with self._lock:
             cursor = self.conn.cursor()
@@ -3034,11 +2752,6 @@ class MemoryManager:
                 return False
 
     def get_session_secretary_persona(self, session_name) -> str:
-        """取会话的秘书人设；无记录 / 未设置 / 查询异常一律返回空串。
-
-        空串语义是"使用内置默认秘书人设"，与读取异常共用同一回落值——人设是
-        提示词增强项，取不到时宁可退回默认证，也不能打断整轮请求。
-        """
         try:
             with self._lock:
                 cursor = self.conn.cursor()
@@ -3051,11 +2764,6 @@ class MemoryManager:
         return str(row[0]) if row and row[0] else ""
 
     def set_session_secretary_persona(self, session_name, persona) -> bool:
-        """写入会话的秘书人设，返回是否有匹配行被更新。
-
-        传 None/空字符串落 NULL（= 回退内置默认秘书人设）；长度等合法性由调用方
-        （core.secretary.validate_secretary_persona）校验。异常回滚返回 False。
-        """
         sec_persona = str(persona).strip() if persona else None
         with self._lock:
             cursor = self.conn.cursor()
@@ -3087,14 +2795,6 @@ class MemoryManager:
 
     @staticmethod
     def _parse_message_rows(rows, with_ids=False, strip_display=False):
-        """把数据库行元组解析成消息字典列表（get_history / get_history_with_ids /
-        get_history_for_llm 共用）。
-
-        with_ids=False 时 rows 每项为 (role, content)，返回的 dict 不新增任何键；
-        with_ids=True 时 rows 每项为 (id, role, content)，返回的 dict 额外带 _msg_id。
-        strip_display=True 时剔除模型显示元数据 _display（仅供 UI 展示，不得混入
-        发给 LLM 的提示词），供 get_history_for_llm 使用。
-        """
         history = []
         for record in rows:
             if with_ids:
@@ -3124,11 +2824,6 @@ class MemoryManager:
         return history
 
     def mark_turn_final_assistant(self, checkpoint_id: str) -> None:
-        """回合封闭时把该检查点最后一条 assistant 关联更新为 assistant_final。
-
-        显式按 message_id 更新（检查点内最后一条 assistant），不属于按时间
-        范围回填；无 assistant 消息（异常回合）时静默跳过。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             try:
@@ -3183,24 +2878,20 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.cursor()
 
-            # 1. 先去查查有没有这个档案袋
             cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
             row = cursor.fetchone()
 
-            # 如果连档案袋都找不到，说明是新聊天，直接返回空列表 []
             if row is None:
                 return []
 
             session_id = row[0]
 
-            # 2. 根据档案袋 ID，把所有的聊天记录按时间顺序（id 从小到大）查出来
             cursor.execute('''
                 SELECT role, content FROM messages
                 WHERE session_id = ?
                 ORDER BY id ASC
             ''', (session_id,))
 
-            # 3. 把查出来的数据，打包成 Python 认识的格式（字典列表）
             return self._parse_message_rows(cursor.fetchall())
 
     def get_last_message_id(self, session_name):
@@ -3253,7 +2944,7 @@ class MemoryManager:
                 return [], False
             session_id = row[0]
 
-            limit = max(1, int(limit))          # 防御 limit<=0，避免 page[-1] IndexError
+            limit = max(1, int(limit))
             max_fetch = limit + 30
             if before_id is None:
                 cursor.execute(
@@ -3263,13 +2954,12 @@ class MemoryManager:
                 cursor.execute(
                     'SELECT id, role, content FROM messages WHERE session_id = ? AND id < ? '
                     'ORDER BY id DESC LIMIT ?', (session_id, int(before_id), max_fetch))
-            fetched = cursor.fetchall()          # 倒序：最新在前
+            fetched = cursor.fetchall()
             if not fetched:
                 return [], False
 
             page = fetched[:limit]
-            extra = list(fetched[limit:])   # 倒序的扩展余量
-            # 回合对齐：本页最旧（page[-1]）非 user 时，沿更早方向吞并 extra 直到 user 或耗尽
+            extra = list(fetched[limit:])
             while extra and page[-1][1] != 'user':
                 page.append(extra.pop(0))
 
@@ -3279,18 +2969,10 @@ class MemoryManager:
                 (session_id, oldest_id))
             has_more = bool(cursor.fetchone()[0])
 
-            page.reverse()                        # 回到正序
+            page.reverse()
             return self._parse_message_rows(page, with_ids=True), has_more
 
     def get_session_user_nav_items(self, session_name):
-        """红点导航全量索引：该会话全部 user 消息的 [{id, text, is_observation}]（正序）。
-
-        仅提取纯文本（多模态 blocks 只拼 text 块），不做后缀剥离/截断——
-        预览清洗在 gui_bridge 层完成（strip_context_suffix 位于高层，
-        memory 不反向依赖）。is_observation 标记电脑操控观察跟进协议消息
-        （_computer_v1 结构标记），展示层据此过滤，模型上下文不受影响。
-        判定助手经惰性导入使用（memory 是底层模块，避免顶层依赖 computer 包）。
-        """
         from core.computer.provider_generic import is_observation_protocol_message
 
         with self._lock:
@@ -3335,7 +3017,6 @@ class MemoryManager:
             memory_summary = row[1]
             summarized_until_msg_id = row[2] or 0
 
-            # 仅获取 id > summarized_until_msg_id 的消息
             cursor.execute('''
                 SELECT role, content FROM messages
                 WHERE session_id = ? AND id > ?
@@ -3348,11 +3029,6 @@ class MemoryManager:
             # 防止坏历史让 API 报 "tool_call_id is not found" 后会话彻底不可用
             history = _sanitize_tool_call_pairing(history)
 
-            # 如果存在背景记忆摘要，将其包装为参考上下文并插在首部。
-            # 注意 role 必须是 user 而非 system：持久化的上下文块（动态运行上下文/
-            # 时间注记等）使用 system 角色，摘要用 user 角色可以与之明确区分，
-            # 且位置固定在 history[0]，在两次压缩之间保持稳定，
-            # 不破坏 provider 侧 prefix caching。
             if memory_summary:
                 summary_content = (
                     f"[历史对话记忆摘要 (以下是前段长对话的归纳记忆，请作为背景上下文参考，无需直接回复这段摘要)]\n{memory_summary}"
@@ -3376,7 +3052,6 @@ class MemoryManager:
             if not row: return
             session_id = row[0]
 
-            # 找到最后一条 user 记录的 ID
             cursor.execute('''
                 SELECT id FROM messages 
                 WHERE session_id = ? AND role = 'user' 
@@ -3386,7 +3061,6 @@ class MemoryManager:
 
             if last_user:
                 user_msg_id = last_user[0]
-                # 删除这条 user 提问【之后】产生的所有 assistant 和 tool 记录
                 try:
                     cursor.execute('''
                         DELETE FROM messages
@@ -3400,8 +3074,6 @@ class MemoryManager:
                         SET memory_summary = NULL, summarized_until_msg_id = 0
                         WHERE id = ? AND (memory_summary IS NOT NULL OR summarized_until_msg_id)
                     ''', (session_id,))
-                    # 归档代次一并作废：被撤销区间的原始消息已 DELETE，归档的
-                    # 边界与回溯索引随之失真，保守清空（与删除同事务）。
                     cursor.execute(
                         'DELETE FROM session_summary_generations WHERE session_name = ?',
                         (session_name,),
@@ -3425,18 +3097,6 @@ class MemoryManager:
             return str(row[0]) if row else None
 
     def rewind_to_message(self, session_name, msg_id):
-        """把会话截断到指定消息之前：删除该条及之后的全部记录。
-
-        编辑历史用户消息意味着「从这条重新分叉」，因此：
-        - messages 表里 id >= msg_id 的行全部删除（含该条自身，新文本由调用方重发）
-        - message_turn_links 的孤立关联一并清理（该表无 ON DELETE CASCADE）
-        - memory_summary / summarized_until_msg_id 与多代归档作废：被删区间可能
-          已被压缩进摘要，继续注入会让模型看到已撤销的旧结论
-        - messages_fts 无需处理：全文索引是独立表，查询侧 JOIN messages 自然排除
-
-        返回 {"role": 原消息角色, "removed": 删除条数}；目标消息不属于该会话时
-        返回 None（不做任何修改）。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute(
@@ -3455,7 +3115,6 @@ class MemoryManager:
                 return None
             role = target[0]
             try:
-                # turn_undo 未初始化（老库/纯 CLI 环境）时该表可能不存在，跳过即可
                 cursor.execute(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                     "AND name = 'message_turn_links'"
@@ -3491,20 +3150,6 @@ class MemoryManager:
     def get_all_sessions(self, workdir=None, source=None, include_empty=False,
                          include_archived=False, archived_only=False,
                          sources: Optional[List[str]] = None):
-        """返回会话列表（名称/消息数/归属目录/时间/来源/归档时刻）。
-
-        workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
-        source 参数用于过滤 GUI 或 CLI 专属会话。
-        sources 参数用于一次筛选多个来源（如 ["GUI", "SECRETARY"]），语义为
-        `(s.source IN (...) OR s.source IS NULL)`，与 source 的过滤口径一致；
-        sources 与 source 同时传入时以 sources 为准（source 被忽略）。
-        返回的每个会话都带 source 字段（无值时回退为 "GUI"），供上层按来源分组。
-        include_empty=False 时过滤掉无任何消息的空会话（参考 kimicode 的 is_empty 策略），
-        避免会话列表被空会话污染；磁盘记录仍保留，不删除。
-        include_archived=False（默认）时不返回已归档会话，保证既有调用点行为不变；
-        archived_only=True 时只返回已归档会话（供归档区视图）。
-        """
-        # 归档过滤条件：默认隐藏归档会话，archived_only 只取归档会话
         if archived_only:
             archived_filter = " AND s.archived_at IS NOT NULL"
         elif include_archived:
@@ -3558,7 +3203,6 @@ class MemoryManager:
                 row for row in rows
                 if not row[2] or _normalize_workdir(row[2]) == target
             ]
-        # 参考 kimicode：列表过滤空会话（msg_count=0），磁盘保留不删除
         if not include_empty:
             filtered = [row for row in filtered if row[1] > 0]
         return [
@@ -3571,9 +3215,7 @@ class MemoryManager:
                 "source": row[5] or "GUI",
                 # 不可变主键 sessions.id（按回合撤销等功能的稳定归属标识）
                 "id": row[6],
-                # 归档时刻（ISO8601 文本）；None = 未归档
                 "archived_at": row[7],
-                # 首条用户消息前 2000 字，供 @ 检索匹配被会话名截断的内容
                 "search_text": row[8],
             }
             for row in filtered
@@ -3588,28 +3230,10 @@ class MemoryManager:
         limit: int = 30,
         include_archived: bool = False,
     ) -> List[Dict[str, Any]]:
-        """全文与标题复合检索会话。
-
-        scope:
-          - "all": 既检索标题又检索消息内容
-          - "title": 仅检索会话标题/名称
-          - "content": 仅检索消息正文 (role IN ('user', 'assistant'))
-        workdir:
-          - None: 不限工作区
-          - "GLOBAL": 自由通用会话
-          - path: 指定工作目录
-        source:
-          - 默认 "GUI"，匹配 s.source = 'GUI' OR s.source IS NULL
-        limit:
-          - 最大返回条数
-        include_archived:
-          - 默认 False，排除已归档会话（既有调用点行为不变）
-        """
         q = str(query or "").strip()
         if not q:
             return []
 
-        # 转义 SQL LIKE 通配符
         escaped_q = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped_q}%"
 
@@ -3636,7 +3260,6 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.cursor()
 
-            # 1. 标题搜索 (scope in ("all", "title"))
             if scope in ("all", "title"):
                 title_sql = """
                     SELECT s.id, s.session_name, s.workdir, s.updated_at, s.created_at,
@@ -3674,7 +3297,6 @@ class MemoryManager:
                         "snippet": None,
                     })
 
-            # 2. 内容搜索 (scope in ("all", "content"))
             if scope in ("all", "content"):
                 content_sql = """
                     SELECT m.id, m.role, m.content, s.id, s.session_name, s.workdir, s.updated_at, s.created_at,
@@ -3833,15 +3455,7 @@ class MemoryManager:
         return "\n".join(lines)
 
     def get_compressed_messages(self, session_name, before_msg_id, limit=16):
-        """读取已压缩区的原始消息，供 recall_history 工具回溯。
-
-        只服务摘要水位覆盖的范围（id <= summarized_until_msg_id 且
-        id <= before_msg_id，含边界 itself——索引里的 until_msg_id 本身就是
-        已压缩消息）：活跃区消息模型本就可见，不在此重复。
-        返回按时间正序的 [{"id", "role", "content"}]，content 为文本化内容。
-        """
         try:
-            # 显式判 None：仅缺省用 16；0/负数按下限夹到 1，不再被 `or` 误当缺省
             if limit is None:
                 limit = 16
             limit = max(1, min(int(limit), 50))
@@ -3899,10 +3513,6 @@ class MemoryManager:
                         'DELETE FROM session_summary_generations WHERE session_name = ?',
                         (session_name,),
                     )
-                    # token 流水不随会话删除而消失：真实消耗要留在按日/按模型/
-                    # 总计统计里。改挂墓碑名即可两全——既不会被同名新会话继承
-                    # （2026-09-29 状态行 3200 万输入即同名残留所致），也不会出现
-                    # 在会话弹层（list_token_usage_by_sessions 走 JOIN sessions）。
                     cursor.execute(
                         'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
                         (_token_usage_tombstone_name(session_name), session_name),
@@ -3933,7 +3543,6 @@ class MemoryManager:
                     sid = r[0]
                     deleted_names.append(r[1])
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
-                    # 同 delete_session：被删会话的工具结果归档一并清理
                     cursor.execute(
                         'DELETE FROM tool_result_archive WHERE session_id = ?', (sid,)
                     )
@@ -3945,8 +3554,6 @@ class MemoryManager:
                         f'WHERE session_name IN ({placeholders})',
                         deleted_names,
                     )
-                    # 同 delete_session：流水保留为墓碑行，历史统计不丢，
-                    # 同名新会话也不会继承这批累计。
                     for deleted_name in deleted_names:
                         cursor.execute(
                             'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
@@ -4008,7 +3615,6 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.cursor()
 
-            # 1. 查找旧会话是否存在
             cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (old_name,))
             row = cursor.fetchone()
             if not row:
@@ -4016,7 +3622,6 @@ class MemoryManager:
 
             session_id = row[0]
 
-            # 2. 检查新名字是否冲突并生成唯一名字（统一以 strip 后的基准名加后缀）
             base_name = new_name.strip()
             final_name = base_name
             suffix = 1
@@ -4027,21 +3632,16 @@ class MemoryManager:
                 final_name = f"{base_name}_{suffix}"
                 suffix += 1
 
-            # 3. 更新会话名称
             try:
                 cursor.execute('UPDATE sessions SET session_name = ? WHERE id = ?', (final_name, session_id))
                 cursor.execute(
                     'UPDATE deepseek_prompt_generations SET session_name = ? WHERE session_name = ?',
                     (final_name, old_name),
                 )
-                # 归档代次同样按 session_name 键控：不随改名迁移会孤儿化，
-                # 回溯索引静默消失且旧名行永远清不掉（与上方更新同事务）
                 cursor.execute(
                     'UPDATE session_summary_generations SET session_name = ? WHERE session_name = ?',
                     (final_name, old_name),
                 )
-                # token 用量流水按 session_name 记账：不随迁则按会话统计
-                # 在改名后静默丢历史（与上方更新同事务）
                 cursor.execute(
                     'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
                     (final_name, old_name),
@@ -4075,15 +3675,6 @@ class MemoryManager:
         return result
 
     def archive_session(self, session_name, archived_at=None) -> bool:
-        """归档会话：从默认会话列表隐藏，数据零损失、可随时恢复。
-
-        只写 sessions.archived_at 一列（NULL = 未归档，非空 = 归档时刻的
-        ISO8601 文本），不触碰 messages / session_summary_generations /
-        harness_* / token_usage，也不刷新 updated_at——归档不是「会话有新活动」，
-        混用会污染活跃时间排序。
-        幂等：已归档会话再次调用不覆盖原 archived_at，仍返回 True；
-        会话不存在时返回 False，由调用方提示。
-        """
         stamp = (
             str(archived_at).strip()
             if archived_at
@@ -4113,11 +3704,6 @@ class MemoryManager:
                 raise
 
     def unarchive_session(self, session_name) -> bool:
-        """取消归档：把 archived_at 置回 NULL，会话恢复回主列表。
-
-        幂等：对未归档会话调用同样安全返回 True（不产生额外副作用）；
-        会话不存在时返回 False。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             try:
@@ -4161,15 +3747,12 @@ class MemoryManager:
                 try:
                     content_obj, ok = _try_parse_json(raw_content)
                     if not ok:
-                        # 纯文本消息：直接按字符串处理，回写时保持原始纯文本格式
                         content_obj = raw_content
                     modified = False
 
                     def prune_text(text):
                         if "[附带上下文:" in text:
                             return re.sub(
-                                # T1.2 起标记行与代码块之间多了一行信源声明（不含反引号），
-                                # 故容忍这样的一行；无声明行的既有消息仍照常匹配。
                                 r"(\[附带上下文: .*?\])(?:\n[^\n`]{1,80})?\n```.*?\n```\n?", 
                                 r"\1 (⚠️ 内容已折叠以节省 Token。若需再次查看请使用 read_file 工具)\n\n", 
                                 text, 
@@ -4192,14 +3775,12 @@ class MemoryManager:
                             modified = True
 
                     if modified:
-                        # 只有原本是 JSON 结构的消息才以 JSON 回写，纯文本保持原样
                         new_raw = json.dumps(content_obj, ensure_ascii=False) if ok else content_obj
                         updates.append((new_raw, msg_id))
                 except Exception:
                     error_count += 1
 
             if error_count:
-                # 诊断日志：折叠失败的条目不阻断整体流程，但要留下痕迹
                 import logging
                 logging.getLogger("py.warnings").warning(
                     "prune_history_files: %d 条消息折叠失败 (session=%s)", error_count, session_name
@@ -4221,14 +3802,6 @@ class MemoryManager:
                     raise
 
     def evict_oldest_turn_persistent(self, session_name):
-        """DB 层滑窗淘汰：推进 summarized_until_msg_id，把最早一个完整轮次
-        （首个非 system 消息到下一个 user 之前）一次性排除出活跃历史。
-
-        只推进水位、不改写任何消息字节（字节稳定性铁律允许的一次性 DB 层水位
-        推进）。纯内存淘汰会在下一轮 prepare 时被 get_history_for_llm 全量读回
-        而失效，淘汰必须持久化才真正生效。
-        返回 True 表示确实淘汰了一个轮次，False 表示没有可安全淘汰的内容。
-        """
         with self._lock:
             cursor = self.conn.cursor()
             try:
@@ -4257,7 +3830,6 @@ class MemoryManager:
                     len(rows),
                 )
                 if end >= len(rows):
-                    # 最早轮次已是最后轮次：再淘汰会清空活跃历史，拒绝
                     return False
                 new_boundary = rows[end - 1][0]
                 if new_boundary <= boundary:
@@ -4271,7 +3843,7 @@ class MemoryManager:
                 )
                 if cursor.rowcount == 0:
                     self.conn.rollback()
-                    return False        # 期间有人推进过水位，本轮放弃，下轮重读
+                    return False
                 self.conn.commit()
                 return True
             except Exception:
@@ -4279,14 +3851,6 @@ class MemoryManager:
                 raise
 
     def maintain_tool_results(self, session_name, tier=1, protection_tokens=PROTECTION_ZONE_TOKENS):
-        """分层本地维护旧工具结果（Snip/Elide），DB 层一次性改写并永久冻结。
-
-        tier=1 截断（snip）；tier=2 占位符化（elide，snipped 可升级一次）。
-        尾部 protection_tokens 估算 token 为保护区内消息，永不改写。
-        只处理 id > summarized_until_msg_id 的活跃消息（已被摘要排除的消息
-        不在请求前缀里，无需维护）。
-        返回 (snipped_count, elided_count)。
-        """
         from core.tool_output_reducer import REDUCED_HINT_MARK, reduce_tool_output
         from core.tool_result_maintenance import (
             ERROR_PREFIXES,
@@ -4314,7 +3878,6 @@ class MemoryManager:
             )
             records = cursor.fetchall()
 
-            # 保护区：从尾部向前累加估算 token
             protection_start = 0
             total = 0
             for i in range(len(records) - 1, -1, -1):
@@ -4344,11 +3907,6 @@ class MemoryManager:
                 # 归档自动去重；已 frozen 的 marker 沿用 marker 里的句柄（snip → elide
                 # 升级必须是同一句柄，否则同一结果的原文会被重复归档）。
                 frozen_handle = extract_handle(text)
-                # 命令感知精简：先按输出特征去掉重复行/噪声行。命中时原文必须先
-                # 归档（保持可逆），并跳过本条的 snip/elide——已是精简文本，再
-                # 截断只会丢信息。reducer 属于 Tier 1 维护，tier=0 时不启用；
-                # 已冻结（snip/elide marker）、错误结果、已带精简提示的结果
-                # 一律不精简，保持既有幂等与「错误不改写」不变量。
                 reduced = None
                 if (
                     tier >= 1
@@ -4365,7 +3923,6 @@ class MemoryManager:
                         + f"\n\n[... 原文 {reduced.original_chars} 字符，已按 "
                         f"{reduced.reducer} 规则精简，完整内容见 #{handle} ...]"
                     )
-                    # 计入 snipped，与下面的 elide/snip 分支互斥，不会重复累加
                     snipped += 1
                 else:
                     # snip/elide 的 marker 必须携带内容寻址句柄，所以先算句柄再传进去
@@ -4489,8 +4046,6 @@ class MemoryManager:
                     clauses.append("session_id = ?")
                     params.append(row[0])
                 if cutoff_text is not None:
-                    # created_at 是 '%Y-%m-%d %H:%M:%S' 文本，与同格式 cutoff
-                    # 直接字符串比较即可（字典序 == 时间序）；NULL 行不会被误删。
                     clauses.append("created_at IS NOT NULL AND created_at < ?")
                     params.append(cutoff_text)
                 cursor.execute(
@@ -4514,12 +4069,6 @@ class MemoryManager:
         keep_days=ARCHIVE_TTL_DAYS,
         protect_seconds=3600,
     ) -> dict:
-        """归档层容量治理：先删过期，再按 accessed_at 升序淘汰到预算内。
-
-        返回 {"expired": n, "evicted": n}。protect_seconds 内的记录视为「刚被
-        取回」，即使超预算也跳过——它们最可能还被模型引用，删了 marker 就取不回。
-        任何异常都静默（回滚 + 返回零统计），这条路径只服务闲时维护。
-        """
         stats = {"expired": 0, "evicted": 0}
         with self._lock:
             cursor = self.conn.cursor()
@@ -4533,8 +4082,6 @@ class MemoryManager:
                     cutoff_text = (now - datetime.timedelta(days=days)).strftime(
                         "%Y-%m-%d %H:%M:%S"
                     )
-                    # created_at 与 cutoff 同为 '%Y-%m-%d %H:%M:%S' 文本，
-                    # 字典序即时间序；NULL 行不被误删（与 prune 保持同口径）。
                     cursor.execute(
                         'DELETE FROM tool_result_archive '
                         'WHERE created_at IS NOT NULL AND created_at < ?',
@@ -4542,7 +4089,6 @@ class MemoryManager:
                     )
                     stats["expired"] = max(cursor.rowcount or 0, 0)
                 if budget_bytes is not None:
-                    # 旧行没有 stored_bytes，按 LENGTH(content) 估算
                     total = int(
                         cursor.execute(
                             'SELECT COALESCE(SUM(COALESCE(stored_bytes, '
@@ -4558,8 +4104,6 @@ class MemoryManager:
                             ).strftime("%Y-%m-%d %H:%M:%S")
                         except (TypeError, ValueError):
                             protect_before = now.strftime("%Y-%m-%d %H:%M:%S")
-                        # 候选：未访问过（NULL）或最近访问早于保护窗口；按 accessed_at
-                        # 升序（冷的最先）淘汰，NULL 视为最冷排最前。
                         cursor.execute(
                             'SELECT handle, COALESCE(stored_bytes, LENGTH(content)) '
                             'FROM tool_result_archive '
@@ -4587,23 +4131,13 @@ class MemoryManager:
                 return {"expired": 0, "evicted": 0}
         return stats
 
-    # ---------- 消息全文检索（FTS5 + bigram 归一化，懒同步） ----------
-
     # 单条消息参与索引的最大字符数：超大工具结果先截断再归一化，
     # 避免一次检索维护把索引体积撑爆（原文仍在 messages 表中）。
     _FTS_MAX_CONTENT_CHARS = 20000
-    # 只索引这三类有检索价值的角色；notice/summary 等注入块不索引。
     _FTS_INDEX_ROLES = ("user", "assistant", "tool")
     _FTS_INSERT_SQL = "INSERT INTO messages_fts(rowid, tokens) VALUES (?, ?)"
 
     def _ensure_message_fts(self, cursor=None) -> bool:
-        """幂等创建消息全文索引表；FTS5 不可用时静默降级并返回 False。
-
-        索引表是独立的 FTS5 表（tokens 列 + unicode61 分词），rowid 对齐
-        messages.id。不用 external content 模式：messages 表没有 session_name
-        列，无法满足外部内容映射。任何失败（该 SQLite 未编译 FTS5、建表被拒）
-        都只记一条 warning，绝不冒泡，不影响其它建表与既有功能。
-        """
         if self._fts_available:
             return True
         if self._fts_disabled:
@@ -4641,20 +4175,12 @@ class MemoryManager:
 
     @classmethod
     def _fts_tokens_for_content(cls, content) -> str:
-        """把一条消息的 content 归一化成索引 token 串（超长先截断）。"""
         text = message_content_to_text(content) if content is not None else ""
         if len(text) > cls._FTS_MAX_CONTENT_CHARS:
             text = text[:cls._FTS_MAX_CONTENT_CHARS]
         return _fts_normalize(text)
 
     def sync_message_index(self) -> int:
-        """把 messages 中尚未入索引的消息增量补进 FTS 索引，返回补入条数。
-
-        懒同步：不在 add_message / add_messages / 删除 / undo / 会话清理等
-        任何写入路径挂钩子（避免漏点），检索前调用一次即可。水位取
-        messages.MAX(id) 与 messages_fts.MAX(rowid) 的比较结果。已删除消息
-        留下的孤儿索引行不主动清理——查询侧的 JOIN messages 会自然排除。
-        """
         if not self._ensure_message_fts():
             return 0
         with self._lock:
@@ -4708,8 +4234,6 @@ class MemoryManager:
             reader = self.conn.cursor()
             writer = self.conn.cursor()
             try:
-                # FTS5 的 'rebuild' 命令只对 external content 表有效；
-                # 本索引是独立表，直接 DELETE 清空即可。
                 writer.execute("DELETE FROM messages_fts")
                 reader.execute(
                     "SELECT id, role, content FROM messages "
@@ -4742,12 +4266,6 @@ class MemoryManager:
                 return 0
 
     def search_messages(self, query, limit=10, session_name=None):
-        """跨会话按关键词检索历史消息（含已被压缩归档的消息）。
-
-        返回 list[dict]（id/role/session_name/display_name/snippet），按相关度
-        排序；FTS5 不可用时返回 None，以区分「不可用」与「无命中」的空列表。
-        查询语法问题等 SQLite 层面的错误一律吞掉并记日志，不向调用方抛。
-        """
         if not self._ensure_message_fts():
             return None
         match_expr = _fts_match_expression(_fts_normalize(query))
@@ -4798,5 +4316,4 @@ class MemoryManager:
         ]
 
 
-# Backward-compatible public name used by the original test and extension API.
 SessionManager = MemoryManager

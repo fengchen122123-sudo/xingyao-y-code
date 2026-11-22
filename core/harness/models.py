@@ -1,5 +1,3 @@
-"""Immutable models and explicit state transitions for the harness kernel."""
-
 from dataclasses import dataclass
 from enum import Enum
 
@@ -39,8 +37,6 @@ class HarnessEventKind(str, Enum):
     TOOL_FINISHED = "tool_finished"
     TOOL_RESULT_COMMITTED = "tool_result_committed"
     TURN_ERROR = "turn_error"
-    # 断点续跑（resume）事件：只做记录与回放标记，不新增任何状态迁移边——
-    # INTERRUPTED 仍是终态，续跑以新 turn（parent_turn_id 指向旧 turn）承载。
     RESUME_STARTED = "resume_started"
     RESUME_READ_REPLAYED = "resume_read_replayed"
     RESUME_WRITE_CONFIRM_REQUIRED = "resume_write_confirm_required"
@@ -118,7 +114,6 @@ def _state_value(state: object) -> object:
 
 
 def transition_turn(current: TurnStatus, target: TurnStatus) -> TurnStatus:
-    """Validate and apply one explicitly allowed turn status transition."""
     if not isinstance(current, TurnStatus):
         raise InvalidHarnessTransition(
             f"Invalid turn transition: {_state_value(current)} -> {_state_value(target)} "
@@ -132,7 +127,6 @@ def transition_turn(current: TurnStatus, target: TurnStatus) -> TurnStatus:
 
 
 def transition_step(current: StepStatus, target: StepStatus) -> StepStatus:
-    """Validate and apply one explicitly allowed step status transition."""
     if not isinstance(current, StepStatus):
         raise InvalidHarnessTransition(
             f"Invalid step transition: {_state_value(current)} -> {_state_value(target)} "

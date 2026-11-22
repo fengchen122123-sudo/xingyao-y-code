@@ -1,5 +1,3 @@
-"""core.web_preview 的纯函数测试：预览页落盘、文件名稳定性与体积上限。"""
-
 import pytest
 
 from core import web_preview as wp
@@ -24,7 +22,6 @@ def test_same_source_reuses_same_file(preview_dir):
     first = wp.write_preview_page("<html>v1</html>", r"D:\proj\a.md")
     second = wp.write_preview_page("<html>v2</html>", r"D:\proj\a.md")
 
-    # 同一源文件重复点击只覆盖同一份预览页，不在磁盘上堆垃圾
     assert first == second
     assert first.read_text(encoding="utf-8") == "<html>v2</html>"
 

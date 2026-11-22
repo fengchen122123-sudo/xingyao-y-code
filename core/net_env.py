@@ -1,14 +1,3 @@
-"""启动期网络环境自愈：清掉"指向本机、但已经没人监听"的代理变量。
-
-背景：本机代理客户端（如 FengWoMeta 这类 mihomo 内核客户端）退出后，终端会话里可能
-残留 HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:17980。任何从该会话继承环境启动的进程
-都会把外网请求发往一个没人监听的端口，统一报 WinError 10061（目标计算机积极拒绝），
-对外表现为"登录失败""模型连接失败"，看起来像服务端故障，实际是本机代理残影。
-
-这里在启动最早阶段做一次极短探测：变量指向本机而端口不通就移除；指向远程代理的
-一律不动（远程代理断开属于对方问题，不该由我们擅自改配置）。任何异常静默放过，
-绝不影响启动。
-"""
 from __future__ import annotations
 
 import os
@@ -28,7 +17,6 @@ _PROBE_TIMEOUT = 0.3
 
 
 def _parse_local_target(value: str):
-    """解析代理地址，返回 (host, port)；不是本机地址则返回 (None, None)。"""
     text = (value or "").strip()
     if not text:
         return None, None

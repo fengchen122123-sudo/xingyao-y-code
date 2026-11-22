@@ -102,10 +102,10 @@ async function startFakeSocks5(t: TestContext): Promise<FakeSocks5> {
           client.write(data);
         });
         upstream.on("end", () => {
-          try { client.end(); } catch { /* noop */ }
+          try { client.end(); } catch { }
         });
         upstream.on("error", () => {
-          try { client.destroy(); } catch { /* noop */ }
+          try { client.destroy(); } catch { }
         });
       }
     };
@@ -119,10 +119,10 @@ async function startFakeSocks5(t: TestContext): Promise<FakeSocks5> {
       tryParse();
     });
     client.on("end", () => {
-      try { upstream?.end(); } catch { /* noop */ }
+      try { upstream?.end(); } catch { }
     });
     client.on("error", () => {
-      try { upstream?.destroy(); } catch { /* noop */ }
+      try { upstream?.destroy(); } catch { }
     });
   });
 

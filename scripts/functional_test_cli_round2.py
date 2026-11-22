@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""CLI 功能测试 · 第二轮：覆盖第一批脚本（functional_test_cli_parity.py）未触及的 20 个命令。
-
-与第一批相同的隔离手段：
-- YCODE_DATA_DIR 指向临时目录（config.json / ycode.db / permissions.json / 记忆文件 /
-  /share 导出文件全部隔离）；
-- print_formatted_text / schedule_ui 打桩（后台线程输出同步捕获）；
-- 全程不携带真实 API key：/dream、/compress 走"密钥未配置/对话过少"的优雅失败路径，
-  headless 冒烟验证无 key 时退出码 1（0=成功/1=失败/2=配置错误契约）；
-  /update 已由第一批脚本覆盖（真实网络），本脚本不再重复。
-
-运行：venv/Scripts/python scripts/functional_test_cli_round2.py
-"""
 
 import os
 import sys
@@ -49,7 +37,7 @@ printed = []
 main.print_formatted_text = lambda *a, **k: printed.append(str(a[0]))
 main.app_instance = None
 main.current_session = "功能测试会话二"
-main.schedule_ui = lambda cb: cb()  # /dream /compress 后台线程输出同步化
+main.schedule_ui = lambda cb: cb()
 
 
 def out():
@@ -82,16 +70,12 @@ def wait_output(marker, timeout=30):
 
 
 def _listed_exports():
-    # /share 默认导出目录 = config.YCODE_DIR/exports（遵守 YCODE_DATA_DIR）
     exp_dir = pathlib.Path(DATA_DIR) / "exports"
     if not exp_dir.is_dir():
         return []
     return [str(p) for p in exp_dir.iterdir() if p.is_file()]
 
 
-# ---------------------------------------------------------------------------
-# T1 /theme（真实 config 持久化）
-# ---------------------------------------------------------------------------
 from core.themes import THEMES  # noqa: E402
 
 _orig_theme = load_config().get("theme", "default")
@@ -109,9 +93,6 @@ check("T1.3 非法主题报错", "未知主题配色" in out() and "可选主题
 safe_call(f"/theme {_orig_theme}")
 check("T1.4 主题还原", load_config().get("theme") == _orig_theme)
 
-# ---------------------------------------------------------------------------
-# T2 /permission（与 GUI set_permission_mode 同一套别名归一）
-# ---------------------------------------------------------------------------
 _orig_perm = load_config().get("permission_mode", "confirm")
 
 safe_call("/permission")
@@ -126,9 +107,6 @@ check("T2.3 非法模式报错", "未知权限模式" in out())
 safe_call(f"/permission {_orig_perm}")
 check("T2.4 权限模式还原", load_config().get("permission_mode") == _orig_perm)
 
-# ---------------------------------------------------------------------------
-# T3 /turns（真实 turn_limits 校验链）
-# ---------------------------------------------------------------------------
 from core.harness.turn_limits import load_turn_step_limit, MIN_TURN_STEP_LIMIT, MAX_TURN_STEP_LIMIT  # noqa: E402
 
 _orig_turns = load_turn_step_limit()
@@ -148,9 +126,6 @@ check("T3.4 超上限报错", "❌" in out() and load_turn_step_limit() == _mid)
 safe_call(f"/turns {_orig_turns}")
 check("T3.5 轮次还原", load_turn_step_limit() == _orig_turns)
 
-# ---------------------------------------------------------------------------
-# T4 /sandbox（真实 config 键 allow_outside_workspace）
-# ---------------------------------------------------------------------------
 _orig_sandbox = bool(load_config().get("allow_outside_workspace", False))
 
 safe_call("/sandbox")
@@ -168,9 +143,6 @@ check("T4.4 非法参数报错", "未知参数" in out())
 if _orig_sandbox:
     safe_call("/sandbox on")
 
-# ---------------------------------------------------------------------------
-# T5 /whitelist（真实 permission_store 持久化，落在隔离目录）
-# ---------------------------------------------------------------------------
 safe_call("/whitelist")
 check("T5.1 list 展示双区白名单", "任务白名单" in out() and "持久化白名单" in out())
 
@@ -201,9 +173,6 @@ check("T5.9 clear confirm 清空", "已清空" in out())
 safe_call("/whitelist 胡乱动作")
 check("T5.10 未知动作报用法", "用法" in out())
 
-# ---------------------------------------------------------------------------
-# T6 /undo 与 /checkpoint（TurnUndoService 真实链路，空会话路径）
-# ---------------------------------------------------------------------------
 err = safe_call("/undo list")
 check("T6.1 /undo list 空会话优雅提示", err is None and "没有按回合撤销记录" in out(), err or "")
 
@@ -213,9 +182,6 @@ check("T6.2 /checkpoint list 空会话优雅提示", err is None and "没有检�
 err = safe_call("/undo 00000000")
 check("T6.3 /undo 不存在的回合不崩溃", err is None and out().strip() != "", err or "(无输出)")
 
-# ---------------------------------------------------------------------------
-# T7 /diagram（真实 diagram_export 扫描）
-# ---------------------------------------------------------------------------
 err = safe_call("/diagram list")
 check("T7 /diagram list 空记录", err is None and ("还没有生成过流程图" in out() or "暂无" in out()), err or out()[:60])
 
@@ -228,9 +194,6 @@ check("T8.1 /worktree list 列出真实仓库", err is None and "worktree" in ou
 err = safe_call("/worktree 胡乱子命令")
 check("T8.2 未知子命令报用法", "未知子命令" in out())
 
-# ---------------------------------------------------------------------------
-# T9 /mcp（隔离目录无 mcp.json → 空态路径；不触发真实连接）
-# ---------------------------------------------------------------------------
 err = safe_call("/mcp status")
 check("T9.1 /mcp status 空配置提示", err is None and "未配置任何 MCP 服务" in out(), err or out()[:60])
 
@@ -246,9 +209,6 @@ check("T9.4 enable 不存在服务报错", "⚠" in out())
 err = safe_call("/mcp 胡乱子命令")
 check("T9.5 未知子命令报用法", "未知子命令" in out())
 
-# ---------------------------------------------------------------------------
-# T10 /plugins（真实内置插件扫描）
-# ---------------------------------------------------------------------------
 from core import plugin_loader  # noqa: E402
 
 err = safe_call("/plugins")
@@ -264,24 +224,15 @@ check("T10.3 未知子命令报用法", "未知子命令" in out())
 err = safe_call("/plugins reload")
 check("T10.4 reload 刷新清单", err is None and "插件清单已刷新" in out(), err or "")
 
-# ---------------------------------------------------------------------------
-# T11 /usage（隔离空 DB → 空态 + 非法日期）
-# ---------------------------------------------------------------------------
 err = safe_call("/usage")
 check("T11.1 空库提示暂无用量", err is None and "暂无 token 用量记录" in out(), err or out()[:60])
 
 err = safe_call("/usage 不是日期")
 check("T11.2 非法日期报用法", "用法" in out())
 
-# ---------------------------------------------------------------------------
-# T12 /clear（logo 重绘，不崩溃）
-# ---------------------------------------------------------------------------
 err = safe_call("/clear")
 check("T12 /clear 重绘 logo", err is None and len(out().strip()) > 0, err or "")
 
-# ---------------------------------------------------------------------------
-# T13 /memory 与 /remember（真实 memory_kairos 文件链，隔离目录）
-# ---------------------------------------------------------------------------
 err = safe_call("/memory")
 check("T13.1 空记忆提示", err is None and "没有任何长期记忆索引" in out(), err or "")
 
@@ -293,16 +244,10 @@ from core.memory_kairos import daily_log_path  # noqa: E402
 _log_ok = os.path.isfile(str(daily_log_path()))
 check("T13.3 /remember 写入今日日志", err is None and "成功记录" in out() and _log_ok, err or f"log_exists={_log_ok}")
 
-# ---------------------------------------------------------------------------
-# T14 /dream（无 key → 优雅失败文案，后台线程输出经 schedule_ui 同步捕获）
-# ---------------------------------------------------------------------------
 err = safe_call("/dream")
 _dream_ok = err is None and wait_output("密钥尚未配置", timeout=20)
 check("T14 /dream 无密钥优雅提示", _dream_ok, err or out()[:80])
 
-# ---------------------------------------------------------------------------
-# T15 /compress（空会话：force 与非 force 均应有"对话过少"提示，不再静默）
-# ---------------------------------------------------------------------------
 err = safe_call("/compress force")
 _c1 = err is None and wait_output("对话过少", timeout=20)
 check("T15.1 force 空会话提示对话过少", _c1, err or out()[:80])
@@ -311,9 +256,6 @@ err = safe_call("/compress")
 _c2 = err is None and wait_output("对话过少", timeout=20)
 check("T15.2 非 force 空会话同样提示对话过少", _c2, err or out()[:80])
 
-# ---------------------------------------------------------------------------
-# T16 /new（真实会话创建与切换）
-# ---------------------------------------------------------------------------
 _prev_session = main.current_session
 err = safe_call("/new")
 _new_session = main.current_session
@@ -321,9 +263,6 @@ check("T16 /new 创建并切换会话", err is None and "已创建并切换到�
       and _new_session != _prev_session and _new_session.startswith("session_")
       and main.manager.ensure_session(_new_session) is not None, err or "")
 
-# ---------------------------------------------------------------------------
-# T17 /share（真实导出链：md/html/json 三格式落盘；Path.home 已打桩隔离）
-# ---------------------------------------------------------------------------
 main.manager.add_messages(main.current_session, [("user", "导出测试问题"), ("assistant", "导出测试回答")])
 for fmt, ext in (("md", ".md"), ("html", ".html"), ("json", ".json")):
     err = safe_call(f"/share {fmt}")
@@ -332,15 +271,9 @@ for fmt, ext in (("md", ".md"), ("html", ".html"), ("json", ".json")):
 safe_call("/share pdf")
 check("T17.4 /share 非法格式报错", "未知格式" in out())
 
-# ---------------------------------------------------------------------------
-# T18 /exit
-# ---------------------------------------------------------------------------
 err = safe_call("/exit")
 check("T18 /exit 告别语", err is None and "去休息啦" in out(), err or "")
 
-# ---------------------------------------------------------------------------
-# T19-T22 进程级 headless 冒烟（真实子进程，独立隔离目录）
-# ---------------------------------------------------------------------------
 def run_headless_proc(args, stdin_text=None, timeout=180):
     env = dict(os.environ)
     env["YCODE_DATA_DIR"] = tempfile.mkdtemp(prefix="ycode_func_headless_")
@@ -361,9 +294,6 @@ try:
     check("T20 空stdin退出码2+stderr提示", proc.returncode == 2 and "为空" in (proc.stderr or "") + proc.stdout,
           f"rc={proc.returncode}")
 
-    # 退出码契约（run_headless 文档）：0=成功 / 1=任务失败 / 2=配置错误。
-    # 无 key 时 LLM 请求失败 → turn_error 事件 → headless 收尾排空事件队列
-    # 检出失败 → 退出码 1 + stderr 失败说明。
     proc = run_headless_proc(["-p", "功能冒烟：请原样回复收到"], stdin_text=None)
     _all_out = (proc.stdout or "") + (proc.stderr or "")
     check("T21 无key一次性任务失败退出码1+stderr说明",
@@ -378,9 +308,6 @@ try:
 except subprocess.TimeoutExpired as exc:
     check("T19-T22 headless 进程冒烟（超时——疑似无 key 下挂起）", False, str(exc)[:100])
 
-# ---------------------------------------------------------------------------
-# 汇总
-# ---------------------------------------------------------------------------
 passed = sum(1 for _, ok in RESULTS if ok)
 failed = len(RESULTS) - passed
 print("\n" + "=" * 60)

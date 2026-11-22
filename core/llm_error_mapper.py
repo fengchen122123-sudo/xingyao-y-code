@@ -1,11 +1,3 @@
-"""大模型上游报错中文映射与排查建议引擎。
-
-将各模型云厂商与聚合网关 (OpenAI/Anthropic/DeepSeek/Kimi/GLM/通义千问等，
-包括网关侧基于 litellm 搭建的中转站) 返回的
-HTTP 状态码、英文异常及 JSON 报错结构，智能解析为对用户友好的中文诊断与操作建议，
-同时对敏感 API Key 等进行不可逆脱敏，保留必要技术简讯以供开发者排查。
-"""
-
 from __future__ import annotations
 
 import re
@@ -17,10 +9,10 @@ from typing import Any
 class LLMErrorInfo:
     """结构化大模型报错信息。"""
 
-    category: str  # 错误简短分类标识 (如 auth, quota, rate_limit, context_overflow 等)
-    title: str  # 友好的中文诊断标题 (如 "API 凭证无效 (401)")
-    reason: str  # 通俗易懂的原因说明
-    suggestion: str  # 明确可行的操作排查指引
+    category: str
+    title: str
+    reason: str
+    suggestion: str
     raw_message: str  # 脱敏后的原始报错简讯 (截断在安全长度内)
 
 
@@ -48,22 +40,18 @@ def sanitize_error_text(text: Any) -> str:
 
 
 def _extract_status_code(exc: Any, text: str) -> int | None:
-    """尝试从异常对象或错误文本中提取 HTTP 状态码。"""
-    # 1. 直接读取异常属性
     code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     if isinstance(code, int) and 100 <= code <= 599:
         return code
     if isinstance(code, str) and code.isdigit() and 100 <= int(code) <= 599:
         return int(code)
 
-    # 2. 从 response 对象读取
     resp = getattr(exc, "response", None)
     if resp is not None:
         resp_code = getattr(resp, "status_code", None)
         if isinstance(resp_code, int) and 100 <= resp_code <= 599:
             return resp_code
 
-    # 3. 正则提取常见模式
     m = re.search(
         r"(?:error[ _-]?code|status[ _-]?code|http(?: status)?|code)\s*[:=]?\s*([45]\d{2})\b",
         text,
@@ -86,7 +74,6 @@ def _extract_status_code(exc: Any, text: str) -> int | None:
 
 
 def _is_mostly_chinese(text: str) -> bool:
-    """检查文本是否已主要是中文（例如业务已处理过的友好提示），避免重复包裹。"""
     if not text:
         return False
     clean = re.sub(r"\s+", "", text)
@@ -112,7 +99,6 @@ _RE_MODEL_UNSUPPORTED = re.compile(
 
 
 def _looks_like_unsupported_model(text: str) -> bool:
-    """报错文本是否属于"模型不被上游支持/已下线"这一类。"""
     return bool(_RE_MODEL_UNSUPPORTED.search(text or ""))
 
 
@@ -123,7 +109,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
     text_lower = f"{exc_type} {raw_str}".lower()
     status_code = _extract_status_code(exc, raw_str)
 
-    # 1. 余额欠费 / 额度耗尽 (必须先于普通的 429 速率限制匹配)
     if status_code == 402 or any(
         kw in text_lower
         for kw in (
@@ -149,7 +134,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 2. 鉴权失败 / API Key 无效 (401)
     if status_code == 401 or "authenticationerror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -164,8 +148,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             "未授权",
         )
     ):
-        # 401 也可能只是"模型不被上游支持"（模型下线/不属于该渠道）：此时提示
-        # 用户去查 API Key 会把排障方向带偏，因此先单独归类。
         if _looks_like_unsupported_model(text_lower):
             return LLMErrorInfo(
                 category="model_unavailable",
@@ -188,7 +170,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 3. 访问权限受限 / 地域不支持 (403)
     if status_code == 403 or "permissiondeniederror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -210,7 +191,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 4. 模型不存在 / 未找到 (404)
     if status_code == 404 or "notfounderror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -231,7 +211,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 5. 上下文窗口超限 (400 Context Overflow)
     if "contextwindowexceedederror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -254,7 +233,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 6. 请求速率超限 / 429 频繁限制
     if status_code == 429 or "ratelimiterror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -277,7 +255,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 7. 服务商过载或临时维护 (503 / 529)
     if status_code in (503, 529) or any(
         kw in text_lower
         for kw in (
@@ -299,7 +276,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 8. 网关超时与网关错误 (502 / 504 / 520~524)
     if status_code in (502, 504, 520, 521, 522, 523, 524) or any(
         kw in text_lower
         for kw in (
@@ -319,7 +295,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 9. 服务商内部故障 (500)
     if status_code == 500 or "internalservererror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -338,7 +313,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 10. 网络连接失败 / 本地超时
     if any(
         kw in exc_type
         for kw in (
@@ -372,7 +346,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 11. 内容安全合规拦截
     if any(
         kw in text_lower
         for kw in (
@@ -396,7 +369,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 12. 请求参数非法 / 400 格式错误
     if status_code == 400 or "badrequesterror" in exc_type or any(
         kw in text_lower
         for kw in (
@@ -416,7 +388,6 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
-    # 13. 等待超时（星瑶内部硬上限）
     if "requestwaitgiveuperror" in exc_type or "仍未收到首字节" in raw_str:
         return LLMErrorInfo(
             category="wait_give_up",
@@ -451,7 +422,6 @@ def format_user_facing_error(exc: Any) -> str:
     if not raw_str:
         return "未知错误"
 
-    # 防御：已包含完整中文提示或已经是短中文业务通知，原样透传
     if _is_mostly_chinese(raw_str) and not any(
         p in raw_str for p in ("litellm", "OpenAIException", "AnthropicError", "Error code:", "status_code")
     ):
@@ -459,7 +429,6 @@ def format_user_facing_error(exc: Any) -> str:
 
     info = map_llm_error(exc)
 
-    # 截取精简的原始错误摘要（去除换行、多余空格），限长 300 字符
     concise_raw = " ".join(info.raw_message.split())
     if len(concise_raw) > 300:
         concise_raw = concise_raw[:200] + " ... " + concise_raw[-80:]

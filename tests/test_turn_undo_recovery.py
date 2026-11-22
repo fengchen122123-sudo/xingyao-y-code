@@ -1,5 +1,3 @@
-"""turn_undo 崩溃中断与显式恢复测试：启动扫描、冻结、continue/cancel、recovery_required。"""
-
 import threading
 
 import time
@@ -64,7 +62,6 @@ def _record_write(env, ctx, path, content, call="call-1"):
 
 
 def preview_operation_id(env, checkpoint):
-    """取该检查点最近的 revert 操作（恢复预检/执行的对象）。"""
     ops = [
         o for o in env["storage"].list_operations_for_checkpoint(checkpoint.checkpoint_id)
         if o.kind == "revert"
@@ -83,11 +80,6 @@ def _parent_status(env, checkpoint):
 
 
 def _interrupt_mid_apply(env, checkpoint, token, fail_path):
-    """执行撤销并在第二个文件应用前注入失败 → applying 中断。
-
-    毒化只作用于该路径的第二次捕获（第一次是 CAS 前的整组指纹复核，
-    必须保持真实），模拟"应用前发现文件被外部修改"。
-    """
     original_capture = tu_recorder.capture_node_state
     fail_canonical = tu_recorder.canonicalize_path(str(fail_path))
     counter = {"n": 0}
@@ -136,10 +128,6 @@ def _two_file_turn(env):
     return checkpoint, f1, f2, token
 
 
-# ---------------------------------------------------------------------------
-# 中断 → 冻结 → continue_revert
-# ---------------------------------------------------------------------------
-
 def test_interrupt_freezes_paths_and_continue_revert_completes(env, monkeypatch):
     monkeypatch.chdir(env["ws"])
     checkpoint, f1, f2, token = _two_file_turn(env)
@@ -147,22 +135,18 @@ def test_interrupt_freezes_paths_and_continue_revert_completes(env, monkeypatch)
 
     row = env["storage"].get_checkpoint(checkpoint.checkpoint_id)
     assert row.status_enum is TurnUndoStatus.INTERRUPTED
-    # 第一个文件已恢复到 old，第二个文件未触碰
     assert f1.read_bytes() == b"old-1"
     assert f2.read_bytes() == b"new-2"
-    # 影响路径被冻结（含父/子判定）
     coordinator = env["coordinator"]
     assert coordinator.is_path_frozen_any(str(f1))
     assert coordinator.is_path_frozen_any(str(f2))
     sub = env["ws"] / "subdir" / "x.txt"
-    assert coordinator.is_path_frozen_any(str(sub)) is False  # 无关路径不受影响
+    assert coordinator.is_path_frozen_any(str(sub)) is False
 
-    # 冻结期间：文件工具拒绝、同工作区通用命令拒绝
     result = write_file(str(f1), "sneaky")
     assert "冻结" in result
     assert f1.read_bytes() == b"old-1"
 
-    # 恢复预检：continue_revert
     preview, rtoken = turn_undo_service.preview_turn_undo_recovery(
         env["session_id"], preview_operation_id(env, checkpoint),
         RecoveryAction.CONTINUE_REVERT,
@@ -177,12 +161,9 @@ def test_interrupt_freezes_paths_and_continue_revert_completes(env, monkeypatch)
     )
     assert result.checkpoint_status is TurnUndoStatus.REVERTED
     assert f2.read_bytes() == b"old-2"
-    # 冻结解除
     assert not coordinator.is_path_frozen_any(str(f1))
-    # 父操作被原子解决
     parent_status = _parent_status(env, checkpoint)
     assert parent_status == OperationStatus.COMMITTED.value
-    # 纠正记录存在
     corrections = env["storage"].list_corrections(checkpoint.workspace_root)
     assert len(corrections) == 1
 
@@ -199,14 +180,11 @@ def test_cancel_revert_restores_pre_undo_state(env):
     result = turn_undo_service.execute_turn_undo_recovery(
         env["session_id"], op_id, RecoveryAction.CANCEL_REVERT, rtoken,
     )
-    # 取消撤销：回到用户点击撤销之前（两文件都是 new-*）
     assert result.checkpoint_status is TurnUndoStatus.READY
     assert f1.read_bytes() == b"new-1"
     assert f2.read_bytes() == b"new-2"
     assert _parent_status(env, checkpoint) == OperationStatus.COMPENSATED.value
-    # 取消撤销不产生纠正记录
     assert env["storage"].list_corrections(checkpoint.workspace_root) == []
-    # 检查点回到 ready，可重新正常撤销
     _, token2 = turn_undo_service.preview_turn_undo(env["session_id"], checkpoint.turn_id)
     assert token2
     res = turn_undo_service.execute_turn_undo(env["session_id"], checkpoint.turn_id, token2)
@@ -219,7 +197,6 @@ def test_unknown_state_requires_recovery_required(env):
     checkpoint, f1, f2, token = _two_file_turn(env)
     _interrupt_mid_apply(env, checkpoint, token, f2)
     op_id = preview_operation_id(env, checkpoint)
-    # 中断后外部修改了"未处理"文件 → 未知状态
     f2.write_bytes(b"external-after-crash")
 
     preview, rtoken = turn_undo_service.preview_turn_undo_recovery(
@@ -227,7 +204,6 @@ def test_unknown_state_requires_recovery_required(env):
     )
     assert preview.recovery_required is True
     assert "r2.py" in preview.unknown_files
-    # 未知状态下不会签发恢复令牌，任何令牌都无法执行
     with pytest.raises(TurnUndoError) as exc:
         turn_undo_service.execute_turn_undo_recovery(
             env["session_id"], op_id, RecoveryAction.CONTINUE_REVERT,
@@ -243,7 +219,6 @@ def test_recovery_scope_mismatch(env, tmp_path):
     checkpoint, f1, f2, token = _two_file_turn(env)
     _interrupt_mid_apply(env, checkpoint, token, f2)
     op_id = preview_operation_id(env, checkpoint)
-    # 另一个会话尝试恢复 → operation_scope_mismatch
     env["manager"].add_messages("other-session", [("user", "hi")])
     other_id = env["storage"].resolve_session_id("other-session")
     with pytest.raises(TurnUndoError) as exc:
@@ -256,7 +231,6 @@ def test_recovery_scope_mismatch(env, tmp_path):
 def test_generic_command_rejected_during_freeze(env):
     checkpoint, f1, f2, token = _two_file_turn(env)
     _interrupt_mid_apply(env, checkpoint, token, f2)
-    # execute_command 在冻结工作区被拒（workdir 路由到冻结工作区）
     from core.workspace_context import set_workdir, clear_workdir
 
     set_workdir(str(env["ws"]))
@@ -267,34 +241,25 @@ def test_generic_command_rejected_during_freeze(env):
         clear_workdir()
 
 
-# ---------------------------------------------------------------------------
-# 启动扫描
-# ---------------------------------------------------------------------------
-
 def test_startup_scan_marks_interrupted_without_replay(env):
     checkpoint, f1, f2, token = _two_file_turn(env)
     _interrupt_mid_apply(env, checkpoint, token, f2)
-    # 手动解冻模拟"进程重启后协调器状态丢失"
     env["coordinator"].unfreeze_paths(
         checkpoint.workspace_root, [str(f1), str(f2)]
     )
-    # 重启扫描：已 interrupted 的操作保持，不重放写入
     report = turn_undo_service.startup_recovery_scan()
     row = env["storage"].get_checkpoint(checkpoint.checkpoint_id)
     assert row.status_enum is TurnUndoStatus.INTERRUPTED
-    assert f2.read_bytes() == b"new-2"  # 不自动重放
-    # 冻结按持久化状态重建
+    assert f2.read_bytes() == b"new-2"
     assert env["coordinator"].is_path_frozen_any(str(f2))
 
 
 def test_startup_scan_converts_stale_previewed_to_cancelled(env):
     checkpoint, f1, f2, token = _two_file_turn(env)
-    # 预检后进程"重启"：previewed 操作的令牌跨 boot 失效 → 扫描收敛为 cancelled
     report = turn_undo_service.startup_recovery_scan()
     assert len(report) == 1
     assert report[0]["to_status"] == OperationStatus.CANCELLED.value
     assert report[0]["operation_id"] == preview_operation_id(env, checkpoint)
-    # 检查点从未进入 reverting，保持 ready
     assert env["storage"].get_checkpoint(checkpoint.checkpoint_id).status_enum \
         is TurnUndoStatus.READY
     assert f1.read_bytes() == b"new-1"
@@ -302,14 +267,9 @@ def test_startup_scan_converts_stale_previewed_to_cancelled(env):
 
 
 def test_startup_scan_converting_boundaries(env):
-    """状态边界崩溃注入的启动收敛：
-    - preparing/prepared（未触盘）→ 操作 failed + 检查点 failed；
-    - applying/verifying（磁盘不确定）→ 操作 interrupted + 检查点 interrupted + 冻结。
-    """
     from core.turn_undo.models import OperationStatus as OS
     from core.turn_undo.models import OperationKind as OKind
 
-    # --- preparing 边界：CAS 已提交但阶段化未完成 ---
     checkpoint, f1, f2, token = _two_file_turn(env)
     storage = env["storage"]
     op = storage.create_operation(
@@ -321,8 +281,7 @@ def test_startup_scan_converting_boundaries(env):
     assert entry and entry[0]["to_status"] == OS.FAILED.value
     assert storage.get_checkpoint(checkpoint.checkpoint_id).status_enum \
         is TurnUndoStatus.FAILED
-    assert not env["coordinator"].is_path_frozen_any(str(f1))  # 未触盘不冻结
-    # failed 检查点可重新预检恢复（failed -> ready）
+    assert not env["coordinator"].is_path_frozen_any(str(f1))
     preview, token2 = turn_undo_service.preview_turn_undo(
         env["session_id"], checkpoint.turn_id)
     assert token2
@@ -350,13 +309,11 @@ def test_startup_scan_verifying_boundary_marks_interrupted(env):
     assert entry and entry[0]["to_status"] == OS.INTERRUPTED.value
     assert storage.get_checkpoint(checkpoint.checkpoint_id).status_enum \
         is TurnUndoStatus.INTERRUPTED
-    # 磁盘不确定 → 冻结重建，不自动重放
     assert env["coordinator"].is_path_frozen_any(str(f1))
     assert f1.read_bytes() == b"new-1"
 
 
 def test_different_workspaces_not_serialized(env):
-    """不同工作区的协调锁互不阻塞：可真实并行（规格 21）。"""
     ws_a = env["tmp"] / "par-a"
     ws_b = env["tmp"] / "par-b"
     ws_a.mkdir()
@@ -385,17 +342,11 @@ def test_different_workspaces_not_serialized(env):
     tb.start()
     ta.join(timeout=10)
     tb.join(timeout=10)
-    # b 在 a 持锁期间就能进入自己的工作区锁
     assert order == ["a-enter", "b-enter", "a-exit"] or order == [
         "a-enter", "b-enter", "b-enter", "a-exit"] or order[0:2] == ["a-enter", "b-enter"]
 
 
 def test_subdir_write_serialized_with_undo_lock(env, tmp_path, monkeypatch):
-    """H1 回归：子目录文件的写入与撤销事务共用同一把工作区根锁。
-
-    持有工作区根锁期间，子目录文件的 write_file 必须被阻塞；
-    释放后才能完成（撤销应用区间与受控写入互斥，规格 21）。
-    """
     import threading as _threading
     from core.workspace_context import workspace_scope
     from core.tools import write_file
@@ -420,7 +371,6 @@ def test_subdir_write_serialized_with_undo_lock(env, tmp_path, monkeypatch):
         t = _threading.Thread(target=_writer, daemon=True)
         t.start()
         t.join(timeout=0.8)
-        # 持锁期间写入未完成（互斥生效）
         assert not done.is_set(), "工作区根锁未阻塞子目录写入"
     t.join(timeout=10)
     assert done.is_set(), "释放锁后写入应完成"
@@ -429,7 +379,6 @@ def test_subdir_write_serialized_with_undo_lock(env, tmp_path, monkeypatch):
 
 
 def test_startup_scan_wires_retention_expiry(env):
-    """M3 回归：启动扫描必须触发保留策略——超过每会话配额的旧检查点快照过期。"""
     from core.turn_undo.models import SnapshotAvailability
 
     for i in range(53):
@@ -441,16 +390,11 @@ def test_startup_scan_wires_retention_expiry(env):
     rows = env["storage"].list_checkpoints_for_session(env["session_id"])
     expired = [r for r in rows if r["snapshot_availability"] == SnapshotAvailability.EXPIRED.value]
     assert len(expired) >= 3
-    # 生命周期事实不被覆盖
     for r in expired:
         assert r["status"] in ("ready", "reverted", "failed", "conflicted")
 
 
 def test_startup_scan_reaps_stale_recording_checkpoint(env):
-    """崩溃残留的 recording 检查点：超过阈值启动时收敛为 unavailable。
-
-    否则该工作区的撤销/恢复会被活跃登记永久阻塞为 workspace_busy。
-    """
     from core.turn_undo.storage import now_ms
 
     cp, ctx = _begin_turn(env, turn="turn-crashed")
@@ -476,7 +420,6 @@ def test_startup_scan_reaps_stale_recording_checkpoint(env):
 
 
 def test_startup_scan_keeps_fresh_recording_checkpoint(env):
-    """刚启动的短 recording 检查点不得被误回收。"""
     cp, ctx = _begin_turn(env, turn="turn-fresh")
     try:
         turn_undo_service.startup_recovery_scan()

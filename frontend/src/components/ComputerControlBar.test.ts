@@ -20,7 +20,6 @@ beforeEach(() => {
   (window as any).pywebview = { api };
 });
 
-// brief 样例 4 的挂载辅助：运行中的 run + 已挂载 pinia 的 global 选项
 function piniaWithRunningComputer() {
   const pinia = createPinia();
   setActivePinia(pinia);
@@ -37,8 +36,6 @@ function piniaWithRunningComputer() {
   return { plugins: [pinia] };
 }
 
-// 桌面操控的运行态：安全条按设计 16.1 正常显示（浏览器目标改为「就地围观」后
-// 不再渲染安全条，需要条的用例统一用桌面目标构造）
 function piniaWithRunningDesktop() {
   const pinia = createPinia();
   setActivePinia(pinia);
@@ -53,8 +50,6 @@ function piniaWithRunningDesktop() {
   };
   return { plugins: [pinia] };
 }
-
-// ── Store reducer：顺序、容量与脱敏（brief Step 1 样例 1-3 逐字） ──
 
 it('rejects late events from old runs and older event_seq', () => {
   const store = useAppStore();
@@ -81,7 +76,7 @@ it('recalibrates from bridge snapshot after queue drops events', async () => {
   const store = useAppStore();
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'running' });
   api.get_computer_control_status.mockResolvedValue({ run_id: 'run-2', status: 'stopped', stop_reason: 'hotkey' });
-  await store.refreshComputerRun();  // 窗口重新聚焦/切到操控页签时也调用
+  await store.refreshComputerRun();
   expect(store.computerRun.status).toBe('stopped');
 });
 
@@ -92,8 +87,6 @@ it('always shows stop and pause controls on the compact bar', () => {
   expect(wrapper.get('[data-test="computer-stop"]').isVisible()).toBe(true);
   wrapper.unmount();
 });
-
-// ── 追加项：平铺信封分发、run 生命周期与脱敏轨迹 ──
 
 it('routes flat computer envelopes through the bridge event handler', () => {
   const store = useAppStore();
@@ -108,7 +101,6 @@ it('a new run resets the trace and the previous run keeps it until then', () => 
   store.reduceComputerEvent({ type: 'computer_action_started', run_id: 'run-1', event_seq: 2, action_ordinal: 1, action_kind: 'click', target: 'browser' });
   store.reduceComputerEvent({ type: 'computer_action_finished', run_id: 'run-1', event_seq: 3, action_ordinal: 1, action_kind: 'click', ok: true, error_code: '' });
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 4, status: 'stopped', stop_reason: 'user_stop' });
-  // run 结束：轨迹保留到下一个 run（设计 16.2）
   expect(store.computerTrace).toHaveLength(1);
   expect(store.computerRun.status).toBe('stopped');
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
@@ -173,8 +165,6 @@ it('a failed control operation surfaces the error and keeps the snapshot', async
   expect(store.confirmModal.message).toContain('未知的电脑操控 run');
 });
 
-// ── 安全条可见性（brief Step 4 的显示状态表逐字） ──
-
 it.each([
   ['starting'], ['running'], ['paused'], ['waiting_for_user'],
   ['provider_safety_required'], ['stopping'], ['failed'],
@@ -209,11 +199,12 @@ it('renders the target, action count and current surface on the bar', () => {
   wrapper.unmount();
 });
 
-it('hides the bar for browser runs: browser control shows only the browser pane', () => {
-  // 浏览器操控改为「就地围观」：右侧只留浏览器页签，不再显示操控安全条
-  // （停止入口收进浏览器工具栏，见 BrowserPane 的 bp-computer-stop）
+it('shows the bar for browser runs so Edge/Chrome and collapsed panel keep a stop entry', () => {
   const wrapper = mount(ComputerControlBar, { global: piniaWithRunningComputer() });
-  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  const bar = wrapper.find('[data-test="computer-control-bar"]');
+  expect(bar.exists()).toBe(true);
+  expect(bar.text()).toContain('Edge');
+  expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(true);
   wrapper.unmount();
 });
 
@@ -257,9 +248,6 @@ it('pause and stop buttons drive the bridge with the current run id', async () =
   wrapper.unmount();
 });
 
-// ── 安全条的会话归属：其他会话发起的操控不串显到当前会话 ──
-
-// 挂载辅助：指定 run 的归属会话与当前查看的会话
 function mountBarForSession(ownerSession: string, viewingSession: string) {
   const pinia = createPinia();
   setActivePinia(pinia);
@@ -276,15 +264,19 @@ function mountBarForSession(ownerSession: string, viewingSession: string) {
   return { store, wrapper };
 }
 
-it('hides the bar while another session owns the running computer', () => {
+it('shows owner attribution and stop control while another session owns the running computer', () => {
   const { wrapper } = mountBarForSession('A', 'B');
-  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  const bar = wrapper.find('[data-test="computer-control-bar"]');
+  expect(bar.exists()).toBe(true);
+  expect(bar.text()).toContain('A');
+  expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(true);
   wrapper.unmount();
 });
 
 it('shows the bar when the running computer belongs to the current session', () => {
   const { wrapper } = mountBarForSession('A', 'A');
   expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="computer-owner-banner"]').exists()).toBe(false);
   wrapper.unmount();
 });
 
@@ -294,12 +286,16 @@ it('keeps the bar when the run owner is unknown (legacy snapshot)', () => {
   wrapper.unmount();
 });
 
-it('hides the bar as soon as the user switches away from the owner session', async () => {
+it('switches to cross-session attribution bar with stop button when user switches away from owner session', async () => {
   const { store, wrapper } = mountBarForSession('A', 'A');
   expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="computer-owner-banner"]').exists()).toBe(false);
   store.currentSessionName = 'B';
   await nextTick();
-  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  const bar = wrapper.find('[data-test="computer-control-bar"]');
+  expect(bar.exists()).toBe(true);
+  expect(wrapper.get('[data-test="computer-owner-banner"]').text()).toContain('A');
+  expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(true);
   wrapper.unmount();
 });
 
@@ -311,7 +307,129 @@ it('keeps the global bar getter session-agnostic for the right panel', () => {
   store.computerRun = {
     ...store.computerRun, run_id: 'run-1', status: 'running', owner_session_id: 'A',
   };
-  // 全局判据（RightPanel 自动登记操控页签依赖）仍为 true，会话归属只在条自身生效
   expect(store.computerControlBarVisible).toBe(true);
   expect(store.computerBarVisibleInCurrentSession).toBe(false);
+});
+
+it('merges state by (run_generation, event_seq) and clears current_action only on matching ordinal', async () => {
+  const store = useAppStore();
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-1', run_generation: 2, event_seq: 1, status: 'running',
+  } as any);
+  store.reduceComputerEvent({
+    type: 'computer_action_started', run_id: 'run-1', run_generation: 2, event_seq: 2,
+    action_ordinal: 1, action_kind: 'click', target: 'desktop',
+  } as any);
+  expect(store.computerRun.current_action).toBe('click');
+
+  // 旧代次迟到事件/快照不得覆盖当前 run
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-0', run_generation: 1, event_seq: 99, status: 'stopped',
+  } as any);
+  store._applyComputerSnapshot({
+    run_id: 'run-0', run_generation: 1, event_seq: 99, status: 'stopped',
+  });
+  expect(store.computerRun.run_id).toBe('run-1');
+  expect(store.computerRun.status).toBe('running');
+
+  // 新 ordinal 开始时，旧 ordinal 迟到的 finish 不得清除新动作指示
+  store.reduceComputerEvent({
+    type: 'computer_action_started', run_id: 'run-1', run_generation: 2, event_seq: 3,
+    action_ordinal: 2, action_kind: 'wait_for', target: 'desktop',
+  } as any);
+  store.reduceComputerEvent({
+    type: 'computer_action_finished', run_id: 'run-1', run_generation: 2, event_seq: 4,
+    action_ordinal: 1, action_kind: 'click', ok: true, error_code: '',
+  } as any);
+  expect(store.computerRun.current_action).toBe('wait_for');
+
+  // 匹配 ordinal 2 的 finish 才清理 current_action
+  store.reduceComputerEvent({
+    type: 'computer_action_finished', run_id: 'run-1', run_generation: 2, event_seq: 5,
+    action_ordinal: 2, action_kind: 'wait_for', ok: true, error_code: '',
+  } as any);
+  expect(store.computerRun.current_action).toBe('');
+});
+
+it('single-flights snapshot refresh on event_seq gap and replays buffered newer events', async () => {
+  const store = useAppStore();
+  let resolveSnap!: (v: unknown) => void;
+  api.get_computer_control_status.mockImplementation(
+    () => new Promise((resolve) => { resolveSnap = resolve; }),
+  );
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-1', run_generation: 3, event_seq: 1, status: 'running', target: 'desktop',
+  } as any);
+
+  // seq 1 -> seq 4 (断档) 与 seq 5 均应在单飞快照校准前先暂存，且只发一次请求
+  store.reduceComputerEvent({
+    type: 'computer_action_started', run_id: 'run-1', run_generation: 3, event_seq: 4,
+    action_ordinal: 2, action_kind: 'click', target: 'desktop',
+  } as any);
+  store.reduceComputerEvent({
+    type: 'computer_observation', run_id: 'run-1', run_generation: 3, event_seq: 5,
+    origin_or_window: '记事本', preview_url: '/p/5.png',
+  } as any);
+  expect(api.get_computer_control_status).toHaveBeenCalledTimes(1);
+  // 快照覆盖到 seq=4（running，动作 2 进行中），之后回放 seq=5 更新 preview_url
+  resolveSnap({
+    ok: true, run_id: 'run-1', run_generation: 3, event_seq: 4, status: 'running',
+    target: 'desktop', action_count: 2, current_action: 'click',
+  });
+  await vi.waitFor(() => expect(store.computerRun.preview_url).toBe('/p/5.png'));
+  expect(store.computerRun.action_count).toBe(2);
+});
+
+it('prevents duplicate stop bridge calls while request is in flight', async () => {
+  let resolveStop!: (v: unknown) => void;
+  api.stop_computer_control.mockImplementation(
+    () => new Promise((resolve) => { resolveStop = resolve; }),
+  );
+  const { wrapper } = mountBarForSession('A', 'A');
+  const stopBtn = wrapper.get('[data-test="computer-stop"]');
+  await stopBtn.trigger('click');
+  await stopBtn.trigger('click');
+  expect(api.stop_computer_control).toHaveBeenCalledTimes(1);
+  resolveStop({ ok: true, run_id: 'run-1', run_generation: 1, event_seq: 2, status: 'stopping' });
+  await vi.waitFor(() => expect(useAppStore().computerRun.status).toBe('stopping'));
+  wrapper.unmount();
+});
+
+it('最后一条终态事件丢失时通过快照校准收敛到 stopped，且迟到非终态事件不得复活 running', async () => {
+  const store = useAppStore();
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-9', run_generation: 4, event_seq: 1,
+    status: 'running', target: 'browser', browser: 'edge', browser_mode: 'external',
+  } as any);
+  expect(store.computerRun.browser).toBe('edge');
+  expect(store.computerRun.browser_mode).toBe('external');
+
+  api.get_computer_control_status.mockResolvedValue({
+    ok: true, run_id: 'run-9', run_generation: 4, event_seq: 8,
+    status: 'stopped', stop_reason: 'user_stop', target: 'browser', browser: 'edge', browser_mode: 'external',
+  });
+  await store.refreshComputerRun();
+  expect(store.computerRun.status).toBe('stopped');
+
+  // 迟到的非终态事件（即使缺 event_seq 或带较旧序号）也不得推翻同代次终态
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-9', run_generation: 4, event_seq: 0, status: 'running',
+  } as any);
+  store.reduceComputerEvent({
+    type: 'computer_state', run_id: 'run-9', run_generation: 4, event_seq: 9, status: 'running',
+  } as any);
+  expect(store.computerRun.status).toBe('stopped');
+});
+
+it('bar distinguishes embedded browser, external Edge/Chrome, and desktop', () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-e', status: 'running', target: 'browser', browser: 'embedded', browser_mode: 'embedded',
+  };
+  const wrapper = mount(ComputerControlBar, { global: { plugins: [pinia] } });
+  expect(wrapper.get('[data-test="computer-control-bar"]').text()).toContain('内置浏览器');
+  wrapper.unmount();
 });

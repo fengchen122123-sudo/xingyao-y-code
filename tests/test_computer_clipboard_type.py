@@ -1,8 +1,7 @@
-"""type_text 非 ASCII 剪贴板路径（2026-09-06，提速计划 Task 4）。"""
-
 from __future__ import annotations
 
 import sys
+import threading
 
 import pytest
 
@@ -13,7 +12,6 @@ from tests.computer_fakes import FakeImage, FakeWin32Adapter
 
 
 class ClipboardRecordingAdapter(FakeWin32Adapter):
-    """在 FakeWin32Adapter 上追加剪贴板写入记录。"""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -59,6 +57,48 @@ def test_chinese_text_goes_through_clipboard_paste():
     backend.close()
 
 
+def test_stop_during_clipboard_set_does_not_send_paste():
+    clipboard_written = threading.Event()
+    allow_clipboard_call_to_finish = threading.Event()
+    adapter = ClipboardRecordingAdapter()
+    original_set_clipboard_text = adapter.set_clipboard_text
+
+    def record_clipboard_text(text):
+        original_set_clipboard_text(text)
+        clipboard_written.set()
+        assert allow_clipboard_call_to_finish.wait(timeout=1)
+
+    adapter.set_clipboard_text = record_clipboard_text
+    backend = _backend_with(adapter)
+    backend.start()
+    backend.observe("run-clip-stop")
+    errors = []
+
+    def type_text():
+        try:
+            backend.execute(
+                "run-clip-stop",
+                ComputerAction(kind="type_text", target="desktop", text="中文"),
+            )
+        except ComputerControlError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=type_text)
+    worker.start()
+    try:
+        assert clipboard_written.wait(timeout=1)
+        backend.request_stop()
+    finally:
+        allow_clipboard_call_to_finish.set()
+        worker.join(timeout=2)
+        backend.close()
+
+    assert not worker.is_alive()
+    assert len(errors) == 1 and errors[0].code == "computer_cancelled"
+    assert adapter.clipboard_writes == ["中文"]
+    assert adapter.keys_sent == []
+
+
 def test_clipboard_failure_raises_stable_error():
     adapter = ClipboardRecordingAdapter()
     adapter.clipboard_error = ComputerControlError("computer_backend_error", "剪贴板被占用")
@@ -74,9 +114,6 @@ def test_clipboard_failure_raises_stable_error():
     backend.close()
 
 
-# ---------------- Win32InputAdapter.set_clipboard_text 真实 seam ----------------
-
-
 def test_adapter_set_clipboard_text_rejects_empty():
     adapter = Win32InputAdapter()
     with pytest.raises(ComputerControlError) as raised:
@@ -85,7 +122,6 @@ def test_adapter_set_clipboard_text_rejects_empty():
 
 
 def test_adapter_set_clipboard_text_seam_injection():
-    """seam 注入路径：不触碰真实剪贴板，验证成功与失败两条分支。"""
     calls = []
 
     def _ok_set(text):
@@ -104,16 +140,7 @@ def test_adapter_set_clipboard_text_seam_injection():
     assert raised.value.code == "computer_backend_error"
 
 
-# ---------------- 真实剪贴板功能回归（会话 156 缺陷防护） ----------------
-
-
 def test_real_clipboard_write_roundtrip():
-    """真机功能回归：ctypes 函数归属错误（EmptyClipboard/SetClipboardData 在
-    user32 不在 kernel32）与 64 位句柄截断（缺 restype 声明）都会在此暴露。
-
-    写入哨兵文本后读回校验，并把剪贴板复位为哨兵确认文本（不尝试恢复
-    原内容的读取——读取本身依赖同一段签名代码，读不到原内容时不可靠）。
-    """
     import ctypes
     from ctypes import wintypes
 

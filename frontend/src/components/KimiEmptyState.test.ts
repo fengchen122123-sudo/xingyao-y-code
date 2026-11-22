@@ -28,8 +28,6 @@ it('keeps the new conversation send button enabled while another session runs', 
 it('makes the large new-conversation surfaces follow the transparent workspace surface', () => {
   const appStyles = readFileSync('src/style.css', 'utf8');
   const style = document.createElement('style');
-  // jsdom 不解析 CSS 自定义属性。用手工值代入生产样式，验证最终级联结果：
-  // 普通卡片底色为白，workspace 主题表面为透明。
   style.textContent = appStyles
     .replaceAll('var(--theme-region-surface-panel)', 'transparent')
     .replaceAll('var(--theme-region-surface)', 'transparent')

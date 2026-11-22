@@ -94,12 +94,6 @@ def test_deepseek_non_thinking_provider_kwargs_are_byte_golden(monkeypatch):
 
 
 def test_deepseek_on_maas_aggregate_domain_provider_kwargs_are_byte_golden(monkeypatch):
-    """deepseek 名 × maas 聚合域：聚合域不得改写请求字节（Task 1a 的回归防线）。
-
-    该 (model, api_base) 组合此前落在 Qwen 域名兜底里，会被追加
-    x-dashscope-session-cache 头并把 content 改写成 cache_control 块；
-    名称优先后应与官方 api.deepseek.com 的 deepseek 金样只差 api_base。
-    """
     import core.llm as llm
 
     captured = _capture(
@@ -279,7 +273,6 @@ def test_kimi_anthropic_max_reasoning_provider_kwargs_are_byte_golden(monkeypatc
 
 
 def test_stepfun_anthropic_provider_kwargs_map_effort_to_output_config(monkeypatch):
-    """阶跃 Anthropic 路由：思考档位必须编码为官方 output_config.effort。"""
     import core.llm as llm
 
     captured = _capture(
@@ -460,7 +453,6 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
 def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
     monkeypatch, model, model_cfg, provider_tail, tools, expected_messages
 ):
-    """新思考策略的最终 provider 字节必须精确，不允许混入第二套开关。"""
     import core.llm as llm
 
     messages = [
@@ -498,9 +490,6 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
 def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
     monkeypatch,
 ):
-    """中转站未知 gpt-5* 模型（历史 litellm 时代需放行 allowed_openai_params）：
-    自研引擎无内置清单校验，tool_choice 原样透传，请求不含放行字段，
-    其余字节与普通 openai 路由完全一致。"""
     import core.llm as llm
 
     messages = [
@@ -532,7 +521,6 @@ def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
 def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
     monkeypatch,
 ):
-    """gpt-5* 模型请求不含放行字段（自研引擎透传 tool_choice，无需白名单）。"""
     import core.llm as llm
 
     captured = _capture(
@@ -550,12 +538,6 @@ def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
 def test_native_computer_first_and_continuation_requests_are_byte_golden(
     monkeypatch, tmp_path
 ):
-    """Task 11b：原生 computer 首请求与 continuation 请求的 provider 字节精确。
-
-    首请求：正常会话历史 input + 尾部 computer built-in，无 previous_response_id。
-    continuation：重发同一 model、同序 tools、必要 instructions/options 与上一
-    response id；input 只有本批 computer_call_output，无 messages 键。
-    """
     import threading
 
     import core.llm as llm
@@ -674,7 +656,6 @@ def test_native_computer_first_and_continuation_requests_are_byte_golden(
 
 
 def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
-    """重复 route 时，真实事件入口必须使用当前模型 ID 对应的选择。"""
     import core.llm as llm
 
     captured = _capture(

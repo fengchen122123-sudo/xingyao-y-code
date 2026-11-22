@@ -70,8 +70,6 @@
 
       <p v-if="errorMsg" data-test="persona-error" class="persona-error">{{ errorMsg }}</p>
       <p v-else-if="savedTip" data-test="persona-saved" class="persona-saved">{{ savedTip }}</p>
-      <!-- 会话级稳定段落快照：人设属于注入点 2，进行中的会话已在首请求定型目录字节
-           以保住前缀缓存；因此保存的改动只对新建会话生效。 -->
       <p class="persona-note" data-test="session-snapshot-note">保存后对新建会话生效。</p>
     </section>
   </div>
@@ -120,7 +118,6 @@ async function loadPersona() {
   try {
     const api = (window as any).pywebview?.api;
     if (!api?.get_persona_settings) {
-      // 后端未就绪（如测试环境）：显示占位但不报错
       applySnapshot('星瑶', '', '');
       return;
     }
@@ -169,7 +166,6 @@ async function savePersona() {
         String(res.persona ?? personaDraft.value),
         String(res.user_title ?? userTitleDraft.value.trim()),
       );
-      // 名称/称呼即时同步全局：界面文案、执行过程、思考提示立刻切换，无需重启
       store.applyPersonaSettings({ agent_name: res.agent_name, user_title: res.user_title });
       savedTip.value = res.msg || '已保存';
       if (savedTipTimer) clearTimeout(savedTipTimer);

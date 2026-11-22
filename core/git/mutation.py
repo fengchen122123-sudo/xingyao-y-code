@@ -1,10 +1,3 @@
-"""白名单写操作层（规格 §5.4–§5.14）。
-
-本层只负责"单个白名单 git 操作"的参数构造、作用域与执行；
-锁、快照校验、风险确认、信任检查由 GitApplicationService 统一编排（§9.3）。
-所有操作显式失败：非零退出 → GitError，绝不自动重试或补救。
-"""
-
 from __future__ import annotations
 
 from typing import List, Optional, Sequence
@@ -17,7 +10,6 @@ from core.git.models import (
 from core.git.query import StatusV2
 from core.git.runner import ExecScope, GitRunner, with_paths
 
-# merge/rebase/cherry-pick/revert 的 Continue/Skip/Abort 合法动作表（§14）
 _OPERATION_ACTIONS = {
     "merge": {"continue", "abort"},
     "rebase": {"continue", "skip", "abort"},
@@ -57,7 +49,6 @@ def unstage(runner: GitRunner, identity: RepositoryIdentity, paths: Sequence[str
 def discard_worktree_changes(
     runner: GitRunner, identity: RepositoryIdentity, paths: Sequence[str]
 ) -> None:
-    """Restore 未提交内容（§13 高风险：令牌由服务层校验）。"""
     if not paths:
         raise GitError(GitErrorCode.INVALID_STATE, "discard 需要至少一个路径")
     runner.run_checked(
@@ -100,7 +91,6 @@ def _parse_committed_oid(runner: GitRunner, identity: RepositoryIdentity) -> str
 def undo_last_commit(
     runner: GitRunner, identity: RepositoryIdentity, keep_staged: bool
 ) -> None:
-    """Undo 最近一次本地提交：soft 保留暂存 / mixed 保留为未暂存（§5.4）。"""
     mode = "soft" if keep_staged else "mixed"
     runner.run_checked(
         ["reset", f"--{mode}", "HEAD~1"],
@@ -109,8 +99,6 @@ def undo_last_commit(
         timeout=60.0,
     )
 
-
-# ---------------------------------------------------------------- 分支（§5.5/§5.6）
 
 def create_branch(
     runner: GitRunner,
@@ -207,8 +195,6 @@ def delete_local_branch(
     )
 
 
-# ---------------------------------------------------------------- Remote 与同步（§5.7）
-
 def remote_add(runner: GitRunner, identity: RepositoryIdentity, name: str, url: str) -> None:
     runner.run_checked(
         ["remote", "add", name, url], cwd=identity.worktree_root,
@@ -240,7 +226,6 @@ def fetch(runner: GitRunner, identity: RepositoryIdentity, remote: Optional[str]
 
 
 def pull_ff_only(runner: GitRunner, identity: RepositoryIdentity) -> None:
-    """Pull 默认只允许 Fast-forward；无法 ff 时显式失败（§5.7）。"""
     runner.run_checked(
         ["pull", "--ff-only"], cwd=identity.worktree_root, scope=ExecScope.NETWORK, timeout=600.0
     )
@@ -263,8 +248,6 @@ def push(
     args += [remote, refspec]
     runner.run_checked(args, cwd=identity.worktree_root, scope=ExecScope.NETWORK, timeout=600.0)
 
-
-# ---------------------------------------------------------------- Stash（§5.8）
 
 def stash_create(
     runner: GitRunner, identity: RepositoryIdentity, message: str, include_untracked: bool
@@ -324,8 +307,6 @@ def _has_conflict_markers(stderr: str) -> bool:
     return "conflict" in lowered
 
 
-# ---------------------------------------------------------------- Tag（§5.12）
-
 def tag_create(
     runner: GitRunner,
     identity: RepositoryIdentity,
@@ -368,8 +349,6 @@ def tag_delete_remote(runner: GitRunner, identity: RepositoryIdentity, remote: s
     )
 
 
-# ---------------------------------------------------------------- Reset / Merge / Rebase / Cherry-pick / Revert（§5.10/§5.11）
-
 def reset(runner: GitRunner, identity: RepositoryIdentity, mode: str, target: str) -> None:
     if mode not in ("soft", "mixed", "hard"):
         raise GitError(GitErrorCode.INVALID_STATE, f"非法 reset 模式: {mode}")
@@ -379,7 +358,6 @@ def reset(runner: GitRunner, identity: RepositoryIdentity, mode: str, target: st
 
 
 def clean_untracked(runner: GitRunner, identity: RepositoryIdentity, dry_run: bool = False) -> str:
-    """Clean 未跟踪文件：服务层必须先 dry-run 展示清单再执行（§5.3）。"""
     args = ["clean", "-d"]
     args.append("-n" if dry_run else "-f")
     result = runner.run_checked(
@@ -461,8 +439,6 @@ def _ensure_action_allowed(kind: str, action: str) -> None:
             f"{kind} 状态下不合法的动作: {action}（合法: {sorted(allowed)}）",
         )
 
-
-# ---------------------------------------------------------------- Worktree（§5.14，路径校验在服务层）
 
 def worktree_add(
     runner: GitRunner, identity: RepositoryIdentity, path: str, branch: str, new_branch: bool = False

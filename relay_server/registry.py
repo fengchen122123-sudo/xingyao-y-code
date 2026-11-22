@@ -1,20 +1,3 @@
-"""设备注册表（提取自旧网关 gateway/relay.py，剥离 account 维度）。
-
-在线状态只在内存里，库里只留设备和 token 哈希。协议职责与旧网关一致：
-- 单连接 generation：新注册令旧连接 close 4401，之后的帧一律作废；
-- 128 帧镜像 + replay/resync_required：只承诺窗口内去重，溢出/丢帧必须显式要求整态；
-- App 名额（MAX_APPS）：按 jti 占位，断开/登出必须释放，不能泄漏后误报超限；
-- RPC id 命名空间：只做传输级的 id 前缀化和一次性回程路由，不解包 method 语义。
-
-与旧网关的语义差异（验收测试固定）：
-- register 返回 kicked/reset/online 布尔标志（帧另给 *_frame 键）；
-  online 仅在「离线→上线」或 boot 变更时为 True，同 boot 踢旧连接不重复播在线；
-- sweep / mark_offline 自行向订阅者广播 device_status；
-- 镜像序号断裂（holes）的 resync 原因是 gap（设备侧丢帧），
-  出站队列丢帧（dropped/enqueue）才是 queue_drop；
-- last_seq 为 0/None 一律按首连处理（补全窗口，不要求 resync）。
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -46,19 +29,12 @@ class RelayRegistry:
     def __init__(self):
         self.devices = {}
         self.mirrors = {}
-        # device_id -> [{"app_id": <jti>, "key": <连接唯一键>}]
         self.apps = {}
-        # 桌面出站队列丢帧的次数（App 取走一次 resync_required 后清零）
         self.dropped = {}
-        # 设备侧序号断裂的起点 seq：这一段帧永远补不回来
         self.holes = {}
-        # 镜像因 MIRROR_LIMIT 挤出去的最大 seq
         self.overflowed = {}
-        # device_id -> OrderedDict{命名空间化后的 id: (app 键, 原 id)}
         self.rpc_routes = {}
         self.listeners = []
-
-    # ---- 设备生命周期 -------------------------------------------------
 
     def create_device(self, database, name: str) -> tuple[str, str]:
         device_id = str(uuid.uuid4())
@@ -103,7 +79,6 @@ class RelayRegistry:
         return device_id, token
 
     def _forget(self, device_id: str) -> dict | None:
-        """清掉一台设备在内存里的全部痕迹（镜像/名额/丢帧标记/路由表）。"""
         current = self.devices.pop(device_id, None)
         self.mirrors.pop(device_id, None)
         self.apps.pop(device_id, None)
@@ -158,7 +133,6 @@ class RelayRegistry:
         mirror = self.mirrors[device_id]
         oldest = mirror[0][0] if mirror else None
         newest = mirror[-1][0] if mirror else None
-        # online 帧表示「离线→上线」：同 boot 踢旧连接时设备一直在线，不重复播。
         online_transition = (not was_online) or boot_changed
         online_frame = (
             {
@@ -219,8 +193,6 @@ class RelayRegistry:
         self._close(current)
         return current
 
-    # ---- 在线状态 -----------------------------------------------------
-
     def mark_offline(self, device_id: str) -> dict | None:
         """套接字自己断了：立刻标离线（比 45 秒扫描更早）并广播 device_status。"""
         device = self.devices.get(device_id)
@@ -228,7 +200,6 @@ class RelayRegistry:
             return None
         device["online"] = False
         device["connection"] = None
-        # 出站队列随连接一起死了：清掉 send，让在途 RPC 立即收到 device_offline。
         device["send"] = None
         frame = {"type": "device_status", "data": {"device_id": device_id, "online": False}}
         self.publish(device_id, frame)
@@ -260,8 +231,6 @@ class RelayRegistry:
                 events.append(frame)
                 self.publish(device_id, frame)
         return events
-
-    # ---- App 名额 -----------------------------------------------------
 
     def attach_app(self, device_id: str, app_id: str) -> dict:
         """占一个 App 名额。同一 jti 重连只换连接键，不重复计数。"""
@@ -303,8 +272,6 @@ class RelayRegistry:
     def app_keys(self, device_id: str) -> list[str]:
         return [item["key"] for item in (self.apps.get(device_id) or [])]
 
-    # ---- 镜像与补发 ---------------------------------------------------
-
     def remember(self, device_id: str, seq: int, payload: str) -> None:
         """记账设备上行的帧。重复帧丢弃；序号断裂和镜像挤出都留下痕迹供 resync 用。"""
         mirror = self.mirrors.setdefault(device_id, deque(maxlen=MIRROR_LIMIT))
@@ -313,7 +280,6 @@ class RelayRegistry:
             if seq <= last:
                 return
             if seq != last + 1:
-                # 桌面出站队列满丢过帧：中间这段永远补不回来，只能让 App 整态自愈。
                 self.holes[device_id] = max(self.holes.get(device_id, last), last)
         if len(mirror) == mirror.maxlen:
             evicted = mirror[0][0]
@@ -342,27 +308,15 @@ class RelayRegistry:
         }
 
     def frames_for(self, device_id: str, last_seq, last_boot_id: str | None) -> dict:
-        """给刚连上的 App 决定「补窗口」还是「要求整态」。
-
-        只承诺窗口内去重：镜像溢出、设备侧序号断裂、出站队列丢帧都必须如实
-        要求 resync_required，不能无条件声称不重不漏。
-        last_seq 为 0/None 一律按首连处理：补全窗口，不要求 resync。
-        """
         device = self.devices.get(device_id)
         first = last_seq is None or int(last_seq) <= 0
         if device is None:
-            # 设备尚未注册：首连回空窗口（App 侧随后走 get_initial_state 取整态）；
-            # 带水位重连则对未知设备无法承诺任何事，如实要求 resync。
             if first and not last_boot_id:
                 return {"type": "replay", "frames": []}
             return self._resync(device_id, None, "boot")
         boot_id = device["boot_id"]
-        # 首连（客户端没有任何水位）不补历史窗口：App 启动走一次 get_initial_state
-        # 就能拿到整态，补窗口等于把同一批状态在窄带外网上再传一遍（实测单次 1MB 级）。
-        # 带 last_boot_id 的首连（GUI 重启后水位归零）仍走下面的窗口逻辑。
         if first and not last_boot_id:
             return {"type": "replay", "frames": []}
-        # 首连（last_boot_id 为空）只代表「我没见过任何帧」，不是 GUI 重启。
         if last_boot_id and last_boot_id != boot_id:
             return self._resync(device_id, boot_id, "boot")
         if not first and self.dropped.get(device_id):
@@ -383,8 +337,6 @@ class RelayRegistry:
         frames = [payload for seq, payload in mirror if first or seq > int(last_seq)]
         return {"type": "replay", "frames": frames}
 
-    # ---- RPC id 命名空间 ----------------------------------------------
-
     def namespace_rpc(self, device_id: str, app_key: str, rpc_id) -> str:
         """两个 App 各自的 id=1 不能串：在传输层加前缀，回程按前缀还原。"""
         namespaced = f"{app_key}:{rpc_id}"
@@ -400,8 +352,6 @@ class RelayRegistry:
         if not routes or not isinstance(namespaced, str):
             return None
         return routes.pop(namespaced, None)
-
-    # ---- 广播 ---------------------------------------------------------
 
     def listen(self, device_id: str, send, app_key: str | None = None) -> tuple:
         item = (device_id, send, app_key)

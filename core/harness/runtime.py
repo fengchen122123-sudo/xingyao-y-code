@@ -1,5 +1,3 @@
-"""In-process and durable lifecycle coordination for one model turn."""
-
 from __future__ import annotations
 
 import logging
@@ -120,15 +118,6 @@ class TurnRuntime:
         return runtime
 
     def _start_heartbeat_sidecar(self) -> None:
-        """回合存续期间的 owner 心跳兜底线程。
-
-        此前心跳只搭车在 journal 操作与 raise_if_cancelled 上：单个工具执行
-        超过 _OWNER_STALE_AFTER_MS（10s）期间零心跳，另一进程（GUI 与 CLI
-        共享 ycode.db）的任意 journal 操作即把本进程在飞 Turn/Step 误标
-        interrupted（stale owner 误中断，回合随后 CAS 失败莫名报错）。
-        本线程按节流间隔续租，turn 进入终态即退出；journal 为 None 的
-        非持久回合不启动（保持原行为）。
-        """
         if self.journal is None:
             return
         stop = threading.Event()
@@ -146,7 +135,6 @@ class TurnRuntime:
             try:
                 self.journal.heartbeat()
             except Exception:
-                # 单次心跳失败不影响回合；下一拍重试（DB 锁竞争等瞬态）
                 _LOGGER.debug("harness heartbeat sidecar beat failed", exc_info=True)
 
     def _stop_heartbeat_sidecar(self) -> None:
@@ -386,12 +374,6 @@ class StepRuntime:
         self._transition(StepStatus.TOOLS_RUNNING)
 
     def mark_tool_call_count(self, count: int) -> None:
-        """记录本轮工具调用数（续跑需要知道"原本要执行几个"）。
-
-        只在 tools_running 状态下更新；非该状态（批处理尾部、已提交）静默跳过，
-        避免把调用方的收尾逻辑打断。状态正确但更新行数异常时抛错，与
-        capture_request 的并发防护口径一致。
-        """
         try:
             total = int(count)
         except (TypeError, ValueError):

@@ -1,15 +1,4 @@
 # -*- coding: utf-8 -*-
-"""CLI 能力对齐 GUI 第一批 · 功能测试。
-
-真实 core 链路逐命令验证（区别于 mock 单元测试）：
-- 用 YCODE_DATA_DIR 指向临时目录做全量隔离（config.json / ycode.db / persona.json
-  均落在临时目录，首次导入自动从仓库默认 config.json 播种）；
-- os.startfile 打桩（不真弹资源管理器）；/update install 只测门禁与无包路径，
-  绝不真正启动安装；/update check 走真实 Gitee 网络（只读）；
-- /paste-image 会真实写入系统剪贴板（测试后不还原，属已知副作用）。
-
-运行：venv/Scripts/python scripts/functional_test_cli_parity.py
-"""
 
 import os
 import sys
@@ -64,15 +53,9 @@ def drain_queue():
     return items
 
 
-# ---------------------------------------------------------------------------
-# T1 启动与隔离
-# ---------------------------------------------------------------------------
 check("T1.1 config.json 播种到隔离目录", os.path.isfile(os.path.join(DATA_DIR, "config.json")))
 check("T1.2 DB 落在隔离目录", str(config.DB_FILE).replace("/", "\\").startswith(DATA_DIR.replace("/", "\\").replace("\\", "\\")) or DATA_DIR in str(config.DB_FILE))
 
-# ---------------------------------------------------------------------------
-# T2 /clear-history（真实 MemoryManager）
-# ---------------------------------------------------------------------------
 main.manager.ensure_session(main.current_session)
 main.manager.add_messages(main.current_session, [("user", "功能测试问题一"), ("assistant", "功能测试回答一")])
 before_count = len(main.manager.get_history(main.current_session))
@@ -90,9 +73,6 @@ check("T2.2 确认后清空", len(main.manager.get_history(main.current_session)
 check("T2.3 token 快照重置", llm.session_token_usage["latest_total"] == 0 and llm.session_token_usage["latest_prompt"] == 0)
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T3 /persona（真实 persona_settings 存取）
-# ---------------------------------------------------------------------------
 from core.persona_settings import get_persona_settings  # noqa: E402
 
 main.handle_slash_command("/persona")
@@ -112,9 +92,6 @@ _reset = get_persona_settings()
 check("T3.5 reset 恢复默认", _reset["agent_name"] == "星瑶" and _reset["persona"] == "" and _reset["user_title"] == "")
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T4 /shell（真实解释器探测）
-# ---------------------------------------------------------------------------
 from core.command_shell import get_selected_command_shell, list_command_shell_options  # noqa: E402
 
 _orig_shell = get_selected_command_shell()
@@ -134,9 +111,6 @@ if _orig_shell and any(o["id"] == _orig_shell and o["available"] for o in _opts)
     main.handle_slash_command(f"/shell {_orig_shell}")
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T5 /open（startfile 打桩，验证路径解析）
-# ---------------------------------------------------------------------------
 _opened = []
 _startfile_orig = getattr(os, "startfile", None)
 os.startfile = lambda p: _opened.append(os.path.abspath(str(p)))
@@ -151,16 +125,10 @@ if _startfile_orig is not None:
     os.startfile = _startfile_orig
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T6 /skills refresh（真实技能目录扫描）
-# ---------------------------------------------------------------------------
 main.handle_slash_command("/skills refresh")
 check("T6 技能目录重扫", "技能目录已重新扫描" in out() and "共" in out())
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T7 /queue（真实 msg_queue）
-# ---------------------------------------------------------------------------
 main.msg_queue.put({"text": "排队一", "was_queued": True, "session": main.current_session})
 main.msg_queue.put({"text": "排队二", "was_queued": True, "session": main.current_session})
 
@@ -177,9 +145,6 @@ main.handle_slash_command("/queue clear")
 check("T7.3 clear 清空", main.msg_queue.qsize() == 0)
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T8 /paste-image（真实系统剪贴板 → 真实视觉管线）
-# ---------------------------------------------------------------------------
 try:
     from PIL import Image
     _png = os.path.join(DATA_DIR, "clip_test.png")
@@ -190,7 +155,6 @@ try:
     )
     main.handle_slash_command("/paste-image 功能测试说明")
     _q = drain_queue()
-    # 修复后：路径经队列条目 explicit_paths 通道传递，text 只保留说明
     check("T8.1 剪贴板文件入队（explicit_paths 通道）",
           bool(_q) and _q[0].get("text") == "功能测试说明" and _q[0].get("explicit_paths") == [_png],
           str(_q[0])[:100] if _q else "队列为空")
@@ -203,13 +167,10 @@ try:
         )
         check("T8.2 端到端：explicit_paths 产出视觉消息", _is_image,
               f"content 类型={type(_content).__name__}")
-except Exception as _exc:  # 剪贴板依赖桌面会话，失败不算功能缺陷，单测已覆盖
+except Exception as _exc:
     check("T8 剪贴板链路（环境受限跳过）", True, f"{type(_exc).__name__}: {str(_exc)[:80]}")
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T9 /computer browser（真实 settings 存取 + 真实 controller 快照）
-# ---------------------------------------------------------------------------
 try:
     from core.computer.controller import get_computer_control_service
     from core.computer.settings import load_computer_settings
@@ -231,9 +192,6 @@ except Exception as _exc:
     check("T9 电脑操控（构造受限跳过）", True, f"{type(_exc).__name__}: {str(_exc)[:80]}")
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T10 /effort（真实 config + 思考能力表）
-# ---------------------------------------------------------------------------
 from core.model_manager import load_config, get_model_reasoning_choice  # noqa: E402
 from core.reasoning_capabilities import get_reasoning_capability  # noqa: E402
 
@@ -275,7 +233,6 @@ clear_out()
 import time as _time  # noqa: E402
 
 main.handle_slash_command("/update")
-# 修复后 check 异步执行：轮询等待结果回填（最长 25 秒）
 _deadline = _time.time() + 25
 while _time.time() < _deadline:
     if ("已是最新版本" in out()) or ("发现新版本" in out()) or ("检查更新失败" in out()):
@@ -288,25 +245,16 @@ main.handle_slash_command("/update install")
 check("T11.2 install 无包安全路径", ("未找到可安装的安装包" in out()) or ("即将安装" in out()))
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T12 /changes（隔离 DB → 空记录路径；有记录渲染由单测覆盖）
-# ---------------------------------------------------------------------------
 main.handle_slash_command("/changes")
 check("T12 空会话变更记录", "还没有文件修改记录" in out())
 clear_out()
 
-# ---------------------------------------------------------------------------
-# T13 /help 与未知指令
-# ---------------------------------------------------------------------------
 main.handle_slash_command("/help")
 check("T13.1 /help 输出指令指南", "clear-history" in out() and "paste-image" in out() and "/update" in out())
 
 main.handle_slash_command("/非存在命令xyz")
 check("T13.2 未知指令提示", "未知指令" in out())
 
-# ---------------------------------------------------------------------------
-# 汇总
-# ---------------------------------------------------------------------------
 passed = sum(1 for _, ok in RESULTS if ok)
 failed = len(RESULTS) - passed
 print("\n" + "=" * 60)

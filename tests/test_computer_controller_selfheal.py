@@ -1,12 +1,3 @@
-"""通用化重构 Task D：激活吞击 no-op 点击自愈（controller 层）测试。
-
-用脚本化 desktop backend fake 驱动真实 ComputerControlService，验证：
-- click 后画面与点击前完全一致且发生前台切换 → 同一动作自动补击恰好一次；
-- 画面已变化（非吞击）或未发生激活 → 不补击；
-- 补击路径上取消事件置位 → 抛 computer_cancelled。
-绝不触碰真实键鼠、浏览器或截屏。
-"""
-
 from __future__ import annotations
 
 import threading
@@ -24,7 +15,6 @@ from tests.computer_fakes import GENERIC_CAPABILITY
 
 
 class _ScriptedBackend:
-    """desktop backend fake：observe 按 script 产出，execute 记录并可挂钩子。"""
 
     def __init__(self, observe_script, on_execute=None):
         self.target = "desktop"
@@ -98,8 +88,7 @@ def _start_and_observe(service, owner):
     return snapshot.run_id
 
 
-def test_activation_swallowed_click_replays_exactly_once():
-    """吞击场景：画面未变 + 发生激活 → 同一动作自动补击恰好一次。"""
+def test_activation_and_unchanged_frame_do_not_replay_click():
     backend = _ScriptedBackend(
         [
             {"screen_sha256": "sha-A"},
@@ -115,15 +104,13 @@ def test_activation_swallowed_click_replays_exactly_once():
         owner,
         ComputerAction(kind="click", target="desktop", x=10, y=20),
     )
-    assert observation.screen_sha256 == "sha-B"
+    assert observation.screen_sha256 == "sha-A"
     assert observation.action == "click"
-    assert backend.execute_calls == [(run_id, "click"), (run_id, "click")]
-    # 补击不新增 ordinal：observe + click 仍共 2 个动作。
+    assert backend.execute_calls == [(run_id, "click")]
     assert service.snapshot().action_count == 2
 
 
 def test_screen_changed_click_does_not_replay():
-    """非吞击：点击后画面已变化 → 不补击。"""
     backend = _ScriptedBackend(
         [
             {"screen_sha256": "sha-A"},
@@ -143,7 +130,6 @@ def test_screen_changed_click_does_not_replay():
 
 
 def test_click_without_activation_does_not_replay():
-    """画面未变但未发生前台切换：不满足吞击判定 → 不补击。"""
     backend = _ScriptedBackend(
         [
             {"screen_sha256": "sha-A"},
@@ -159,8 +145,7 @@ def test_click_without_activation_does_not_replay():
     assert backend.execute_calls == [(run_id, "click")]
 
 
-def test_replay_honours_cancellation_before_and_after():
-    """补击路径复核取消：第二次执行后取消事件置位 → 抛 computer_cancelled。"""
+def test_cancellation_after_click_prevents_followup_input():
     cancel_event = threading.Event()
     backend = _ScriptedBackend(
         [
@@ -169,7 +154,7 @@ def test_replay_honours_cancellation_before_and_after():
             {"screen_sha256": "sha-B"},
         ],
         on_execute=lambda call_index: (
-            cancel_event.set() if call_index == 2 else None
+            cancel_event.set() if call_index == 1 else None
         ),
     )
     service = _service_with(backend)
@@ -182,5 +167,25 @@ def test_replay_honours_cancellation_before_and_after():
             ComputerAction(kind="click", target="desktop", x=10, y=20),
         )
     assert exc.value.code == "computer_cancelled"
-    # 补击确实发生了（第二次 execute 进入），但未走到成功提交。
-    assert backend.execute_calls == [(run_id, "click"), (run_id, "click")]
+    assert backend.execute_calls == [(run_id, "click")]
+
+
+def test_observe_failure_after_click_does_not_replay_click():
+    class _FailSecondObserveBackend(_ScriptedBackend):
+        def observe(self, run_id):
+            if self.execute_calls:
+                raise ComputerControlError("computer_action_failed", "截屏失败")
+            return super().observe(run_id)
+
+    backend = _FailSecondObserveBackend([{"screen_sha256": "sha-A"}])
+    service = _service_with(backend)
+    owner = _owner()
+    run_id = _start_and_observe(service, owner)
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(
+            run_id,
+            owner,
+            ComputerAction(kind="click", target="desktop", x=10, y=20),
+        )
+    assert raised.value.code == "computer_action_failed"
+    assert backend.execute_calls == [(run_id, "click")]

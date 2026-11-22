@@ -1,5 +1,3 @@
-"""core.computer 包公共导出；不创建任何全局副作用。"""
-
 from core.computer.actions import (
     COMPUTER_ACTION_TOOL_SCHEMA,
     observation_provider_projection,

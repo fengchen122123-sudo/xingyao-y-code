@@ -1,5 +1,3 @@
-"""CLI 与 GUI 共用的模型协议和预置厂商目录。"""
-
 from copy import deepcopy
 
 
@@ -109,8 +107,6 @@ def validate_protocol(protocol: str) -> str:
 
 
 def provider_route_name(protocol: str, model_name: str) -> str:
-    """构造 provider 路由名（{protocol}/{model} 前缀串）；Responses 是 OpenAI
-    兼容传输而非 provider 前缀。"""
     validate_protocol(protocol)
     if model_name.startswith(("openai/", "anthropic/")):
         return model_name

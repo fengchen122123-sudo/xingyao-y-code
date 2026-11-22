@@ -1,10 +1,3 @@
-"""闲时自动维护调度回归。
-
-空闲超时后跑本地水位维护（tier1/tier2）+ 水位达标才触发 LLM 压缩（复用
-_trigger_background_precompress）；回合开始撤销未触发任务并协作中断在跑
-的闲时压缩；配置 0 = 关闭。
-"""
-
 import threading
 import time
 
@@ -24,7 +17,6 @@ def manager():
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, manager):
-    # 测试用极短延时 + 直接注入 manager，不触碰真实 app_context 单例
     monkeypatch.setattr(im, "get_idle_maintenance_seconds", lambda: 0.05)
     monkeypatch.setattr("core.app_context.get_manager", lambda: manager)
     fake_active = {
@@ -60,7 +52,7 @@ def test_local_tiers_run_and_no_compression_below_watermark(manager, monkeypatch
     svc.on_turn_finished("idle-session", notify=None)
     assert done.wait(5)
     assert sorted(calls) == [1, 2]
-    assert pre == []  # 水位远未达标：不产生任何 LLM 调用
+    assert pre == []
     svc.shutdown()
 
 
@@ -81,7 +73,7 @@ def test_compression_triggers_above_watermark(manager, monkeypatch):
         holder["notify"] = notify
         fired.set()
         if done_event is not None:
-            done_event.set()  # 模拟压缩线程结束信号
+            done_event.set()
         return True
 
     monkeypatch.setattr(
@@ -93,7 +85,6 @@ def test_compression_triggers_above_watermark(manager, monkeypatch):
     svc.on_turn_finished("idle-session", notify=lambda kind, msg: notices.append(msg))
     assert fired.wait(5)
     assert holder["session"] == "idle-session"
-    # notify 原样透传给压缩管道
     holder["notify"]("compress", "提示")
     assert notices == ["提示"]
     svc.shutdown()
@@ -101,8 +92,8 @@ def test_compression_triggers_above_watermark(manager, monkeypatch):
 
 def test_turn_start_cancels_pending_job():
     svc = IdleMaintenanceService()
-    svc.on_turn_finished("s")  # 0.05s 后将触发
-    svc.on_turn_started("s")   # 回合开始：立即撤销
+    svc.on_turn_finished("s")
+    svc.on_turn_started("s")
     time.sleep(0.3)
     assert svc.status()["pending"] == 0
     svc.shutdown()
@@ -119,22 +110,16 @@ def test_turn_start_sets_cancel_event_of_running_compression():
         started.set()
         release.wait(5)
 
-    svc._do_maintenance = fake_do  # 拦截实际维护，只验证取消传播
+    svc._do_maintenance = fake_do
     svc.on_turn_finished("s")
     assert started.wait(5)
     svc.on_turn_started("s")
-    assert holder["event"].wait(2)  # 协作取消事件必须被置位
+    assert holder["event"].wait(2)
     release.set()
     svc.shutdown()
 
 
 def test_cancel_event_stays_registered_until_compression_done(manager, monkeypatch):
-    """压缩在飞期间 cancel_event 必须留在注册表，回合开始才能中断它。
-
-    回归背景：_trigger_background_precompress 发射后即返回，若 worker 不等
-    压缩结束就弹事件，压缩在飞的整个过程里 on_turn_started 拿不到事件，
-    协作中断承诺对 LLM 阶段失效。
-    """
     monkeypatch.setattr(
         manager, "maintain_tool_results", lambda session, tier: (0, 0)
     )
@@ -159,13 +144,13 @@ def test_cancel_event_stays_registered_until_compression_done(manager, monkeypat
     svc.on_turn_finished("idle-session")
     assert started.wait(5)
     with svc._condition:
-        assert "idle-session" in svc._cancel_events  # 压缩未结束：事件必须仍在注册表
+        assert "idle-session" in svc._cancel_events
 
-    svc.on_turn_started("idle-session")  # 用户发消息：必须能拿到并置位该事件
+    svc.on_turn_started("idle-session")
     with svc._condition:
         assert svc._cancel_events["idle-session"].is_set()
 
-    release.set()  # 压缩结束
+    release.set()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         with svc._condition:
@@ -186,7 +171,6 @@ def test_disabled_when_zero(monkeypatch):
 
 
 def test_busy_session_is_skipped_at_fire_time(monkeypatch, manager):
-    """到期的瞬间恰好有新回合开始：锁内复查忙闲后必须跳过本轮维护。"""
     ran = threading.Event()
 
     def fake_maintain(session, tier):
@@ -202,8 +186,8 @@ def test_busy_session_is_skipped_at_fire_time(monkeypatch, manager):
         svc._ensure_thread_locked()
         svc._condition.notify_all()
     time.sleep(0.3)
-    assert not ran.is_set()          # 忙会话被跳过
-    assert svc.status()["pending"] == 0  # 条目已消费，不会反复空转
+    assert not ran.is_set()
+    assert svc.status()["pending"] == 0
     svc._busy.discard("s")
     svc.shutdown()
 
@@ -211,7 +195,6 @@ def test_busy_session_is_skipped_at_fire_time(monkeypatch, manager):
 def test_self_learning_thread_binds_own_session_instead_of_active_ui_session(
     manager, monkeypatch
 ):
-    """闲时学习线程必须绑定目标会话，否则 memory_filter 会串到当前查看的会话。"""
     from core import app_context
 
     observed = {}

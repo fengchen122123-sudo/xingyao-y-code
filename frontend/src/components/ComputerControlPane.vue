@@ -1,10 +1,10 @@
 <template>
   <div class="computer-pane">
-    <!-- run 状态与目标 + 控制操作（设计 16.2） -->
     <div class="cp-head">
       <span class="cp-dot" :class="dotClass"></span>
       <span class="cp-status">{{ statusText }}</span>
       <span class="cp-target">{{ targetLabel }}</span>
+      <span v-if="store.computerRunIsExternalBrowser" class="cp-ext-badge" data-test="cp-external-badge">外部浏览器截图预览</span>
       <span class="cp-actions">
         <button
           v-if="store.computerControlPausable !== 'none'"
@@ -29,28 +29,58 @@
     </div>
 
     <template v-if="store.computerRun.run_id">
-      <!-- 最新截图预览：loopback token URL，绝不经 evaluate_js 传 base64 -->
-      <div v-if="store.computerRun.preview_url" class="cp-preview">
-        <img data-test="computer-preview-image" :src="store.computerRun.preview_url" alt="电脑操控最新截图" />
+      <div v-if="store.computerRunIsExternalBrowser" class="cp-ext-note" data-test="cp-external-note">
+        右栏展示外部浏览器最新采集截图（非可交互页面控件）。
       </div>
 
-      <!-- run 摘要（mini-list，不塞整表） -->
+      <!-- 最新截图预览：loopback token URL，绝不经 evaluate_js 传 base64 -->
+      <div v-if="store.computerRun.preview_url" class="cp-preview">
+        <div v-if="previewLoadFailed" class="cp-preview-error" data-test="cp-preview-load-error">
+          截图预览加载失败，请等待下一帧观察或检查本地预览服务。
+        </div>
+        <img
+          v-else
+          data-test="computer-preview-image"
+          :src="store.computerRun.preview_url"
+          alt="电脑操控最新截图"
+          @error="previewLoadFailed = true"
+          @load="previewLoadFailed = false"
+        />
+      </div>
+      <div v-else-if="!store.computerRunTerminal" class="cp-waiting" data-test="cp-waiting-first-frame">
+        运行中，正在等待首帧观察画面…
+      </div>
+
+      <div
+        v-if="store.computerRun.image_omitted || store.computerRun.observation_error"
+        class="cp-reason"
+        data-test="cp-observation-notice"
+      >
+        <AppIcon name="info" :size="13" />
+        <span>
+          观察状态：{{ store.computerRun.image_omitted || store.computerRun.observation_error }}
+          <template v-if="store.computerRun.image_omitted && store.computerRun.observation_error">
+            （{{ store.computerRun.observation_error }}）
+          </template>
+        </span>
+      </div>
+
       <ul class="cp-summary" data-test="computer-run-summary">
         <li><AppIcon name="chart" :size="12" /> 已执行 {{ store.computerRun.action_count }} 个动作</li>
         <li v-if="store.computerRun.model_name"><AppIcon name="brain" :size="12" /> {{ store.computerRun.model_name }}</li>
-        <li v-if="surface"><AppIcon name="eye" :size="12" /> {{ surface }}</li>
+        <li v-if="surface" :data-test="store.computerRun.target === 'desktop' ? 'cp-desktop-window' : 'cp-surface-name'">
+          <AppIcon name="eye" :size="12" /> {{ store.computerRun.target === 'desktop' ? '当前窗口：' : '' }}{{ surface }}
+        </li>
+        <li v-if="formattedObservationTime" data-test="cp-observation-time">
+          <AppIcon name="clock" :size="12" /> 最近采集：{{ formattedObservationTime }}
+        </li>
       </ul>
 
-      <!-- 登录/接管/Provider safety/失败原因（设计 16.2 第 4 项）：
-           Provider safety 确认契约验证前只显示状态与停止，无“继续”入口 -->
       <div v-if="reasonText" class="cp-reason" :class="{ bad: reasonIsFailure }" data-test="computer-run-reason">
         <AppIcon name="triangle-alert" :size="13" />
         <span>{{ reasonText }}</span>
       </div>
 
-      <!-- 动作明细不再在这里堆列表：每个动作已经以「点击 · 目标 · 耗时」的
-           紧凑行长在对话区，点开还能看当帧截图。面板只保留控制与最新一张图，
-           避免同一批动作在两处重复展示、列表越滚越长。 -->
     </template>
 
     <p v-else class="cp-empty" data-test="computer-empty-state">
@@ -61,11 +91,15 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 
 const store = useAppStore();
+const previewLoadFailed = ref(false);
+watch(() => store.computerRun.preview_url, () => {
+  previewLoadFailed.value = false;
+});
 
 const dotClass = computed(() => {
   const status = store.computerRun.status;
@@ -94,12 +128,22 @@ const targetLabel = computed(() => {
   const run = store.computerRun;
   if (run.target === 'desktop') return '桌面';
   const browser = String(run.browser || '').toLowerCase();
+  if (browser === 'embedded' || run.browser_mode === 'embedded') return '内置浏览器';
   if (browser === 'edge') return 'Edge';
   if (browser === 'chrome') return 'Chrome';
   return run.target === 'browser' ? '浏览器' : '';
 });
 
 const surface = computed(() => String(store.computerRun.current_surface || ''));
+const formattedObservationTime = computed(() => {
+  const ms = Number(store.computerRun.observation_updated_at_ms || 0);
+  if (!ms) return '';
+  try {
+    return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false });
+  } catch {
+    return String(ms);
+  }
+});
 
 // 登录/接管/失败原因：paused 显示暂停原因，stopped 显示停止原因，
 // failed / provider_safety_required 显示错误码
@@ -180,6 +224,26 @@ async function stop() {
   color: var(--text);
   white-space: nowrap;
   font-size: 11.5px;
+}
+.cp-ext-badge {
+  padding: 1px 7px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--theme-radius-small);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  white-space: nowrap;
+  font-size: 11px;
+}
+.cp-ext-note,
+.cp-waiting,
+.cp-preview-error {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--theme-radius-medium);
+  background: var(--bg2);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 .cp-actions {
   display: flex;

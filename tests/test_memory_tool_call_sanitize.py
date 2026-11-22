@@ -1,10 +1,3 @@
-"""_sanitize_tool_call_pairing 对不可回放 tool call 的净化回归。
-
-背景：Agnes AI 等严格网关对请求历史中 assistant.tool_calls 的
-name/arguments 做校验，空函数名或非法 JSON arguments 直接 400 整个请求，
-坏记录落库后该会话每轮复现。加载层净化后旧会话自愈（DB 原文不动）。
-"""
-
 from core.memory import _sanitize_tool_call_pairing
 
 
@@ -38,8 +31,6 @@ def test_broken_empty_name_call_and_its_orphan_result_are_dropped():
 
 
 def test_truncated_arguments_call_is_dropped_for_wire_safety():
-    """截断 JSON 的原始字节即使本地可修复修复也非 strict JSON，严格网关
-    会拒绝整请求——加载层按不可回放剔除。"""
     history = [
         _assistant([
             {"id": "call-1", "type": "function",
@@ -92,7 +83,6 @@ def test_all_calls_broken_leaves_plain_assistant_text():
 
 
 def test_missing_arguments_key_is_treated_as_no_arg_call():
-    """缺 arguments 键按无参调用处理（与执行层默认一致），不得误杀旧历史。"""
     history = [
         _assistant([
             {"id": "call-1", "type": "function",
@@ -108,7 +98,6 @@ def test_missing_arguments_key_is_treated_as_no_arg_call():
 
 
 def test_null_arguments_call_is_dropped():
-    """arguments 键存在但为 None：执行层无法解析、严格网关拒绝，判不可回放。"""
     history = [
         _assistant([
             {"id": "call-1", "type": "function",
@@ -124,9 +113,6 @@ def test_null_arguments_call_is_dropped():
 
 
 def test_notice_between_tool_calls_and_results_is_repaired():
-    """编排提醒等注入的 user 消息落在 assistant.tool_calls 与 tool 结果之间时，
-    上游报 "An assistant message with 'tool_calls' must be followed by tool
-    messages"；加载层把 tool 结果搬回 assistant 之后，正文一律保留不丢。"""
     nudge = "本回合已连续执行多步操作，仍未建立任务计划。"
     history = [
         {"role": "user", "content": "跑一下"},
@@ -148,7 +134,6 @@ def test_notice_between_tool_calls_and_results_is_repaired():
 
 
 def test_calls_split_by_notice_are_reordered_by_call_order():
-    """同一 step 的多个调用被注入消息拆散、且结果乱序时，按 tool_calls 顺序重排。"""
     nudge = "本回合已连续执行多步操作，仍未建立任务计划。"
     calls = [
         {"id": "call-1", "type": "function",
@@ -171,7 +156,6 @@ def test_calls_split_by_notice_are_reordered_by_call_order():
 
 
 def test_already_adjacent_pairs_keep_original_order():
-    """已经合法相邻的调用组不得被重排（幂等，避免每轮请求扰动前缀缓存）。"""
     nudge = "本回合已连续执行多步操作，仍未建立任务计划。"
     history = [
         {"role": "user", "content": "hi"},

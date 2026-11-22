@@ -1,9 +1,3 @@
-// markdown 文件的「右栏浏览器预览页」构建：把渲染器产出的正文包成一份自包含
-// HTML（内联阅读样式），交内嵌浏览器按 file:// 打开。
-//
-// 为什么放在前端做：实测内嵌 WebView2 直接打开 file:// 的 .md 只显示源码文本；
-// 而 markdown 渲染器是 TS 侧实现（与消息气泡共用同一套），因此由前端渲染好
-// 再经桥落盘（core.web_preview），最后把那份 HTML 交给浏览器打开。
 
 import { renderMarkdown } from './markdown';
 import { toAbsoluteLocalPath, toFileUrl } from './localPath';
@@ -83,17 +77,11 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
-/** 文件所在目录（与路径分隔符无关）；无分隔符时返回空串 */
 function dirOf(filePath: string): string {
   const index = Math.max(filePath.lastIndexOf('\\'), filePath.lastIndexOf('/'));
   return index > 0 ? filePath.slice(0, index) : '';
 }
 
-/**
- * 相对资源地址 → file:// 绝对 URI；已是绝对 URL（http/https/data/file/协议相对）
- * 或页内锚点的原样保留。这样 md 里 `![](img/a.png)` 这种相对图片才能在预览页里
- * 正常显示（预览页落在 ~/.ycode/exports/preview，与源文件不同目录）。
- */
 export function absolutizeResourceUrl(raw: string, baseDir: string): string {
   const value = (raw || '').trim();
   if (!value) return raw;
@@ -120,16 +108,6 @@ function baseName(path: string): string {
   return index >= 0 ? path.slice(index + 1) : path;
 }
 
-/**
- * 重写正文里的图片/链接地址（DOMParser 不可用时原样返回，不影响主流程）。
- *
- * 两件事：
- * 1. 相对地址 → file:// 绝对地址（预览页落在导出目录，与源文件不同目录）；
- * 2. 渲染器在「没有媒体上下文」时会把 `![alt](a.png)` 降级成 `<a data-file-link>`
- *    （消息气泡里靠点击协议处理），预览页是普通网页、点了没反应——这里把指向
- *    图片的这类链接还原成 <img>（浏览器能直接显示本地图片），其余改成可点击的
- *    file:// 链接。
- */
 function rewriteLocalResources(html: string, baseDir: string): string {
   if (typeof DOMParser === 'undefined') return html;
   try {
@@ -162,16 +140,11 @@ function rewriteLocalResources(html: string, baseDir: string): string {
   }
 }
 
-/**
- * 构建 markdown 预览页 HTML：正文用与消息气泡同一个渲染器，样式内联，
- * 相对图片/链接重写为本地 file:// 地址。
- */
 export function buildMarkdownPreviewHtml(
   markdownText: string,
   sourcePath: string,
   title = 'Markdown 预览',
 ): string {
-  // Windows 文件多为 CRLF，\r 会让标题/代码块等行级语法失配（与弹窗预览同处理）
   const normalized = String(markdownText || '').replace(/\r\n/g, '\n');
   const baseDir = dirOf(sourcePath);
   const body = rewriteLocalResources(renderMarkdown(normalized), baseDir);

@@ -5,7 +5,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import DecisionRecordPopup from './DecisionRecordPopup.vue';
 import { useAppStore } from '../stores/appStore';
 
-// mock 决策桥方法：默认未启用 + 无记录；用例按需覆盖
 function mockApi(overrides: Record<string, unknown> = {}) {
   const api = {
     get_decision_audit_summary: vi.fn(async () => ({
@@ -65,7 +64,6 @@ describe('DecisionRecordPopup', () => {
     // 昨天有决策、今天没有：仍要能看到最近记录，不能退化成空态
     expect(wrapper.find('[data-test="decision-pop-empty"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="decision-pop-list"]').text()).toContain('昨天那次判断');
-    // 今日计数照旧单独展示，明确是「当前会话」口径
     expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('当前会话');
     expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('今日0');
   });
@@ -93,8 +91,6 @@ describe('DecisionRecordPopup', () => {
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
 
-    // 记录按会话隔离：limit=10 + 当前会话名 + session_only=true
-    // （today_* 与 recent 都只看本会话，全局口径只留给设置页面板）
     expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(1);
     expect(api.get_decision_audit_summary).toHaveBeenCalledWith(10, 'sess-A', true);
 
@@ -105,7 +101,6 @@ describe('DecisionRecordPopup', () => {
     expect(statsText).toContain('采纳1');
     expect(statsText).toContain('回退0');
     const list = wrapper.find('[data-test="decision-pop-list"]').text();
-    // 场景显示中文标签：一眼看出这条记录在判什么
     expect(list).toContain('探针（连通性）');
     expect(list).toContain('路由（选模型）');
     expect(list).toContain('影子');
@@ -147,7 +142,6 @@ describe('DecisionRecordPopup', () => {
     expect(listText).toContain('回退：timeout');
     expect(listText).toContain('记忆筛选');
     expect(listText).toContain('仅留事实');
-    // 超出 72 字的摘要也完整展示，不再截断省略
     expect(listText).toContain(longDigest);
 
     await wrapper.find('[data-test="decision-pop-close"]').trigger('click');
@@ -165,7 +159,6 @@ describe('DecisionRecordPopup', () => {
     expect(api.get_decision_audit_summary).not.toHaveBeenCalled();
     expect(wrapper.find('[data-test="decision-pop-empty"]').exists()).toBe(true);
 
-    // 空白会话名同样不发请求
     await wrapper.unmount();
     store.currentSessionName = '   ';
     const wrapper2 = mount(DecisionRecordPopup);
@@ -229,7 +222,6 @@ describe('DecisionRecordPopup', () => {
     const wrapper = mount(DecisionRecordPopup);
     await flushPromises();
 
-    // 默认收起
     expect(wrapper.find('[data-test="decision-pop-detail"]').exists()).toBe(false);
 
     await wrapper.find('[data-test="decision-pop-item"]').trigger('click');
@@ -244,14 +236,12 @@ describe('DecisionRecordPopup', () => {
     expect(answers).toContain('"choice": "secondary"');
     expect(answers).toContain('0.999');
 
-    // 再点一次收起
     await wrapper.find('[data-test="decision-pop-item"]').trigger('click');
     await flushPromises();
     expect(wrapper.find('[data-test="decision-pop-detail"]').exists()).toBe(false);
   });
 
   it('连点两条记录：先发出的详情请求后返回也不能覆盖后一条', async () => {
-    // 用对象持有 resolve：直接 let 变量会被 TS 收窄成 null（赋值发生在 Promise executor 里）
     const first = { resolve: null as ((value: unknown) => void) | null };
     const api = mockApi({
       get_decision_audit_summary: vi.fn(async () => ({
@@ -280,8 +270,8 @@ describe('DecisionRecordPopup', () => {
     await flushPromises();
 
     const items = wrapper.findAll('[data-test="decision-pop-item"]');
-    await items[0]?.trigger('click'); // 先点第一条：请求挂起不返回
-    await items[1]?.trigger('click'); // 立刻点第二条：应以后者为准
+    await items[0]?.trigger('click');
+    await items[1]?.trigger('click');
     await flushPromises();
     expect(api.get_decision_record_detail).toHaveBeenCalledTimes(2);
 
@@ -330,7 +320,6 @@ describe('DecisionRecordPopup', () => {
     expect(api.get_decision_audit_summary).toHaveBeenCalledTimes(1);
     expect(api.get_decision_audit_summary).toHaveBeenLastCalledWith(10, 'sess-A', true);
 
-    // 模拟后端 decision_recorded 事件（store 侧 tick 递增）
     store.decisionUnread = 3;
     store.decisionEventTick += 1;
     await flushPromises();

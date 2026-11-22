@@ -1,17 +1,3 @@
-"""对话归档（conversation archive）CLI 层回归测试。
-
-对应设计文档 docs/2026-10-11-conversation-archive-design.md 第 6 / 8 / 10.2 节：
-
-- `/sessions archive|unarchive|archived` 三个子命令的成功 / 失败 / 用法错误路径；
-- 归档当前活跃会话被拒绝（不变量 4），归档后默认列表不显示（不变量 5）；
-- 归档视图能看到归档会话、重复归档幂等（不变量 2）；
-- 会话管家（core/session_selector.py）的 a / u / tab 键位：归档后该行从当前列表
-  移除、光标按边界防御回退、底部按键提示行随视图切换。
-
-会话管家是 prompt_toolkit 全屏 App，这里用替身 Application 接管 run()，按脚本
-回放按键并抓取每次渲染出的界面文本，避免真实终端交互。
-"""
-
 import os
 
 import pytest
@@ -20,10 +6,6 @@ import main
 from core import session_selector as selector_module
 from core.memory import MemoryManager
 
-
-# ---------------------------------------------------------------------------
-# 通用桩
-# ---------------------------------------------------------------------------
 
 def _capture_print(monkeypatch):
     printed = []
@@ -39,14 +21,12 @@ def _quiet_ui(monkeypatch):
 
 @pytest.fixture
 def manager(tmp_path):
-    """真实 SQLite 会话库：归档过滤是 SQL 层行为，桩掉就测不出「默认列表不显示」。"""
     mm = MemoryManager(str(tmp_path / "archive_cli.db"))
     yield mm
     mm.conn.close()
 
 
 def _make_session(mm, name, text="hello"):
-    """建一个归属当前工作目录、带一条消息的会话（空会话会被 include_empty 过滤）。"""
     mm.ensure_session(name, workdir=os.getcwd(), source="CLI")
     mm.add_message(name, "user", text)
     return name
@@ -64,10 +44,6 @@ def _use_slash_env(monkeypatch, mm, current="s1"):
     monkeypatch.setattr(main, "manager", mm)
     monkeypatch.setattr(main, "current_session", current)
 
-
-# ---------------------------------------------------------------------------
-# /sessions archive
-# ---------------------------------------------------------------------------
 
 def test_sessions_archive_marks_target_and_reports(monkeypatch, manager):
     printed = _capture_print(monkeypatch)
@@ -113,13 +89,8 @@ def test_sessions_archive_without_name_shows_usage_error(monkeypatch, manager):
     main.handle_slash_command("/sessions archive")
 
     assert any("用法错误" in line for line in printed)
-    # 不得把子命令名当成会话名创建出来
     assert "archive" not in {s["name"] for s in manager.get_all_sessions()}
 
-
-# ---------------------------------------------------------------------------
-# /sessions unarchive
-# ---------------------------------------------------------------------------
 
 def test_sessions_unarchive_restores_target(monkeypatch, manager):
     printed = _capture_print(monkeypatch)
@@ -156,10 +127,6 @@ def test_sessions_unarchive_without_name_shows_usage_error(monkeypatch, manager)
     assert "unarchive" not in {s["name"] for s in manager.get_all_sessions()}
 
 
-# ---------------------------------------------------------------------------
-# /sessions archived
-# ---------------------------------------------------------------------------
-
 def test_sessions_archived_lists_only_archived_with_timestamp(monkeypatch, manager):
     printed = _capture_print(monkeypatch)
     _use_slash_env(monkeypatch, manager, current="s1")
@@ -188,10 +155,6 @@ def test_sessions_archived_empty_state(monkeypatch, manager):
 
     assert any("没有任何已归档会话" in line for line in printed)
 
-
-# ---------------------------------------------------------------------------
-# 默认列表 / 幂等
-# ---------------------------------------------------------------------------
 
 def test_sessions_all_hides_archived_session(monkeypatch, manager):
     printed = _capture_print(monkeypatch)
@@ -223,10 +186,6 @@ def test_sessions_archive_is_idempotent_and_keeps_original_timestamp(monkeypatch
     assert any("已归档" in line and "s2" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# 不变量 6：切换到归档会话时自动取消归档
-# ---------------------------------------------------------------------------
-
 def test_switch_to_archived_session_auto_unarchives(monkeypatch, manager):
     printed = _capture_print(monkeypatch)
     _use_slash_env(monkeypatch, manager, current="s1")
@@ -243,17 +202,12 @@ def test_switch_to_archived_session_auto_unarchives(monkeypatch, manager):
     assert any("取消归档" in line for line in printed)
 
 
-# ---------------------------------------------------------------------------
-# 会话管家键位（core/session_selector.py）
-# ---------------------------------------------------------------------------
-
 class _FakeEvent:
     def __init__(self, app):
         self.app = app
 
 
 class _FakeApplication:
-    """替身 Application：run() 按脚本回放按键，并记录每次渲染后的界面文本。"""
 
     instances = []
     script = []
@@ -283,7 +237,6 @@ class _FakeApplication:
         return "".join(text for _style, text in control.text())
 
 
-# prompt_toolkit 会把 "tab" / "enter" 归一化成控制键（Keys.ControlI / Keys.ControlM）
 KEY_TAB = "c-i"
 KEY_ENTER = "c-m"
 
@@ -308,13 +261,11 @@ def test_selector_archive_removes_row_and_pulls_cursor_back(fake_app, manager):
     for name in ("s1", "s2", "s3"):
         _make_session(manager, name)
 
-    # 列表按 id 倒序：[s3, s2, s1]，当前会话 s3 在首位，光标移到末行的 s1 再归档
     app = _open_selector(fake_app, manager, ["down", "down", "a"], current="s3")
     last = app.renders[-1]
 
     assert "已归档：s1" in last
     assert "[    ] s1" not in last
-    # 光标原在末行（s1），归档后回退到新的末行（s2）
     assert " > [    ] s2" in last
     assert _archived_at_of(manager, "s1")
 
@@ -338,7 +289,6 @@ def test_selector_tab_toggles_archived_view(fake_app, manager):
     app = _open_selector(fake_app, manager, [KEY_TAB], current="s1")
     first, last = app.renders[0], app.renders[-1]
 
-    # 活跃视图默认不显示归档会话，归档视图能看到
     assert "s2" not in first
     assert "[    ] s2" in last
     assert "[当前] s1" not in last

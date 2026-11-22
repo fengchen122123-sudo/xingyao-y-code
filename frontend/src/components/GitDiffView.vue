@@ -40,7 +40,6 @@ interface DiffRow {
 
 const props = defineProps<{ diff: GitDiffDto | null }>();
 
-// 大 Diff 截断：超过 2000 行只渲染前 2000 行并明确提示（§5.3 截断提示要求）
 const MAX_LINES = 2000;
 
 const visibleHunks = computed(() => {
@@ -69,8 +68,6 @@ function lineClass(line: string): string {
   return 'git-line-ctx';
 }
 
-// 统一 diff 行号推进：- 行只走旧文件行号，+ 行只走新文件行号，
-// 上下文行两侧同时推进；"\ No newline" 标记不占行号
 function hunkRows(hunk: { old_start: number; new_start: number; lines: string[] }): DiffRow[] {
   let oldNo = hunk.old_start;
   let newNo = hunk.new_start;
@@ -83,7 +80,6 @@ function hunkRows(hunk: { old_start: number; new_start: number; lines: string[] 
     } else if (line.startsWith('+')) {
       newCol = newNo++;
     } else if (line.startsWith('\\')) {
-      // "\ No newline at end of file" 标记：不占行号
     } else {
       oldCol = oldNo++;
       newCol = newNo++;

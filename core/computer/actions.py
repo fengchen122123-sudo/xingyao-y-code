@@ -1,10 +1,3 @@
-"""统一电脑动作的白名单 schema、严格解析与 Provider 投影。
-
-解析规则以 docs/superpowers/specs/2026-09-02-computer-control-design.md 第 7.2、10 节为准：
-任何未知字段、缺失字段、bool 伪装整数、NaN 或越界值都抛出
-ComputerControlError("computer_invalid_action", ...)，绝不通过删除字段继续。
-"""
-
 from collections.abc import Mapping
 from urllib.parse import urlsplit
 
@@ -32,19 +25,13 @@ _ALLOWED = {
     "forward": _COMMON,
     "reload": _COMMON,
     "request_user_takeover": _COMMON | {"reason_code"},
-    # R10 语义定位与局部观察（协议扩展）：desktop 用 surface_ref/generation
-    # 定位候选窗口；browser（E5，2026-11-03）用 x/y/width/height 指定 CSS
-    # 视口内的区域，用于放大图片型/网格型界面里的小目标。
     "list_surfaces": _COMMON,
     "activate_surface": _COMMON | {"surface_ref", "surface_generation"},
     "invoke_surface": _COMMON | {"surface_ref", "surface_generation"},
     "observe_region": _COMMON | {
         "surface_ref", "surface_generation", "x", "y", "width", "height",
     },
-    # 批量微动作（2026-09-06 协议扩展）：一次调用串行执行多个基本输入动作，
-    # 中途不截图，完成后只返回最终截图。
     "sequence": _COMMON | {"steps"},
-    # 阶段二（2026-09-06 协议扩展；desktop only）：UIA 元素观察与元素引用动作。
     "list_elements": _COMMON,
     "click_element": _COMMON | {"element_ref"},
     "set_value_element": _COMMON | {"element_ref", "text"},
@@ -58,12 +45,8 @@ _ALLOWED = {
 
 _TARGETS = ("browser", "desktop")
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
-# E2（2026-09-21 元素定位修复）有意协议变更：click_element / set_value_element
-# 改为双 target 支持——浏览器 observe 自动携带元素列表（el-N），元素动作按 ref
-# 走同一套 Playwright locator 通路；list_elements 仍为桌面专属（浏览器版职责
-# 由 observe 直接承担，不提供独立动作，见设计规格 3.1）。
 _DESKTOP_ONLY_KINDS = frozenset(
-    {"list_surfaces", "activate_surface", "invoke_surface", "list_elements", "wait_for"}
+    {"list_surfaces", "activate_surface", "invoke_surface", "list_elements"}
 )
 _BUTTONS = frozenset({"left", "right", "middle"})
 _REASON_CODES = frozenset({"login_required", "captcha_required", "credential_required"})
@@ -85,11 +68,6 @@ MAX_KEYS = 8
 MIN_PATH_POINTS = 2
 MAX_PATH_POINTS = 256
 
-# wait_for 条件等待（Windows-MCP 对齐，2026-11-09 协议扩展，desktop only）：
-# - condition 缺省 text_exists；每个条件只认自己的必填字段，无关字段拒绝；
-# - text / window_name 为 1~MAX_WAIT_FOR_NAME_CODEPOINTS 个字符；window_name
-#   在非 window_active 条件下可选作范围限定；
-# - timeout_ms / interval_ms 有默认值，越界直接拒绝（不裁剪、不静默收敛）。
 WAIT_FOR_CONDITIONS = ("text_exists", "element_exists", "element_enabled", "window_active")
 WAIT_FOR_DEFAULT_CONDITION = "text_exists"
 WAIT_FOR_DEFAULT_TIMEOUT_MS = 8000
@@ -100,16 +78,6 @@ MIN_WAIT_FOR_INTERVAL_MS = 100
 MAX_WAIT_FOR_INTERVAL_MS = 2000
 MAX_WAIT_FOR_NAME_CODEPOINTS = 200
 
-# sequence 批量动作（2026-09-06 协议扩展）：
-# - 子步骤白名单：无副作用定位的基本输入动作。observe/request_user_takeover
-#   改变操控状态、语义定位依赖观察候选、navigate 是 browser 专属跳转，
-#   均不允许打包（必须单独调用并逐次观察）。
-# - 2026-11-09（Windows-MCP 对齐）：click_element / set_value_element 可打包，
-#   让模型把「点按钮 → 填输入框」按元素引用一次提交，减少往返；它们只按
-#   el-N 引用操作，不刷新 ref 表。list_elements 会整体刷新 ref（它之前解析的
-#   子步骤引用会失效），故仍必须单独调用、不允许进 sequence。
-# - 子步骤 target 必须与 sequence 本身一致；schema 层 items 故意宽松
-#   （嵌套完整动作 schema 会成倍膨胀 tools 字节），严格校验在 parse 层。
 _SEQUENCE_STEP_KINDS = frozenset(
     {
         "click",
@@ -126,10 +94,6 @@ _SEQUENCE_STEP_KINDS = frozenset(
 )
 MAX_SEQUENCE_STEPS = 10
 
-# R7 滚动单位契约（显式协议扩展，2026-09-05）：
-# - browser：css_pixel（Playwright mouse.wheel 语义），每轴 -4000..4000；
-# - desktop：wheel_step（Win32 滚轮步进），每轴 -10..10；
-# 正方向统一为向右/向下；超限拒绝（不裁剪），两轴同时为零拒绝。
 SCROLL_UNITS = ("css_pixel", "wheel_step")
 MAX_BROWSER_SCROLL_PX = 4000
 MAX_DESKTOP_SCROLL_STEPS = 10
@@ -160,8 +124,8 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
             "browser 的 observe_region 用 x/y/width/height（CSS 视口坐标）"
             "裁剪放大该区域；之后再点击时坐标以这块区域左上角为 (0,0)。"
             "等待界面变化优先用 wait_for（text_exists / element_exists /"
-            " element_enabled / window_active，desktop only），不要用 wait 加"
-            "反复 observe 轮询：wait_for 命中后直接返回新观察，超时返回"
+            " element_enabled 支持 browser 同文档和 desktop；window_active 只支持 desktop），"
+            "不要用 wait 加反复 observe 轮询：wait_for 命中后直接返回新观察，超时返回"
             " computer_wait_timeout，此时改用 observe 检查画面再决定下一步。"
             "sequence 可以打包 click_element / set_value_element 等元素动作，但"
             "元素引用必须来自 sequence 之前最近一次 list_elements 返回的 ref，"
@@ -278,7 +242,6 @@ def _invalid(message: str) -> ComputerControlError:
 
 
 def _strict_int(value: object, field_name: str) -> int:
-    """只接受真正的 int；bool、float（含 NaN）和字符串一律拒绝。"""
     if type(value) is not int:
         raise _invalid(f"{field_name} 必须是整数，收到 {type(value).__name__}")
     return value
@@ -350,8 +313,6 @@ def _parse_url(value: object) -> str:
         parts = urlsplit(value)
         scheme = parts.scheme.lower()
         hostname = parts.hostname
-        # 访问 port 触发 urlsplit 的端口合法性校验（非法 IPv6 字面量、
-        # 非数字或越界端口在此抛 ValueError），统一归为 computer_invalid_action。
         parts.port
     except ValueError as exc:
         raise _invalid(f"url 不是合法地址: {exc}") from exc
@@ -474,7 +435,6 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
 
     if kind == "observe_region":
         if target == "desktop":
-            # desktop 沿用语义定位：按候选窗口边界裁剪，区域由候选决定。
             ref = payload.get("surface_ref")
             if not isinstance(ref, str) or not ref:
                 raise _invalid(
@@ -488,7 +448,6 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
             kwargs["surface_ref"] = ref
             kwargs["surface_generation"] = generation
         else:
-            # browser（E5）：按 CSS 视口坐标显式指定区域，用于放大密集小目标。
             if "surface_ref" in payload or "surface_generation" in payload:
                 raise _invalid("browser observe_region 不接受 surface_ref，请用 x/y/width/height")
             if any(name not in payload for name in ("x", "y", "width", "height")):
@@ -532,14 +491,16 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
         kwargs["element_ref"] = ref
 
     if kind == "wait_for":
-        # 条件等待（Windows-MCP 对齐，desktop only）：condition 缺省 text_exists；
-        # 每个条件只认自己的必填字段，不属于该条件的字段一律拒绝（不静默忽略），
-        # timeout_ms / interval_ms 越界直接拒绝，不裁剪也不静默收敛。
         condition = payload.get("condition", WAIT_FOR_DEFAULT_CONDITION)
         if not isinstance(condition, str) or condition not in WAIT_FOR_CONDITIONS:
             raise _invalid(
                 f"wait_for 的 condition 只支持 {list(WAIT_FOR_CONDITIONS)}，"
                 f"收到 {condition!r}"
+            )
+        if target == "browser" and condition == "window_active":
+            raise _invalid(
+                "browser wait_for 仅支持同文档 text_exists / element_exists / element_enabled，"
+                "window_active 只允许 desktop target"
             )
         kwargs["condition"] = condition
         if condition == "text_exists":
@@ -571,6 +532,8 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
                 "只有 element_exists / element_enabled 使用 element_ref"
             )
         if "window_name" in payload:
+            if target == "browser":
+                raise _invalid("browser wait_for 不支持 window_name（窗口匹配只允许 desktop）")
             window_name = payload["window_name"]
             if (
                 not isinstance(window_name, str)
@@ -655,16 +618,6 @@ def sanitized_action_summary(action: ComputerAction) -> dict:
 
 
 def observation_provider_projection(observation: ComputerObservation) -> dict:
-    """发给 Provider 的精简结果（设计 10.2）。
-
-    只含 ok/target/action/screen_sha256/width/height/origin_or_window/
-    error_code/error_message；绝不包含 png_path、时间戳、随机序号、
-    完整 URL query 或输入正文，保证相同画面产生相同字节。
-
-    R10：仅当观察携带语义定位候选（list_surfaces 结果）时附加
-    surface_candidates（ref/kind/label/bounds/operations/代数摘要），
-    普通观察投影字节不变。
-    """
     if observation.target == "browser":
         origin_or_window = observation.page_origin
     else:
@@ -693,3 +646,55 @@ def observation_provider_projection(observation: ComputerObservation) -> dict:
             for candidate in observation.surface_candidates
         ]
     return projection
+
+
+_PRE_SUBMIT_SEQUENCE_CODES = frozenset(
+    {
+        "computer_invalid_action",
+        "computer_coordinate_out_of_bounds",
+        "computer_element_stale",
+        "computer_surface_changed",
+        "computer_surface_ambiguous",
+        "computer_surface_unknown",
+        "computer_foreground_lost",
+        "computer_foreground_activation_failed",
+        "computer_elements_unavailable",
+        "computer_surfaces_unavailable",
+        "computer_cancelled",
+        "computer_wait_timeout",
+    }
+)
+
+
+def annotate_sequence_step_error(
+    error: ComputerControlError,
+    *,
+    step_index: int,
+    step_kind: str,
+    total_steps: int,
+    submitted_before_call: bool = True,
+) -> ComputerControlError:
+    """为 sequence/多步动作异常补充 failed_step_index 与提交态（不猜重放安全）。"""
+    details = dict(error.details) if error.details else {}
+    explicit = str(details.get("submission_state") or "")
+    if error.code == "computer_action_timeout" or explicit == "outcome_unknown":
+        submission_state = "outcome_unknown"
+    elif (
+        not submitted_before_call
+        or explicit == "not_submitted"
+        or error.code in _PRE_SUBMIT_SEQUENCE_CODES
+    ):
+        submission_state = "submitted" if step_index > 0 else "not_submitted"
+    else:
+        submission_state = "outcome_unknown"
+    details["failed_step_index"] = int(step_index)
+    details["failed_step_kind"] = str(step_kind or "")
+    details["submission_state"] = submission_state
+    details["completed_steps"] = int(step_index)
+    details["total_steps"] = int(total_steps)
+    suffix = (
+        f"（第 {step_index + 1}/{total_steps} 步 {step_kind} 失败，"
+        f"submission_state={submission_state}）"
+    )
+    message = error.message if "submission_state=" in error.message else f"{error.message}{suffix}"
+    return ComputerControlError(error.code, message, details=details)

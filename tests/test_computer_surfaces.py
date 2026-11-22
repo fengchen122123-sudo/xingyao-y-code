@@ -1,9 +1,3 @@
-"""R10：语义定位（SurfaceLocator）、局部观察与协议扩展测试。
-
-所有测试只使用 fake host / FakeSurfaceLocator / FakeImage / FakeWin32Adapter，
-绝不触碰真实窗口、UI Automation、鼠标键盘或截屏。
-"""
-
 import sys
 import threading
 import time
@@ -33,9 +27,6 @@ from tests.computer_fakes import (
 )
 
 
-# ---------------- region_to_physical 纯函数 ----------------
-
-
 def test_region_coordinate_round_trip_with_negative_origin():
     region = ObservationRegion(
         origin_x=-1000, origin_y=200, original_width=400, original_height=200,
@@ -56,11 +47,7 @@ def test_region_rejects_out_of_bounds_and_bool_without_clamping():
             region_to_physical(x, y, region)
 
 
-# ---------------- WindowsSurfaceLocator（fake host） ----------------
-
-
 class _FakeHost:
-    """_DefaultSurfaceHost 的纯 fake：返回配置的窗口/托盘元组。"""
 
     def __init__(self, windows=(), tray=()):
         self.windows = list(windows)
@@ -134,7 +121,7 @@ def test_list_windows_registers_candidates_with_refs_and_bounds():
     assert window.supported_operations == ("activate", "click_point")
     icon = tray[0]
     assert icon.kind == "tray_icon" and "invoke" in icon.supported_operations
-    assert icon.ref != window.ref  # 同名称候选身份也不同
+    assert icon.ref != window.ref
 
 
 def test_stale_ref_or_generation_is_rejected():
@@ -144,7 +131,6 @@ def test_stale_ref_or_generation_is_rejected():
     with pytest.raises(ComputerControlError) as raised:
         locator.activate_window(candidate.ref, candidate.surface_generation + 99)
     assert raised.value.code == "computer_surface_unknown"
-    # 重新列表后旧 ref 失效。
     fresh = locator.list_windows()[0]
     with pytest.raises(ComputerControlError) as raised2:
         locator.activate_window(candidate.ref, candidate.surface_generation)
@@ -164,7 +150,7 @@ def test_activate_window_verification_failure_propagates():
 
 
 def test_invoke_requires_invoke_support():
-    host = _FakeHost(tray=[(9001, "图标", (0, 0, 24, 24), False)])  # can_invoke=False
+    host = _FakeHost(tray=[(9001, "图标", (0, 0, 24, 24), False)])
     locator = _locator(host)
     candidate = locator.list_tray_icons()[0]
     assert candidate.supported_operations == ("click_point",)
@@ -192,9 +178,6 @@ def test_closed_locator_rejects_everything():
     assert raised.value.code == "computer_surfaces_unavailable"
 
 
-# ---------------- 动作解析 ----------------
-
-
 def test_parse_accepts_semantic_desktop_actions():
     action = parse_computer_action({"kind": "list_surfaces", "target": "desktop"})
     assert action.kind == "list_surfaces"
@@ -212,10 +195,10 @@ def test_parse_accepts_semantic_desktop_actions():
 
 
 @pytest.mark.parametrize("payload", [
-    {"kind": "list_surfaces", "target": "browser"},          # desktop only
+    {"kind": "list_surfaces", "target": "browser"},
     {"kind": "activate_surface", "target": "browser",
      "surface_ref": "r", "surface_generation": 0},
-    {"kind": "activate_surface", "target": "desktop"},       # 缺 ref/generation
+    {"kind": "activate_surface", "target": "desktop"},
     {"kind": "activate_surface", "target": "desktop", "surface_ref": "r"},
     {"kind": "activate_surface", "target": "desktop",
      "surface_ref": "", "surface_generation": 0},
@@ -223,7 +206,7 @@ def test_parse_accepts_semantic_desktop_actions():
      "surface_ref": "r", "surface_generation": True},
     {"kind": "observe_region", "target": "desktop",
      "surface_ref": "r", "surface_generation": -1},
-    {"kind": "list_surfaces", "target": "desktop", "x": 1},  # 未知字段
+    {"kind": "list_surfaces", "target": "desktop", "x": 1},
 ])
 def test_parse_rejects_invalid_semantic_actions(payload):
     with pytest.raises(ComputerControlError) as raised:
@@ -237,9 +220,6 @@ def test_schema_declares_semantic_actions():
     for kind in ("list_surfaces", "activate_surface", "observe_region"):
         assert kind in kinds
     assert "surface_ref" in properties and "surface_generation" in properties
-
-
-# ---------------- 桌面 backend 语义动作 ----------------
 
 
 def _desktop_backend(locator=None, adapter=None):
@@ -266,7 +246,6 @@ def test_list_surfaces_candidates_ride_on_next_observation():
     assert any("微信" in label for label in labels)
     kinds = {candidate["kind"] for candidate in observation.surface_candidates}
     assert kinds == {"window", "tray_icon"}
-    # 普通观察不再携带候选。
     assert backend.observe("run-a").surface_candidates == ()
 
 
@@ -304,11 +283,9 @@ def test_observe_region_crops_original_resolution_and_maps_coordinates():
         ),
     )
     region_observation = backend.observe("run-a")
-    # 48x48 区域保持原分辨率（不再缩小到 24x24）。
     assert (region_observation.width, region_observation.height) == (48, 48)
     assert (region_observation.origin_x, region_observation.origin_y) == (1000, 600)
     assert region_observation.scale_x == 1.0
-    # 区域中心点击反算回物理坐标。
     backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=24, y=24))
     assert adapter.clicks == [(1024, 624, "left")]
 
@@ -331,7 +308,6 @@ def test_region_baseline_invalidated_when_candidate_moves():
         ),
     )
     backend.observe("run-a")
-    # 候选移动：旧区域坐标作废，零输入。
     locator.bounds_override[candidate["ref"]] = (500, 300, 48, 48)
     with pytest.raises(ComputerControlError) as raised:
         backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=24, y=24))
@@ -377,12 +353,8 @@ def test_semantic_candidates_in_provider_projection():
     assert candidates[0]["label"] == "微信"
     assert candidates[0]["bounds"] == [1, 2, 300, 200]
     assert "surface_generation" in candidates[0]
-    # 无候选的普通观察投影字节形状不变。
     plain = observation_provider_projection(backend.observe("run-a"))
     assert "surface_candidates" not in plain
-
-
-# ---------------- Controller 集成 ----------------
 
 
 def _owner():
@@ -393,7 +365,6 @@ def _owner():
 
 
 def test_semantic_actions_flow_through_controller_and_are_no_progress_exempt():
-    """list_surfaces/observe_region 经固定适配链执行，且不计入无进展。"""
     backend = FakeComputerBackend(target="desktop")
     service = ComputerControlService(
         backend_factory=lambda target, identity: backend,
@@ -420,12 +391,10 @@ def test_semantic_actions_flow_through_controller_and_are_no_progress_exempt():
 # call() 再把任务投进无人消费的队列、再白等 10 秒，最终对外谎报「调用超时」。
 # 以下测试只注入 sys.modules 里的纯 fake，绝不触碰真实 comtypes / UIA。
 
-# 初始化失败时的最长可接受耗时：远小于旧的 10 秒空等。
 _PROMPT_FAILURE_BUDGET_SECONDS = 2.0
 
 
 def _install_fake_comtypes(monkeypatch):
-    """把纯 fake 的 comtypes 家族塞进 sys.modules，返回 (生命周期记录, 假 UIA 对象)。"""
     lifecycle = []
     sentinel_uia = object()
 
@@ -446,7 +415,7 @@ def _install_fake_comtypes(monkeypatch):
     uia_client = types.ModuleType("comtypes.gen.UIAutomationClient")
 
     class IUIAutomation:
-        """占位接口类型：仅用于满足 `from ... import IUIAutomation`。"""
+        pass
 
     uia_client.IUIAutomation = IUIAutomation
     gen.UIAutomationClient = uia_client
@@ -460,10 +429,8 @@ def _install_fake_comtypes(monkeypatch):
 
 
 def test_com_thread_start_raises_immediately_when_import_fails(monkeypatch):
-    """comtypes 导入失败：start() 必须立即报真实异常类型，而不是等 10 秒。"""
     from core.computer.platforms.windows_surfaces import _ComThread
 
-    # sys.modules[name] = None 会让 `import name` 抛 ImportError（纯桩，无真实依赖）。
     monkeypatch.setitem(sys.modules, "comtypes", None)
     try:
         import comtypes  # noqa: F401  仅为取得真实异常类型名
@@ -482,7 +449,7 @@ def test_com_thread_start_raises_immediately_when_import_fails(monkeypatch):
 
     assert raised.value.code == "computer_surfaces_unavailable"
     message = str(raised.value)
-    assert expected_type_name in message  # 带真实异常类型，例如 ModuleNotFoundError
+    assert expected_type_name in message
     assert "超时" not in message  # 绝不把初始化失败伪装成调用超时
     assert elapsed < _PROMPT_FAILURE_BUDGET_SECONDS, (
         f"初始化失败必须立即返回，实际等待 {elapsed:.2f} 秒"
@@ -490,7 +457,6 @@ def test_com_thread_start_raises_immediately_when_import_fails(monkeypatch):
 
 
 def test_com_thread_call_fails_immediately_after_init_failure(monkeypatch):
-    """初始化失败后 call() 必须立即失败，不得再空等 10 秒。"""
     from core.computer.platforms.windows_surfaces import _ComThread
 
     monkeypatch.setitem(sys.modules, "comtypes", None)
@@ -508,19 +474,18 @@ def test_com_thread_call_fails_immediately_after_init_failure(monkeypatch):
 
     assert raised.value.code == "computer_surfaces_unavailable"
     assert "超时" not in str(raised.value)
-    assert executed == []  # 任务根本不应被投递到无人消费的队列
+    assert executed == []
     assert elapsed < _PROMPT_FAILURE_BUDGET_SECONDS, (
         f"初始化失败后 call() 必须立即失败，实际等待 {elapsed:.2f} 秒"
     )
 
 
 def test_com_thread_success_path_and_close_semantics_unchanged(monkeypatch):
-    """正常初始化路径仍可用；call 正常执行、异常透传，close 释放 COM。"""
     from core.computer.platforms.windows_surfaces import _ComThread
 
     lifecycle, sentinel_uia = _install_fake_comtypes(monkeypatch)
     com = _ComThread()
-    com.start()  # 成功路径不得抛错
+    com.start()
     try:
         assert com.call(lambda uia: uia is sentinel_uia) is True
         assert com.call(lambda uia: "ok") == "ok"

@@ -1,5 +1,3 @@
-"""P1a0：无窗口导入、健康检查。"""
-
 from __future__ import annotations
 
 import json

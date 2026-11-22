@@ -9,7 +9,6 @@
       :style="panelStyle"
       @click.stop
     >
-      <!-- 本会话块：数字与状态行同源（落库聚合，重启不清零），额外给请求数/最近活跃 -->
       <div class="tup-section">
         <div class="tup-title-row">
           <span class="tup-title">本会话</span>
@@ -25,7 +24,6 @@
           <span class="tup-metric"><i>请求</i>{{ formatTokenCount(sessionTotals.requests) }} 次</span>
         </div>
         <div class="tup-sub">最近活跃 {{ lastActiveText }}</div>
-        <!-- 保活烧损单列：只在确有保活轮次时出现，不与对话口径混算 -->
         <div v-if="sessionTotals.keepalive_requests > 0" class="tup-keepalive" data-test="tup-keepalive">
           保活烧损 {{ formatTokenCount(sessionTotals.keepalive_prompt) }} tokens
           （{{ sessionTotals.keepalive_requests }} 次保活请求）
@@ -34,7 +32,6 @@
 
       <div class="tup-sep"></div>
 
-      <!-- 全部会话合计：走落库口径，重启不清零（与状态行旧进程累计口径区分） -->
       <div class="tup-section">
         <div class="tup-title-row">
           <span class="tup-title">全部会话</span>
@@ -53,7 +50,6 @@
 
       <template v-if="sessionRows.length">
         <div class="tup-sep"></div>
-        <!-- 会话列表：按合计 token 降序，点击行切换到对应会话 -->
         <div class="tup-list" data-test="tup-session-list">
           <div
             v-for="row in sessionRows"
@@ -118,7 +114,6 @@ const allRateText = computed(() => {
   return rate === null ? '' : `${Math.round(rate)}%`;
 });
 
-// 相对时间：与侧栏"5天/17小时"同风格的粗粒度表达，够定位即可
 const lastActiveText = computed(() => {
   const ts = sessionTotals.value.last_ts;
   if (!ts) return '暂无记录';
@@ -143,7 +138,6 @@ function onPickSession(sessionId: string) {
   store.switchSession(sessionId);
 }
 
-// 打开即拉取列表与合计（每次打开都刷新，不做后台轮询）
 watch(() => props.visible, (visible) => {
   if (visible) {
     positionPanel();
@@ -158,14 +152,12 @@ function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') emit('close');
 }
 
-// 点击面板与锚点之外关闭（与 PermDropdown 同款全局点击约定）
 function onGlobalClick(e: MouseEvent) {
   if (props.visible && props.anchorEl && !props.anchorEl.contains(e.target as Node)) {
     emit('close');
   }
 }
 
-// —— 定位：向上弹出（输入框在底部）、水平对齐锚点并在视口内夹取 ——
 const PANEL_WIDTH = 380;
 const PANEL_GAP = 8;
 const VIEWPORT_PADDING = 12;

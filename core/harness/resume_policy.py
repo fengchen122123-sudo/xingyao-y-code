@@ -1,8 +1,3 @@
-"""断点续跑判定层：纯函数，零 I/O、零项目内依赖。
-
-判定顺序即安全优先级：任何"不确定"一律先 BLOCK，绝不猜。
-本模块只回答"这一步能不能自动重放"，不做任何执行。
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,7 +10,7 @@ class ReplayDecision(str, Enum):
 
     REPLAY = "replay"              # 只读 + 已完成 + 哈希一致 → 回灌结果，不重新执行
     REPLAY_FRESH = "replay_fresh"  # 只读但结果哈希不符 → 允许重新执行该只读调用
-    CONFIRM = "confirm"            # 写操作，需用户逐项确认
+    CONFIRM = "confirm"
     BLOCK = "block"                # 绝不自动执行
 
 
@@ -32,7 +27,7 @@ class ToolReplayFacts:
     tool_name: str
     side_effect_scope: str
     read_only: bool
-    source: str = "builtin"            # builtin | plugin | mcp | secretary
+    source: str = "builtin"
     started: bool = True
     finished: bool = False
     result_hash_ok: bool = True
@@ -62,7 +57,6 @@ def _is_pure_read(scope: str, read_only: bool) -> bool:
 
 
 def decide_replay(facts: Any) -> tuple[ReplayDecision, str]:
-    """返回 (决策, 原因码)。对任何输入都不抛异常。"""
     try:
         scope = _text(getattr(facts, "side_effect_scope", ""))
         read_only = _flag(facts, "read_only")
@@ -79,7 +73,6 @@ def decide_replay(facts: Any) -> tuple[ReplayDecision, str]:
             return ReplayDecision.BLOCK, "hash_anchor_mismatch"
         if not _flag(facts, "tool_available", True):
             return ReplayDecision.BLOCK, "tool_unavailable"
-        # 只有"已开始但未完成"才是不确定态；从未开始不算。
         if started and not finished:
             return ReplayDecision.BLOCK, "uncertain_state"
         if source in UNTRUSTED_SOURCES:
@@ -92,7 +85,6 @@ def decide_replay(facts: Any) -> tuple[ReplayDecision, str]:
             if _flag(facts, "result_hash_ok", True):
                 return ReplayDecision.REPLAY, "read_replay"
             return ReplayDecision.REPLAY_FRESH, "read_hash_mismatch"
-        # workspace / git / network / system 以及未知 scope 一律走人工确认。
         return ReplayDecision.CONFIRM, "write_requires_confirmation"
     except Exception:
         # 决策异常的兜底：保守确认（方向与写操作一致），但原因码独立，

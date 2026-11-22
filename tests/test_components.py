@@ -1,17 +1,3 @@
-"""core/components.py（Playwright 按需组件）单元测试。
-
-覆盖：
-  - 未安装时 playwright_installed() 为 False、ensure_playwright() 抛 ComponentError
-  - 手工造出的组件目录被识别为已安装、ensure_playwright() 不抛
-  - 解压安全（zip-slip）：含 ``../`` 成员的包被拒绝且临时目录外无文件落盘
-  - 下载安装状态机：SHA256 不匹配时安装失败且旧组件保持原状；正常包能装进去
-  - Release 说明里的组件包 digest：命中则强制校验（错就 corrupt 失败、对就装进去），
-    缺失时仍安装但必须留下告警（不允许静默放行）
-
-全部用例不发起真实网络请求（urlopen 被 monkeypatch），组件目录与 YCODE_DIR
-都指向 pytest 的 tmp_path。
-"""
-
 from __future__ import annotations
 
 import json
@@ -29,7 +15,6 @@ from core import components
 
 
 class _FakeResponse:
-    """urllib.request.urlopen 的最小替身：实现 context manager + read(size)。"""
 
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -53,7 +38,6 @@ class _FakeResponse:
 
 
 def _patch_urlopen(monkeypatch, payload: bytes) -> None:
-    """把 urllib.request.urlopen 换成返回固定字节的替身，杜绝真实网络。"""
 
     def fake_urlopen(request, timeout=None):
         return _FakeResponse(payload)
@@ -62,7 +46,6 @@ def _patch_urlopen(monkeypatch, payload: bytes) -> None:
 
 
 def _make_component_dir(pw_dir: Path, version: str = "1.50.0") -> None:
-    """手工造一个结构完整的组件目录（playwright 包 + node driver + 依赖 + manifest）。"""
     pw_dir = Path(pw_dir)
     (pw_dir / "playwright" / "driver").mkdir(parents=True, exist_ok=True)
     (pw_dir / "playwright" / "__init__.py").write_text("", encoding="utf-8")
@@ -76,7 +59,6 @@ def _make_component_dir(pw_dir: Path, version: str = "1.50.0") -> None:
 
 
 def _build_component_zip(zip_path: Path, version: str) -> bytes:
-    """构造一个结构合法的组件压缩包，返回其字节内容。"""
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.writestr(
             "COMPONENT.json",
@@ -90,7 +72,6 @@ def _build_component_zip(zip_path: Path, version: str) -> bytes:
 
 
 def _staging_dirs(root: Path) -> list[Path]:
-    """列出组件根目录下残留的临时解压目录。"""
     if not root.exists():
         return []
     return [p for p in root.iterdir() if p.name.startswith(".playwright-extract-")]
@@ -98,7 +79,6 @@ def _staging_dirs(root: Path) -> list[Path]:
 
 @pytest.fixture()
 def component_env(tmp_path, monkeypatch):
-    """把组件目录整体指到 tmp_path，并重置模块级单例状态。"""
     root = tmp_path / "components"
     root.mkdir()
     monkeypatch.delenv("YCODE_COMPONENT_DIR", raising=False)
@@ -106,9 +86,7 @@ def component_env(tmp_path, monkeypatch):
     monkeypatch.setattr(components, "COMPONENT_ROOT", str(root))
     monkeypatch.setattr(components, "PLAYWRIGHT_DIR", str(root / "playwright"))
     monkeypatch.setattr(config, "YCODE_DIR", str(tmp_path))
-    # sys.path 换成副本：ensure_playwright 的插入不污染真实解释器状态
     monkeypatch.setattr(sys, "path", list(sys.path))
-    # 模块级缓存/单例状态复位（避免用例间互相影响）
     monkeypatch.setattr(components, "_import_ready", False)
     monkeypatch.setattr(components, "_download_thread", None)
     monkeypatch.setattr(
@@ -128,8 +106,6 @@ def component_env(tmp_path, monkeypatch):
 
 
 def test_not_installed_status_and_ensure_raises(component_env, monkeypatch):
-    """未安装：installed 为 False、无版本号，ensure_playwright() 抛 missing 错误码。"""
-    # 开发环境 site-packages 里装着 playwright，用 None 占位强制 import 失败
     monkeypatch.setitem(sys.modules, "playwright", None)
 
     assert components.playwright_installed() is False
@@ -138,7 +114,6 @@ def test_not_installed_status_and_ensure_raises(component_env, monkeypatch):
     assert status["installed"] is False
     assert status["downloading"] is False
     assert status["dir"] == str(components.PLAYWRIGHT_DIR)
-    # 未安装时版本比对为「未知」，不得误报 outdated
     assert status["version_compatible"] is None
     assert status["outdated"] is False
     assert status["version_warning"] == ""
@@ -148,7 +123,6 @@ def test_not_installed_status_and_ensure_raises(component_env, monkeypatch):
     assert excinfo.value.code == "playwright_component_missing"
     assert "电脑操控" in str(excinfo.value)
 
-    # 组件目录只允许被插入 sys.path 一次（重复调用不得重复插入）
     target = os.path.normcase(os.path.abspath(str(components.PLAYWRIGHT_DIR)))
     inserted = [p for p in sys.path if os.path.normcase(os.path.abspath(p)) == target]
     assert len(inserted) == 1
@@ -159,18 +133,16 @@ def test_not_installed_status_and_ensure_raises(component_env, monkeypatch):
 
 
 def test_installed_component_detected_and_ensure_ok(component_env):
-    """结构完整的组件目录：检测为已安装，ensure_playwright() 不抛异常。"""
     _make_component_dir(Path(components.PLAYWRIGHT_DIR), version="1.51.0")
 
     assert components.playwright_installed() is True
     assert components.playwright_version() == "1.51.0"
     assert components.get_status()["installed"] is True
-    components.ensure_playwright()  # 不抛即通过
+    components.ensure_playwright()
     assert components._import_ready is True
 
 
 def test_version_falls_back_to_repo_version_file(component_env):
-    """COMPONENT.json 缺失版本号时回退读 playwright/_repo_version.py。"""
     pw_dir = Path(components.PLAYWRIGHT_DIR)
     _make_component_dir(pw_dir, version="1.50.0")
     (pw_dir / "COMPONENT.json").unlink()
@@ -181,24 +153,22 @@ def test_version_falls_back_to_repo_version_file(component_env):
 
 
 def test_ensure_inserts_component_dir_once_then_caches(component_env, monkeypatch):
-    """首轮 import 失败时插入组件目录并重试；成功后走缓存不再重试。"""
     calls: list[bool] = []
 
     def fake_try_import() -> bool:
         calls.append(True)
-        return len(calls) > 1  # 首次失败（需插入 sys.path），插入后成功
+        return len(calls) > 1
 
     monkeypatch.setattr(components, "_try_import_playwright", fake_try_import)
     components.ensure_playwright()
     assert len(calls) == 2
     target = os.path.normcase(os.path.abspath(str(components.PLAYWRIGHT_DIR)))
     assert [p for p in sys.path if os.path.normcase(os.path.abspath(p)) == target]
-    components.ensure_playwright()  # 缓存命中，不再调用
+    components.ensure_playwright()
     assert len(calls) == 2
 
 
 def test_extract_rejects_path_traversal(component_env, tmp_path):
-    """含 ../ 成员的 zip 被拒绝解压，且临时目录外没有任何文件落盘。"""
     archive_path = tmp_path / "evil.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("../evil.txt", "pwned")
@@ -213,7 +183,6 @@ def test_extract_rejects_path_traversal(component_env, tmp_path):
 
 
 def test_extract_rejects_absolute_member_path(component_env, tmp_path):
-    """含绝对路径成员的 zip 同样被拒绝（防目录穿越的另一半）。"""
     archive_path = tmp_path / "absolute.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr(str(tmp_path / "abs.txt"), "pwned")
@@ -228,7 +197,6 @@ def test_extract_rejects_absolute_member_path(component_env, tmp_path):
 def test_sha256_mismatch_fails_and_keeps_previous_install(
     component_env, monkeypatch, tmp_path
 ):
-    """SHA256 不匹配：报 corrupt 错误码、清理临时文件、旧组件目录保持原状。"""
     _make_component_dir(Path(components.PLAYWRIGHT_DIR), version="1.0.0")
     payload = _build_component_zip(tmp_path / "new.zip", "9.9.9")
     _patch_urlopen(monkeypatch, payload)
@@ -240,7 +208,6 @@ def test_sha256_mismatch_fails_and_keeps_previous_install(
         url="https://example.invalid/playwright-component.zip",
     )
     assert started is True
-    # 下载中重复调用返回 False（单例语义）
     assert components.start_download(on_event=events.append) is False
 
     thread = components._download_thread
@@ -252,7 +219,6 @@ def test_sha256_mismatch_fails_and_keeps_previous_install(
     assert status["installed"] is True
     assert status["error"]
     assert components.playwright_version() == "1.0.0"
-    # 不留半装状态：临时 zip / 临时解压目录全部清理
     assert not (component_env / "playwright-component.zip").exists()
     assert not (component_env / "playwright-component.zip.tmp").exists()
     assert _staging_dirs(component_env) == []
@@ -261,7 +227,6 @@ def test_sha256_mismatch_fails_and_keeps_previous_install(
 
 
 def test_download_success_replaces_old_component(component_env, monkeypatch, tmp_path):
-    """正常包：下载→解压→原子替换，旧组件被新版本替换且不留 .bak。"""
     _make_component_dir(Path(components.PLAYWRIGHT_DIR), version="1.0.0")
     payload = _build_component_zip(tmp_path / "new.zip", "9.9.9")
     _patch_urlopen(monkeypatch, payload)
@@ -288,19 +253,15 @@ def test_download_success_replaces_old_component(component_env, monkeypatch, tmp
     assert "downloading" in stages
     assert "extracting" in stages
     assert stages[-1] == "done"
-    # 旧目录已被删除，没有 .bak 残留
     assert not [p for p in component_env.iterdir() if ".bak-" in p.name]
     assert _staging_dirs(component_env) == []
-    # Minor 3：安装成功后组件包不再保留（见 test_success_install_removes_component_zip）
     assert not (component_env / "playwright-component.zip").exists()
 
 
 def test_cancel_download_cleans_temp_files(component_env, monkeypatch, tmp_path):
-    """取消下载：线程尽快退出、状态复位且不留临时文件。"""
     payload = _build_component_zip(tmp_path / "new.zip", "9.9.9")
 
     def slow_urlopen(request, timeout=None):
-        # 首块之后就让取消标志生效：模拟用户在下载中途点取消
         return _FakeResponse(payload)
 
     monkeypatch.setattr(components.urllib.request, "urlopen", slow_urlopen)
@@ -320,7 +281,6 @@ def test_cancel_download_cleans_temp_files(component_env, monkeypatch, tmp_path)
 
 
 def test_resolve_component_url_prefers_explicit_and_env(component_env, monkeypatch):
-    """下载源解析：显式参数 > 环境变量 > Release 附件（这里只测前两级，不联网）。"""
     assert components._resolve_component_url("https://example.invalid/explicit.zip") == (
         "https://example.invalid/explicit.zip"
     )
@@ -329,11 +289,9 @@ def test_resolve_component_url_prefers_explicit_and_env(component_env, monkeypat
 
 
 def test_resolve_component_url_uses_release_asset(component_env, monkeypatch):
-    """无显式地址时从 fetch_latest_release 的摊平字段里挑 playwright-component 资产。"""
     import core.updater
 
     monkeypatch.delenv("YCODE_PLAYWRIGHT_COMPONENT_URL", raising=False)
-    # 单测不能依赖线上 Release：先隔离完整 Release 拉取，再验证摊平字段回退。
     monkeypatch.setattr(components, "_fetch_latest_release_entry", lambda: {})
     monkeypatch.setattr(
         core.updater,
@@ -350,7 +308,6 @@ def test_resolve_component_url_uses_release_asset(component_env, monkeypatch):
 
 
 def test_resolve_component_url_raises_when_no_asset(component_env, monkeypatch):
-    """Release 里没有组件包时抛 download_failed 且提示未找到下载源。"""
     import core.updater
 
     monkeypatch.delenv("YCODE_PLAYWRIGHT_COMPONENT_URL", raising=False)
@@ -371,11 +328,6 @@ def test_resolve_component_url_raises_when_no_asset(component_env, monkeypatch):
 
 
 
-# ---------------------------------------------------------------- 组件包 digest
-# 发版侧（build_release.py::step4c_make_release_parts）把组件包 SHA256 写进 Release
-# 说明的固定行：``<资产文件名>  SHA256=<64 位十六进制>``。以下用例锁定「客户端必须
-# 用这条 digest 强制校验」以及「拿不到 digest 时不得静默放行」。
-
 _MAIN_INSTALLER_DIGEST = "b" * 64
 
 
@@ -384,7 +336,6 @@ def _component_asset_name(version: str = "9.9.9") -> str:
 
 
 def _make_release_notes(component_lines: str = "") -> str:
-    """仿 build_release.py 生成的发布说明（含主安装包 SHA256 行与组件包校验行）。"""
     lines = [
         "## 更新内容",
         "（从 assets/CHANGELOG.md 复制本版本条目）",
@@ -401,7 +352,6 @@ def _make_release_notes(component_lines: str = "") -> str:
 
 
 def _patch_release_entry(monkeypatch, asset_name: str, notes: str) -> None:
-    """把 Release 条目查询换成固定结构（含 body=发布说明，不发起网络请求）。"""
     monkeypatch.setattr(
         components,
         "_fetch_latest_release_entry",
@@ -420,7 +370,6 @@ def _patch_release_entry(monkeypatch, asset_name: str, notes: str) -> None:
 
 
 def test_parse_component_digest_line_from_release_notes(component_env):
-    """发布说明里的组件包校验行能被解析，且不会污染主安装包的 SHA256 解析。"""
     import core.updater
 
     digest = "a" * 64
@@ -428,18 +377,15 @@ def test_parse_component_digest_line_from_release_notes(component_env):
     notes = _make_release_notes(f"{name}  SHA256={digest}")
 
     assert components._parse_component_digest(notes, name) == digest
-    # 发版时组件包换了版本号（名字对不上）也只有一条组件行，仍然认它
     assert components._parse_component_digest(
         notes, "playwright-component-2.0.0.zip"
     ) == digest
-    # 关键回归：组件行不得被主安装包的 SHA256 解析器误吞
     assert core.updater.parse_release_sha256(notes) == _MAIN_INSTALLER_DIGEST
     # 说明里没有组件包行时返回空串（由调用层告警，绝不能静默放行）
     assert components._parse_component_digest(_make_release_notes(""), name) == ""
 
 
 def test_parse_component_digest_prefers_matching_asset_name(component_env):
-    """多条组件校验行时按资产名精确匹配；都对不上且有多条则不瞎猜。"""
     first, second = "1" * 64, "2" * 64
     notes = _make_release_notes(
         f"playwright-component-1.50.0.zip  SHA256={first}\n"
@@ -457,7 +403,6 @@ def test_parse_component_digest_prefers_matching_asset_name(component_env):
 
 
 def test_release_digest_mismatch_blocks_install(component_env, monkeypatch, tmp_path):
-    """Release 说明里的 digest 与包内容不符：报 corrupt、拒绝安装、旧组件保持原状。"""
     _make_component_dir(Path(components.PLAYWRIGHT_DIR), version="1.0.0")
     payload = _build_component_zip(tmp_path / "new.zip", "9.9.9")
     _patch_urlopen(monkeypatch, payload)
@@ -481,20 +426,18 @@ def test_release_digest_mismatch_blocks_install(component_env, monkeypatch, tmp_
     monkeypatch.setattr(components, "_verify_sha256", spy)
 
     events: list[dict] = []
-    # 刻意不传 expected_sha256：调用层必须自己从 Release 说明解析出来
     assert components.start_download(on_event=events.append) is True
     thread = components._download_thread
     thread.join(timeout=20)
     assert not thread.is_alive()
 
-    # digest 确实来自 Release 说明（而不是空值直接放行）
     assert verified[0] == wrong_digest
     assert "code=playwright_component_corrupt" in verified
     status = components.get_status()
     assert status["downloading"] is False
     assert status["error"]
     assert "SHA256" in status["error"]
-    assert components.playwright_version() == "1.0.0"  # 旧组件保持原状
+    assert components.playwright_version() == "1.0.0"
     assert events[-1]["stage"] == "error"
     assert not (component_env / "playwright-component.zip").exists()
     assert not (component_env / "playwright-component.zip.tmp").exists()
@@ -502,7 +445,6 @@ def test_release_digest_mismatch_blocks_install(component_env, monkeypatch, tmp_
 
 
 def test_release_digest_match_installs_component(component_env, monkeypatch, tmp_path):
-    """Release 说明里的 digest 与包内容一致：正常完成安装并标记已校验。"""
     import hashlib
 
     payload = _build_component_zip(tmp_path / "new.zip", "9.9.9")
@@ -531,7 +473,6 @@ def test_release_digest_match_installs_component(component_env, monkeypatch, tmp
 def test_missing_release_digest_installs_with_warning(
     component_env, monkeypatch, tmp_path, caplog
 ):
-    """Release 说明缺组件包校验行：仍可安装，但必须留下日志与进度告警。"""
     payload = _build_component_zip(tmp_path / "new.zip", "9.9.9")
     _patch_urlopen(monkeypatch, payload)
     name = _component_asset_name("9.9.9")
@@ -550,7 +491,6 @@ def test_missing_release_digest_installs_with_warning(
     assert components.playwright_version() == "9.9.9"
     assert status["digest_verified"] is False
     assert status["warning"]
-    # 告警必须同时出现在进度事件里，前端/CLI 才看得见
     assert any(event.get("warning") for event in events)
 
 
@@ -561,7 +501,6 @@ def test_missing_release_digest_installs_with_warning(
 
 
 def test_success_install_removes_component_zip(component_env, monkeypatch, tmp_path):
-    """安装成功（stage=done）后组件包被删除，组件目录照常可用。"""
     import hashlib
 
     payload = _build_component_zip(tmp_path / "new.zip", "1.60.0")
@@ -582,7 +521,6 @@ def test_success_install_removes_component_zip(component_env, monkeypatch, tmp_p
     assert status["installed"] is True
     assert status["error"] == ""
     assert components.playwright_version() == "1.60.0"
-    # 关键断言：删除只发生在安装确认成功之后
     assert not (component_env / "playwright-component.zip").exists()
     assert not (component_env / "playwright-component.zip.tmp").exists()
     assert _staging_dirs(component_env) == []
@@ -590,7 +528,6 @@ def test_success_install_removes_component_zip(component_env, monkeypatch, tmp_p
 
 
 def test_failed_install_keeps_component_zip_for_diagnosis(component_env, monkeypatch):
-    """解压失败（下载内容不是有效 zip）：转正后的组件包必须保留供人工排查。"""
     import hashlib
 
     payload = b"definitely not a zip archive"
@@ -610,20 +547,12 @@ def test_failed_install_keeps_component_zip_for_diagnosis(component_env, monkeyp
     assert status["stage"] == "error"
     assert status["installed"] is False
     assert events[-1]["stage"] == "error"
-    # 失败路径保留组件包（排查凭据），只清临时 zip 与解压暂存目录
     assert (component_env / "playwright-component.zip").exists()
     assert not (component_env / "playwright-component.zip.tmp").exists()
     assert _staging_dirs(component_env) == []
 
 
-# ---------------------------------------------------------------- 组件版本比对
-# 主程序对 Playwright 有版本要求（requirements.txt 的 playwright>=1.55,<2），组件目录
-# COMPONENT.json 的 playwright_version 必须落在该约束内；Release 升级主程序后沿用旧
-# 组件时，get_status() 必须给出可见提示，而不是只判断「能否 import」。
-
-
 def test_required_playwright_spec_matches_requirements_txt():
-    """运行期常量必须与 requirements.txt 的 playwright 约束逐字一致（防漂移）。"""
     requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
     spec = ""
     for line in requirements.read_text(encoding="utf-8").splitlines():
@@ -636,7 +565,6 @@ def test_required_playwright_spec_matches_requirements_txt():
 
 
 def test_version_compatible_within_and_outside_spec():
-    """比对函数：范围内的算匹配，越界/跨大版本算不匹配，无法解析算未知（None）。"""
     assert components.playwright_version_compatible("1.62.0") is True
     assert components.playwright_version_compatible("1.55") is True
     assert components.playwright_version_compatible("1.60.0.post1") is True
@@ -647,7 +575,6 @@ def test_version_compatible_within_and_outside_spec():
 
 
 def test_status_flags_outdated_component(component_env):
-    """旧组件：installed 仍为 True，但 status 必须给出中文「版本不匹配」提示。"""
     _make_component_dir(Path(components.PLAYWRIGHT_DIR), version="1.51.0")
 
     status = components.get_status()
@@ -663,7 +590,6 @@ def test_status_flags_outdated_component(component_env):
 
 
 def test_status_accepts_component_matching_spec(component_env):
-    """版本落在要求范围内：不报 outdated，提示为空串。"""
     _make_component_dir(Path(components.PLAYWRIGHT_DIR), version="1.62.0")
 
     status = components.get_status()
@@ -674,10 +600,8 @@ def test_status_accepts_component_matching_spec(component_env):
 
 
 def test_status_keeps_quiet_when_version_unknown(component_env):
-    """已安装但版本号读不出来：判断为未知（None），不得误报 outdated。"""
     pw_dir = Path(components.PLAYWRIGHT_DIR)
     _make_component_dir(pw_dir, version="1.62.0")
-    # 无 COMPONENT.json 也无 playwright/_repo_version.py → playwright_version() 返回空串
     (pw_dir / "COMPONENT.json").unlink()
 
     status = components.get_status()
@@ -714,7 +638,6 @@ _FFMPEG_STATUS_KEYS = {
 
 
 def test_ffmpeg_spec_registered():
-    """ffmpeg 已登记进 _COMPONENTS，且关键字段值固定（桥接层/前端文案依赖它们）。"""
     spec = components._COMPONENTS["ffmpeg"]
     assert spec is components.FFMPEG_SPEC
     assert components.get_component_spec("ffmpeg") is spec
@@ -725,7 +648,6 @@ def test_ffmpeg_spec_registered():
     assert spec.asset_hint == "ffmpeg-component"
     assert spec.required_files == ("ffmpeg.exe",)
     assert spec.required_dirs == ()
-    # 不是 Python 包：版本约束/版本探测文件/import 名一律为空，泛化实现必须容忍
     assert spec.version_spec == ""
     assert spec.version_probe_file == ""
     assert spec.import_name == ""
@@ -738,7 +660,6 @@ def test_ffmpeg_spec_registered():
 
 
 def test_ffmpeg_not_installed_status(component_env):
-    """空组件目录：installed/downloading 均为 False，15 键齐全且版本为空串。"""
     status = components.get_component_status("ffmpeg")
 
     assert set(status.keys()) == _FFMPEG_STATUS_KEYS
@@ -746,7 +667,6 @@ def test_ffmpeg_not_installed_status(component_env):
     assert status["installed"] is False
     assert status["downloading"] is False
     assert status["version"] == ""
-    # 没有版本约束 → 版本比对为「未知」，不得误报 outdated
     assert status["required_version"] == ""
     assert status["version_compatible"] is None
     assert status["outdated"] is False
@@ -756,7 +676,6 @@ def test_ffmpeg_not_installed_status(component_env):
 
 
 def test_ffmpeg_installed_detection(component_env):
-    """ffmpeg.exe 就位即算已安装，且版本号能从 COMPONENT.json 的 ffmpeg_version 读到。"""
     ffmpeg_dir = Path(components.component_dir("ffmpeg"))
     ffmpeg_dir.mkdir(parents=True, exist_ok=True)
     (ffmpeg_dir / "ffmpeg.exe").write_bytes(b"stub-ffmpeg")
@@ -771,27 +690,17 @@ def test_ffmpeg_installed_detection(component_env):
     assert status["outdated"] is False
     assert status["version_warning"] == ""
 
-    # 必检文件缺失 → 回到未安装（required_files 真的在参与判定）
     (ffmpeg_dir / "ffmpeg.exe").unlink()
     assert components.get_component_status("ffmpeg")["installed"] is False
 
 
 def test_unknown_component_raises():
-    """未知组件 id 抛 ComponentError，错误码为 ``<id>_component_unknown``。"""
     with pytest.raises(components.ComponentError) as excinfo:
         components.get_component_status("nope")
     assert excinfo.value.code == "nope_component_unknown"
 
 
-# ---------------------------------------------------------------- search 组件
-# 第三个接入组件注册表的组件（网页搜索组件：ddgs + primp + lxml + fake_useragent
-# 四个纯 Python/二进制包目录）。与 ffmpeg 恰好互补地验证另一条空值分支：
-# 它 required_files 为空、required_dirs 有四个——安装检测必须靠目录判定，
-# 不能因为「没有单个标志文件」就恒判未安装或恒判已安装。
-
-
 def test_search_spec_registered():
-    """search 已登记进 _COMPONENTS，且关键字段值固定（桥接层/提示文案依赖它们）。"""
     spec = components._COMPONENTS["search"]
     assert spec is components.SEARCH_SPEC
     assert components.get_component_spec("search") is spec
@@ -800,10 +709,8 @@ def test_search_spec_registered():
     assert spec.archive_name == "search-component.zip"
     assert spec.extract_prefix == ".search-extract-"
     assert spec.asset_hint == "search-component"
-    # 与 ffmpeg 相反：没有单个标志文件，只能按顶层包目录判定
     assert spec.required_files == ()
     assert spec.required_dirs == ("ddgs", "primp", "lxml", "fake_useragent")
-    # 不做版本约束：没有约束、没有版本探测文件
     assert spec.version_spec == ""
     assert spec.version_probe_file == ""
     assert spec.manifest_version_key == "search_version"
@@ -816,16 +723,13 @@ def test_search_spec_registered():
 
 
 def test_search_not_installed_status(component_env):
-    """空组件目录：installed/downloading 均为 False，15 键齐全且版本为空串。"""
     status = components.get_component_status("search")
 
-    # 状态形状必须与 playwright / ffmpeg 完全一致（前端同一套渲染）
     assert set(status.keys()) == _FFMPEG_STATUS_KEYS
     assert len(status) == 15
     assert status["installed"] is False
     assert status["downloading"] is False
     assert status["version"] == ""
-    # 没有版本约束 → 版本比对为「未知」，不得误报 outdated
     assert status["required_version"] == ""
     assert status["version_compatible"] is None
     assert status["outdated"] is False
@@ -835,7 +739,6 @@ def test_search_not_installed_status(component_env):
 
 
 def test_search_installed_detection(component_env):
-    """四个包目录 + COMPONENT.json 就位即算已安装；缺任一目录回到未安装。"""
     search_dir = Path(components.component_dir("search"))
     for package in ("ddgs", "primp", "lxml", "fake_useragent"):
         (search_dir / package).mkdir(parents=True, exist_ok=True)
@@ -851,26 +754,20 @@ def test_search_installed_detection(component_env):
     assert status["outdated"] is False
     assert status["version_warning"] == ""
 
-    # 少一个必检目录 → 未安装（required_dirs 真的在参与判定，而不是恒真/恒假）
     shutil.rmtree(search_dir / "fake_useragent")
     assert components.get_component_status("search")["installed"] is False
 
 
 def test_ensure_search_component_inserts_dir_then_caches(component_env, monkeypatch):
-    """首轮导入失败时插入组件目录并重试；成功后走独立缓存不再重试。
-
-    顺带守住「缓存不与 playwright 共用」这条约束：_search_import_ready 与
-    _import_ready 是两个独立布尔，playwright 已就绪不代表 ddgs 已就绪。
-    """
     calls: list[bool] = []
 
     def fake_try_import() -> bool:
         calls.append(True)
-        return len(calls) > 1  # 首次失败（需插入 sys.path），插入后成功
+        return len(calls) > 1
 
     monkeypatch.setattr(components, "_try_import_ddgs", fake_try_import)
     monkeypatch.setattr(components, "_search_import_ready", False)
-    monkeypatch.setattr(components, "_import_ready", True)  # playwright 已就绪
+    monkeypatch.setattr(components, "_import_ready", True)
 
     components.ensure_search_component()
     assert len(calls) == 2
@@ -878,12 +775,11 @@ def test_ensure_search_component_inserts_dir_then_caches(component_env, monkeypa
     assert [p for p in sys.path if os.path.normcase(os.path.abspath(p)) == target]
     assert components._search_import_ready is True
 
-    components.ensure_search_component()  # 缓存命中，不再重试
+    components.ensure_search_component()
     assert len(calls) == 2
 
 
 def test_ensure_search_component_missing_raises(component_env, monkeypatch):
-    """导入始终失败：抛 search_component_missing，文案带设置页路径。"""
     monkeypatch.setattr(components, "_try_import_ddgs", lambda: False)
     monkeypatch.setattr(components, "_search_import_ready", False)
 

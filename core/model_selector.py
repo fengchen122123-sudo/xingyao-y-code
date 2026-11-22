@@ -1,8 +1,3 @@
-"""
-core/model_selector.py
-/models 指令触发的全屏 CLI 选择器。
-预置厂商、模型元数据与 GUI 共用 core.model_catalog，只需输入 API Key。
-"""
 import io
 import threading
 import contextlib
@@ -34,17 +29,10 @@ PRESET_PROVIDERS = get_preset_providers()
 
 
 def _test_model_connection(protocol: str, model: str, base_url: str, api_key: str):
-    """使用与正式对话完全相同的协议入口验证模型连接。
-
-    多 Key（换行 / 逗号 / 分号分隔）时逐 Key 尝试，任一成功即通过；
-    全部失败抛出最后一个错误（调用方的错误格式化与展示逻辑不变）；
-    单 Key / 空 Key 行为与现状完全一致。
-    """
     from core.provider_keys import split_provider_keys
 
     keys = split_provider_keys(api_key)
     if not keys:
-        # 空串或非字符串输入：维持现状——不带 api_key 直接请求一次
         keys = [api_key]
     last_error: Exception | None = None
     for key in keys:
@@ -57,7 +45,6 @@ def _test_model_connection(protocol: str, model: str, base_url: str, api_key: st
 
 
 def _test_model_connection_once(protocol: str, model: str, base_url: str, api_key: str):
-    """单 Key 连接测试：正式对话同源协议入口（不做多 Key 遍历）。"""
     from core.llm import _request_stream
 
     kwargs = {
@@ -80,23 +67,19 @@ def _test_model_connection_once(protocol: str, model: str, base_url: str, api_ke
 
 
 def _t(style: str, text: str):
-    """快捷构造 (style, text) 元组"""
     return (style, text)
 
 
 def _format_test_error(exception, model_name):
-    """格式化连接测试错误信息"""
     msg = str(exception)
     if not msg:
         msg = repr(exception)
-    # 截断过长的错误信息
     if len(msg) > 200:
         msg = msg[:200] + "..."
     return f"连接测试失败 (模型: {model_name}): {msg}"
 
 
 def _fetched_model_entry(entry: dict) -> dict:
-    """把「拉取可用模型」的条目转成 add_preset_provider_with_models 接受的形状。"""
     model = {
         "name": str(entry.get("id") or ""),
         "context_window": int(entry.get("context_window") or 128000),
@@ -109,7 +92,6 @@ def _fetched_model_entry(entry: dict) -> dict:
 
 
 def _latest_total_tokens() -> int:
-    """读取当前会话最新一轮的 token 总量（持锁，与 core.llm 的后台写线程互斥）。"""
     from core.llm import session_token_usage, token_usage_lock
     with token_usage_lock:
         return session_token_usage["latest_total"]
@@ -117,13 +99,13 @@ def _latest_total_tokens() -> int:
 
 def open_model_selector(on_model_selected=None):
     state = {
-        "mode":           "list",   # list | wizard | edit | addmodel
+        "mode":           "list",
         "cursor":         0,
         "items":          [],
         "preset_cursor":  0,
         "selected_preset": None,
         "proto_cursor":   0,
-        "add_step":       0,        # 0=select_preset_or_custom, 100=preset_key, 1=custom_name...
+        "add_step":       0,
         "add_data":       {},
         "new_provider_id": None,
         "message":        "",
@@ -132,7 +114,7 @@ def open_model_selector(on_model_selected=None):
         "edit_data":      {},
         "edit_model_id":   None,
         "edit_provider_id":None,
-        "am_step":        0,        # 为已有厂商添加模型：0=model_name 1=ctx
+        "am_step":        0,
         "am_data":        {},
         "am_provider_id":  None,
         "sec_cursor":     0,
@@ -141,7 +123,7 @@ def open_model_selector(on_model_selected=None):
         "roles_data":     {"vision": True, "compression": True, "subagent": True},
         "return_to_secondary": False,
         "secondary_candidate_id": None,
-        "pick":           None,      # 拉取可用模型列表的选择态（None=未拉取）
+        "pick":           None,
     }
 
     # 显式使用 multiline=False 限制单行输入框，绝不允许插入换行符造成残留与扩展
@@ -240,10 +222,6 @@ def open_model_selector(on_model_selected=None):
         threading.Thread(target=test_conn, daemon=True).start()
 
     def _save_preset_with_models(event, key, entries):
-        """用拉取到的所选模型验证预设厂商连接，成功后保存厂商与所选模型。
-
-        预置目录只含厂商信息、不携带模型，模型由「拉取可用模型」按需选择。
-        """
         preset = state.get("selected_preset")
         if not preset or not entries:
             return
@@ -364,7 +342,6 @@ def open_model_selector(on_model_selected=None):
                 def _on_success():
                     state["message"] = "✔ 模型连接测试成功，已保存！"
                     state["add_step"] = 6
-                    # new_provider_id 在 UI 线程写入，供后续"继续添加模型"复用
                     state["new_provider_id"] = pid
                     main_win.vertical_scroll = 0
                     layout.focus(main_win)
@@ -448,11 +425,6 @@ def open_model_selector(on_model_selected=None):
         threading.Thread(target=test_conn, daemon=True).start()
 
     def _start_pick(event, purpose, base_url, api_key, protocol, title):
-        """后台拉取厂商可用模型列表，结果回投 UI 后在下方展示供选择。
-
-        purpose: add=custom 新增厂商 / addmodel=给已有厂商加模型 / preset=预设厂商。
-        拉取失败与网络不可达都只落到 pick["msg"]，可随时按 r 重试或 Esc 回到手动输入。
-        """
         from core.model_discovery import fetch_model_list
 
         state["pick"] = {
@@ -517,7 +489,6 @@ def open_model_selector(on_model_selected=None):
         return pick.get("models") or []
 
     def _pick_rows() -> int:
-        """选择态的可移动行数（模型数 + 可选手动输入行）。"""
         pick = state.get("pick") or {}
         rows = len(_pick_entries())
         return rows + (1 if pick.get("allow_manual") else 0)
@@ -942,7 +913,6 @@ def open_model_selector(on_model_selected=None):
         return out
 
     def get_main_content():
-        # 拉取选择态覆盖当前向导：列表需要可滚动与独立光标
         if state.get("pick"):
             return render_picker()
         if state["mode"] == "list":
@@ -963,22 +933,16 @@ def open_model_selector(on_model_selected=None):
         # 各 render 函数开头均有固定头部行，items 从偏移行后开始，每项占 1 行。
         mode = state["mode"]
         if state.get("pick"):
-            # render_picker: 标题 + 分隔线 + 端点 + 个数 + 提示 = 5 行头部；
-            # 加载中/失败态没有可滚动列表，光标置于顶部
             pick = state["pick"]
             if pick.get("status") == "ok":
                 return Point(x=0, y=5 + int(pick.get("cursor") or 0))
             return Point(x=0, y=0)
         if mode == "list":
-            # render_list：标题 + 分隔线 + 副模型行 = 3 行头部
             return Point(x=0, y=3 + state["cursor"])
         if mode == "secondary":
-            # render_secondary_selector：标题 + 分隔线 + 当前用途 = 3 行头部
             return Point(x=0, y=3 + state["sec_cursor"])
         if mode == "wizard" and state["add_step"] == 0:
-            # render_wizard step0：标题 + 分隔线 + 步骤标题 + 提示 = 4 行头部
             return Point(x=0, y=4 + state["preset_cursor"])
-        # 其他模式（向导输入步 / 编辑 / 副模型用途）内容较短，光标置于顶部
         return Point(x=0, y=0)
 
     main_ctrl = FormattedTextControl(get_main_content, focusable=True, get_cursor_position=get_cursor_position)
@@ -1081,7 +1045,6 @@ def open_model_selector(on_model_selected=None):
     @kb.add("up", filter=Condition(lambda: state["mode"] == "list"))
     def _up(event):
         if state["cursor"] == 0:
-            # 已在列表顶部，不允许向上绕行到底部
             return
         state["cursor"] = max(0, state["cursor"] - 1)
         _skip_providers(-1)
@@ -1161,7 +1124,6 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("d", filter=Condition(lambda: state["mode"] == "list"))
     def _delete(event):
-        # 两步确认：删除模型是破坏性操作，与会话/MCP 选择器保持一致的确认习惯
         if not state["items"]:
             return
         item = state["items"][min(state["cursor"], len(state["items"]) - 1)]
@@ -1209,8 +1171,6 @@ def open_model_selector(on_model_selected=None):
     @kb.add("c-c")
     def _quit(event):
         if state.get("testing"):
-            # 连接测试进行中不允许退出：后台线程还会回投 UI 更新，
-            # 此时关闭 loop 会让测试线程崩溃
             state["message"] = "⏳ 正在测试连接，请稍候再退出..."
             return
         event.app.exit()
@@ -1242,8 +1202,6 @@ def open_model_selector(on_model_selected=None):
             
         state["message"] = ""
         step = state["add_step"]
-        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
-        # 混入配置后请求会直接 400，且肉眼极难排查
         text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
@@ -1301,7 +1259,6 @@ def open_model_selector(on_model_selected=None):
 
         elif step == 4:
             if not text:
-                # 空输入 = 拉取该厂商可用模型列表（Base URL 与 API Key 已在上一步录入）
                 proto = PROTOCOLS[state["add_data"].get("proto_idx", 0)][0]
                 _start_pick(
                     event, "add",
@@ -1411,7 +1368,6 @@ def open_model_selector(on_model_selected=None):
             input_buf.set_document(Document(str(state["add_data"].get("context_window", 128000))))
             layout.focus(input_buf)
         elif step == 6:
-            # "继续添加/完成保存"步骤按 Esc：直接完成保存，返回列表
             state["items"] = build_items()
             state["mode"] = "list"
             state["message"] = "✔ 厂商已保存！"
@@ -1426,13 +1382,10 @@ def open_model_selector(on_model_selected=None):
 
         state["message"] = ""
         step = state["am_step"]
-        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
-        # 混入配置后请求会直接 400，且肉眼极难排查
         text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
             if not text:
-                # 空输入 = 拉取该厂商可用模型列表（直接复用已保存的厂商配置）
                 provider = None
                 for candidate in load_config().get("providers", []):
                     if candidate["id"] == state["am_provider_id"]:
@@ -1522,8 +1475,6 @@ def open_model_selector(on_model_selected=None):
             
         state["message"] = ""
         step = state["edit_step"]
-        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
-        # 混入配置后请求会直接 400，且肉眼极难排查
         text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
@@ -1677,9 +1628,6 @@ def open_model_selector(on_model_selected=None):
     def _roles_esc(event):
         _open_secondary_selector(event)
 
-    # ----- 拉取可用模型列表的选择态 -----
-    # 这些绑定注册在最后：prompt_toolkit 按键分发按「后注册优先」，
-    # 保证列表选择期间 Enter / ↑↓ / Esc 不会落进各向导分支。
     def _pick_retry(event):
         pick = state.get("pick") or {}
         if state.get("testing"):
@@ -1715,7 +1663,6 @@ def open_model_selector(on_model_selected=None):
             return
 
         if cursor >= len(models):
-            # 「手动输入模型名称」行：关掉列表，回到名称输入框
             state["pick"] = None
             state["message"] = ""
             if purpose == "add":

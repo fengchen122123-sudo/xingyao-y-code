@@ -1,26 +1,3 @@
-"""
-publish_release.py
-==================
-把 build_release.py 产出的 dist/release_parts/ 分卷附件一键发布到 Gitee Releases。
-
-流程：
-  1. 解析 Gitee 认证令牌（GITEE_TOKEN 环境变量 > git credential 存储的 HTTPS 凭据）
-  2. 读取 core/version.py 版本号与 dist/release_parts/RELEASE_NOTES.txt 中的 SHA256
-  3. 从 assets/CHANGELOG.md 提取本版本条目组装发布说明（保留 SHA256 校验行，
-     自动更新端 core/updater.py 依赖它做安装包完整性校验，格式勿改动）
-  4. 创建 Release（tag v{版本}，指向 dev 分支最新提交）
-  5. 逐个流式上传分卷附件（multipart，避免 95MB 整体读入内存）
-
-用法：
-  venv\\Scripts\\python publish_release.py --check      验证令牌并查看现有 Release
-  venv\\Scripts\\python publish_release.py              正式发布（tag 已存在时报错退出）
-  venv\\Scripts\\python publish_release.py --force     tag 已存在时删除重建
-  venv\\Scripts\\python publish_release.py --dry-run   只打印将要发布的内容，不调写接口
-
-令牌准备（git 凭据不可用时）：
-  https://gitee.com/profile/personal_access_tokens 创建私人令牌（勾选 projects），
-  然后 set GITEE_TOKEN=xxx 或临时 $env:GITEE_TOKEN='xxx' 后运行本脚本。
-"""
 import argparse
 import json
 import os
@@ -34,16 +11,11 @@ from urllib.parse import urlencode
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-# 与 core/updater.py 的 GITEE_REPO 保持一致
 GITEE_REPO = "feng-chenhao/xingyao-y-code"
 API_BASE = "https://gitee.com/api/v5"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 RELEASE_TARGET_BRANCH = "dev"
 
-
-# ============================================================================
-# 认证与 API 基础封装
-# ============================================================================
 
 def resolve_token():
     """GITEE_TOKEN 环境变量优先；否则读 git credential 里 gitee.com 的 HTTPS 凭据。
@@ -75,14 +47,8 @@ def resolve_token():
 
 def _api_request(path, token, method="GET", params=None, data=None,
                  headers=None, timeout=60):
-    """统一 API 调用：GET 走 query，写操作走 form-encoded body。
-
-    data 为 dict 时 form 编码并追加 access_token；为自定义流式对象时
-    原样透传（大文件 multipart 上传用）。
-    """
     url = f"{API_BASE}{path}"
     if method == "GET":
-        # GET 请求统一把 access_token 拼进 query（params 为空也必须带上）
         merged = dict(params or {})
         merged["access_token"] = token
         url += "?" + urlencode(merged)
@@ -101,10 +67,6 @@ def _api_request(path, token, method="GET", params=None, data=None,
 
 
 class MultipartBody:
-    """流式 multipart 请求体：字段前缀 + 文件内容 + 结尾边界。
-
-    实现 read() 供 http.client 分块发送，95MB 分卷不必整体读入内存。
-    """
 
     def __init__(self, field, filename, filepath, extra_fields=None):
         self.boundary = "----ycodepub" + uuid.uuid4().hex
@@ -126,7 +88,7 @@ class MultipartBody:
         self._filesize = os.path.getsize(filepath)
         self.length = len(self._prefix) + self._filesize + len(self._suffix)
         self._file = None
-        self._phase = 0  # 0=前缀 1=文件 2=后缀 3=完成
+        self._phase = 0
 
     def read(self, n=-1):
         """读取最多 n 字节，跨阶段聚合。
@@ -157,7 +119,6 @@ class MultipartBody:
                     parts.append(chunk)
                     total += len(chunk)
                 else:
-                    # 文件读尽：关文件进 phase 2，循环继续取结尾边界
                     self._file.close()
                     self._file = None
                     self._phase = 2
@@ -172,10 +133,6 @@ class MultipartBody:
         return b"".join(parts)
 
 
-# ============================================================================
-# 发布内容组装
-# ============================================================================
-
 def read_project_version():
     path = os.path.join(PROJECT_DIR, "core", "version.py")
     with open(path, encoding="utf-8") as f:
@@ -187,7 +144,6 @@ def read_project_version():
 
 
 def changelog_section(version):
-    """提取 CHANGELOG.md 中本版本小节（## {version} ... 到下一个 ## 之间）。"""
     path = os.path.join(PROJECT_DIR, "assets", "CHANGELOG.md")
     with open(path, encoding="utf-8") as f:
         text = f.read()
@@ -236,10 +192,6 @@ def build_release_body(version, sha256, part_files):
 
     return "\n".join(lines).strip()
 
-
-# ============================================================================
-# 发布流程
-# ============================================================================
 
 def list_releases(token):
     return _api_request(f"/repos/{GITEE_REPO}/releases", token,
@@ -312,10 +264,9 @@ def upload_attachment(token, release_id, filepath, retries=3):
             except urllib.error.HTTPError as e:
                 last_err = e
                 if e.code in (400, 422):
-                    continue  # 字段名不对，换下一个再试
+                    continue
                 raise
             except Exception as e:
-                # 网络抖动（远端断连/超时）：重试
                 last_err = e
                 break
         if attempt < retries:
@@ -336,18 +287,6 @@ def delete_attachment(token, release_id, attach_file_id):
 
 
 def verify_remote_attachment(download_url, local_path, timeout=30.0):
-    """上传后回读校验：确认 Gitee 附件管道没有按内容嗅探篡改文件。
-
-    v1.2.16 事故：part4 首字节 FE 91 被误判为 UTF-16 文本，CDN 注入 FF
-    拼成 BOM（体积 +1 字节）并以 text/plain; charset=utf-16le 返回，
-    旧客户端的 Content-Type 防线将其误判为风控页，自动更新确定性失败。
-
-    三重比对（只读首 64 字节，不整文件下载）：
-      1. Content-Type 不得为 text/html / text/plain（文本/网页标记）
-      2. Content-Length 必须与本地文件一致（注入/截断必导致不等）
-      3. 首 64 字节必须与本地完全一致（同长度的内容改写也能检出）
-    返回 (ok, 失败原因)；ok=True 时原因为空串。
-    """
     try:
         req = urllib.request.Request(
             download_url, headers={"User-Agent": "ycode-publisher-verify"})
@@ -372,12 +311,6 @@ def verify_remote_attachment(download_url, local_path, timeout=30.0):
 
 
 def upload_and_verify(token, release_id, filepath):
-    """上传附件并立即回读校验；校验失败自动删除坏附件重传一次。
-
-    重传仍失败时抛 RuntimeError——绝把被 CDN 篡改的附件留在 Release 上
-    （旧客户端会因此确定性更新失败）。
-    成功时返回最后一次上传的 API 响应 dict。
-    """
     last_reason = ""
     for attempt in (1, 2):
         resp = upload_attachment(token, release_id, filepath)
@@ -416,22 +349,15 @@ def parse_version_from_tag(tag):
 
 
 def cleanup_old_releases(token, current_tag, releases, keep_last_n=2):
-    """自动清理旧 Release：保留最近 keep_last_n 个版本，删除更早的。
-
-    用于控制 Gitee 仓库附件总容量（免费版约 500MB）。例如当前 v1.2.8，
-    keep_last_n=2 时保留 v1.2.8 + v1.2.7，删除 v1.2.6 及更早版本。
-    """
     if not releases:
         return
 
-    # 按版本号降序排序（新 -> 旧）
     sorted_releases = sorted(
         releases,
         key=lambda r: parse_version_from_tag(r.get("tag_name", "")),
         reverse=True,
     )
 
-    # 保留前 keep_last_n 个，删除其余的
     to_delete = sorted_releases[keep_last_n:]
     if not to_delete:
         print(f"ℹ 现有 Release 共 {len(releases)} 个，无需清理（保留最近 {keep_last_n} 个）")
@@ -470,7 +396,6 @@ def main():
         print("   然后 $env:GITEE_TOKEN='令牌' 后重新运行。")
         sys.exit(1)
 
-    # 验证令牌（只打印登录名，不回显令牌）
     releases = []
     if token and not args.dry_run:
         try:
@@ -482,7 +407,6 @@ def main():
             print("   $env:GITEE_TOKEN='令牌' 然后重试")
             sys.exit(1)
 
-        # 列出现有 Release
         try:
             releases = list_releases(token)
             print(f"ℹ 现有 Release {len(releases)} 个：")
@@ -502,7 +426,6 @@ def main():
         print(f"❌ 未找到 {parts_dir}（先运行 build_release.py 生成分卷产物）")
         sys.exit(1)
 
-    # 待上传附件 = 目录下除指引外的全部文件（分卷 + 未切分的单 exe）
     raw_files = [
         f for f in os.listdir(parts_dir)
         if f != "RELEASE_NOTES.txt" and os.path.isfile(os.path.join(parts_dir, f))
@@ -517,11 +440,10 @@ def main():
         stem = re.sub(r"\.part\d+$", "", name)
         low = stem.lower()
         is_cli = "cli" in low
-        # 主安装包：新命名 XingYaoCode-{版本}，或旧命名 Y-code-{版本}（均不含 cli）
         is_main = (low.startswith("xingyaocode") or low.startswith("y-code")) and not is_cli
         group_rank = 0 if is_main else (1 if is_cli else 2)
         m = re.search(r"\.part(\d+)$", name)
-        part_no = int(m.group(1)) if m else 0  # 数字升序，避免 part10 排到 part2 前面
+        part_no = int(m.group(1)) if m else 0
         return (group_rank, low, part_no)
 
     part_files = sorted(raw_files, key=_upload_sort_key)
@@ -529,8 +451,6 @@ def main():
         print("❌ dist/release_parts/ 下没有可上传的附件")
         sys.exit(1)
 
-    # 回读校验模式：逐片比对远端附件与本地分卷（Content-Type/大小/首 64 字节），
-    # 用于发布事故排查与发布后的独立审计
     if args.verify:
         try:
             release = get_release_by_tag(token, tag)
@@ -582,7 +502,6 @@ def main():
         print("\n[dry-run] 未实际创建 Release。")
         return
 
-    # 补传模式：Release 已存在（上次上传部分失败），只传缺失附件
     if args.attach_only:
         try:
             release = get_release_by_tag(token, tag)
@@ -623,7 +542,6 @@ def main():
         print(f"👉 https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
         return
 
-    # tag 冲突处理
     existing = next((r for r in releases if r.get("tag_name") == tag), None) if releases else None
     if existing:
         if not args.force:
@@ -633,7 +551,6 @@ def main():
         delete_release(token, existing["id"])
         print("✔ 旧 Release 已删除")
 
-    # 创建 Release
     print(f"\n🚀 创建 Release {tag} ...")
     release = create_release(token, tag, f"Y-CODE v{version}", body)
     release_id = release.get("id")
@@ -642,7 +559,6 @@ def main():
         sys.exit(1)
     print(f"✔ Release 已创建 (id={release_id})")
 
-    # 逐个上传附件
     ok, failed = 0, []
     total = len(part_files)
     for i, name in enumerate(part_files, 1):
@@ -667,19 +583,14 @@ def main():
     print(f"👉 Release 页面: https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
     print("ℹ 老版本应用内『检查更新』即可自动下载分卷拼接并校验安装。")
 
-    # Gitee latest 指针不会因 API 创建 Release 而自动刷新，存量客户端的
-    # 更新检查会因此看不到新版本：发布成功后触碰一次触发重算。
     try:
         touch_release(token, release_id, tag, f"Y-CODE v{version}", body)
         print("✔ 已触碰 Release，latest 指针已刷新")
     except Exception as e:
         print(f"⚠ 触碰 Release 失败（latest 指针可能滞留旧版，可网页端手动编辑一次）：{e}")
 
-    # 发布成功后按需清理旧版本附件（仅 --cleanup 显式开启）：
-    # 默认不清理，旧版本由维护者手动在网页端删除
     if args.cleanup and not args.dry_run and releases:
         try:
-            # 重新拉取最新 Release 列表（包含刚发布的）
             updated_releases = list_releases(token)
             cleanup_old_releases(token, tag, updated_releases, keep_last_n=2)
         except Exception as e:

@@ -1,28 +1,3 @@
-"""项目画像：跨项目结构化长期记忆（秘书升级设计 2026-11-04 第 5 节）。
-
-一个项目（workdir）对应一个 Markdown 文件，落在
-``~/.ycode/memory/projects/<sha1(规范化 workdir)[:12]>.md``。文件纯文本、
-可读可手改，供秘书在两件事上复用：
-
-1. **派活自动注入**：``dispatch_task`` 把 技术栈 / 架构决策 / 硬约束 三节
-   截断后拼在任务正文前，目标会话不用用户再交代一遍背景；
-2. **显式记录**：秘书调 ``remember_decision`` 把约束、踩坑、偏好落盘，
-   跨会话跨项目可查。
-
-职责边界（与 ``core.secretary_dispatches`` 同风格）：
-
-- 只碰 ``~/.ycode/memory/projects/`` 下的文件，**绝不写项目目录**；每次写盘
-  前都用 ``os.path.abspath`` 校验目标仍在 projects 目录内（防 ``../`` 越界）；
-- 读失败一律返回空串、写失败只记 ``logger.debug`` 不抛，异常不得把派活或
-  回合收尾带崩；
-- 唯一的"抛"是**入参校验**（非法章节 / 空内容）：那是调用方的错误，必须让
-  它看到可读原因，而不是静默丢弃用户的记录。
-
-数据目录取值与 ``core.memory_kairos`` 同源：``YCODE_DATA_DIR`` 优先，否则
-``~/.ycode``；两者都在**调用时**解析（而非 import 时），这样测试重定向
-``HOME`` / ``USERPROFILE`` / ``YCODE_DATA_DIR`` 后立即生效。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -61,16 +36,13 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# --- 章节常量 ---------------------------------------------------------------
 SECTION_STACK = "技术栈"
 SECTION_ARCHITECTURE = "架构决策"
 SECTION_CONSTRAINT = "硬约束"
 SECTION_PITFALL = "踩坑记录"
 SECTION_PREFERENCE = "用户偏好"
-#: 任务流水由回合收尾自动追加（纯文本 append，不调模型），不在秘书可写枚举里
 SECTION_TASK_LOG = "任务流水"
 
-#: 秘书可通过 ``remember_decision`` 写入的章节（设计第 5.2 节）
 SECTION_ALLOWED = (
     SECTION_STACK,
     SECTION_ARCHITECTURE,
@@ -79,19 +51,15 @@ SECTION_ALLOWED = (
     SECTION_PREFERENCE,
 )
 
-#: 画像正文的章节顺序（模板与重写都按它排，任务流水固定最后）
 SECTION_ORDER = SECTION_ALLOWED + (SECTION_TASK_LOG,)
 
 #: 派活时自动带入的章节：只带"约束类"信息，踩坑与偏好留给秘书按需查
 INJECT_SECTIONS = (SECTION_STACK, SECTION_ARCHITECTURE, SECTION_CONSTRAINT)
 
-#: 注入正文的默认字符上限（设计第 5.3 节）
 DEFAULT_INJECTION_LIMIT = 800
 
-#: 会话级「项目状态」注入块的标题行（每轮现算，不进稳定快照）
 STATE_HEADER = "【项目状态】以下为本工作目录已记录的项目背景（自动注入，无需向用户复述来源）："
 
-#: 画像 frontmatter ``updated`` 超过该天数即标注「状态可能已过期」
 STATE_STALE_DAYS = 30
 
 #: 单条记录的内容上限，防止一轮把画像写成日志
@@ -104,9 +72,6 @@ _HEADING_RE = re.compile(r"^##\s+(.+?)\s*$")
 _DRIVE_RE = re.compile(r"^([A-Za-z]):")
 
 
-# ---------------------------------------------------------------------------
-# 路径解析
-# ---------------------------------------------------------------------------
 def _data_dir() -> Path:
     """数据根目录：``YCODE_DATA_DIR`` 优先，否则 ``~/.ycode``（调用时解析）。"""
     override = str(os.environ.get("YCODE_DATA_DIR") or "").strip()
@@ -121,11 +86,6 @@ def projects_root() -> Path:
 
 
 def normalize_workdir(workdir) -> str:
-    """规范化 workdir 作为哈希键：统一分隔符、折叠 ``.``/``..``、去尾分隔符、
-    Windows 盘符大写；空值 / ``GLOBAL``（以及 ``SECRETARY``）返回空串。
-
-    只做词法处理，不碰磁盘——画像键必须在目录还被删掉时依然稳定。
-    """
     raw = str(workdir or "").strip().strip('"').strip("'").strip()
     if not raw:
         return ""
@@ -141,7 +101,6 @@ def normalize_workdir(workdir) -> str:
             if folded and folded[-1] != "..":
                 folded.pop()
                 continue
-            # 相对路径开头的 .. 保留（越界只影响哈希值，落盘位置始终在 projects 下）
             folded.append(part)
             continue
         folded.append(part)
@@ -155,11 +114,6 @@ def normalize_workdir(workdir) -> str:
 
 
 def profile_path(workdir) -> Optional[Path]:
-    """画像文件路径；workdir 为空 / ``GLOBAL`` 时返回 ``None``。
-
-    用 ``None`` 而不是 ``Path("")`` 表示"没有画像"：后者等价于当前目录，
-    极易被 ``if path:`` 误判成合法路径。
-    """
     normalized = normalize_workdir(workdir)
     if not normalized:
         return None
@@ -168,7 +122,6 @@ def profile_path(workdir) -> Optional[Path]:
 
 
 def _project_name(normalized: str) -> str:
-    """画像文件的展示名：workdir 的最后一段（``D:/work/demo`` → ``demo``）。"""
     text = str(normalized or "").rstrip("/")
     if not text:
         return normalized
@@ -179,11 +132,7 @@ def _project_name(normalized: str) -> str:
     return name or normalized
 
 
-# ---------------------------------------------------------------------------
-# 解析与渲染
-# ---------------------------------------------------------------------------
 def _strip_frontmatter(text: str) -> str:
-    """去掉开头 ``---`` ... ``---`` 的 frontmatter，返回正文。"""
     lines = text.splitlines()
     if lines and lines[0].strip() == "---":
         for index in range(1, len(lines)):
@@ -193,7 +142,6 @@ def _strip_frontmatter(text: str) -> str:
 
 
 def _split_blocks(text: str) -> List[Tuple[str, str]]:
-    """正文按 ``## 章节`` 切成 ``[(章节名, 正文)]``；首个 ## 之前的一段章节名为空串。"""
     blocks: List[Tuple[str, List[str]]] = [(("", []))]
     current_name = ""
     current_lines: List[str] = []
@@ -215,7 +163,6 @@ def _split_blocks(text: str) -> List[Tuple[str, str]]:
 
 
 def _section_map(text: str) -> dict:
-    """``{章节名: 正文}``；同名章节按出现顺序拼接（手改重复标题时不丢内容）。"""
     merged: dict = {}
     for name, body in _split_blocks(_strip_frontmatter(text)):
         if not name:
@@ -234,7 +181,6 @@ def _render(
     preamble: str,
     stamp: str,
 ) -> str:
-    """按模板重写整份画像（frontmatter + 六章 + 用户手加的额外章节）。"""
     lines = ["---", "workdir: %s" % normalized, "updated: %s" % stamp, "---"]
     if preamble.strip():
         lines += ["", preamble.strip()]
@@ -251,7 +197,6 @@ def _render(
 
 
 def _template(normalized: str, stamp: str) -> str:
-    """新建画像时的模板（设计第 5.1 节：frontmatter + 六个空章节）。"""
     return _render(normalized, {}, [], "", stamp)
 
 
@@ -267,11 +212,7 @@ def _bullet_block(content: str) -> str:
     return "\n".join(out)
 
 
-# ---------------------------------------------------------------------------
-# 读写
-# ---------------------------------------------------------------------------
 def _read_text(path: Path) -> str:
-    """读文件全文；不存在或读失败返回空串（不抛）。"""
     try:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -279,7 +220,7 @@ def _read_text(path: Path) -> str:
     except OSError as exc:
         logger.debug("读取项目画像失败：%s（%s）", path, exc)
         return ""
-    except Exception as exc:  # 编码异常等脏数据同样不该冒泡
+    except Exception as exc:
         logger.debug("读取项目画像异常：%s（%s）", path, exc)
         return ""
 
@@ -302,7 +243,6 @@ def _within_projects(path: Path) -> bool:
     try:
         common = os.path.commonpath([os.path.normcase(path_abs), os.path.normcase(root_abs)])
     except ValueError:
-        # 不同盘符 / 非法路径：直接拒绝
         return False
     return common == os.path.normcase(root_abs)
 
@@ -322,7 +262,6 @@ def _write_text(path: Path, text: str) -> bool:
 
 
 def _append(workdir, section_name: str, block: str) -> str:
-    """把已渲染好的条目块追加到指定章节；成功返回全文，失败返回空串。"""
     path = profile_path(workdir)
     if path is None or not block:
         return ""
@@ -352,14 +291,6 @@ def _append(workdir, section_name: str, block: str) -> str:
 
 
 def append_section(workdir, section, content) -> str:
-    """把 ``content`` 追加到 ``section`` 章节末尾（章节不存在则补建）。
-
-    返回给调用方的可读确认（``已记入「项目名」的「章节」``）；workdir 为空 /
-    ``GLOBAL`` 或写盘失败时返回空串（不抛）。
-
-    章节非法或内容为空**抛 ValueError**：这是调用方入参错误，必须让它看到
-    可读原因（工具层据此返回给模型），而不是静默丢弃用户要记的东西。
-    """
     section_name = str(section or "").strip()
     if section_name not in SECTION_ALLOWED:
         raise ValueError(
@@ -381,11 +312,6 @@ def append_section(workdir, section, content) -> str:
 
 
 def append_task_log(workdir, line) -> None:
-    """往「任务流水」追加一行（回合收尾自动调用，失败静默）。
-
-    调用方传完整一行文本（``2026-11-04 #12 「补 README」done：…``）；
-    内部补 ``- `` 前缀并把换行压成空格，保证流水始终是一行一条。
-    """
     try:
         text = " ".join(str(line or "").split())
         if not text:
@@ -396,15 +322,7 @@ def append_task_log(workdir, line) -> None:
         logger.debug("追加项目任务流水失败：%s", exc)
 
 
-# ---------------------------------------------------------------------------
-# 派活注入
-# ---------------------------------------------------------------------------
 def build_injection(workdir, limit: int = DEFAULT_INJECTION_LIMIT) -> str:
-    """拼出派活用的项目背景块（只含 技术栈 / 架构决策 / 硬约束）。
-
-    ``limit`` 是三节合计的字符上限，超出时截断并补省略号；无画像或三节全空
-    返回空串（调用方据此原样投递）。
-    """
     try:
         parsed_limit = int(limit)
     except Exception:
@@ -429,16 +347,7 @@ def build_injection(workdir, limit: int = DEFAULT_INJECTION_LIMIT) -> str:
     return injection
 
 
-# ---------------------------------------------------------------------------
-# 结构化读写（GUI 项目状态面板：查看 + 每节编辑保存）
-# ---------------------------------------------------------------------------
 def read_state(workdir) -> dict:
-    """结构化读画像三节（技术栈 / 架构决策 / 硬约束），给 GUI 面板用。
-
-    返回 ``{"workdir", "exists", "updated", "sections"}``；``exists`` 表示画像
-    文件已有内容，``updated`` 是 frontmatter 时间原文（缺失为空串）。任何异常
-    都返回同结构的空值，不抛。
-    """
     empty = {
         "workdir": normalize_workdir(workdir),
         "exists": False,
@@ -465,11 +374,6 @@ def read_state(workdir) -> dict:
 
 
 def set_section(workdir, section, content) -> bool:
-    """**整节覆盖**写入（GUI 编辑框提交的就是该节新正文）；空内容 = 清空该节。
-
-    与 ``append_section`` 的差别只在"替换 vs 追加"。章节非法抛 ``ValueError``
-    （调用方入参错误）；workdir 为空 / 写盘失败（含越界被拒）返回 ``False``。
-    """
     section_name = str(section or "").strip()
     if section_name not in SECTION_ALLOWED:
         raise ValueError(
@@ -501,11 +405,7 @@ def set_section(workdir, section, content) -> bool:
     return _write_text(path, text)
 
 
-# ---------------------------------------------------------------------------
-# 会话级「项目状态」注入（特性 1）
-# ---------------------------------------------------------------------------
 def _frontmatter_updated(text: str) -> Optional[datetime]:
-    """取 frontmatter 里的 ``updated:`` 时间；缺失或格式非法返回 ``None``。"""
     lines = str(text or "").splitlines()
     if not lines or lines[0].strip() != "---":
         return None
@@ -526,17 +426,6 @@ def _frontmatter_updated(text: str) -> Optional[datetime]:
 
 
 def build_state_section(workdir, limit: int = DEFAULT_INJECTION_LIMIT) -> str:
-    """拼出会话级「项目状态」注入块（技术栈 / 架构决策 / 硬约束）。
-
-    与 ``build_injection``（派活用）同源同口径，差别只有三点：
-
-    - 头部带固定标题行，让模型知道这段是自动注入的背景；
-    - frontmatter ``updated`` 超过 ``STATE_STALE_DAYS`` 天时补「状态可能已过期」；
-    - 总长（标题 + 提示 + 正文）不超过 ``limit``；正文预算扣掉标题占用后
-      复用 ``build_injection`` 的截断逻辑。
-
-    任何异常 / 无画像 / 三节全空都返回空串，调用方据此"不注入"。
-    """
     try:
         try:
             parsed_limit = int(limit)

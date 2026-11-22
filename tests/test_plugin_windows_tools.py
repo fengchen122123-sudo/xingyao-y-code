@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""plugins/windows_tools 平台门控与进程/剪贴板/注册表/通知能力用例。
-
-对齐 windows-mcp 对齐计划 Task 5 / Task 6，并覆盖「只读不审批、写操作审批」的
-读写拆分修正（ToolSpec.requires_permission 是工具级静态标记，双模式工具无法
-区分 list/get 与 kill/set，故拆成六个独立工具）。
-
-覆盖：
-- plugin.json 元信息（name / version / entry / enabled / 中文描述）
-- 模块顶层不导入 psutil / win32api / win32gui / winreg / comtypes / ctypes
-  （非 Windows 可安全 exec）
-- 非 Windows、YCODE_TOOL_PROFILE=cli 时注册为空
-- Windows 下注册顺序固定为六个工具，且只读工具免审批、写工具要审批
-- 受保护进程拒绝结束（全部用假 psutil.process_iter，绝不真的结束系统进程）
-- 注册表只读：set/delete 被拒、相对路径被拒、读取失败不抛栈（假 winreg，绝不碰真注册表）
-- 通知：字符上限校验、MessageBox 调用（假 win32gui，绝不真的弹窗）
-"""
 
 import ast
 import importlib.util
@@ -28,7 +12,6 @@ import pytest
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PLUGIN_DIR = os.path.join(_PROJECT_ROOT, "plugins", "windows_tools")
 
-# 注册顺序：只读查询 → 写操作 → 注册表 → 通知，顺序稳定便于 schema 字节稳定。
 _EXPECTED_ORDER = [
     "windows_process_list",
     "windows_process_kill",
@@ -38,18 +21,14 @@ _EXPECTED_ORDER = [
     "windows_notify",
 ]
 
-# 只读工具：不弹审批、无副作用。
 _READ_ONLY_TOOLS = ("windows_process_list", "windows_clipboard_get", "windows_registry")
-# 写工具：必须走审批，系统级副作用。
 _WRITE_TOOLS = ("windows_process_kill", "windows_clipboard_set")
-# 不需要审批的工具 = 只读工具 + 通知（通知不改变系统状态，但会阻塞到点确定）。
 _PERMISSIONLESS_TOOLS = tuple(_READ_ONLY_TOOLS) + ("windows_notify",)
 
 _FORBIDDEN_TOP_LEVEL_IMPORTS = {"psutil", "win32api", "win32gui", "winreg", "comtypes", "ctypes", "wmi"}
 
 
 def _load_plugin_module():
-    """按路径加载插件薄壳，与 plugin_loader 的加载方式一致。"""
     entry = os.path.join(_PLUGIN_DIR, "plugin.py")
     module_spec = importlib.util.spec_from_file_location("_test_windows_tools_plugin", entry)
     module = importlib.util.module_from_spec(module_spec)
@@ -75,13 +54,9 @@ def _properties(spec):
 
 @pytest.fixture
 def win_env(monkeypatch):
-    """模拟 Windows + 非 CLI 档位的注册环境。"""
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.delenv("YCODE_TOOL_PROFILE", raising=False)
     return _load_plugin_module()
-
-
-# ── 元信息与导入安全 ─────────────────────────────────────────
 
 
 def test_plugin_json_metadata():
@@ -93,17 +68,15 @@ def test_plugin_json_metadata():
     assert meta["entry"] == "plugin.py"
     assert meta["enabled"] is True
     assert meta["description"].strip()
-    # 中文描述：至少含一个中文字符
     assert any("\u4e00" <= char <= "\u9fff" for char in meta["description"])
 
 
 def test_module_top_level_imports_are_platform_safe():
-    """psutil / win32api / win32gui / winreg / comtypes 只能在函数内惰性导入。"""
     source = open(os.path.join(_PLUGIN_DIR, "plugin.py"), encoding="utf-8").read()
     tree = ast.parse(source)
 
     top_level = set()
-    for node in tree.body:  # 只看模块顶层语句，函数体内的 import 不计
+    for node in tree.body:
         if isinstance(node, ast.Import):
             top_level.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -112,9 +85,6 @@ def test_module_top_level_imports_are_platform_safe():
 
     assert top_level <= {"os", "sys", "core", "__future__"}, top_level
     assert not (top_level & _FORBIDDEN_TOP_LEVEL_IMPORTS)
-
-
-# ── 平台门控 ────────────────────────────────────────────────
 
 
 def test_register_is_noop_on_non_windows(monkeypatch):
@@ -137,9 +107,6 @@ def test_register_order_on_windows(win_env):
     names = _registry_names(_register(win_env))
 
     assert names == _EXPECTED_ORDER
-
-
-# ── 声明契约：只读不审批 / 写操作审批 ───────────────────────
 
 
 @pytest.mark.parametrize("name", _READ_ONLY_TOOLS)
@@ -181,14 +148,12 @@ def test_every_spec_has_chinese_activity_description(win_env, name):
 def test_split_tools_only_declare_their_own_fields(win_env):
     registry = _register(win_env)
 
-    # list 不需要 pid / name / force；get 不需要 text。
     assert _properties(registry.get("windows_process_list")) == {"filter", "sort_by", "limit"}
     assert _properties(registry.get("windows_process_kill")) == {"pid", "name", "force"}
     assert _properties(registry.get("windows_clipboard_get")) == set()
     assert _properties(registry.get("windows_clipboard_set")) == {"text"}
     assert registry.get("windows_clipboard_set").input_schema.get("required") == ["text"]
 
-    # 拆分后的每个工具都不再暴露 mode 字段（注册表除外，它本来就是 get/list）。
     for name in (
         "windows_process_list",
         "windows_process_kill",
@@ -199,11 +164,7 @@ def test_split_tools_only_declare_their_own_fields(win_env):
     assert _properties(registry.get("windows_registry")) == {"mode", "path", "name", "view"}
 
 
-# ── 进程能力 ────────────────────────────────────────────────
-
-
 class _FakeProcess:
-    """替身进程：只记录结束调用，绝不碰真实进程。"""
 
     def __init__(self, pid, name, memory_mb=10.0, cpu=1.0):
         self.pid = pid
@@ -317,7 +278,7 @@ def test_kill_without_pid_or_name_is_rejected(win_env, fake_processes):
 def test_kill_target_process_uses_terminate_by_default(win_env, fake_processes):
     fakes = fake_processes((2468, "notepad.exe"))
 
-    result = win_env._process_kill_tool(name="notepad")  # 省略 .exe 也能命中
+    result = win_env._process_kill_tool(name="notepad")
 
     assert result.is_error is False
     assert "已结束 1 个进程" in result.content
@@ -343,7 +304,6 @@ def test_list_processes_renders_table_and_filter(win_env, fake_processes):
 
     assert result.is_error is False
     assert "PID" in result.content and "内存(MB)" in result.content and "名称" in result.content
-    # 默认按内存降序：chrome 在前
     assert result.content.index("chrome.exe") < result.content.index("notepad.exe")
 
     filtered = win_env._process_list_tool(filter="notepad")
@@ -363,14 +323,10 @@ def test_list_processes_sorts_by_cpu_and_name(win_env, fake_processes):
 
 
 def test_unknown_mode_is_rejected(win_env):
-    """底层双模式实现仍保留（拆 split 只改注册与入口），非法 mode 照旧拒绝。"""
     result = win_env._process_tool(mode="suspend")
 
     assert result.is_error is True
     assert result.content.startswith("windows_invalid_mode")
-
-
-# ── 剪贴板能力（只验证参数校验路径，真实读写依赖运行桌面会话） ──
 
 
 def test_clipboard_set_with_empty_text_is_rejected(win_env):
@@ -388,18 +344,13 @@ def test_clipboard_unknown_mode_is_rejected(win_env):
     assert result.content.startswith("windows_invalid_mode")
 
 
-# ── 注册表（只读；全部走假 winreg，绝不读写真实注册表） ──────
-
-
 class _FakeKey:
-    """假注册表项句柄。"""
 
     def __init__(self, owner):
         self.owner = owner
 
 
 class _FakeWinreg:
-    """替身 winreg 模块：只记录调用，不触达真实注册表。"""
 
     HKEY_CURRENT_USER = "HKCU"
     HKEY_LOCAL_MACHINE = "HKLM"
@@ -477,9 +428,9 @@ def test_registry_delete_mode_is_rejected(win_env, fake_winreg):
 @pytest.mark.parametrize(
     "path",
     [
-        "Software\\Microsoft\\Windows",       # 相对路径
-        "HKLM\\Software",                     # 非白名单别名
-        "HKEY_USERS\\Software",               # 不在白名单的根键
+        "Software\\Microsoft\\Windows",
+        "HKLM\\Software",
+        "HKEY_USERS\\Software",
     ],
 )
 def test_registry_relative_path_is_rejected(win_env, fake_winreg, path):
@@ -526,7 +477,6 @@ def test_registry_get_reads_value_with_key_read(win_env, fake_winreg):
     root, subpath, access = fake.open_calls[0]
     assert root == _FakeWinreg.HKEY_CURRENT_USER
     assert subpath == "Software\\Xingyao"
-    # 只申请读权限（默认视图不带 WOW64 位）。
     assert access == _FakeWinreg.KEY_READ
     assert fake.closed == 1
 
@@ -590,11 +540,7 @@ def test_registry_output_is_truncated(win_env, fake_winreg):
 
     assert result.is_error is False
     assert "截断" in result.content
-    # 正文截断到 4000 字符 + 一小段说明。
     assert len(result.content) <= 4000 + 120
-
-
-# ── 通知（全部走假 win32gui，绝不真的弹 MessageBox） ────────
 
 
 class _FakeWin32Gui:
@@ -656,7 +602,6 @@ def test_notify_shows_message_box(win_env, fake_win32gui):
     result = win_env._notify_tool(title="构建完成", message="产物已就绪，请查收")
 
     assert result.is_error is False
-    # MB_OK | MB_ICONINFORMATION = 0x40，附带当前前台窗口句柄。
     assert fake.message_boxes == [(4242, "产物已就绪，请查收", "构建完成", 0x40)]
     assert "确定" in result.content
 
@@ -672,7 +617,6 @@ def test_notify_failure_returns_error_without_traceback(win_env, fake_win32gui):
 
 
 def test_notify_missing_pywin32_degrades_gracefully(win_env, monkeypatch):
-    """win32gui 不可导入时返回明确错误码，而不是抛 ImportError。"""
     monkeypatch.setitem(sys.modules, "win32gui", None)
 
     result = win_env._notify_tool(title="提醒", message="正文")

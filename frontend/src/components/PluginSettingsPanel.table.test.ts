@@ -5,7 +5,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import PluginSettingsPanel from './PluginSettingsPanel.vue';
 import { useAppStore } from '../stores/appStore';
 
-// 第六类 section：table（账号池）——渲染、缺列空串、单元格换行、右对齐、badge 上色、行内动作、空态
 const TABLE_PAGE = {
   title: 'WorkBuddy',
   sections: [
@@ -64,33 +63,27 @@ describe('PluginSettingsPanel table 控件', () => {
   it('渲染两行数据、列头、标题，单元格 \n 拆成两行，缺列显示空串', async () => {
     const { wrapper } = await mountPanel(TABLE_PAGE);
 
-    // section.title 渲染成 .field-label 小标题
     const label = wrapper.findAll('.field-label').find((el) => el.text() === '账号池');
     expect(label).toBeTruthy();
     expect(wrapper.find('[data-test="plugin-table"]').exists()).toBe(true);
 
-    // 列头
     expect(wrapper.get('[data-test="col-account"]').text()).toBe('账号');
     expect(wrapper.get('[data-test="col-credit"]').text()).toBe('积分');
     expect(wrapper.get('[data-test="col-state"]').text()).toBe('状态');
 
-    // 两行
     expect(wrapper.find('[data-test="table-row-0"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="table-row-1"]').exists()).toBe(true);
     expect(wrapper.findAll('[data-test^="table-row-"]').length).toBe(2);
 
-    // 单元格换行渲染成两行
     const accountCell = wrapper.get('[data-test="table-row-0"] [data-test="cell-account"]');
     const lines = accountCell.findAll('.plugin-table-line');
     expect(lines.length).toBe(2);
     expect(lines[0].text()).toBe('木偶');
     expect(lines[1].text()).toBe('uid 0011');
 
-    // 缺列（第二行没给 source）显示空串，不抛错
     const missing = wrapper.get('[data-test="table-row-1"] [data-test="cell-source"]');
     expect(missing.text()).toBe('');
 
-    // 第二行没有 actions，行内动作列仍占位但不渲染按钮
     expect(wrapper.get('[data-test="table-row-1"]').findAll('button').length).toBe(0);
   });
 
@@ -99,7 +92,6 @@ describe('PluginSettingsPanel table 控件', () => {
 
     expect(wrapper.get('[data-test="col-credit"]').classes()).toContain('align-right');
     expect(wrapper.get('[data-test="table-row-0"] [data-test="cell-credit"]').classes()).toContain('align-right');
-    // 未声明 align 的列按左对齐
     expect(wrapper.get('[data-test="col-account"]').classes()).toContain('align-left');
   });
 
@@ -114,7 +106,6 @@ describe('PluginSettingsPanel table 控件', () => {
     expect(second.text()).toBe('已禁用');
     expect(second.classes()).toContain('tone-err');
 
-    // 非 badge 列不渲染徽标
     expect(wrapper.find('[data-test="cell-account"] .plugin-badge').exists()).toBe(false);
   });
 

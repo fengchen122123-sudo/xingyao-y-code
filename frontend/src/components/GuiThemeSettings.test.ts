@@ -150,7 +150,6 @@ describe('GuiThemeSettings', () => {
     await wrapper.get('[data-test="unify-text_unify-hex"]').setValue('#123456');
     await flushPromises();
 
-    // 4 个全局文字令牌 + 7 个分区的文字色一次性写成同一个颜色
     const previewed = previewGuiTheme.mock.calls.at(-1)?.[0] as GuiTheme;
     expect(previewed.tokens.text_primary).toBe('#123456');
     expect(previewed.tokens.text_bright).toBe('#123456');
@@ -159,7 +158,6 @@ describe('GuiThemeSettings', () => {
     for (const region of Object.values(previewed.regions)) {
       expect(region.text).toBe('#123456');
     }
-    // 刻意不动语义色：彩色按钮上的前景色跟着变会出现「绿字压蓝底」
     expect(previewed.tokens.accent).toBe('#7867d9');
     expect(previewed.tokens.danger).toBe('#d95656');
   });
@@ -192,7 +190,6 @@ describe('GuiThemeSettings', () => {
   it('deletes an inactive user theme from the list entry', async () => {
     const other = makeTheme('spare-theme', false);
     const wrapper = mountThemeSettings({ active: userTheme() });
-    // 列表里追加一个非活动用户主题
     const store = useAppStore();
     store.guiThemes = [...store.guiThemes, summary(other)];
     await nextTick();
@@ -201,7 +198,6 @@ describe('GuiThemeSettings', () => {
     await wrapper.get('[data-test="delete-theme-spare-theme"]').trigger('click');
 
     expect(deleteGuiTheme).toHaveBeenCalledWith('spare-theme');
-    // 列表里活动主题自己没有删除入口
     expect(wrapper.find('[data-test="delete-theme-rose"]').exists()).toBe(false);
   });
 
@@ -337,7 +333,6 @@ describe('GuiThemeSettings', () => {
     await flushPromises();
     await wrapper.get('[data-test="background-hex"]').setValue('#112233');
 
-    // 服务器移除图片后返回的主题不含飞行前的本地颜色修改
     const serverTheme = userTheme();
     serverTheme.regions.workspace.image = null;
     api.remove_gui_theme_image.mockResolvedValue({ ok: true, theme: serverTheme });

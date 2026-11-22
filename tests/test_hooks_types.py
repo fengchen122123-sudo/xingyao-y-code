@@ -1,5 +1,3 @@
-"""C1：Hooks 契约层测试（事件 / 注册项 / stdin-stdout 契约 / 合并规则）。"""
-
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
@@ -83,34 +81,29 @@ def test_merge_output_collects_contexts_and_strictest_permission():
         HookEvent.PRE_TOOL_USE,
     )
     assert result.additional_contexts == ["A", "B"]
-    assert result.permission_override == "ask"  # deny > ask > allow
+    assert result.permission_override == "ask"
 
     result.merge_output(HookOutput(permission_decision="deny"), HookEvent.PRE_TOOL_USE)
     assert result.permission_override == "deny"
 
 
 def test_merge_output_block_semantics_by_event():
-    # PreToolUse 阻断 → block_requested
     r1 = HookRunResult()
     r1.merge_output(HookOutput(continue_=False, reason="危险"), HookEvent.PRE_TOOL_USE)
     assert r1.block_requested is True and r1.block_reason == "危险"
 
-    # Stop 阻断 → continue_after_stop（阻止结束回合 = 续跑）
     r2 = HookRunResult()
     r2.merge_output(HookOutput(continue_=False, reason="没做完"), HookEvent.STOP)
     assert r2.continue_after_stop is True and r2.block_requested is False
 
-    # SessionStart / PostToolUse 不支持阻断：请求被忽略
     r3 = HookRunResult()
     r3.merge_output(HookOutput(continue_=False), HookEvent.POST_TOOL_USE)
     assert r3.block_requested is False and r3.continue_after_stop is False
 
-    # permission_override 只在 PreToolUse 收集
     r4 = HookRunResult()
     r4.merge_output(HookOutput(permission_decision="deny"), HookEvent.STOP)
     assert r4.permission_override is None
 
-    # reason 取第一个非空值（先到先得，不覆盖）
     r5 = HookRunResult()
     r5.merge_output(HookOutput(continue_=False, reason="first"), HookEvent.PRE_TOOL_USE)
     r5.merge_output(HookOutput(continue_=False, reason="second"), HookEvent.PRE_TOOL_USE)

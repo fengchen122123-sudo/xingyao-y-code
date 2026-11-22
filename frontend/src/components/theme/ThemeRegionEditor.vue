@@ -1,6 +1,5 @@
 <template>
   <div class="theme-region-editor" :data-mode="mode">
-    <!-- 分区模式：背景 / 文字 / 边框 / 强调色 + 透明度 + 背景图 -->
     <template v-if="mode === 'region'">
       <div class="editor-group">
         <div class="group-title">颜色</div>
@@ -105,7 +104,6 @@
       </div>
     </template>
 
-    <!-- 全局模式：语义颜色令牌 + 全局背景图 -->
     <template v-else-if="mode === 'global'">
       <div class="editor-group">
         <div class="group-title">全局语义颜色</div>
@@ -162,7 +160,6 @@
       </div>
     </template>
 
-    <!-- 原生标题栏模式：仅 #RRGGBB 颜色与明暗模式，无图片 -->
     <template v-else>
       <div class="editor-group">
         <div class="group-title">Windows 系统标题栏</div>
@@ -212,7 +209,6 @@ const props = defineProps<{
   mode: 'region' | 'global' | 'native';
   modelValue: ThemeRegion | Record<string, string | number> | NativeTitlebarTheme;
   disabled?: boolean;
-  /** 全局模式下的全局背景图（由父组件从草稿读写） */
   appImage?: AppImageTheme;
 }>();
 
@@ -340,9 +336,6 @@ function commitAppImageSelect(key: 'image_size' | 'image_position', event: Event
 .secondary-button:disabled { opacity: 0.5; cursor: not-allowed; }
 .mono { font-family: var(--mono); }
 
-/* ── 手机端（≤480px）：修复颜色令牌网格与选择框网格溢出 ──
-   auto-fill minmax(240px,1fr) 在 ≤360px 屏上列宽不足会撑破容器，
-   改单列；两个并排的填充方式/位置选择框也收成单列。 */
 @media (max-width: 480px) {
   .token-grid { grid-template-columns: 1fr; gap: 6px 0; }
   .select-grid { grid-template-columns: 1fr; gap: 0; }

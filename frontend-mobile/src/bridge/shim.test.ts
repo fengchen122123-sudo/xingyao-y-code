@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
-// vitest cwd = frontend-mobile；shim 在仓库根的 frontend/ 下
 const SHIM_PATH = path.resolve(process.cwd(), '../frontend/mobile-shim.js');
 const STORAGE_KEY = 'yc-pair-token';
 
@@ -15,7 +14,6 @@ interface FakeWs {
   onerror: (() => void) | null;
 }
 
-/** 以给定 URL 查询串 / 预置 localStorage 加载 shim，返回它创建的假 WebSocket */
 function loadShim(
   search: string,
   storage: Record<string, string> = {},
@@ -77,9 +75,7 @@ describe('mobile-shim：token 持久化 + 4401 配对失效', () => {
 
   it('URL 带 token：写入 localStorage 并从地址栏清理', () => {
     const { ws } = loadShim('?token=ABC');
-    // token 已落 localStorage
     expect(window.localStorage.getItem(STORAGE_KEY)).toBe('ABC');
-    // 地址栏 query 已清理、path 保留
     expect(window.location.search).toBe('');
     expect(window.location.pathname).toBe('/m/');
     ws.onopen?.();
@@ -99,7 +95,6 @@ describe('mobile-shim：token 持久化 + 4401 配对失效', () => {
     ws.onclose?.({ code: 4401 });
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull();
     expect(fired).toBe(true);
-    // 不重连：推进定时器后不应再有新的 WebSocket
     vi.advanceTimersByTime(5000);
   });
 
@@ -120,7 +115,6 @@ describe('mobile-shim：token 持久化 + 4401 配对失效', () => {
     );
     expect(ws.url).toContain(`/xy/bot/relay/client?device_id=${dev}`);
     ws.onopen?.();
-    // 首帧 replay 空数组不触发重复 get_initial_state
     ws.onmessage?.({ data: JSON.stringify({ type: 'replay', frames: [] }) });
     expect(ws.sent.length).toBe(1);
     ws.onmessage?.({
@@ -134,7 +128,6 @@ describe('mobile-shim：token 持久化 + 4401 配对失效', () => {
       data: JSON.stringify({ type: 'notice', data: { message: 'live' }, seq: 3 }),
     });
 
-    // 断线重连：应附带 last_boot_id 与 last_seq，且能解包服务端返回的 replay.frames
     ws.onclose?.({ code: 1006 });
     vi.advanceTimersByTime(2100);
     expect(sockets.length).toBe(2);

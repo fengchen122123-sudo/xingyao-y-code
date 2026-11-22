@@ -1,8 +1,3 @@
-"""飞书长连接枚举（搬运自 lark-oapi 1.7.3，MIT）。
-
-上游：lark_oapi/ws/enum.py 与 lark_oapi/core/enum.py 的 LogLevel。
-"""
-
 from enum import Enum
 
 

@@ -1,8 +1,3 @@
-"""Turn 起点电脑操控能力决策测试（计划 Task 4 / 设计 9.3）。
-
-resolver 是纯函数：不读全局 config、不网络探测、不按模型名分支。
-"""
-
 import dataclasses
 
 import pytest
@@ -27,16 +22,7 @@ def test_generic_requires_three_explicit_capability_fields(model, enabled_settin
     assert capability.error_code == "computer_model_not_capable"
 
 
-# ---------------- 缺省协议自动判定（自动激活视觉模型） ----------------
-
-
 def test_unset_protocol_auto_enables_generic_for_vision_function_models(enabled_settings):
-    """缺省 computer_protocol：视觉+工具调用双勾 ⇒ 自动按 generic 启用。
-
-    用户裁决（2026-09-05）：只要模型显式声明视觉与工具调用能力，无需逐个
-    配置 computer_protocol 即可使用电脑操控；resolver 仍绝不按模型名猜测，
-    只从两条显式能力元数据推导。
-    """
     model = {"supports_vision": True, "supports_function_calling": True}
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is True
@@ -47,20 +33,17 @@ def test_unset_protocol_auto_enables_generic_for_vision_function_models(enabled_
 
 
 @pytest.mark.parametrize("model", [
-    {"supports_function_calling": True},                     # 缺视觉声明 → 拒绝
-    {"supports_function_calling": False, "supports_vision": True},  # 工具调用显式关闭 → 拒绝（逃生门）
+    {"supports_function_calling": True},
+    {"supports_function_calling": False, "supports_vision": True},
     {},
 ])
 def test_unset_protocol_auto_requires_vision_declared(model, enabled_settings):
-    """缺省协议自动判定（2026-09-05 修订）：视觉必须显式声明；工具调用未声明
-    视为支持（Agent 模型本就靠工具调用驱动），显式 False 才是拒绝理由。"""
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is False
     assert capability.error_code == "computer_model_not_capable"
 
 
 def test_unset_protocol_auto_enables_with_vision_and_undeclared_tools(enabled_settings):
-    """视觉已声明、工具调用未声明（None/缺键）→ 自动启用 generic。"""
     for model in ({"supports_vision": True}, {"supports_vision": True, "supports_function_calling": None}):
         capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
         assert capability.enabled is True
@@ -68,7 +51,6 @@ def test_unset_protocol_auto_enables_with_vision_and_undeclared_tools(enabled_se
 
 
 def test_explicit_none_stays_disabled_even_with_vision_and_function_calling(enabled_settings):
-    """显式 computer_protocol=none 是主动关闭的逃生门，优先于自动判定。"""
     model = {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "none"}
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is False
@@ -88,7 +70,6 @@ def test_lan_turn_is_always_disabled(enabled_settings):
 
 
 def test_feishu_turn_is_also_remote(enabled_settings):
-    """飞书通道发起的回合与 LAN 同属「远程」：即使两个开关全开也禁用电脑操控。"""
     model = {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "generic"}
     capability = resolve_computer_capability(model, {}, enabled_settings, "feishu")
     assert capability.error_code == "computer_remote_forbidden"
@@ -122,8 +103,6 @@ def test_non_windows_platform_is_rejected(enabled_settings):
 
 
 def test_legacy_model_without_function_calling_field_gets_capability(enabled_settings):
-    """旧配置缺 supports_function_calling（2026-09-05 修订）：未声明视为支持，
-    视觉已声明的旧模型获得 generic 资格；显式 False 才被拒绝。"""
     model = {"supports_vision": True, "computer_protocol": "generic"}
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is True
@@ -142,9 +121,6 @@ def test_legacy_model_without_function_calling_field_gets_capability(enabled_set
     {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "auto"},
 ])
 def test_missing_or_unknown_protocol_is_never_capable(model, enabled_settings):
-    """未知 computer_protocol 字符串一律不获得资格；缺省键的自动判定见上方
-    test_unset_protocol_auto_* 组（用户裁决 2026-09-05 修订：视觉声明 +
-    工具调用默认支持即自动 generic）。resolver 绝不按模型名猜测。"""
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is False
     assert capability.error_code == "computer_model_not_capable"
@@ -178,7 +154,6 @@ def test_native_official_openai_responses_is_enabled(enabled_settings):
 
 
 def test_native_does_not_require_generic_vision_function_fields(enabled_settings):
-    """native 判定只看显式原生标记 + Responses 协议 + 官方 base（设计 9.3）。"""
     model = {"computer_protocol": "native_openai"}
     provider = {"protocol": "responses", "base_url": "https://api.openai.com/v1"}
     capability = resolve_computer_capability(model, provider, enabled_settings, "local")
@@ -221,14 +196,7 @@ def test_shared_capability_constants_have_contract_shape():
     assert DISABLED_CAPABILITY.targets == ()
 
 
-# ---------------------------------------------------------------------------
-# Task 15：入口 turn_source 接线（agent_service.build_runtime_context）
-# LAN 回合标记由 LanServer dispatch 注入，经 prepare/build 链原样进入
-# 能力解析；lan 回合即使本机开关开启也冻结为 computer_remote_forbidden。
-# ---------------------------------------------------------------------------
-
 def test_build_runtime_context_forwards_turn_source_to_resolver(monkeypatch):
-    """入口 turn_source（默认 local / 显式 lan）原样交给能力解析入口。"""
     import core.llm as llm_mod
     from core.agent_service import build_runtime_context
     from core.computer.capability import take_turn_computer_capability
@@ -246,11 +214,10 @@ def test_build_runtime_context_forwards_turn_source_to_resolver(monkeypatch):
 
     build_runtime_context("openai/gpt-test", "confirm", turn_source="lan")
     assert captured["turn_source"] == "lan"
-    take_turn_computer_capability()  # 清理线程 handoff，避免跨测试残留
+    take_turn_computer_capability()
 
 
 def test_build_runtime_context_freezes_lan_turn_disabled(monkeypatch):
-    """真实解析链：lan 回合即使两个开关全开也固定 computer_remote_forbidden。"""
     import config
     import core.model_manager as model_manager
     from core.agent_service import build_runtime_context

@@ -1,13 +1,3 @@
-"""CLI 终端配色主题系统（克制单主色 · 全界面语义联动）。
-
-设计原则：
-- 80% 中性灰白（正文/辅助/元数据）+ 15% 当前主题单主色（图标/边框/标题/进度/选中）
-  + 5% 低饱和信号色（ok/warn/err，仅用于成功、告警、报错与 Diff）。
-- 保留原有 9 套主题的键名与全部旧字段（border/label/status_*/text_input/menu_*），
-  并新增 ``starlight``（星辰蓝）及完整语义令牌，供主界面、Markdown、历史回放、
-  工具轨迹与全屏选择器共同读取。
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -31,11 +21,6 @@ def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
 
 
 def blend_hex(fg_hex: str, bg_hex: str, alpha: float) -> str:
-    """按 alpha (0.0~1.0) 把前景色混合到背景色上，返回标准 #RRGGBB。
-
-    prompt_toolkit 样式仅支持 #RRGGBB 十六进制颜色（不支持 rgba），
-    用纯整数混合生成低饱和柔和底色与边框色，避免硬编码黑底补丁或刺眼亮块。
-    """
     a = max(0.0, min(1.0, float(alpha)))
     fr, fg, fb = hex_to_rgb(fg_hex)
     br, bg, bb = hex_to_rgb(bg_hex)
@@ -46,13 +31,11 @@ def blend_hex(fg_hex: str, bg_hex: str, alpha: float) -> str:
 
 
 def ansi_fg(hex_color: str) -> str:
-    """返回 24-bit TrueColor 前景色 ANSI 转义序列。"""
     r, g, b = hex_to_rgb(hex_color)
     return f"\x1b[38;2;{r};{g};{b}m"
 
 
 def ansi_bg(hex_color: str) -> str:
-    """返回 24-bit TrueColor 背景色 ANSI 转义序列。"""
     r, g, b = hex_to_rgb(hex_color)
     return f"\x1b[48;2;{r};{g};{b}m"
 
@@ -71,7 +54,6 @@ def _make_theme(
     err: str = "#d97373",
     code_theme: str = "one-dark",
 ) -> dict[str, str]:
-    """基于单主色与中性暗基底自动派生全套语义令牌，消除各主题间重复定义。"""
     accent_soft = blend_hex(accent, "#edf2f7", 0.36)
     accent_bg = blend_hex(accent, surface_bg, 0.16)
     border_dim = blend_hex(accent, surface_bg, 0.28)
@@ -81,7 +63,6 @@ def _make_theme(
     warn_bg = blend_hex(warn, surface_bg, 0.14)
     err_bg = blend_hex(err, surface_bg, 0.14)
     return {
-        # 语义令牌
         "desc": desc,
         "accent": accent,
         "accent_soft": accent_soft,
@@ -260,7 +241,6 @@ def build_selector_style(theme_name: str | None = None) -> Any:
         "header": f"bold {accent}",
         "footer": muted,
         "provider": f"bold {accent_soft}",
-        # 模型管理器
         "model.active": f"bold {accent}",
         "model.normal": soft,
         "model.cursor": cursor_line,
@@ -274,19 +254,15 @@ def build_selector_style(theme_name: str | None = None) -> Any:
         "input.label": f"bold {accent}",
         "input.sep": t["border_dim"],
         "input.field": text,
-        # 会话管理器
         "session.active": f"bold {accent}",
         "session.normal": soft,
         "session.cursor": cursor_line,
-        # 技能管理器
         "skill.active": f"bold {accent}",
         "skill.normal": soft,
         "skill.cursor": cursor_line,
-        # MCP 管理器
         "mcp.on": f"bold {accent}",
         "mcp.off": soft,
         "mcp.cursor": cursor_line,
-        # 通用信号态
         "ok": f"bold {ok}",
         "warn": warn,
         "empty": warn,

@@ -40,7 +40,6 @@
         </span>
       </label>
 
-      <!-- 一键让星瑶自动部署到服务器 -->
       <div class="deploy-box" data-test="cloud-relay-deploy-card">
         <div class="deploy-head">
           <div>
@@ -362,7 +361,6 @@ function api(): BridgeApi | undefined {
   return (window as unknown as { pywebview?: { api?: BridgeApi } }).pywebview?.api;
 }
 
-/** 只同步连接状态与统计，不动用户正在编辑的输入框（轮询时用） */
 function applyStatus(settings?: RelaySettings | null) {
   if (!settings) return;
   hasToken.value = Boolean(settings.has_token);
@@ -533,7 +531,6 @@ onUnmounted(() => {
   margin: 0 auto;
 }
 
-/* ---------- 头部 ---------- */
 .relay-header {
   display: flex;
   align-items: flex-start;
@@ -574,7 +571,6 @@ onUnmounted(() => {
   border-color: var(--accent);
 }
 
-/* ---------- 状态条 ---------- */
 .relay-status {
   display: flex;
   align-items: center;
@@ -645,7 +641,6 @@ onUnmounted(() => {
   }
 }
 
-/* ---------- 主卡片 ---------- */
 .relay-card {
   display: flex;
   flex-direction: column;
@@ -756,7 +751,6 @@ onUnmounted(() => {
   color: var(--green);
 }
 
-/* ---------- 按钮 ---------- */
 .relay-actions {
   display: flex;
   flex-wrap: wrap;
@@ -824,7 +818,6 @@ onUnmounted(() => {
   color: var(--red);
 }
 
-/* ---------- 检查清单 ---------- */
 .relay-steps {
   padding: 13px 15px;
   border: 1px solid var(--border);
@@ -887,7 +880,6 @@ onUnmounted(() => {
   color: var(--text-faint);
 }
 
-/* ---------- 排障 ---------- */
 .relay-help {
   padding: 0 15px 14px;
   border: 1px solid var(--border);
@@ -946,7 +938,6 @@ onUnmounted(() => {
   color: var(--text-faint);
 }
 
-/* ---------- 一键部署引导 & 折叠手动配置 ---------- */
 .deploy-box {
   margin-top: 12px;
   padding: 13px 14px;

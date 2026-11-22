@@ -1,24 +1,10 @@
-"""平台无关的软件/控件语义定位契约（R10）。
-
-本模块只定义值对象与协议，不导入任何本机图形/COM 依赖。Windows 实现在
-``core/computer/platforms/windows_surfaces.py``，由 WindowsPlatformAdapter 提供；
-macOS/Linux 在各自平台模块实现前一律显式拒绝（computer_unsupported_os）。
-
-ref 只引用当前会话已观察到的对象：每个候选绑定 locator 会话与观察代数
-（surface_generation），操作时必须回传同一代数；模型不得伪造 HWND、进程 ID
-或任意脚本字符串。应用名称有多个候选时返回候选列表，绝不自动点第一个。
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-# 候选 kind 取值：顶层窗口 / 托盘图标 / 窗口内控件。
 SURFACE_KINDS = ("window", "tray_icon", "control")
 
-# 候选支持的操作：activate（置前台窗口）/ invoke（语义调用，如 UIA Invoke）/
-# click_point（边界中点的显式坐标点击）。
 SURFACE_OPERATIONS = ("activate", "invoke", "click_point")
 
 MAX_SURFACE_LABEL_CHARS = 80
@@ -29,8 +15,8 @@ class SurfaceCandidate:
     """一次观察中发现的候选对象；bounds 为虚拟桌面物理坐标 (x, y, w, h)。"""
 
     ref: str
-    kind: str  # SURFACE_KINDS 之一
-    label: str  # 受长度限制的名称摘要
+    kind: str
+    label: str
     surface_generation: int
     supported_operations: tuple[str, ...]
     bounds: tuple[int, int, int, int] = (0, 0, 0, 0)
@@ -38,14 +24,6 @@ class SurfaceCandidate:
 
 @dataclass(frozen=True)
 class ObservationRegion:
-    """局部观察区域（R10）：原点为虚拟桌面物理坐标，含模型图缩放尺寸。
-
-    裁剪图坐标反算与 screenshot_to_physical 同构，但 original_width/height
-    是区域尺寸，不是整个虚拟桌面尺寸：
-
-    physical_x = origin_x + round(x * original_width / model_width)
-    physical_y = origin_y + round(y * original_height / model_height)
-    """
 
     origin_x: int
     origin_y: int

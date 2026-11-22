@@ -59,9 +59,9 @@ class LaneHealth:
     upstream_loss_rate: float
     consecutive_loss: int
     client_rewrite_count: int
-    write_turns: int  # 可判定行中 cache_write_tokens 非 None 且 >0 的轮次数
-    hot_write_tokens: int  # 上述写入轮的写入量之和（未报告/非正数一律不计）
-    verdict: str  # healthy | unreported | upstream_lossy | client_rewrite | insufficient
+    write_turns: int
+    hot_write_tokens: int
+    verdict: str
 
 
 def _is_reported_row(row):
@@ -89,23 +89,9 @@ def _row_write_tokens(row):
 
 
 def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneHealth:
-    """把同一 lane 的窗口内诊断行归类为一条 LaneHealth。
-
-    rows：同一 lane 内按 id 升序的 cache_request_diagnostics 行（dict，可含 None）。
-    window：只取最近 N 行（不足则全取）。prev 的来源看行：带 `prev_prompt` 键时
-    以查询层算好的值为准（时间/行数窗口不切断 prev 链，区间首行照样可判定）；
-    不带该键才退回窗口内滚动（窗口首行与紧跟未报告行之后的行不可判定）。
-    两种口径的差别见模块 docstring。
-    theta：upstream loss 阈值——cached < min(prev_prompt, prompt_tokens) * theta。
-
-    判定顺序即语义：unreported → client_rewrite → insufficient → upstream_lossy
-    → healthy；样本不足时绝不判 upstream_lossy（Task 5 保险丝的前提）。
-    """
     ordered = list(rows or ())
     window_rows = ordered[-window:] if window is not None and window > 0 else list(ordered)
 
-    # 窗口内至少出现一条「已报告且有效」的行才算 reported；全部未报告/无效
-    # （含空窗口）→ reported=False、verdict='unreported'，token 计数保持 0。
     reported = any(_is_reported_row(row) for row in window_rows)
 
     samples = 0
@@ -135,10 +121,8 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
             prev_prompt = rolling_prev
 
         if reason == COLD_START_REASON:
-            # 冷启动：不入健康分母，也不计入换写观察（只排除）。
             states.append("skip")
         elif reason:
-            # 客户端换代 / 历史重写：单独计数，不入健康分母（未报告行不计数）。
             if row_reported:
                 client_rewrite_count += 1
             states.append("skip")
@@ -146,7 +130,6 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
             # 未报告 / 无效：绝不入分母、绝不记 0。
             states.append("skip")
         elif prompt_tokens is None or cached_tokens is None or prev_prompt is None:
-            # 无法判定就不猜：宁可少一个样本，也不把未知当 0。
             states.append("skip")
         else:
             prompt_value = int(prompt_tokens)
@@ -164,7 +147,6 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
             else:
                 states.append("ok")
 
-        # 只有「已报告且有效、值非 NULL」的上一行才能把 prompt 传给下一行做 prev。
         rolling_prev = (
             int(prompt_tokens) if row_reported and prompt_tokens is not None else None
         )
@@ -211,11 +193,6 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
 
 
 def classify_lanes_health(rows_by_lane, *, window=200, theta=DEFAULT_LOSS_THETA) -> list[LaneHealth]:
-    """按 lane 分组批量派生（返回顺序按 (model, api_base, cache_scope) 稳定排序）。
-
-    rows_by_lane：{lane_key: [行, ...]} 映射；每组行须按 id 升序（身份以行内的
-    model / api_base / cache_scope 为准，lane_key 只作分组标识）。
-    """
     if not rows_by_lane:
         return []
     groups = (

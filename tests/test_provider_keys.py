@@ -1,10 +1,3 @@
-"""测试厂商多 Key 解析与「粘性故障转移」Key 池（core/provider_keys.py）。
-
-覆盖：多分隔符解析与去重、单/双 Key 建池判定、粘性不轮换、失败切换与冷却跳过、
-冷却恢复后粘性不抢占、全冷却兜底、配置对账（保留冷却与 sticky）、线程安全冒烟，
-以及 resolve_provider_for_route / build_key_failover 的路由解析（注入假配置）。
-"""
-
 import threading
 
 import pytest
@@ -23,7 +16,6 @@ from core.provider_keys import (
 
 @pytest.fixture(autouse=True)
 def _isolate_pool_registry(monkeypatch):
-    """每个用例独享模块级 Key 池 registry，避免跨用例的池状态串扰。"""
     monkeypatch.setattr(provider_keys, "_POOL_REGISTRY", {})
 
 
@@ -37,15 +29,9 @@ def _make_provider(provider_id, api_key, base_url="https://api.mock.com", models
     }
 
 
-# ---------------------------------------------------------------------------
-# a) 解析：多分隔符 / 去重 / 空串 / 非字符串
-# ---------------------------------------------------------------------------
-
-
 def test_split_provider_keys_mixed_separators_and_dedupe():
     raw = "k1\nk2,k3，k4;k5\r\nk6\n\nk1\n"
     assert split_provider_keys(raw) == ["k1", "k2", "k3", "k4", "k5", "k6"]
-    # 段内空格被 trim，重复 Key 保序去重
     assert split_provider_keys(" k1 , k2 ,k1 ") == ["k1", "k2"]
 
 
@@ -61,15 +47,9 @@ def test_join_provider_keys_roundtrip():
     keys = ["k1", "k2", "k3"]
     assert join_provider_keys(keys) == "k1\nk2\nk3"
     assert split_provider_keys(join_provider_keys(keys)) == keys
-    # 容忍非列表输入，不抛异常
     assert join_provider_keys(None) == ""
     assert join_provider_keys("k1") == "k1"
     assert join_provider_keys(42) == ""
-
-
-# ---------------------------------------------------------------------------
-# b) 单 Key 不建池；多 Key 建池并复用实例
-# ---------------------------------------------------------------------------
 
 
 def test_get_key_pool_single_key_returns_none():
@@ -87,15 +67,9 @@ def test_get_key_pool_multi_key_and_reuse():
     assert pool.keys == ["k1", "k2"]
     assert pool.key_count == 2
 
-    # 同一 provider_id 复用实例，并对外部改序做对账
     same = get_key_pool(dict(provider, api_key="k2,k1\nk2"))
     assert same is pool
     assert same.keys == ["k2", "k1"]
-
-
-# ---------------------------------------------------------------------------
-# c) 粘性：initial_key 连续调用同一 Key；成功也不轮换
-# ---------------------------------------------------------------------------
 
 
 def test_initial_key_sticky_without_rotation():
@@ -104,11 +78,6 @@ def test_initial_key_sticky_without_rotation():
     assert pool.initial_key() == "k1"
     pool.on_success("k1")
     assert pool.initial_key() == "k1"
-
-
-# ---------------------------------------------------------------------------
-# d) 失败切换：k1 失败 → k2；k2 成功后粘性保持 k2（k1 冷却期不抢占）
-# ---------------------------------------------------------------------------
 
 
 def test_failure_switch_then_sticky_holds():
@@ -122,11 +91,6 @@ def test_failure_switch_then_sticky_holds():
     assert pool.initial_key() == "k2"
 
 
-# ---------------------------------------------------------------------------
-# e) 冷却恢复：时间前进 301 秒 k1 冷却过期，但粘性仍是 k2（不抢占）
-# ---------------------------------------------------------------------------
-
-
 def test_cooldown_expiry_does_not_preempt_sticky(monkeypatch):
     assert KEY_COOLDOWN_SECONDS == 300
     clock = [1000.0]
@@ -137,20 +101,12 @@ def test_cooldown_expiry_does_not_preempt_sticky(monkeypatch):
     assert pool.on_failure("k1", {"k1"}) == "k2"
     pool.on_success("k2")
 
-    # 冷却期内（299 秒）k2 依然是首选
     clock[0] += KEY_COOLDOWN_SECONDS - 1
     assert pool.initial_key() == "k2"
 
-    # 前进到 301 秒：k1 冷却过期，但粘性不抢占，initial_key 仍是 k2
     clock[0] += 2
     assert pool.initial_key() == "k2"
-    # k1 已回到候选池：k2 失败时可再次选用 k1
     assert pool.on_failure("k2", {"k2"}) == "k1"
-
-
-# ---------------------------------------------------------------------------
-# f) 全冷却兜底：on_failure 仍返回未试过的 Key；全试过 → None
-# ---------------------------------------------------------------------------
 
 
 def test_all_cooled_fallback_and_exhausted(monkeypatch):
@@ -159,21 +115,13 @@ def test_all_cooled_fallback_and_exhausted(monkeypatch):
 
     pool = ProviderKeyPool(["k1", "k2"])
     assert pool.on_failure("k1", {"k1"}) == "k2"
-    assert pool.on_failure("k2", {"k1", "k2"}) is None  # 全部冷却且全试过
+    assert pool.on_failure("k2", {"k1", "k2"}) is None
 
-    # 新请求链：全部冷却时 initial_key 仍回到 sticky
     start = pool.initial_key()
     assert start == "k2"
-    # 兜底：k1 虽在冷却中，但本链未试过，仍返回它尝试
     fallback = pool.on_failure(start, {start})
     assert fallback == "k1"
-    # tried 已包含全部 Key → None（本链结束）
     assert pool.on_failure(fallback, {start, fallback}) is None
-
-
-# ---------------------------------------------------------------------------
-# g) 对账：新增 Key 后保留冷却/粘性；sticky 被移除则重置
-# ---------------------------------------------------------------------------
 
 
 def test_reconcile_keeps_cooldown_and_sticky(monkeypatch):
@@ -184,21 +132,17 @@ def test_reconcile_keeps_cooldown_and_sticky(monkeypatch):
     pool = get_key_pool(provider)
     assert isinstance(pool, ProviderKeyPool)
     assert pool.initial_key() == "k1"
-    assert pool.on_failure("k1", {"k1"}) == "k2"  # k1 冷却，sticky 指向 k2
+    assert pool.on_failure("k1", {"k1"}) == "k2"
 
-    # 配置新增 k3 并调整顺序：同一实例对账更新 keys
     provider2 = _make_provider("p-reconcile", "k2\nk1\nk3")
     pool2 = get_key_pool(provider2)
     assert pool2 is pool
     assert pool2.keys == ["k2", "k1", "k3"]
     assert pool2.key_count == 3
-    # sticky 原 Key（k2）仍存在 → 保持；配置未变时重复调用仍是同一实例
     assert pool2.initial_key() == "k2"
     assert get_key_pool(provider2) is pool2
-    # k1 的冷却记录被保留：环形扫描先遇到 k1 也会跳过，选中 k3
     assert pool2.on_failure("k2", {"k2"}) == "k3"
 
-    # sticky 原 Key 被移除 → 重置为第一个 Key
     provider3 = _make_provider("p-reconcile", "k9\nk8")
     pool3 = get_key_pool(provider3)
     assert pool3 is pool
@@ -241,12 +185,7 @@ def test_thread_safety_smoke():
     assert errors == []
     assert pool.key_count == 4
     assert set(pool.keys) == valid_keys
-    assert seen  # 线程确实执行过
-
-
-# ---------------------------------------------------------------------------
-# resolve_provider_for_route / build_key_failover（注入假配置）
-# ---------------------------------------------------------------------------
+    assert seen
 
 
 def _mock_config():
@@ -304,12 +243,10 @@ def test_resolve_by_model_id(mocker):
 def test_resolve_by_base_url_and_model_name(mocker):
     cfg = _mock_config()
     mocker.patch("core.model_manager.load_config", return_value=cfg)
-    # litellm_model 精确相等
     assert (
         resolve_provider_for_route("openai/b-model", "https://api.b.com")
         is cfg["providers"][1]
     )
-    # 模型 name 也能命中；base_url 归一化（大小写 + 尾部斜杠）
     assert (
         resolve_provider_for_route("a-model", "HTTPS://API.A.COM///")
         is cfg["providers"][0]
@@ -319,14 +256,11 @@ def test_resolve_by_base_url_and_model_name(mocker):
 def test_resolve_single_provider_by_base_url(mocker):
     cfg = _mock_config()
     mocker.patch("core.model_manager.load_config", return_value=cfg)
-    # 模型名未命中，但 base_url 唯一对应 p-a
     assert (
         resolve_provider_for_route("unknown-model", "https://api.a.com")
         is cfg["providers"][0]
     )
-    # base_url 对应两个 provider（p-c / p-d）且模型名未命中 → 不猜，返回 None
     assert resolve_provider_for_route("unknown-model", "https://api.shared.com") is None
-    # 模型名命中则能区分同 base_url 的两个 provider
     assert (
         resolve_provider_for_route("d-model", "https://api.shared.com")
         is cfg["providers"][3]
@@ -336,7 +270,6 @@ def test_resolve_single_provider_by_base_url(mocker):
 def test_resolve_fallthrough_and_misses(mocker):
     cfg = _mock_config()
     mocker.patch("core.model_manager.load_config", return_value=cfg)
-    # model_id 未命中时继续走 base_url + 模型名匹配
     assert (
         resolve_provider_for_route(
             "openai/a-model", "https://api.a.com", model_id="m-missing"
@@ -363,14 +296,11 @@ def test_resolve_returns_none_on_errors(mocker):
 def test_build_key_failover(mocker):
     cfg = _mock_config()
     mocker.patch("core.model_manager.load_config", return_value=cfg)
-    # 单 Key provider → 不建池
     assert build_key_failover("openai/b-model", "https://api.b.com") is None
-    # 双 Key provider → 返回池
     pool = build_key_failover("openai/a-model", "https://api.a.com")
     assert isinstance(pool, ProviderKeyPool)
     assert pool.key_count == 2
     assert pool.initial_key() == "ka1"
-    # 未知路由 → None
     assert build_key_failover("nope", "https://api.none.com") is None
 
 

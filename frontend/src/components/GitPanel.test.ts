@@ -1,4 +1,3 @@
-// GitPanel 组件测试（规格 §17.3：源代码管理分组 / 禁用原因 / 确认对话框）
 import { mount } from '@vue/test-utils';
 import { nextTick } from 'vue';
 import { createPinia, setActivePinia } from 'pinia';
@@ -103,10 +102,8 @@ describe('GitPanel 源代码管理面板', () => {
       },
       typedInput: '',
     };
-    // 挂载面板（mountWithSnapshot 只种 store 快照），再等 Teleport 渲染到 body
     mount(GitPanel);
     await nextTick();
-    // 确认框经 Teleport 渲染在 body 下（逃出右面板层叠上下文），从 document 查询
     const modal = document.body.querySelector('[data-test="git-confirm-modal"]');
     expect(modal).not.toBeNull();
     const input = modal!.querySelector('[data-test="git-confirm-input"]') as HTMLInputElement;

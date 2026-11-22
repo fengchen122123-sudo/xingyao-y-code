@@ -1,24 +1,3 @@
-"""自我成长存储层（``<YCODE_DIR>/self``、``users``、``lessons`` 的读写）。
-
-设计约束：
-- 数据目录一律按「调用时刻」从 ``config.YCODE_DIR`` 现取，不在模块级缓存
-  ``Path``：测试用 monkeypatch 切换数据目录时必须立刻生效，绝不能读写真实
-  ``~/.ycode``。
-- 落盘路径统一由 ``_safe_path`` 拼装后 ``resolve()`` + ``relative_to()``
-  校验，uid/slug 另做白名单校验，本模块不接受任何 ``..``、绝对路径、盘符，
-  越界即拒绝（返回 False / 默认值）。
-- 模型输出属于不可信数据：写入内容统一过
-  ``core.memory_kairos._contains_memory_directive`` 的劫持句式过滤，命中整条
-  丢弃；单条字符串与整文件都有硬上限，超限拒绝写入并留一条 changelog 便于
-  事后诊断「数据为何没落盘」。
-- 读写全程 best-effort：读失败/坏文件回落默认值，写失败只记
-  ``logging.debug`` 并返回 False，绝不向调用方（GUI/CLI 轮次）抛异常——成长
-  记录损坏不能阻断对话。
-- 目录懒创建：只有真正写入时才 ``mkdir(parents=True, exist_ok=True)``；
-  ``reset_*`` 把目标目录整体改名成 ``<name>.bak-<时间戳>`` 而不重建，下次写入
-  时自然再建（用户原始数据一律保留在备份目录里可回溯）。
-"""
-
 from __future__ import annotations
 
 import getpass
@@ -39,7 +18,6 @@ from core.memory_kairos import _contains_memory_directive
 
 logger = logging.getLogger("ycode.identity")
 
-# ---- 硬上限（全部硬编码，不做配置项：上限本身就是安全边界） ----
 MAX_FILE_BYTES = 8 * 1024
 MAX_STRING_CHARS = 200
 MAX_TRAITS = 12
@@ -49,12 +27,7 @@ MAX_GROWTH_LOG = 100
 MAX_PROFILE_ITEMS = 20
 MAX_CHANGELOG_LINES = 200
 MAX_USER_KEY_LEN = 64
-#: 备份目录（self.bak-* / users.bak-* 等）只保留最近这么多份。
-#: 不设上限时反复 reset 会让备份无限堆积，长期占用磁盘。
 MAX_BACKUPS = 5
-#: lesson 正文是「经验沉淀」的主体内容，按条 200 字会写不下可复用的做法，
-#: 因此单字段放宽到 4000 字，真正生效的护栏是整文件 8KB（中文字符 3 字节，
-#: 两段各 3000 字就会超 8KB 被拒）。
 MAX_LESSON_FIELD_CHARS = 4000
 
 DEFAULT_USER_KEY = "default"
@@ -72,14 +45,10 @@ _LESSON_HEADINGS = {"场景": "scene", "做法": "how"}
 _io_lock = threading.RLock()
 
 
-# --------------------------------------------------------------------------
-# 路径与校验
-# --------------------------------------------------------------------------
 def _root() -> Path:
-    """按调用时刻读取数据根目录（测试会 monkeypatch config.YCODE_DIR）。"""
     try:
         raw = getattr(config, "YCODE_DIR", "") or ""
-    except Exception:  # config 导入异常也不该阻断调用方
+    except Exception:
         raw = ""
     try:
         return Path(str(raw)).expanduser()
@@ -88,11 +57,6 @@ def _root() -> Path:
 
 
 def _fs_key(path) -> str:
-    """把文件系统路径规整成可比较的字符串。
-
-    去掉 Windows 的 ``\\\\?\\`` 长路径前缀并按平台规则统一大小写，避免同一个
-    路径因为解析方式不同（``D:\\x`` vs ``\\\\?\\D:\\x``）被判成两处。
-    """
     text = os.fspath(path)
     if text.startswith("\\\\?\\"):
         text = text[4:]
@@ -100,7 +64,6 @@ def _fs_key(path) -> str:
 
 
 def _safe_path(*parts) -> Path | None:
-    """把 parts 拼到 YCODE_DIR 下并校验仍在根目录内；越界返回 None。"""
     try:
         root = _root().resolve()
     except Exception as exc:
@@ -124,7 +87,6 @@ def _safe_path(*parts) -> Path | None:
 
 
 def _is_safe_name(value) -> bool:
-    """uid/slug 白名单校验：只允许字母数字开头、≤64 位、无路径结构。"""
     if not isinstance(value, str) or not value:
         return False
     if ".." in value or "/" in value or "\\" in value:
@@ -135,7 +97,6 @@ def _is_safe_name(value) -> bool:
 
 
 def _sanitize_user_key(raw) -> str:
-    """把任意原始串清洗成白名单内的用户键；无法清洗出内容时返回 ""。"""
     text = "" if raw is None else str(raw).strip()
     if not text:
         return ""
@@ -144,7 +105,6 @@ def _sanitize_user_key(raw) -> str:
     cleaned = cleaned.replace("..", "_")
     cleaned = re.sub(r"_{2,}", "_", cleaned).strip("._-")
     if len(cleaned) > MAX_USER_KEY_LEN:
-        # 超长时用原串 sha1 前 10 位做稳定后缀：同一原始串永远映射到同一目录。
         digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10]
         cleaned = f"{cleaned[: MAX_USER_KEY_LEN - 11]}_{digest}"
     return cleaned
@@ -153,16 +113,11 @@ def _sanitize_user_key(raw) -> str:
 def _system_user() -> str:
     try:
         return getpass.getuser() or ""
-    except Exception:  # 无环境变量/无 passwd 条目的极简环境
+    except Exception:
         return ""
 
 
 def resolve_user_key() -> str:
-    """解析用户键：设置项 user_key > 环境变量 YCODE_USER > 系统用户名 > default。
-
-    结果一定落在 ``[A-Za-z0-9._-]`` 且长度 ≤ 64 内（超长加 sha1 后缀稳定化），
-    因此可直接当作目录名使用，不需要再做路径校验。
-    """
     try:
         settings_key = get_growth_settings().get("user_key", "")
     except Exception:
@@ -189,9 +144,6 @@ def _resolve_uid(uid=None) -> str:
     return key
 
 
-# --------------------------------------------------------------------------
-# 通用读写
-# --------------------------------------------------------------------------
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -200,14 +152,6 @@ _REDACT_FN = None
 
 
 def _redact(text: str) -> str:
-    """落盘/读出文本的密钥脱敏，复用 decision_gateway 的识别规则。
-
-    档案、经验、成长日志都是模型从真实对话里抽出来的，可能夹带 ``sk-...``、
-    ``Bearer ...``、``api_key=...`` 这类内容；它们最终会被注回系统提示词，
-    所以必须在落盘前抹掉。
-
-    局部导入 + 失败降级：脱敏模块不可用时保留原文，绝不阻断成长链路。
-    """
     global _REDACT_FN
     if _REDACT_FN is None:
         try:
@@ -237,12 +181,6 @@ def _one_line(value, limit=MAX_STRING_CHARS) -> str:
 def _clip_list(
     value, limit, item_chars=MAX_STRING_CHARS, keep="head"
 ) -> list[str]:
-    """裁剪列表到上限。
-
-    ``keep="head"`` 保留最早的 N 条（默认，整体替换语义）；
-    ``keep="tail"`` 保留最新的 N 条——偏好、禁区、成长日志都是「新条目追加在
-    尾部」，保留头部会把刚学到的东西切掉，导致新数据永远不生效。
-    """
     if not isinstance(value, (list, tuple)):
         return []
     items = []
@@ -259,7 +197,6 @@ def _clip_list(
 
 
 def _has_directive(value) -> bool:
-    """递归检查任意嵌套结构中的字符串是否命中劫持句式。"""
     if isinstance(value, str):
         return _contains_memory_directive(value)
     if isinstance(value, dict):
@@ -281,7 +218,6 @@ def _filter_directive_items(values) -> list[str]:
 
 
 def _clean_text(value, limit=MAX_STRING_CHARS) -> str:
-    """压成单行；命中劫持句式时丢弃（返回空串），用于称呼/关系这类单值字段。"""
     text = _one_line(value, limit)
     if text and _contains_memory_directive(text):
         return ""
@@ -386,7 +322,6 @@ def write_text_atomic(path: Path | None, text: str) -> bool:
 
 
 def _split_frontmatter(text: str):
-    """返回 (meta, body)；没有合法 frontmatter 时 meta 为空且 body 为原文。"""
     if not text:
         return {}, ""
     lines = text.splitlines()
@@ -410,7 +345,6 @@ def _render_frontmatter(meta: dict, body: str) -> str:
 
 
 def _parse_sections(body: str, headings: dict) -> dict:
-    """按 ``## 中文标题`` 收集小节内容（列表项去掉 "- " 前缀）。"""
     result = {field: ("" if field == "title" else []) for field in headings.values()}
     current = None
     for line in (body or "").splitlines():
@@ -428,9 +362,6 @@ def _parse_sections(body: str, headings: dict) -> dict:
     return result
 
 
-# --------------------------------------------------------------------------
-# 成长设置 self/settings.json
-# --------------------------------------------------------------------------
 def _settings_path() -> Path | None:
     return _safe_path("self", "settings.json")
 
@@ -451,11 +382,6 @@ def get_growth_settings() -> dict:
 
 
 def _migrate_user_profile(old_key: str, new_key: str) -> None:
-    """user_key 变更时把旧档案目录复制到新键下。
-
-    不迁移的话旧数据仍在磁盘上，但界面按新键读，等于凭空消失（孤儿目录）。
-    用复制而非改名：用户改回旧键时原数据还在；目标已存在时不覆盖。
-    """
     if not old_key or not new_key or old_key == new_key:
         return
     source = _safe_path("users", old_key)
@@ -502,9 +428,6 @@ def save_growth_settings(**patch) -> dict:
         return merged
 
 
-# --------------------------------------------------------------------------
-# 自我模型 self/self.json
-# --------------------------------------------------------------------------
 def _default_self_model() -> dict:
     return {
         "version": 1,
@@ -530,15 +453,12 @@ def _normalize_growth_log(value) -> list[dict]:
         if not note or _contains_memory_directive(note):
             continue
         entries.append({"date": date_text, "note": note})
-    # 成长日志是「新条目追加在尾部」的语义：满额时挤掉最旧的，保留最新。
-    # 保留头部会让新学到的笔记静默消失（写入却报成功），是 C1 的根因。
     if len(entries) > MAX_GROWTH_LOG:
         entries = entries[-MAX_GROWTH_LOG:]
     return entries
 
 
 def _normalize_self_model(data) -> dict:
-    """把任意来源的数据收敛成合法 schema（永不抛异常）。"""
     model = _default_self_model()
     if not isinstance(data, dict):
         return model
@@ -605,7 +525,6 @@ def save_self_model(patch: dict) -> bool:
                     merged["voice"][key] = _clip_list(voice.get(key), MAX_VOICE_ITEMS)
         if "growth_log" in patch:
             merged["growth_log"] = _normalize_growth_log(patch.get("growth_log"))
-        # 最后一道防线：归一化后仍命中说明有字段漏了过滤
         if _has_directive(merged):
             append_changelog("self", "拒绝写入：自我模型内容含可疑指令")
             return False
@@ -617,9 +536,6 @@ def save_self_model(patch: dict) -> bool:
         return _write_text(path, text)
 
 
-# --------------------------------------------------------------------------
-# 用户档案 users/<uid>/profile.md
-# --------------------------------------------------------------------------
 def _profile_path(uid=None) -> Path | None:
     key = _resolve_uid(uid)
     if not key:
@@ -670,7 +586,6 @@ def update_user_profile(
     if not key or path is None:
         return False
     with _io_lock:
-        # 只检查本次入参：历史脏条目已在读路径被剔除（毒丸效应）。
         if _has_directive(
             {
                 "title": title,
@@ -715,9 +630,6 @@ def update_user_profile(
         return _write_text(path, text)
 
 
-# --------------------------------------------------------------------------
-# 经验教训 lessons/<slug>.md
-# --------------------------------------------------------------------------
 def _normalize_lesson(meta: dict, body: str) -> dict:
     sections = _parse_sections(body, _LESSON_HEADINGS)
     try:
@@ -761,7 +673,6 @@ def iter_lessons() -> list[dict]:
 
 
 def save_lesson(slug, scene, how, kind="lesson", source="") -> bool:
-    """写入 lessons/<slug>.md；同 slug 再次保存时 hits+1 并刷新 last_hit_at。"""
     if not _is_safe_name(slug):
         return False
     path = _safe_path("lessons", f"{slug}.md")
@@ -801,9 +712,6 @@ def save_lesson(slug, scene, how, kind="lesson", source="") -> bool:
         return _write_text(path, text)
 
 
-# --------------------------------------------------------------------------
-# 变更日志 self/changelog.md
-# --------------------------------------------------------------------------
 def _changelog_path() -> Path | None:
     return _safe_path("self", "changelog.md")
 
@@ -841,9 +749,6 @@ def get_changelog(limit=50) -> list[str]:
     return rows[-limit:]
 
 
-# --------------------------------------------------------------------------
-# 重置（改名备份，不重建）
-# --------------------------------------------------------------------------
 def _prune_backups(parent: Path | None, base_name: str) -> None:
     """只保留最近 ``MAX_BACKUPS`` 份 <base>.bak-* 备份，其余删除。
 
@@ -871,7 +776,6 @@ def _prune_backups(parent: Path | None, base_name: str) -> None:
 
 
 def _backup_dir(path: Path | None) -> bool:
-    """把目录整体改名为 <name>.bak-<YYYYmmddHHMMSS>（重名加序号），不重建。"""
     if path is None:
         return False
     try:
@@ -914,9 +818,6 @@ def reset_all() -> bool:
     return all(results)
 
 
-# --------------------------------------------------------------------------
-# GUI 快照
-# --------------------------------------------------------------------------
 def get_growth_snapshot() -> dict:
     """给 GUI 的一次性快照：身份、称呼、阶段、特质、经验数与设置。"""
     try:

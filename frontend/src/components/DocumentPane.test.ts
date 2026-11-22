@@ -14,7 +14,6 @@ vi.mock('pdfjs-dist', () => ({
   getDocument: vi.fn(),
 }));
 vi.mock('pdfjs-dist/build/pdf.worker.min.mjs?url', () => ({ default: 'pdf.worker.min.mjs' }));
-// docx-preview 同样顶掉：jsdom 里没有真实 docx 二进制可解析，这里只验数据流
 vi.mock('docx-preview', () => ({ renderAsync: vi.fn().mockResolvedValue(undefined) }));
 
 const PDF_DATA_URL = 'data:application/pdf;base64,JVBERi0xLjQK';
@@ -26,7 +25,6 @@ function stubBridge(api: Record<string, unknown>) {
 function makePageProxy() {
   return {
     getViewport: ({ scale }: { scale: number }) => ({ width: 600 * scale, height: 800 * scale }),
-    // 真渲染这里会往 canvas 里画，jsdom 无 2d 上下文，只要 promise 兑现即可
     render: () => ({ promise: Promise.resolve() }),
   };
 }
@@ -74,7 +72,6 @@ it('打开 PDF：读文件 → pdf.js 解析 → 按页生成 canvas，工具栏
   expect(wrapper.get('[data-test="dc-pager"]').text()).toBe('1 / 2');
   expect(wrapper.find('[data-test="dc-page-1"]').exists()).toBe(true);
   expect(wrapper.find('[data-test="dc-page-2"]').exists()).toBe(true);
-  // 占位块按 scale=1 的页面尺寸给出，图片出来前高度不跳动
   expect((wrapper.get('[data-test="dc-page-1"]').element as HTMLElement).style.height).toBe('800px');
   // 位图尺寸必须按 viewport 像素定好：留默认 300×150 的话，pdf.js 会把整页画进
   // 那一小片，再被 CSS 拉伸成一片糊字（2026-11-06 用户反馈的"乱码"就是这个）
@@ -98,7 +95,6 @@ it('翻页与缩放：页码前进到末页、缩放百分比按 20% 步进', as
   await nextTick();
   await flushPromises();
 
-  // jsdom 里量不到容器宽度，适应宽度比例保持 1 → 初始 100%
   expect(wrapper.get('[data-test="dc-zoom"]').text()).toBe('100%');
 
   await wrapper.get('[data-test="dc-next"]').trigger('click');
@@ -114,7 +110,6 @@ it('翻页与缩放：页码前进到末页、缩放百分比按 20% 步进', as
 
   await wrapper.get('[data-test="dc-zoom-out"]').trigger('click');
   await flushPromises();
-  // 缩小后「适应宽度」把比例拉回 1
   await wrapper.get('[data-test="dc-fit"]').trigger('click');
   await flushPromises();
   expect(wrapper.get('[data-test="dc-zoom"]').text()).toBe('100%');
@@ -195,7 +190,6 @@ it('「在文件夹中打开」定位源文件：Office 文档用 sourcePath，�
   });
 
   const store = useAppStore();
-  // Office 文档：path 是后端转出的缓存 PDF，sourcePath 才是用户点开的那个 .docx
   store.openDocumentInRightPanel(
     'C:\\Users\\x\\.ycode\\exports\\preview\\office_ab12.pdf',
     '季度报告.docx',
@@ -208,7 +202,6 @@ it('「在文件夹中打开」定位源文件：Office 文档用 sourcePath，�
   await wrapper.get('[data-test="dc-reveal"]').trigger('click');
   await flushPromises();
   expect(reveal).toHaveBeenCalledWith('D:\\docs\\季度报告.docx');
-  // 标题显示源文档名，用户认的是 .docx
   expect(wrapper.get('[data-test="dc-name"]').text()).toBe('季度报告.docx');
 
   await wrapper.unmount();
@@ -235,9 +228,6 @@ it('宿主没有 reveal_in_explorer（旧后端）：退回只打开所在目录
   await wrapper.unmount();
 });
 
-// ── 编辑模式 ──
-// jsdom 的 getBoundingClientRect 全返回 0，编辑层的坐标换算会除零，
-// 所以统一 stub 成一块 600×800（与 makePageProxy 的 scale=1 尺寸一致）的页面框。
 const EDIT_LAYER_BOX = {
   left: 0, top: 0, width: 600, height: 800,
   right: 600, bottom: 800, x: 0, y: 0,
@@ -248,8 +238,6 @@ function stubLayout() {
   vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue(EDIT_LAYER_BOX);
 }
 
-// jsdom 没有 PointerEvent，手动挂 clientX/clientY（VTU 的 trigger 在无 PointerEvent 时
-// 会退化成 Event，坐标会被丢掉）
 function pointerEvent(type: string, x: number, y: number): Event {
   const ev = new Event(type, { bubbles: true, cancelable: true });
   Object.defineProperty(ev, 'clientX', { value: x });
@@ -313,7 +301,6 @@ it('高亮：拖出一块矩形后生成 highlight 标注，并亮起脏标记',
   expect(annots).toHaveLength(1);
   expect(annots[0].attributes('data-annot-type')).toBe('highlight');
   expect(wrapper.find('[data-test="dc-dirty"]').exists()).toBe(true);
-  // 拖拽预览已收尾
   expect(wrapper.find('[data-test="dc-edit-draft"]').exists()).toBe(false);
 
   await wrapper.unmount();
@@ -392,7 +379,6 @@ it('页面操作：删页后显示「保存时生效」提示条，预览不重�
   expect(bar.text()).toContain('1');
   expect(bar.text()).toContain('删除页');
   expect(bar.text()).toContain('保存时生效');
-  // 页面块数量不变：页数重排要等后端保存时才发生
   expect(wrapper.findAll('[data-page]')).toHaveLength(2);
   expect(wrapper.get('[data-test="dc-pager"]').text()).toBe('1 / 2');
 
@@ -438,7 +424,6 @@ it('保存副本成功：清空标注并退出编辑模式', async () => {
   await wrapper.get('[data-test="dc-edit-save-copy"]').trigger('click');
   await flushPromises();
 
-  // 已落盘：历史与标注清空，编辑模式一并退出（第二行工具栏消失）
   expect(wrapper.findAll('[data-test="dc-annot"]')).toHaveLength(0);
   expect(wrapper.find('[data-test="dc-edit-toolbar"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="dc-dirty"]').exists()).toBe(false);
@@ -481,11 +466,9 @@ it('打开 docx：docx-preview 直接渲染，不出页码也不给 PDF 编辑�
   await flushPromises();
   await nextTick();
 
-  // 渲染交给 docx-preview，容器按 kind=docx 出现，没有任何 canvas 页
   expect(mod.renderAsync).toHaveBeenCalledTimes(1);
   expect(wrapper.find('[data-test="dc-docx"]').exists()).toBe(true);
   expect(wrapper.find('.dc-page').exists()).toBe(false);
-  // Word 文档没有可翻的 PDF 页，也不支持 PDF 编辑
   expect(wrapper.find('[data-test="dc-pager"]').exists()).toBe(false);
   expect(wrapper.get('[data-test="dc-edit-toggle"]').attributes('disabled')).toBe('');
 
@@ -497,14 +480,12 @@ it('选择工具：点选标注后拖动会平移，松手才落历史', async (
   const { wrapper } = await mountEditable(2);
   await enterEditMode(wrapper);
 
-  // 先画一个方框（100,200 → 200,260，scale=1 时显示坐标就等于 PDF 点）
   await wrapper.get('[data-test="dc-tool-rect"]').trigger('click');
   dragOn(layerEl(wrapper, 1), [100, 200], [200, 260]);
   await nextTick();
   const annotSel = '[data-test="dc-annot"]';
   expect(wrapper.findAll(annotSel)).toHaveLength(1);
 
-  // 切到「选择」工具，点中这条标注
   await wrapper.get('[data-test="dc-tool-select"]').trigger('click');
   const annot = wrapper.get(annotSel);
   expect(annot.attributes('data-annot-index')).toBe('0');
@@ -512,14 +493,12 @@ it('选择工具：点选标注后拖动会平移，松手才落历史', async (
   await nextTick();
   expect(annot.classes()).toContain('is-selected');
 
-  // 拖动：window 上收 move/up（跨出页面也能拖）
   window.dispatchEvent(pointerEvent('pointermove', 160, 230));
   await nextTick();
   expect(annot.attributes('transform')).toBe('translate(40 20)');
 
   window.dispatchEvent(pointerEvent('pointerup', 160, 230));
   await nextTick();
-  // 落盘后 transform 清掉，矩形本身平移了 40/20
   const box = wrapper.get(`${annotSel} rect`);
   expect(box.attributes('x')).toBe('140');
   expect(box.attributes('y')).toBe('220');

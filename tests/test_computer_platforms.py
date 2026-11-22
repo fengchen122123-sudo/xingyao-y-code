@@ -1,5 +1,3 @@
-"""平台扩展边界：不使用真实系统输入、浏览器或热键。"""
-
 import builtins
 from types import SimpleNamespace
 

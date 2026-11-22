@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""core.office_preview 的单元测试：全部 mock，不依赖本机真实 Office。
-
-隔离策略：与 tests/test_web_preview.py 一致，monkeypatch
-``core.office_preview.get_preview_dir`` 指向 tmp_path，绝不碰用户真实
-~/.ycode；子进程一律用 ``subprocess.run`` 的假实现替换，断言的是"父进程如何
-调用子进程、如何解释结果"，COM 行为由真实冒烟验证覆盖。
-"""
 
 import os
 import re
@@ -19,7 +12,6 @@ from core import office_preview as op
 
 @pytest.fixture()
 def preview_dir(tmp_path, monkeypatch):
-    """把缓存目录换到临时目录（不触碰 ~/.ycode）。"""
     target = tmp_path / "preview"
     monkeypatch.setattr(op, "get_preview_dir", lambda: target)
     return target
@@ -27,7 +19,6 @@ def preview_dir(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def source_file(tmp_path):
-    """一个存在的 docx 源文件，mtime 压到过去，便于构造"缓存新鲜"。"""
     path = tmp_path / "报告.docx"
     path.write_bytes(b"fake-docx")
     old = 1_600_000_000.0
@@ -37,7 +28,6 @@ def source_file(tmp_path):
 
 @pytest.fixture()
 def no_subprocess(monkeypatch):
-    """subprocess.run 一旦被调用就失败——用来验证"缓存命中不启动子进程"。"""
 
     def _fail(*args, **kwargs):  # pragma: no cover - 命中即说明代码走错分支
         raise AssertionError("缓存命中时不应启动转换子进程")
@@ -48,9 +38,6 @@ def no_subprocess(monkeypatch):
 
 def _completed(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(args=["python"], returncode=returncode, stdout=stdout, stderr=stderr)
-
-
-# ---------------------------------------------------------------- 扩展名判定
 
 
 @pytest.mark.parametrize(
@@ -66,7 +53,6 @@ def _completed(returncode=0, stdout="", stderr=""):
         "a.ppt",
         "a.pptx",
         "a.odp",
-        # 大小写、带目录的绝对路径、首尾空白都应判定为 Office 文档
         r"C:\proj\sub\A.DOCX",
         r"D:/proj/B.XLSX",
         "  C:\\proj\\c.PPTX  ",
@@ -94,7 +80,6 @@ def test_is_office_path_rejects_others(path):
 
 
 def test_office_extensions_mapping():
-    # 调用方（gui_bridge）会按这张表决定"能不能点预览"，键必须是含点小写扩展名
     assert op.OFFICE_EXTENSIONS[".docx"] == "word"
     assert op.OFFICE_EXTENSIONS[".rtf"] == "word"
     assert op.OFFICE_EXTENSIONS[".xlsx"] == "excel"
@@ -106,16 +91,12 @@ def test_office_extensions_mapping():
     assert set(op.OFFICE_EXTENSIONS.values()) == {"word", "excel", "powerpoint"}
 
 
-# ---------------------------------------------------------------- 缓存路径
-
-
 def test_cached_pdf_path_is_stable_and_in_preview_dir(preview_dir, source_file):
     first = op.cached_pdf_path(str(source_file))
     second = op.cached_pdf_path(str(source_file))
 
     assert first == second
     assert first.parent == preview_dir
-    # 命名约定：office_<sha1 前 12 位>.pdf，调用方与清理脚本都按这个模式找文件
     assert re.fullmatch(r"office_[0-9a-f]{12}\.pdf", first.name)
 
 
@@ -140,9 +121,6 @@ def test_cached_pdf_path_ignores_surrounding_whitespace(preview_dir, tmp_path):
     assert op.cached_pdf_path(f"  {tmp_path / 'a.docx'}  ") == plain
 
 
-# ---------------------------------------------------------------- 缓存命中
-
-
 def test_convert_returns_cached_pdf_without_subprocess(preview_dir, source_file, no_subprocess):
     cached = op.cached_pdf_path(str(source_file))
     cached.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +136,6 @@ def test_stale_cache_triggers_conversion(preview_dir, source_file, monkeypatch):
     cached = op.cached_pdf_path(str(source_file))
     cached.parent.mkdir(parents=True, exist_ok=True)
     cached.write_bytes(b"%PDF-1.4 stale")
-    # 让缓存 PDF 比源文件旧 → 必须重新转换
     os.utime(cached, (1_500_000_000.0, 1_500_000_000.0))
 
     calls = []
@@ -175,9 +152,6 @@ def test_stale_cache_triggers_conversion(preview_dir, source_file, monkeypatch):
     assert len(calls) == 1
     assert result == cached
     assert cached.read_bytes() == b"%PDF-1.4 fresh"
-
-
-# ---------------------------------------------------------------- 失败分支
 
 
 def test_convert_missing_source_raises(preview_dir, tmp_path):
@@ -244,16 +218,12 @@ def test_convert_timeout_raises(preview_dir, source_file, monkeypatch):
 
 
 def test_convert_success_but_no_pdf_raises(preview_dir, source_file, monkeypatch):
-    # 子进程返回 0 却没落盘：不能当成成功（用户会看到空白预览）
     monkeypatch.setattr(op.subprocess, "run", lambda *a, **k: _completed())
 
     with pytest.raises(op.OfficeConvertError) as excinfo:
         op.convert_to_pdf(str(source_file))
 
     assert "没有生成 PDF" in str(excinfo.value)
-
-
-# ---------------------------------------------------------------- 子进程约定
 
 
 def test_child_command_shape(preview_dir, source_file, monkeypatch):
@@ -281,7 +251,6 @@ def test_child_command_shape(preview_dir, source_file, monkeypatch):
 
 
 def test_module_has_no_gui_dependencies():
-    # 本模块会被子进程与单测直接导入，必须保持轻量（见模块 docstring 取舍 4）
     source = Path(op.__file__).read_text(encoding="utf-8")
     import_lines = [
         line.strip()

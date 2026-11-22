@@ -1,5 +1,3 @@
-"""Tests for the restrained single-accent CLI visual beautification."""
-
 from __future__ import annotations
 
 import shutil
@@ -62,7 +60,6 @@ def test_selector_styles_and_cli_styles_build_across_all_themes():
         assert sel_style is not None
         cli_style = main._build_cli_style(name)
         assert cli_style is not None
-        # 确认不再强制给输入区盖死黑补丁 bg:#0a0a0f
         rules = dict(cli_style.style_rules)
         assert "bg:#0a0a0f" not in rules.get("input-field", "")
         assert "bg:#0a0a0f" not in rules.get("input-prefix", "")
@@ -92,7 +89,6 @@ def test_terminal_markdown_renders_with_active_theme():
         assert "一级标题" in plain
         assert "▸ 二级标题" in plain
         assert "print('hi')" in plain
-        # 代码块无左右竖线边框，便于终端复制
         code_line = next(line for line in plain.splitlines() if "print('hi')" in line)
         assert "│" not in code_line
 
@@ -115,7 +111,6 @@ def test_print_logo_preserves_pixel_avatar_and_adapts_columns(monkeypatch):
         plain = to_formatted_text(HTML(card_html))
         plain_str = "".join(frag[1] for frag in plain)
 
-        # 经典 4 行像素小头像严格保留
         for avatar_line in ("▄▄    ▄▄", "██████████", "██ █  █ ██", "▀██████▀"):
             assert avatar_line in plain_str
 
@@ -196,13 +191,10 @@ def test_input_app_layout_preserves_activity_index_and_adds_subagent_panel(monke
         with create_app_session(input=pipe_in, output=DummyOutput()):
             app = main._make_input_app()
             root = app.layout.container.content
-            # 回归契约：activity_window 必须仍在 children[4]，高度为 2
             activity_window = root.children[4].content
             assert activity_window.height == 2
-            # 新增并发子代理面板在 children[5]
             subagent_container = root.children[5]
             assert subagent_container.filter() is True
-            # 动态多行输入框 1~5 行 + 左侧 2 格留白引导符 "  ❯ "
             input_vsplit = root.children[8]
             prefix_win = input_vsplit.children[0]
             assert prefix_win.width.min == 4
@@ -215,7 +207,6 @@ def test_turn_output_uses_two_space_margin_and_in_order_queue(monkeypatch):
     plain_md = Text.from_ansi(rendered).plain
     assert plain_md.startswith("  正文测试")
 
-    # 模拟真实交互终端（app._is_running=True）：验证 ✦ 星瑶、Markdown 正文与 "── 完成" 按 FIFO 顺序入队
     queued_ops = []
     printed = []
 
@@ -250,7 +241,6 @@ def test_turn_output_uses_two_space_margin_and_in_order_queue(monkeypatch):
     main._render_ui_event(factory.emit("assistant_delta", {"text": "第一句回答\n\n"}))
     main._render_ui_event(factory.emit("turn_finished"))
 
-    # 所有渲染都应按顺序经 run_in_terminal 排队执行，而不是跳过队列抢先打印
     assert printed == []
     assert len(queued_ops) >= 3
     for op in queued_ops:

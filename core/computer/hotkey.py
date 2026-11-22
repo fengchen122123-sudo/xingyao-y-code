@@ -1,18 +1,3 @@
-"""全局紧急停止热键 Ctrl+Alt+Esc（设计 3.3、15.1、17.3）。
-
-EmergencyStopHotkey 依赖注入 HotkeyApi：回调只调用 on_stop，绝不直接触碰
-GUI、prompt_toolkit 或 Provider 流。默认 Windows 实现（WindowsHotkeyApi）用
-独立消息线程注册 MOD_CONTROL|MOD_ALT + VK_ESCAPE，只在收到对应 WM_HOTKEY
-时回调；其他平台构造即抛 computer_unsupported_os。注册失败抛
-computer_hotkey_unavailable 且 available=False：失败原因由
-_hotkey_unavailable_message 生成用户可读文案，带上 Win32 错误码语义
-（1409 = 热键已被其他进程占用），便于用户自助定位是哪个程序抢了热键。
-
-get_emergency_hotkey_snapshot() 提供含 available 字段的保守快照，供
-core.command_shell.get_system_settings() 惰性导入聚合；无活动实例时
-返回 available=False。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -31,18 +16,16 @@ EMERGENCY_HOTKEY_LABEL = "Ctrl+Alt+Esc"
 # "被别的程序占了"（1409）与"参数非法"（87）这类原因。
 _ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 
-# Win32 常量（仅默认 WindowsHotkeyApi 使用）
 _MOD_ALT = 0x0001
 _MOD_CONTROL = 0x0002
 _MOD_NOREPEAT = 0x4000
 _VK_ESCAPE = 0x1B
 _WM_HOTKEY = 0x0312
-_WM_APP_QUIT = 0x8001  # WM_APP + 1，close() 发给消息线程的退出消息
+_WM_APP_QUIT = 0x8001
 _HOTKEY_ID = 1
 
 
 def _hotkey_unavailable_message(error_code: int = 0) -> str:
-    """注册失败的用户可读原因：点名热键、区分占用与其它错误码并附诊断码。"""
     base = f"无法注册全局紧急停止热键 {EMERGENCY_HOTKEY_LABEL}"
     if error_code == _ERROR_HOTKEY_ALREADY_REGISTERED:
         return (
@@ -134,7 +117,6 @@ class EmergencyStopHotkey:
                     _active_hotkey = None
 
     def _dispatch_for_test(self, hotkey_label: str) -> None:
-        """测试与消息线程共用的分发入口：仅匹配固定热键时调用 on_stop。"""
         if hotkey_label != EMERGENCY_HOTKEY_LABEL:
             return
         self._on_stop()

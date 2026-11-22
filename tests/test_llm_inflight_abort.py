@@ -1,10 +1,3 @@
-"""在飞 LLM 请求硬中断（abort_inflight_streams）回归测试。
-
-覆盖：注册表生命周期、attach 前后 abort、幂等关闭、异常吞没、
-_request_stream 集成、流消费端取消归一（KeyboardInterrupt）、
-子代理 _terminate 触发硬中断。
-"""
-
 import threading
 
 import pytest
@@ -31,7 +24,6 @@ class _FakeStream:
 
 
 class _WrapperWithoutClose:
-    """模拟流包装对象：自身无 close，可关对象藏在里层。"""
 
     def __init__(self, inner):
         self.completion_stream = inner
@@ -67,8 +59,8 @@ def test_abort_is_idempotent_and_swallows_close_errors():
     stream = _FakeStream(close_error=RuntimeError("close boom"))
     holder.attach(stream)
 
-    llm.abort_inflight_streams(event)  # 不抛异常
-    llm.abort_inflight_streams(event)  # 幂等
+    llm.abort_inflight_streams(event)
+    llm.abort_inflight_streams(event)
 
     assert stream.close_calls == 1
     llm._unregister_inflight_stream(event, holder)
@@ -96,12 +88,12 @@ def test_unregister_removes_holder_from_registry():
     assert event not in llm._inflight_streams
     stream = _FakeStream()
     holder.attach(stream)
-    llm.abort_inflight_streams(event)  # 已摘除：不再生效
+    llm.abort_inflight_streams(event)
     assert stream.close_calls == 0
 
 
 def test_abort_with_none_event_is_noop():
-    llm.abort_inflight_streams(None)  # 不抛异常
+    llm.abort_inflight_streams(None)
 
 
 def test_request_stream_registers_and_attaches(monkeypatch):
@@ -156,13 +148,12 @@ def test_stream_chunks_unregisters_holder_after_consumption():
 
 
 def test_stream_chunks_cancel_normalizes_stream_error_to_keyboard_interrupt():
-    """用户取消触发硬中断后，pump 抛出的读错误必须归一为 KeyboardInterrupt。"""
     event = threading.Event()
     calls = []
 
     def raise_if_cancelled():
         calls.append(1)
-        if len(calls) > 1:  # 首次循环检查放行，读到错误项时判定已取消
+        if len(calls) > 1:
             raise KeyboardInterrupt("用户终止了对话。")
 
     with pytest.raises(KeyboardInterrupt):
@@ -176,7 +167,6 @@ def test_stream_chunks_cancel_normalizes_stream_error_to_keyboard_interrupt():
 
 
 def test_subagent_terminate_aborts_inflight_streams(monkeypatch):
-    """子代理取消/超时终态必须硬中断其在飞 LLM 请求。"""
     import json
 
     from core.tools import SubagentManager

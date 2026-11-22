@@ -12,7 +12,6 @@ from gui_bridge import ApiBridge
 def _bare_bridge():
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._sync_active_model_context = lambda: None
-    # 绕过 __init__ 时补齐会被 get_initial_state 后台线程读取的真实默认值。
     bridge._turn_start_lock = threading.Lock()
     bridge._message_queues = {}
     bridge._lan_server = None
@@ -70,12 +69,6 @@ def test_model_settings_snapshot_is_complete_without_secret(tmp_path, monkeypatc
 
 
 def test_model_settings_active_model_follows_session_binding(tmp_path, monkeypatch):
-    """设置快照的 active_model_id 必须是会话生效模型，而非陈旧的全局默认。
-
-    回归：GUI 按会话绑定模型、不更新全局 active_model_id；当全局值属于
-    另一厂商的同名模型时，设置快照若直接返回全局值，前端会把界面选中态
-    打回错误厂商（表现为"选了 A 厂商的模型自动跳到 B 厂商"）。
-    """
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
     bridge._current_session = "sess-kimi"
@@ -90,7 +83,6 @@ def test_model_settings_active_model_follows_session_binding(tmp_path, monkeypat
 
 
 def test_model_settings_active_model_falls_back_to_global(tmp_path, monkeypatch):
-    """会话尚未绑定任何模型时，active_model_id 回退到全局默认值。"""
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
     bridge._current_session = ""
@@ -113,7 +105,6 @@ def test_add_preset_provider_returns_refreshed_snapshot(tmp_path, monkeypatch):
     )
     assert kimi["protocol"] == "openai"
     assert kimi["has_api_key"] is True
-    # 预置厂商只预填厂商信息，模型列表为空（用户经「获取模型列表」添加）
     assert kimi["models"] == []
 
 
@@ -163,7 +154,6 @@ def test_responses_model_test_uses_responses_protocol(tmp_path, monkeypatch):
 
 
 def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch):
-    """启动快照必须携带副模型配置，否则设置页会显示"无/全勾选"假象。"""
     data = _configured_data()
     data["secondary_model_id"] = "m1"
     data["secondary_model_roles"] = {"vision": True, "compression": False, "subagent": False}
@@ -192,11 +182,6 @@ def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch
     assert state["system_settings"]["command_shell_available"] is True
 
 
-# ---------------------------------------------------------------------------
-# 模型能力字段（Task 12：supports_function_calling / computer_protocol）
-# ---------------------------------------------------------------------------
-
-
 def test_model_settings_snapshot_includes_capability_fields(tmp_path, monkeypatch):
     data = _configured_data()
     data["providers"][0]["models"][0]["supports_function_calling"] = True
@@ -214,10 +199,6 @@ def test_model_settings_snapshot_includes_capability_fields(tmp_path, monkeypatc
 
 
 def test_legacy_model_defaults_to_auto_protocol(tmp_path, monkeypatch):
-    """旧模型配置（缺 supports_function_calling 与 computer_protocol 键）：
-    展示层 fc 缺省 false、协议缺省 ""（自动）。由于 fc 为 false，自动判定
-    不会赋予电脑操控资格（设计 9.1 的能力门槛不变，只是协议不再误导性显示
-    为显式关闭）。"""
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
 
     snapshot = _bare_bridge().get_model_settings()
@@ -268,7 +249,6 @@ def test_add_and_update_model_persist_capability_fields(tmp_path, monkeypatch):
 
 
 def test_generic_protocol_requires_vision_and_function_calling(tmp_path, monkeypatch):
-    """model generic 的三字段校验：generic 但视觉未开 → 后端拒绝保存且不落盘。"""
     cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
 
@@ -299,16 +279,7 @@ def test_add_model_rejects_generic_without_required_capabilities(tmp_path, monke
     assert "model-bad" not in stored_names
 
 
-# ---------------- 缺省协议自动判定（自动激活视觉模型） ----------------
-
-
 def test_add_model_default_protocol_stays_unset_for_auto(tmp_path, monkeypatch):
-    """add_model 缺省/传空：不落 computer_protocol 键，由能力元数据自动判定。
-
-    用户裁决（2026-09-05）：新添加的视觉+工具调用模型无需逐个配置协议，
-    开关开启后即可电脑操控。旧实现把缺省强转为 "none"（显式关闭）导致
-    新模型永不自动激活——本测试钉死修复。
-    """
     cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
 
@@ -322,8 +293,6 @@ def test_add_model_default_protocol_stays_unset_for_auto(tmp_path, monkeypatch):
     )
     assert "computer_protocol" not in stored_model
 
-    # 能力解析：视觉+工具调用双勾 ⇒ 自动 generic 启用
-    # （enabled_settings 是 pytest fixture 不能直接调用，此处内联构造同等快照）
     from core.computer.capability import resolve_computer_capability
     from core.computer.settings import ComputerSettingsSnapshot
     from tests.computer_fakes import openai_compatible_provider
@@ -347,7 +316,6 @@ def test_add_model_default_protocol_stays_unset_for_auto(tmp_path, monkeypatch):
 
 
 def test_add_model_empty_string_protocol_means_auto(tmp_path, monkeypatch):
-    """前端「自动」选项传 ""：同样不落键（与缺省一致），不得强转为 "none"。"""
     cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
 
@@ -363,7 +331,6 @@ def test_add_model_empty_string_protocol_means_auto(tmp_path, monkeypatch):
 
 
 def test_update_model_empty_string_protocol_clears_to_auto(tmp_path, monkeypatch):
-    """update_model 传 ""：把已存的显式协议清回自动（删除键）；None 仍表示保留。"""
     cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
 
@@ -382,7 +349,6 @@ def test_update_model_empty_string_protocol_clears_to_auto(tmp_path, monkeypatch
     )
     assert "computer_protocol" not in stored_model
 
-    # None = 保留既有值（不触碰）
     kept = bridge.update_model(
         "p1", added["model_id"], "model-flip", 200000, True, True, None
     )
@@ -397,8 +363,6 @@ def test_update_model_empty_string_protocol_clears_to_auto(tmp_path, monkeypatch
 
 
 def test_all_models_reports_unset_protocol_as_empty_string(tmp_path, monkeypatch):
-    """展示层（_all_models）：缺键模型的 computer_protocol 返回 ""（自动），
-    前端编辑表单据此回填「自动」选项，而非误导性的 "none"。"""
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
 
@@ -408,7 +372,6 @@ def test_all_models_reports_unset_protocol_as_empty_string(tmp_path, monkeypatch
 
 
 def test_fetch_provider_models_returns_sorted_list(tmp_path, monkeypatch):
-    """「获取模型列表」：正常路径返回模型 ID 列表，语音/图像类排到末尾。"""
     import httpx
 
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
@@ -440,7 +403,6 @@ def test_fetch_provider_models_returns_sorted_list(tmp_path, monkeypatch):
     assert [m["id"] for m in result["models"]] == ["alpha", "Beta", "zeta-tts"]
     assert result["models"][0]["model_type"] == "大语言模型"
     assert result["count"] == 3
-    # 双鉴权头兼容 OpenAI 网关（Bearer）与 Anthropic 端点（x-api-key）
     assert captured["url"] == "https://api.example.com/v1/models"
     assert captured["headers"]["Authorization"] == "Bearer sk-secret-value"
     assert captured["headers"]["x-api-key"] == "sk-secret-value"
@@ -474,7 +436,6 @@ def test_fetch_provider_models_unknown_provider(tmp_path, monkeypatch):
 
 
 def test_fetch_provider_models_handles_v1_base_url(tmp_path, monkeypatch):
-    """base_url 已含版本段（…/v1）时不得重复拼接（/v1/v1/models 404 教训）。"""
     import httpx
 
     data = _configured_data()
@@ -501,7 +462,6 @@ def test_fetch_provider_models_handles_v1_base_url(tmp_path, monkeypatch):
 
 
 def test_fetch_provider_models_adds_tokenrhythm_agent_header(tmp_path, monkeypatch):
-    """基元律动厂商：拉取模型列表的请求必须携带 X-TokenRhythm-Agent 客户端标识。"""
     import httpx
 
     data = _configured_data()
@@ -530,7 +490,6 @@ def test_fetch_provider_models_adds_tokenrhythm_agent_header(tmp_path, monkeypat
 def test_fetch_provider_models_omits_tokenrhythm_agent_header_for_other_providers(
     tmp_path, monkeypatch
 ):
-    """非基元律动厂商：拉取模型列表不得携带该标识头。"""
     import httpx
 
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
@@ -555,9 +514,6 @@ def test_fetch_provider_models_omits_tokenrhythm_agent_header_for_other_provider
 
 
 def test_fetch_provider_models_extracts_context_and_vision(tmp_path, monkeypatch):
-    """元数据提取：阶跃 max_input_tokens/enable_vision_input 形状与
-    OpenRouter context_length/architecture.input_modalities 形状都要能填表；
-    缺元数据的条目返回 None（前端保持表单原值）。"""
     import httpx
 
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
@@ -598,7 +554,6 @@ def test_fetch_provider_models_extracts_context_and_vision(tmp_path, monkeypatch
 
 
 def test_model_max_tokens_roundtrip(tmp_path, monkeypatch):
-    """最大输出：快照回显、新增写入、更新改值、0 清除回内置默认。"""
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()
     cfg = tmp_path / "config.json"
@@ -614,9 +569,8 @@ def test_model_max_tokens_roundtrip(tmp_path, monkeypatch):
         if model["id"] == added["model_id"]
     )
     assert stored["max_tokens"] == 65536
-    assert added["settings"]["models"][0]["max_tokens"] is None  # 旧模型未设置
+    assert added["settings"]["models"][0]["max_tokens"] is None
 
-    # 改值
     updated = bridge.update_model(
         "p1", added["model_id"], "model-cap", 200000, True, True, "", 131072
     )
@@ -629,7 +583,6 @@ def test_model_max_tokens_roundtrip(tmp_path, monkeypatch):
     )
     assert stored["max_tokens"] == 131072
 
-    # 0 = 清除键，回到内置默认
     cleared = bridge.update_model(
         "p1", added["model_id"], "model-cap", 200000, True, True, "", 0
     )
@@ -646,7 +599,6 @@ def test_model_max_tokens_roundtrip(tmp_path, monkeypatch):
     )
     assert snapshot_item["max_tokens"] is None
 
-    # 非法负值拒绝
     rejected = bridge.update_model(
         "p1", added["model_id"], "model-cap", 200000, True, True, "", -5
     )
@@ -655,8 +607,6 @@ def test_model_max_tokens_roundtrip(tmp_path, monkeypatch):
 
 
 def test_fetch_provider_models_enriches_from_spec_table(tmp_path, monkeypatch):
-    """厂商未提供元数据的字段由本地规格表回填（官方文档核实值）；
-    厂商自带元数据永远优先。"""
     import httpx
 
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
@@ -678,25 +628,15 @@ def test_fetch_provider_models_enriches_from_spec_table(tmp_path, monkeypatch):
     result = _bare_bridge().fetch_provider_models("p1")
 
     by_id = {m["id"]: m for m in result["models"]}
-    # 规格表回填（deepseek-flash = 1M / 384K，官方定价页核实值）
     assert by_id["deepseek-flash"]["context_window"] == 1048576
     assert by_id["deepseek-flash"]["max_tokens"] == 384000
-    # 厂商自带上下文优先于规格表；step-x 不在规格表 → 输出 None
     assert by_id["step-x"]["context_window"] == 1000
     assert by_id["step-x"]["max_tokens"] is None
-    # 两边都没有 → 保持 None，由前端留空走内置默认
     assert by_id["unknown-model-xyz"]["context_window"] is None
     assert by_id["unknown-model-xyz"]["max_tokens"] is None
 
 
 def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypatch):
-    """模型条目必须带上思考设置字段，供模型编辑弹窗回填「思考设置」下拉。
-
-    - 已登记模型（deepseek-v4-pro）给出真实档位 default/off/low/high/xhigh/max，
-      并带上官方默认档位 high；
-    - 未登记模型回落通用强度兜底 default/off/low/medium/high/xhigh/max（无内置
-      默认档位，default_choice 为空串），而不是隐藏思考设置。
-    """
     data = _configured_data()
     data["providers"][0]["models"] = [
         {
@@ -727,10 +667,8 @@ def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypat
     assert [opt["value"] for opt in known["reasoning_options"]] == [
         "default", "off", "low", "high", "xhigh", "max"
     ]
-    # 已登记模型的官方默认档位随条目下发，供弹窗自动预选
     assert known["reasoning_default_choice"] == "high"
 
-    # 未登记模型：通用强度兜底，GUI 仍显示可操作的思考设置
     unknown = _snapshot_models()["m2"]
     assert unknown["reasoning_visible"] is True
     assert [opt["value"] for opt in unknown["reasoning_options"]] == [
@@ -743,11 +681,7 @@ def test_model_settings_carries_reasoning_choice_and_options(tmp_path, monkeypat
     assert _snapshot_models()["m1"]["reasoning_choice"] == "high"
 
 
-# ---------------- 思考设置随模型新增/编辑落库（reasoning_choice） ----------------
-
-
 def _data_with_model(name):
-    """构造只含一个指定名称模型的临时配置。"""
     data = _configured_data()
     data["providers"][0]["models"] = [
         {
@@ -761,7 +695,6 @@ def _data_with_model(name):
 
 
 def test_add_model_persists_reasoning_choice(tmp_path, monkeypatch):
-    """add_model 传 reasoning_choice="max"：新增成功且思考档位落库。"""
     _use_tmp_config(tmp_path, monkeypatch, _data_with_model("deepseek-v4-pro"))
     bridge = _bare_bridge()
 
@@ -783,14 +716,12 @@ def test_add_model_persists_reasoning_choice(tmp_path, monkeypatch):
     assert stored["reasoning_effort"] == "max"
     assert model_manager.get_model_reasoning_choice(model_id) == "max"
 
-    # 不传 reasoning_choice 的旧调用不得改动思考设置（向后兼容）
     plain = bridge.add_model("p1", "deepseek-v4-pro-b", 200000)
     assert plain["ok"] is True, plain["msg"]
     assert model_manager.get_model_reasoning_choice(plain["model_id"]) == "default"
 
 
 def test_update_model_persists_reasoning_choice(tmp_path, monkeypatch):
-    """update_model 传 reasoning_choice="high"：编辑成功且思考档位落库。"""
     _use_tmp_config(tmp_path, monkeypatch, _data_with_model("deepseek-v4-pro"))
     bridge = _bare_bridge()
 
@@ -814,7 +745,6 @@ def test_update_model_persists_reasoning_choice(tmp_path, monkeypatch):
 def test_update_model_rejects_unsupported_reasoning_choice_without_failing(
     tmp_path, monkeypatch
 ):
-    """非法档位（glm-5.3 不支持 off）：模型主体照常保存，思考设置只警告。"""
     _use_tmp_config(tmp_path, monkeypatch, _data_with_model("glm-5.3"))
     bridge = _bare_bridge()
 
@@ -833,22 +763,14 @@ def test_update_model_rejects_unsupported_reasoning_choice_without_failing(
         for model in provider["models"]
         if model["id"] == "m1"
     )
-    # 模型主体已更新，未被思考设置失败回滚
     assert stored["name"] == "glm-5.3-renamed"
     assert stored["context_window"] == 256000
     assert stored["max_tokens"] == 8192
-    # 思考设置未生效，仍是默认
     assert model_manager.get_model_reasoning_choice("m1") == "default"
     assert "reasoning_choice" not in stored
 
 
 def test_stale_reasoning_choice_keeps_row_visible(tmp_path, monkeypatch):
-    """配置里存了能力表已不支持的档位（glm-5.3 全系无 off）时：
-
-    整行思考设置必须仍然可见（reasoning_visible is True），只把选择回退成
-    默认档。若在这里把 visible 置 False，用户就再也无法从 UI 改回合法档位
-    ——回归：此前 get_model_settings 的兜底会把整行隐藏。
-    """
     data = _data_with_model("glm-5.3")
     data["providers"][0]["models"][0]["reasoning_choice"] = "off"
     _use_tmp_config(tmp_path, monkeypatch, data)
@@ -867,7 +789,6 @@ def test_stale_reasoning_choice_keeps_row_visible(tmp_path, monkeypatch):
 
 
 def test_get_reasoning_snapshot_by_name():
-    """按未落库的模型名预览思考能力（新增/改名时用），choice 恒为 default。"""
     bridge = _bare_bridge()
 
     known = bridge.get_reasoning_snapshot_by_name("deepseek-v4-pro")
@@ -898,14 +819,7 @@ def test_get_reasoning_snapshot_by_name():
     assert empty["ok"] is False
 
 
-# ---------------------------------------------------------------------------
-# 多 Key provider：取 Key 路径与 Key 池一致（单 Key 化），写入/展示原文不变
-# ---------------------------------------------------------------------------
-
-
 def test_get_active_model_returns_single_key_for_multi_key_provider(tmp_path, monkeypatch):
-    """多 Key provider：get_active_model 必须返回 Key 池「当前该用」的单 Key，
-    不得把多行/逗号分隔串整体当作一个 Key 返回。"""
     import core.provider_keys as provider_keys
 
     provider_keys._POOL_REGISTRY.clear()
@@ -921,7 +835,6 @@ def test_get_active_model_returns_single_key_for_multi_key_provider(tmp_path, mo
 
 
 def test_get_active_model_keeps_single_key_as_is(tmp_path, monkeypatch):
-    """单 Key provider：get_active_model 原样返回，行为与改造前一致。"""
     import core.provider_keys as provider_keys
 
     provider_keys._POOL_REGISTRY.clear()
@@ -933,7 +846,6 @@ def test_get_active_model_keeps_single_key_as_is(tmp_path, monkeypatch):
 
 
 def test_get_secondary_model_returns_single_key_for_multi_key_provider(tmp_path, monkeypatch):
-    """副模型读取路径同样只返回单 Key（与主链路 Key 池一致）。"""
     import core.provider_keys as provider_keys
 
     provider_keys._POOL_REGISTRY.clear()
@@ -949,7 +861,6 @@ def test_get_secondary_model_returns_single_key_for_multi_key_provider(tmp_path,
 
 
 def test_get_provider_api_key_returns_full_multiline_raw(tmp_path, monkeypatch):
-    """设置页「显示/复制」路径必须返回完整多行原文（不得拆成单 Key 返回）。"""
     data = _configured_data()
     data["providers"][0]["api_key"] = "sk-line1\nsk-line2"
     _use_tmp_config(tmp_path, monkeypatch, data)
@@ -961,8 +872,6 @@ def test_get_provider_api_key_returns_full_multiline_raw(tmp_path, monkeypatch):
 
 
 def test_fetch_provider_models_prefers_current_key_for_multi_key_provider(tmp_path, monkeypatch):
-    """多 Key provider：拉取模型列表逐 Key 尝试，池「当前该用」的 Key 优先；
-    鉴权头绝不携带多行串整体。"""
     import httpx
     import core.provider_keys as provider_keys
 
@@ -992,7 +901,6 @@ def test_fetch_provider_models_prefers_current_key_for_multi_key_provider(tmp_pa
 
 
 def test_fetch_provider_models_falls_back_to_next_key_on_auth_failure(tmp_path, monkeypatch):
-    """多 Key provider：首个 Key 鉴权失败（401）自动换下一个 Key，任一成功即返回列表。"""
     import httpx
     import core.provider_keys as provider_keys
 
@@ -1026,7 +934,6 @@ def test_fetch_provider_models_falls_back_to_next_key_on_auth_failure(tmp_path, 
 
 
 def test_test_model_falls_back_to_next_key(tmp_path, monkeypatch):
-    """多 Key provider：测试模型时首个 Key 失败自动换下一个 Key，任一成功即通过。"""
     import core.provider_keys as provider_keys
 
     provider_keys._POOL_REGISTRY.clear()

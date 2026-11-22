@@ -1,5 +1,3 @@
-"""RepeatCallGuard 对电脑操控无副作用动作的豁免（提速计划 Task 5）。"""
-
 from __future__ import annotations
 
 from core.harness.tool_pipeline import repeat_guard_exempt

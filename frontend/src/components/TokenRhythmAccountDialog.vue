@@ -1,7 +1,4 @@
 <template>
-  <!-- 账号中心原生弹窗：居中遮罩，直连官方接口拿真实数据，免去二次登录。
-       用量明细 / 个人信息两个入口共用这一个弹窗，按 store.trDialog.tab
-       切视图。Teleport 到 body，独立于侧栏浮层，点击遮罩或关闭按钮关闭。 -->
   <Teleport to="body">
     <div
       v-if="store.trDialog.show"
@@ -16,7 +13,6 @@
         aria-label="基元律动账号中心"
         data-test="tr-dialog"
       >
-        <!-- 标题栏：标签切换 + 关闭 -->
         <header class="trd-head">
           <nav class="trd-tabs">
             <button
@@ -43,14 +39,12 @@
           >×</button>
         </header>
 
-        <!-- 加载态 / 失败态（失败给后端原因 + 重试，不弹第二个窗） -->
         <div v-if="store.trDialog.loading" class="trd-state" data-test="trd-loading">正在加载…</div>
         <div v-else-if="store.trDialog.error" class="trd-state">
           <p class="trd-error" data-test="trd-error">{{ store.trDialog.error }}</p>
           <button type="button" class="trd-retry" data-test="trd-retry" @click="store.fetchTrDialog()">重试</button>
         </div>
 
-        <!-- 用量明细视图：时间窗切换 + summary 指标 + 调用日志分页 -->
         <section v-else-if="store.trDialog.tab === 'usage'" class="trd-body" data-test="trd-usage">
           <div class="trd-ranges">
             <button
@@ -62,7 +56,6 @@
               :data-test="`trd-range-${r.value}`"
               @click="store.trDialogChangeUsageRange(r.value)"
             >{{ r.label }}</button>
-            <!-- 官网入口：跟着时间窗按钮组靠右，进官方控制台看完整消费明细 -->
             <button
               type="button"
               class="trd-site"
@@ -125,7 +118,6 @@
           </footer>
         </section>
 
-        <!-- 个人信息视图：账号基础资料 -->
         <section v-else class="trd-body" data-test="trd-profile">
           <div class="trd-profile">
             <span class="trd-avatar" data-test="trd-avatar">{{ avatarText }}</span>
@@ -133,7 +125,6 @@
               <b class="trd-profile-name" data-test="trd-profile-name">{{ profileName }}</b>
               <span class="trd-profile-account" data-test="trd-profile-account">{{ maskedAccount }}</span>
             </div>
-            <!-- 官网入口：与头像行靠右对齐，进官方个人中心看完整资料 / 改资料 -->
             <button
               type="button"
               class="trd-site"
@@ -180,14 +171,12 @@ onBeforeUnmount(() => {
 
 const PLACEHOLDER = '—';
 
-/** 用量时间窗选项（与服务端路由一致） */
 const RANGES = [
   { value: 'today', label: '今日' },
   { value: '7d', label: '近 7 天' },
   { value: '30d', label: '近 30 天' },
 ] as const;
 
-/** 两个视图各自的官网地址：纸面数据有限，给一条去官网看全量明细的出口 */
 const SITE_URLS = {
   usage: 'https://tokenrhythm.studio/account',
   profile: 'https://tokenrhythm.studio/account/profile',
@@ -207,7 +196,6 @@ const data = computed<Record<string, any>>(() => {
   return d && typeof d === 'object' ? d : {};
 });
 
-// ── 用量明细：summary + 调用日志 ───────────────────────────────────
 const summary = computed<Record<string, any> | null>(() => {
   const s = data.value.summary;
   return s && typeof s === 'object' ? (s as Record<string, any>) : null;
@@ -218,7 +206,6 @@ const callLogs = computed<Record<string, any>[]>(() => {
 });
 const hasMoreLogs = computed(() => callLogs.value.length >= 20);
 
-// ── 个人信息 ─────────────────────────────────────────────────────
 const profile = computed<Record<string, any>>(() => data.value as Record<string, any>);
 const profileName = computed(() => {
   const named = String(profile.value.name || profile.value.nickname || '').trim();
@@ -244,7 +231,6 @@ const profileFields = computed(() => [
   { label: '注册时间', value: fmtTime(profile.value.createdAt || profile.value.registeredAt), test: 'trd-field-created' },
 ]);
 
-// ── 格式化辅助 ───────────────────────────────────────────────────
 function maskPhone(phone: string): string {
   const digits = phone.replace(/\s+/g, '');
   if (digits.length < 7) return digits;
@@ -407,7 +393,6 @@ function statusLabel(status: unknown): string {
   text-align: center;
   font-size: 12.5px;
 }
-/* 用量：时间窗切换 */
 .trd-ranges {
   display: flex;
   gap: 6px;
@@ -425,7 +410,6 @@ function statusLabel(status: unknown): string {
   cursor: pointer;
 }
 .trd-range.active { background: #111; color: #fff; border-color: #111; }
-/* 「去官网查看」入口：两个视图共用，margin-left:auto 贴到行尾，与时间窗按钮同高 */
 .trd-site {
   flex: 0 0 auto;
   margin-left: auto;
@@ -501,7 +485,6 @@ function statusLabel(status: unknown): string {
 .trd-log-status.abort { color: #9a6700; }
 .trd-log-tokens { color: #666; white-space: nowrap; }
 .trd-log-time { color: #a8a8a8; font-size: 11.5px; white-space: nowrap; }
-/* 个人信息 */
 .trd-profile {
   display: flex;
   align-items: center;
@@ -540,7 +523,6 @@ function statusLabel(status: unknown): string {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 分页 */
 .trd-pager {
   display: flex;
   align-items: center;

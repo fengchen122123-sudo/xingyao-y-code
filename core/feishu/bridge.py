@@ -1,18 +1,9 @@
-"""飞书 ↔ 星瑶 桥接层：会话绑定、消息转回合、回合结果回发。
-
-数据流：
-- 飞书消息 → `on_feishu_event()` → 找到/新建绑定的星瑶会话 → `send_user_message(turn_source="feishu")`
-- 星瑶事件 → `on_agent_event()`（由 FeishuService 转发）→ 回合结束时发「执行完成卡」
-
-绑定关系持久化在 `~/.ycode/feishu_state.json`（YCODE_DATA_DIR 可覆盖），
-每个飞书会话（chat）绑定一个星瑶会话，与 opencode-mobile 同模式。
-"""
-
 import json
 import logging
 import os
 import threading
 import time
+import weakref
 from typing import Any, Dict, List, Optional
 
 import config as app_config
@@ -56,10 +47,23 @@ EVENT_MESSAGE = "im.message.receive_v1"
 EVENT_CARD_ACTION = "card.action.trigger"
 STATE_FILENAME = "feishu_state.json"
 
-# 卡住提醒：某会话持续执行但 N 分钟无任何输出时推一次，同会话 2 小时内最多一次
 STALL_MINUTES = 10
 STALL_COOLDOWN_SECONDS = 7200
 WATCHDOG_INTERVAL_SECONDS = 60
+
+_ACTIVE_BRIDGES_LOCK = threading.Lock()
+_ACTIVE_BRIDGES: "weakref.WeakSet[FeishuBridge]" = weakref.WeakSet()
+
+
+def stop_all_watchdogs(timeout: float = 1.0) -> None:
+    """停止所有存活 FeishuBridge 实例的后台检测线程（进程退出/测试清理用）。"""
+    with _ACTIVE_BRIDGES_LOCK:
+        bridges = list(_ACTIVE_BRIDGES)
+    for bridge in bridges:
+        try:
+            bridge.stop(timeout=timeout)
+        except Exception:
+            pass
 
 
 def default_state_path() -> str:
@@ -122,11 +126,6 @@ class FeishuBindingStore:
             self._save_locked()
 
     def rename_session(self, old: str, new: str) -> None:
-        """会话改名后迁移绑定（含展示名）。
-
-        星瑶会在回合中把会话自动重命名（首条消息当标题），不改绑定的话下一条
-        消息 `_session_exists(旧名)` 为假 → 会另建新会话，用户侧表现为「换了话题」。
-        """
         old_name, new_name = str(old or ""), str(new or "")
         if not old_name or not new_name or old_name == new_name:
             return
@@ -135,7 +134,7 @@ class FeishuBindingStore:
             for entry in self._data["bindings"].values():
                 if str(entry.get("session") or "") == old_name:
                     entry["session"] = new_name
-                    entry["label"] = new_name      # 新名字即新标题，展示跟着走
+                    entry["label"] = new_name
                     entry["updated_at"] = int(time.time())
                     changed = True
             if changed:
@@ -169,7 +168,6 @@ class FeishuBridge:
         self._load_config = config_loader
         self._lock = threading.Lock()
         self._api_lock = threading.Lock()
-        # session_name → 本轮飞书回合的上下文（chat_id / 已收到的结果文本）
         self._pending: Dict[str, Dict[str, Any]] = {}
         # 卡片消息 id → 权限请求 id：表单提交按钮带不了 value，只能靠
         # context.open_message_id 反查（与 opencode-mobile 的 messageId 方案一致）
@@ -177,25 +175,18 @@ class FeishuBridge:
         self._card_requests_limit = 500
         # 未决的权限/提问（供 /inbox 聚合）：request_id → 摘要
         self._pending_requests: Dict[str, Dict[str, Any]] = {}
-        # 会话改名别名：改名后的事件名 → 本轮 pending 的键（回合开始时的会话名）。
-        # 星瑶会在回合中把会话自动重命名（首条消息当标题），此时 message_final 仍用
-        # 旧名、turn_finish 用新名——没有这张表，turn_finish 就找不到本轮，卡片静默不发。
         self._session_aliases: Dict[str, str] = {}
-        # 已发送卡片（message_id → 原始卡片）：卡片按钮回调是「原地替换」语义，
-        # 保留原件才能在回执时重建「原内容 + 状态行」，而不是把原内容冲掉
         self._sent_cards: Dict[str, Dict[str, Any]] = {}
         self._sent_cards_limit = 200
         # 卡住提醒的冷却时间戳（session → 上次提醒时刻）
         self._stall_notified: Dict[str, float] = {}
         self._watchdog: Optional[threading.Thread] = None
         self._watchdog_lock = threading.Lock()
-        # 连接状态提供者（由 FeishuService 注入，供 /status 展示）
+        self._watchdog_stop = threading.Event()
         self._status_provider = None
 
     def set_status_provider(self, provider) -> None:
         self._status_provider = provider
-
-    # ---- 依赖 ----
 
     def _config(self) -> FeishuConfig:
         try:
@@ -213,8 +204,6 @@ class FeishuBridge:
                     raise FeishuApiError("飞书未配置（缺少 app_id/app_secret 或开关未打开）")
                 self._api = FeishuApiClient(cfg.app_id, cfg.app_secret)
         return self._api
-
-    # ---- 飞书 → 星瑶 ----
 
     def on_feishu_event(self, event: Dict[str, Any]) -> Optional[Any]:
         """飞书事件入口；返回值会被包进响应帧回给飞书（卡片回调需要）。"""
@@ -278,12 +267,9 @@ class FeishuBridge:
         form_value = action.get("form_value") or {}
         context = body.get("context") or {}
         chat_id = str(context.get("open_chat_id") or context.get("chat_id") or self._store.last_chat_id())
-        # 被点卡片的消息 id：表单提交没有 value，靠它反查请求 id，也靠它取回原始卡片做原地回执
         message_id = str(context.get("open_message_id") or "")
         open_id = str((body.get("operator") or {}).get("open_id") or "")
-        # 表单提交按钮只带 action.name（没有 behaviors/value），因此 kind 要两处取
         kind = str(value.get("kind") or action.get("name") or "")
-        # request_id 优先取按钮 value；表单提交（无 value）用卡片消息 id 反查
         request_id = str(value.get("request_id") or "")
         if not request_id:
             request_id = self._request_id_for_message(str(context.get("open_message_id") or ""))
@@ -321,18 +307,14 @@ class FeishuBridge:
             return self._handle_ask_action(value, form_value, request_id, open_id)
 
         if kind == "cmd":
-            # 面板/列表/翻页按钮：按钮即指令（无状态，页码与参数都在 value 里）
             cmd = str(value.get("cmd") or "")
             arg = str(value.get("arg") or "")
             if cmd:
                 self._handle_command(f"{cmd} {arg}".strip(), chat_id, open_id)
             return None
 
-        # 其余卡片动作由后续任务接管
         logger.info("暂不处理的卡片动作: %s（value=%s）", kind or action.get("name") or "?", sorted(value.keys()))
         return None
-
-    # ---- 审批 / 提问 ----
 
     def _push_permission_card(self, data: Dict[str, Any]) -> None:
         request_id = str(data.get("request_id") or "")
@@ -350,7 +332,6 @@ class FeishuBridge:
         is_question = function_name == "ask_user"
         targets = target_lines(dict(data.get("arguments") or {}))
         workdir = self._session_workdir(session)
-        # 记入未决清单，供 /inbox 聚合与「▶ 处理」重推卡
         with self._lock:
             self._pending_requests[request_id] = {
                 "request_id": request_id,
@@ -386,8 +367,6 @@ class FeishuBridge:
                     buttons_enabled=allowed,
                     hint=hint,
                 )
-            # 记下卡片消息 id → 请求 id：表单提交按钮没有 value，回调只能靠
-            # context.open_message_id 反查（与 opencode-mobile 的 messageId 方案一致）
             message_id = self._send_card(chat_id, card)
             if message_id:
                 self._remember_card_request(message_id, request_id)
@@ -445,7 +424,6 @@ class FeishuBridge:
                 result = self._bridge.respond_permission_choice(request_id, index, "")
                 answer = str((value.get("options") or [None])[index] if value.get("options") else index)
             else:
-                # 自由文本：桌面/移动端统一用 -1 表示自定义回答
                 answer = str(form_value.get("answer") or "").strip()
                 if not answer:
                     return card_response(build_result_card("⚠️ 没有内容", ["请输入回答后再提交"]))
@@ -460,16 +438,7 @@ class FeishuBridge:
             self._pending_requests.pop(request_id, None)
         return card_response(build_result_card("✅ 已回答", [f"回答：{answer}"]))
 
-    # ---- 星瑶 → 飞书 ----
-
     def on_agent_event(self, event_type: str, data: Any) -> None:
-        """星瑶事件转发入口（由 FeishuService 调用，跑在事件源线程里）。
-
-        - 审批/提问不分来源：桌面端发起的回合同样可能等人拍板，人在外面时
-          正是靠这条链路把审批推到飞书（与 opencode-mobile 一致）。
-        - 回合结果只处理「由飞书发起的回合」：`_pending` 里没有该会话就直接返回，
-          桌面端自己的回合不会产生多余的飞书消息。
-        """
         if not isinstance(data, dict):
             return
 
@@ -478,7 +447,6 @@ class FeishuBridge:
             return
 
         if event_type == "permission_dismiss":
-            # 审批被别处处理（桌面端/超时/取消）：清掉收件箱里的未决项
             with self._lock:
                 self._pending_requests.clear()
             return
@@ -493,16 +461,13 @@ class FeishuBridge:
         if not session:
             logger.info("飞书事件 %s 无 session_name，已忽略", event_type)
             return
-        # 改名后的事件名经别名回溯到本轮 pending 的键
         key = self._pending_key(session)
-        # 任何事件都算「有输出」，刷新卡住判定
         self._touch_activity(key)
         with self._lock:
             buffered = key in self._pending
         if event_type in ("message_final", "turn_error", "turn_finish", "turn_cancelled"):
             logger.info("飞书回合事件: %s session=%s 命中本轮=%s", event_type, session, buffered)
         if not buffered:
-            # 桌面端自己的回合不产生飞书消息（设计如此）；仅当看起来该有本轮时才提示
             return
 
         if event_type == "message_final":
@@ -541,12 +506,10 @@ class FeishuBridge:
             key = self._session_aliases.get(old, old)
             entry = self._pending.get(key)
             if entry is not None:
-                # 改名后的事件名（turn_finish 用新名）也能回溯到本轮
                 self._session_aliases[new] = key
                 entry["name"] = new
 
     def _pending_key(self, session: str) -> str:
-        """把事件里的会话名解析成本轮 pending 的键（沿改名别名回溯）。"""
         with self._lock:
             return self._session_aliases.get(session, session)
 
@@ -580,8 +543,6 @@ class FeishuBridge:
         except Exception:
             logger.exception("发送飞书回合结果失败（chat=%s）", chat_id)
 
-    # ---- 内部工具 ----
-
     def _buffer_turn(self, session: str, chat_id: str, text: str = "") -> None:
         now = time.time()
         with self._lock:
@@ -600,25 +561,33 @@ class FeishuBridge:
         self._pop_pending(self._pending_key(session))
 
     def _touch_activity(self, session: str) -> None:
-        """回合有输出就刷新活跃时间（卡住判定的依据）。"""
         with self._lock:
             entry = self._pending.get(session)
             if entry is not None:
                 entry["last_activity"] = time.time()
 
-    # ---- 卡住提醒 ----
+    def stop(self, timeout: float = 2.0) -> None:
+        """停止后台卡住检测守护线程（线程安全、幂等）。"""
+        self._watchdog_stop.set()
+        with self._watchdog_lock:
+            thread = self._watchdog
+            self._watchdog = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
 
     def _ensure_watchdog(self) -> None:
         with self._watchdog_lock:
             if self._watchdog is not None and self._watchdog.is_alive():
                 return
+            self._watchdog_stop.clear()
+            with _ACTIVE_BRIDGES_LOCK:
+                _ACTIVE_BRIDGES.add(self)
             self._watchdog = threading.Thread(
                 target=self._watchdog_loop, daemon=True, name="feishu-stall-watchdog")
             self._watchdog.start()
 
     def _watchdog_loop(self) -> None:
-        while True:
-            time.sleep(WATCHDOG_INTERVAL_SECONDS)
+        while not self._watchdog_stop.wait(WATCHDOG_INTERVAL_SECONDS):
             try:
                 self._check_stalls()
             except Exception:
@@ -646,8 +615,6 @@ class FeishuBridge:
                 minutes=int((now - last) / 60),
             ))
 
-    # ---- 指令 ----
-
     def _handle_command(self, text: str, chat_id: str, open_id: str) -> None:
         cmd, arg = parse_command(text)
         if not cmd:
@@ -673,7 +640,6 @@ class FeishuBridge:
             return self._status_snapshot_card(chat_id)
 
         if cmd == "/whoami":
-            # 回执用纯文本：open_id 要能长按复制，卡片里不好选
             allowed, _ = self._approver_allowed(open_id)
             self._safe_send_text(chat_id, whoami_text(open_id=open_id, chat_id=chat_id, allowed=allowed))
             return None
@@ -767,15 +733,7 @@ class FeishuBridge:
         return text_card("✅ 已切换模型",
                          f"**{target.get('name') or target.get('id')}**\n`{target.get('id')}`", "green")
 
-    # ---- 新建会话与工作目录 ----
-
     def _command_new(self, chat_id: str, open_id: str, arg: str, workdir: str = "GLOBAL"):
-        """新建会话并绑定到本飞书会话。
-
-        默认 `workdir="GLOBAL"`（自由对话，不绑定目录）——与桌面端「新建对话」一致。
-        **不能传 None**：后端 `create_session(workdir=None)` 的默认是**进程当前目录**
-        （`os.getcwd()`），会把飞书新会话悄悄绑到星瑶进程所在目录（真机踩过）。
-        """
         title = (arg or "").strip() or self._label_for(open_id) or "飞书 · 会话"
         try:
             result = self._bridge.create_session(title, workdir)
@@ -793,7 +751,6 @@ class FeishuBridge:
         return new_session_card(title=title, name=name, workdir=where)
 
     def _project_dirs(self) -> List[Dict[str, Any]]:
-        """已知项目目录（来自会话分组，自由对话组除外）。"""
         try:
             groups = self._bridge.get_sessions() or []
         except Exception:
@@ -813,7 +770,6 @@ class FeishuBridge:
         return out
 
     def _command_newdir(self, chat_id: str, arg: str):
-        """选项目目录建会话：不带参数给目录选择卡，带路径直接绑定创建。"""
         path = str(arg or "").strip()
         if not path or path.startswith("page:"):
             return dir_picker_card(dirs=self._project_dirs(), page=self._page_of(path))
@@ -862,17 +818,13 @@ class FeishuBridge:
                          f"会话 **{label}** → {permission_mode_label(applied)}\n"
                          f"（只影响本会话，桌面端全局默认不变）", "green")
 
-    # ---- 沙盒开关（全局，放宽项）----
-
     @staticmethod
     def _sandbox_enabled() -> bool:
-        """沙盒放行状态（全局配置 allow_outside_workspace，/sandbox on 的落点）。"""
         try:
             from core.model_manager import load_config
 
             return bool((load_config() or {}).get("allow_outside_workspace", False))
         except Exception:
-            # 读不到按"未放行"处理（fail-closed），并留痕——此前这类异常会被静默吞掉
             logger.warning("读取沙盒开关失败（按未放行处理）", exc_info=True)
             return False
 
@@ -941,7 +893,6 @@ class FeishuBridge:
             item = self._pending_requests.get(request_id)
         if not item:
             return text_card("⚠️ 该待办已处理", "它可能已经被桌面端或其他人处理了。", "red")
-        # 重新推一张对应的卡（按钮直接可用），不再另建状态
         cfg = self._config()
         allowed = bool(cfg.approvers)
         hint = "" if allowed else "未配置审批白名单（设置 → 飞书集成），请在桌面端处理本次授权。"
@@ -997,11 +948,6 @@ class FeishuBridge:
             return ""
 
     def _send_card(self, chat_id: str, card: Dict[str, Any]) -> str:
-        """发送卡片、记日志、记住原件（供原地回执重建），返回 message_id。
-
-        成功必须留痕：此前 `_flush` 直接调 api 且只在失败时记日志，"卡片到底发没发出去"
-        只能靠猜（真机排查时踩过）。
-        """
         resp = self._api_client().send_card(chat_id, card)
         message_id = str(((resp or {}).get("data") or {}).get("message_id") or "")
         title = ((card or {}).get("header") or {}).get("title") or {}
@@ -1027,12 +973,6 @@ class FeishuBridge:
             return self._sent_cards.get(message_id)
 
     def _status_response(self, message_id: str, title: str, detail: str = "") -> Dict[str, Any]:
-        """原地回执：**保留**被点卡片的原内容，只在末尾追加状态行。
-
-        飞书会用回调返回的卡片原地替换被点的那张卡——完成卡上直接返回小回执卡会把
-        星瑶的回复内容冲掉（真机反馈过）。取不到原件（超出保留上限/非本进程发的卡）
-        时退回独立小卡。
-        """
         original = self._original_card(message_id)
         if original is not None:
             body = f"**{title}**" + (f"\n{detail}" if detail else "")
@@ -1069,12 +1009,10 @@ class FeishuBridge:
         return f"飞书 · {suffix}" if suffix else "飞书 · 会话"
 
     def _notify_chat(self) -> str:
-        """审批卡推送落点：优先配置的固定 chat，其次最后一次说话的会话。"""
         cfg = self._config()
         return cfg.notify_chat_id or self._store.last_chat_id()
 
     def _approver_allowed(self, open_id: str):
-        """审批白名单校验（fail-closed）：未配置白名单时任何人都不放行。"""
         approvers = list(self._config().approvers or [])
         if not approvers:
             return False, "未配置审批白名单（设置 → 飞书集成），暂不可在飞书审批"

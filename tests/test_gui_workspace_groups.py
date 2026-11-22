@@ -7,7 +7,6 @@ from gui_bridge import ApiBridge
 
 
 def _bare_gui_bridge(db=":memory:"):
-    """不经 __init__ 构造裸实例，挂一个内存版 MemoryManager。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._memory = MemoryManager(db)
     bridge._current_session = "测试会话"
@@ -18,7 +17,6 @@ def _bare_gui_bridge(db=":memory:"):
 
 
 def test_get_sessions_does_not_register_app_install_dir(monkeypatch):
-    """cwd 是应用安装目录时，不得自动注册为项目分组（幻影分组根因）。"""
     bridge = _bare_gui_bridge()
     app_dir = gui_bridge._app_install_dir()
     monkeypatch.setattr(os, "getcwd", lambda: app_dir)
@@ -30,7 +28,6 @@ def test_get_sessions_does_not_register_app_install_dir(monkeypatch):
 
 
 def test_get_sessions_registers_normal_project_dir(monkeypatch, tmp_path):
-    """cwd 是普通项目目录时，仍然自动注册分组（原有行为不破坏）。"""
     bridge = _bare_gui_bridge()
     proj = str(tmp_path)
     monkeypatch.setattr(os, "getcwd", lambda: proj)
@@ -54,11 +51,9 @@ def test_get_workspace_state_reads_explicit_project(tmp_path):
 
 
 def test_delete_folder_group_does_not_resurrect(monkeypatch):
-    """删除安装目录幻影分组后，刷新列表不会再把它加回来。"""
     bridge = _bare_gui_bridge()
     app_dir = gui_bridge._app_install_dir()
     monkeypatch.setattr(os, "getcwd", lambda: app_dir)
-    # 模拟老版本遗留：workspaces 表里已有安装目录记录
     bridge._memory.add_workspace(app_dir)
     assert app_dir in bridge._memory.get_all_workspaces()
 
@@ -70,12 +65,9 @@ def test_delete_folder_group_does_not_resurrect(monkeypatch):
 
 
 def test_file_tree_per_dir_quota_keeps_late_top_level_entries(tmp_path):
-    """回归：字母序靠前目录的子树不得吃满配额导致靠后的顶层条目被丢弃。"""
     bridge = _bare_gui_bridge()
     project = tmp_path / "project"
     project.mkdir()
-    # 字母序靠前的目录：嵌套子树总条目数远超旧版全局配额（旧实现深优扫描
-    # 会在该子树内耗尽全局预算，丢弃靠后的顶层条目）
     big = project / "aaa_big"
     big.mkdir()
     for i in range(30):
@@ -83,7 +75,6 @@ def test_file_tree_per_dir_quota_keeps_late_top_level_entries(tmp_path):
         sub.mkdir()
         for j in range(30):
             (sub / f"file_{j:03d}.txt").write_text("x", encoding="utf-8")
-    # 字母序靠后的顶层条目必须仍然可见
     (project / "zzz_last.txt").write_text("x", encoding="utf-8")
 
     tree = bridge._get_file_tree(str(project))
@@ -93,7 +84,6 @@ def test_file_tree_per_dir_quota_keeps_late_top_level_entries(tmp_path):
 
 
 def test_file_tree_shows_dot_entries_like_explorer(tmp_path):
-    """点开头的隐藏条目与文件资源管理器一致照常显示（仅跳过 .git 等重目录）。"""
     bridge = _bare_gui_bridge()
     project = tmp_path / "project"
     project.mkdir()
@@ -110,7 +100,6 @@ def test_file_tree_shows_dot_entries_like_explorer(tmp_path):
 
 
 def test_describe_permission_request_human_readable():
-    """权限询问文案必须写清楚执行什么命令 / 查看什么文件，不给 JSON 原文。"""
     from core.tool_presenter import describe_permission_request
 
     assert describe_permission_request(
@@ -134,7 +123,6 @@ def test_describe_permission_request_human_readable():
 
 
 def test_get_dir_children_scans_one_level_on_demand(tmp_path):
-    """懒加载接口：任意深度目录都能按需取下一层（初始树深度上限之外的层级）。"""
     bridge = _bare_gui_bridge()
     project = tmp_path / "project"
     project.mkdir()
@@ -145,14 +133,12 @@ def test_get_dir_children_scans_one_level_on_demand(tmp_path):
     (deep / "leaf.txt").write_text("x", encoding="utf-8")
     (deep / "sub").mkdir()
 
-    # 初始树深度 4：l3 可展开出 l4，但 l4 不再有预载 children
     tree = bridge._get_file_tree(str(project))
     l1 = tree[0]
     l4 = l1["children"][0]["children"][0]["children"][0]
     assert l4["n"] == "l4"
-    assert "children" not in l4  # 超出深度，未预载
+    assert "children" not in l4
 
-    # 懒加载：对 l4 及其之下任意层级都能取到下一层
     res = bridge.get_dir_children(os.path.join(str(project), "l1", "l2", "l3", "l4"))
     assert res["ok"] is True
     assert [c["n"] for c in res["children"]] == ["l5"]
@@ -163,7 +149,6 @@ def test_get_dir_children_scans_one_level_on_demand(tmp_path):
     assert "leaf.txt" in names
     assert "sub" in names
 
-    # 非目录 / 不存在路径：返回 ok=False 与空 children，前端兜底为空数组
     res = bridge.get_dir_children(os.path.join(str(deep), "leaf.txt"))
     assert res["ok"] is False
     assert res["children"] == []
@@ -172,14 +157,12 @@ def test_get_dir_children_scans_one_level_on_demand(tmp_path):
 
 
 class _AliveThread:
-    """模拟存活的回合线程（is_alive 恒真）。"""
 
     def is_alive(self):
         return True
 
 
 def test_delete_session_refused_while_turn_active():
-    """M21：回合运行中删除会话必须拒绝，否则回合线程继续写已删会话（幽灵数据）。"""
     bridge = _bare_gui_bridge()
     bridge._memory.create_session_explicit("活会话", workdir="GLOBAL", source="GUI")
     bridge._active_turns = {"活会话": _AliveThread()}
@@ -192,7 +175,6 @@ def test_delete_session_refused_while_turn_active():
 
 
 def test_rename_session_refused_while_turn_active():
-    """M21：回合运行中重命名必须拒绝，否则终态事件带旧名导致前端状态失配。"""
     bridge = _bare_gui_bridge()
     bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
     bridge._active_turns = {"旧名": _AliveThread()}
@@ -233,7 +215,6 @@ def test_rename_session_migrates_task_permission_grants():
 
 
 def _collect_events(bridge):
-    """替换 emit_event 收集事件，返回 [(event_type, payload), ...]。"""
     events = []
     bridge.emit_event = lambda kind, data: events.append((kind, data))
     return events
@@ -244,7 +225,6 @@ def _session_names_in_payload(payload):
 
 
 def test_rename_session_emits_session_renamed_event():
-    """手动重命名成功后推送 session_renamed，前端据此迁移运行态与当前会话名。"""
     bridge = _bare_gui_bridge()
     bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
     events = _collect_events(bridge)
@@ -256,13 +236,11 @@ def test_rename_session_emits_session_renamed_event():
     kind, payload = events[0]
     assert kind == "session_renamed"
     assert payload["old"] == "旧名" and payload["new"] == "新名"
-    # 兼容旧字段名，与 _rename_session_to_title 的负载保持一致
     assert payload["old_name"] == "旧名" and payload["new_name"] == "新名"
     assert "新名" in _session_names_in_payload(payload)
 
 
 def test_rename_session_refused_while_turn_active_emits_no_event():
-    """回合运行中重命名被拒时不推事件，避免前端把状态迁到未生效的新名。"""
     bridge = _bare_gui_bridge()
     bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
     bridge._active_turns = {"旧名": _AliveThread()}
@@ -275,7 +253,6 @@ def test_rename_session_refused_while_turn_active_emits_no_event():
 
 
 def test_rename_session_emit_failure_still_reports_success():
-    """事件推送失败不改判结果：DB 与授权迁移已生效，报失败会让前端以为没改名。"""
     bridge = _bare_gui_bridge()
     bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
 
@@ -294,7 +271,6 @@ def test_rename_session_emit_failure_still_reports_success():
 
 
 def test_rename_session_snapshot_failure_returns_ok_without_sessions():
-    """取列表失败仍返回 ok=True 且 sessions=None：前端据此跳过列表覆盖，不清空侧栏。"""
     bridge = _bare_gui_bridge()
     bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
     _collect_events(bridge)

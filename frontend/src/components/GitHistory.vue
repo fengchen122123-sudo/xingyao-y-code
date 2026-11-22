@@ -21,7 +21,6 @@
       </div>
     </div>
 
-    <!-- Reflog 恢复（§5.11） -->
     <div v-if="showReflog" class="gh-reflog-card">
       <div class="gh-reflog-title">Reflog 操作日志（可创建恢复分支找回历史位置/误删分支）</div>
       <div v-if="reflogLoading" class="gh-empty">加载 Reflog 中…</div>
@@ -244,7 +243,6 @@ watch(
   cursor: default;
 }
 
-/* Reflog 卡片 */
 .gh-reflog-card {
   background: var(--xy-card, var(--bg1));
   border: 1px solid var(--xy-border, var(--border));
@@ -301,7 +299,6 @@ watch(
   filter: brightness(0.95);
 }
 
-/* 提交列表卡片 */
 .gh-empty-card {
   background: var(--xy-card, var(--bg1));
   border: 1px dashed var(--xy-border-strong, var(--border));

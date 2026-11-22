@@ -1,22 +1,8 @@
-"""右栏内嵌浏览器用的本地预览页落盘（markdown → 带样式的 HTML 文件）。
-
-为什么需要这一层：实测内嵌 WebView2 打开 `file://` 的 `.md` 只会显示源码
-文本，而右栏浏览器要给出「阅读样式」的渲染结果。渲染这件事复用前端已有的
-markdown 渲染器（与消息气泡同一套），本模块只负责把渲染好的完整 HTML 落盘成
-文件，再交浏览器按 file:// 打开。
-
-落盘策略：文件名取源文件绝对路径的 sha1 前 12 位——同一文件重复点击覆盖同一
-份预览页，不在磁盘上堆垃圾；目录跟随 core.share 的导出目录约定
-（`~/.ycode/exports/preview`，可用 YCODE_DATA_DIR 覆盖）。
-"""
-
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
 
-# 单页体积上限：预览页由前端渲染结果拼装，正常远小于此；超限说明调用方
-# 误传（例如把整个文件树塞进来），直接拒绝而不是往磁盘写大文件。
 MAX_PREVIEW_BYTES = 8 * 1024 * 1024
 
 

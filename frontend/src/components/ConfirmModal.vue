@@ -24,7 +24,6 @@
               :data-icon="iconVariant"
               aria-hidden="true"
             >
-              <!-- 统一 20px 双色调极简线性图标，去除了厚重浅底色块与尖锐三角警示框 -->
               <svg
                 class="cm-svg"
                 viewBox="0 0 24 24"

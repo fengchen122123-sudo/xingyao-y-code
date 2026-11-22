@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-spec_lint.py — 执行提示词「复现级」自检器
-
-用法：
-    python spec_lint.py <文档路径> [--verbose]
-
-输出：结构检查 + 量化密度 + 模糊词 + 验收项统计 + 10 项评分 + 是否通过（门槛 16/20）。
-退出码：0 通过 / 1 未通过 / 2 参数或读取错误
-"""
 import os
 import re
 import sys
@@ -53,7 +44,7 @@ def analyze(text):
     text = re.sub(r"^\s*>.*$", "", text, flags=re.M)
     cn = count_chinese(text) or 1
     numbers = re.findall(r"\d+(?:\.\d+)?", text)
-    num_ratio = len(numbers) / (cn / 100.0)   # 每百中文字的数值数
+    num_ratio = len(numbers) / (cn / 100.0)
 
     fuzzy_hits = {}
     for w in FUZZY:

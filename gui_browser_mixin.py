@@ -1,18 +1,10 @@
-"""GUI 内嵌浏览器桥接 Mixin。
-
-把前端通过 pywebview js_api 上报的矩形/导航指令转发给 core.embedded_browser
-的控制器，并把控制器状态通过 emit_event('embedded_browser', ...) 回推前端。
-
-顶层只 import 轻量模块；控制器惰性单例创建，非 Windows 或创建失败时
-所有桥方法统一返回 {'ok': False, 'error': 'unsupported_platform'}。
-"""
-
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -33,15 +25,6 @@ class BrowserBridgeMixin:
     """为 ApiBridge 提供 browser_pane_* 系列桥方法。"""
 
     def _browser_controller(self) -> Optional[object]:
-        """惰性单例：只在 Windows 上创建一次内嵌浏览器控制器。
-
-        js_api 方法由 pywebview 在各自线程派发，并发进入必须串行化创建：
-        未命中缓存时取实例锁、锁内复查（双检）再创建——否则两个线程会各建
-        一个控制器，后建者覆盖 self._embedded_browser，先建的原生 WebView2
-        控件失去引用且残留在主窗体上（泄漏/重叠）。锁只覆盖创建段（含
-        ctrl.shutdown 的包装赋值）；_release_browser_controller 自身不取该
-        锁，不存在重入死锁。
-        """
         ctrl = getattr(self, "_embedded_browser", None)
         if ctrl is not None:
             return ctrl
@@ -61,7 +44,7 @@ class BrowserBridgeMixin:
                         # 锁——同样串行化创建，且无嵌套持锁、不引入死锁。
                         lock = _LOCK_CREATION_GUARD
         with lock:
-            ctrl = getattr(self, "_embedded_browser", None)  # 双检：等锁期间可能已创建
+            ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is not None:
                 return ctrl
             try:
@@ -111,26 +94,13 @@ class BrowserBridgeMixin:
             except Exception:
                 pass
             try:
-                # 释放路径挂接：ApiBridge.shutdown 只持有控制器引用直接调
-                # ctrl.shutdown()，控件 Dispose 后引用若留在实例上，后续
-                # set_bounds/get_state 会打到已销毁控件。把"清引用"绑到释放动作上，
-                # 释放后各桥方法与"从未打开"语义一致（实例级包装，不改 API 表面）。
-                release = ctrl.shutdown  # 先取原始绑定方法，避免包装后自递归
+                release = ctrl.shutdown
                 ctrl.shutdown = lambda: self._release_browser_controller(ctrl, release)
             except Exception:
                 logger.debug("挂接内嵌浏览器释放钩子失败", exc_info=True)
             return ctrl
 
     def _release_browser_controller(self, ctrl, shutdown) -> Dict[str, Any]:
-        """执行控制器释放，并按释放结果决定是否清掉桥层缓存引用。
-
-        返回语义保持不变（控制器原始的 {'ok': ...} 结构）。仅在释放成功
-        （shutdown 返回 ok 真值）时清引用：此后 browser_pane_set_bounds 返回
-        not_open、get_state 返回 state=None、hide 返回 ok——与"未打开过"完全
-        一致，不再触碰已 Dispose 的控件。释放失败（返回 ok: False 或抛异常）
-        时保留引用并记 warning：Dispose 可能未执行、残留控件仍挂在主窗体上，
-        清引用会让它失去唯一引用，下次 open 还会在原控件之上再叠加一个新控件。
-        """
         try:
             result = shutdown()
         except Exception as exc:
@@ -142,8 +112,6 @@ class BrowserBridgeMixin:
         if isinstance(result, dict) and result.get("ok"):
             if getattr(self, "_embedded_browser", None) is ctrl:
                 self._embedded_browser = None
-            # 控件已 Dispose：页面随控件一起消失，页面记账同步作废（会话地址表
-            # 保留，重建控件后切回该会话仍能恢复自己的页面）
             self._browser_pane_mark_content("")
         else:
             logger.warning(
@@ -159,7 +127,6 @@ class BrowserBridgeMixin:
         return all(key in rect for key in _RECT_KEYS)
 
     def _use_controller(self):
-        """返回 (controller, error_dict) 之一。"""
         if sys.platform != "win32":
             return None, {"ok": False, "error": "unsupported_platform"}
         ctrl = self._browser_controller()
@@ -169,7 +136,6 @@ class BrowserBridgeMixin:
 
     @staticmethod
     def _is_tokenrhythm_url(url: str) -> bool:
-        """判断是否为基元律动官方站点（含子域）。"""
         try:
             host = urlparse(url or "").hostname or ""
         except Exception:
@@ -195,29 +161,16 @@ class BrowserBridgeMixin:
             # 免登录是增强项：任何失败都只记 debug，不干扰导航本身。
             logger.debug("注入基元律动会话 cookie 失败", exc_info=True)
 
-    # ------------------------------------------------------- 会话归属（多会话）
-    #
-    # 原生 WebView2 控件全进程只有一个，因此必须明确「此刻归哪个会话」：
-    # - 前台会话（UI 当前查看的会话）调用：立即作用到控件；
-    # - 后台会话调用：只登记待加载 URL，并通知前端在该会话自己的右栏开页签，
-    #   绝不移动/显示控件——否则浏览器会盖到用户正在看的另一个会话上；
-    # - 用户切到该会话时，前端调用 browser_pane_set_active_session，桥层切换
-    #   归属并回放 pending（embedded_browser_activation），前端就地 open + 导航。
-    # 前端直接调用不带 session_name，一律按「当前查看会话」处理（与旧版一致）。
-
     def _browser_pane_session(self, session_name: str = "") -> str:
-        """解析本次调用的归属会话：显式入参 > UI 当前查看会话。"""
         explicit = str(session_name or "").strip()
         if explicit:
             return explicit
         return str(getattr(self, "_current_session", "") or "")
 
     def _browser_pane_owner(self) -> str:
-        """当前占用原生控件的会话名（状态事件的归属）。"""
         return str(getattr(self, "_browser_pane_owner_session", "") or "")
 
     def _browser_pane_pending(self) -> Dict[str, Dict[str, Any]]:
-        """后台会话的待加载意图：session_name -> {'url': str}。"""
         pending = getattr(self, "_browser_pane_pending_intents", None)
         if not isinstance(pending, dict):
             pending = {}
@@ -238,11 +191,9 @@ class BrowserBridgeMixin:
         return urls
 
     def _browser_pane_content_session(self) -> str:
-        """控件里**当前这一页**属于哪个会话；空串 = 控件还没载入过任何页面。"""
         return str(getattr(self, "_browser_pane_content_owner", "") or "")
 
     def _browser_pane_mark_content(self, session_name: str) -> None:
-        """登记「控件里现在这一页属于某个会话」（导航类操作生效时调用）。"""
         self._browser_pane_content_owner = str(session_name or "")
 
     def _browser_pane_is_foreground(self, session_name: str) -> bool:
@@ -254,7 +205,6 @@ class BrowserBridgeMixin:
         return target == current
 
     def _browser_pane_defer(self, session_name: str, url: str) -> Dict[str, Any]:
-        """后台会话：登记待加载 URL 并通知前端在它自己的右栏开页签。"""
         target = str(session_name or "").strip() or str(
             getattr(self, "_current_session", "") or ""
         )
@@ -268,10 +218,36 @@ class BrowserBridgeMixin:
             logger.debug("推送内嵌浏览器归属事件失败", exc_info=True)
         return {"ok": True, "deferred": True, "session_name": target}
 
-    # ---------------------------------------------------------------- 桥方法
+    @staticmethod
+    def _accepts_surface_generation(method: Any) -> bool:
+        try:
+            sig = inspect.signature(method)
+        except (TypeError, ValueError):
+            return False
+        if "surface_generation" in sig.parameters:
+            return True
+        return any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in sig.parameters.values()
+        )
+
+    def _call_surface_op(
+        self,
+        method: Any,
+        *args: Any,
+        surface_generation: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if surface_generation is not None and self._accepts_surface_generation(method):
+            return method(*args, surface_generation=surface_generation)
+        return method(*args)
 
     def browser_pane_open(
-        self, rect: Dict[str, Any], url: str = "", zoom: float = 1.0, session_name: str = ""
+        self,
+        rect: Dict[str, Any],
+        url: str = "",
+        zoom: float = 1.0,
+        session_name: str = "",
+        surface_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
         try:
             target = self._browser_pane_session(session_name)
@@ -282,8 +258,6 @@ class BrowserBridgeMixin:
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
-            # 先记归属再 open：controller 的 on_state 回调据此给事件打 session；
-            # open 失败时归属残留无副作用（下次成功 open 会覆盖）。
             self._browser_pane_owner_session = target
             page = str(url or "").strip()
             if not page:
@@ -295,7 +269,9 @@ class BrowserBridgeMixin:
                 if content and content != target:
                     page = self._browser_pane_urls().get(target, "") or _BLANK_PAGE
             self._inject_tokenrhythm_session(ctrl, page)
-            result = ctrl.open(rect, page, zoom)
+            result = self._call_surface_op(
+                ctrl.open, rect, page, zoom, surface_generation=surface_generation
+            )
             if isinstance(result, dict) and result.get("ok") and page:
                 self._browser_pane_mark_content(target)
                 if page != _BLANK_PAGE:
@@ -305,11 +281,6 @@ class BrowserBridgeMixin:
             return {"ok": False, "error": str(exc)}
 
     def browser_pane_assign(self, url: str = "", session_name: str = "") -> Dict[str, Any]:
-        """只登记「该会话要打开这个地址」，不创建/移动原生控件。
-
-        给模型用的 open 入口：模型不可能知道窗口布局，rect 一律由前端在页签
-        激活时测量上报；前台会话收到 assigned 后立即开页签并导航。
-        """
         try:
             return self._browser_pane_defer(self._browser_pane_session(session_name), url)
         except Exception as exc:
@@ -345,7 +316,11 @@ class BrowserBridgeMixin:
             return {"ok": False, "error": str(exc)}
 
     def browser_pane_set_bounds(
-        self, rect: Dict[str, Any], zoom: float = 1.0, session_name: str = ""
+        self,
+        rect: Dict[str, Any],
+        zoom: float = 1.0,
+        session_name: str = "",
+        surface_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
         try:
             if not self._browser_pane_is_foreground(
@@ -354,15 +329,14 @@ class BrowserBridgeMixin:
                 return {"ok": False, "error": "not_visible"}
             if not self._valid_rect(rect):
                 return {"ok": False, "error": "invalid_rect"}
-            # 平台守卫与其余桥方法保持一致（评审 S5）；控制器不存在时
-            # 返回 not_open 而非惰性创建——set_bounds 是高频心跳调用，
-            # 不应成为创建入口
             if sys.platform != "win32":
                 return {"ok": False, "error": "unsupported_platform"}
             ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is None:
                 return {"ok": False, "error": "not_open"}
-            return ctrl.set_bounds(rect, zoom)
+            return self._call_surface_op(
+                ctrl.set_bounds, rect, zoom, surface_generation=surface_generation
+            )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -370,7 +344,6 @@ class BrowserBridgeMixin:
         try:
             target = self._browser_pane_session(session_name)
             if not self._browser_pane_is_foreground(target):
-                # 后台会话导航只更新意图，切回该会话时再真正加载
                 return self._browser_pane_defer(target, url)
             ctrl, error = self._use_controller()
             if error is not None:
@@ -378,8 +351,6 @@ class BrowserBridgeMixin:
             self._inject_tokenrhythm_session(ctrl, url)
             result = ctrl.navigate(url)
             if isinstance(result, dict) and result.get("ok") and not result.get("deferred"):
-                # 导航生效：控件里这一页从此属于该会话，同时记成该会话的
-                # 「上次地址」（切回它时按这张表恢复自己的页面）
                 self._browser_pane_owner_session = target
                 self._browser_pane_mark_content(target)
                 page = str(url or "").strip()
@@ -441,7 +412,9 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_hide(self, session_name: str = "") -> Dict[str, Any]:
+    def browser_pane_hide(
+        self, session_name: str = "", surface_generation: Optional[int] = None
+    ) -> Dict[str, Any]:
         try:
             if not self._browser_pane_is_foreground(
                 self._browser_pane_session(session_name)
@@ -450,18 +423,13 @@ class BrowserBridgeMixin:
             ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is None:
                 return {"ok": True}
-            return ctrl.hide()
+            return self._call_surface_op(
+                ctrl.hide, surface_generation=surface_generation
+            )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     def write_preview_page(self, html_text: str, source_path: str = "") -> Dict[str, Any]:
-        """把前端渲染好的预览 HTML 落盘，返回可交给内嵌浏览器打开的本地路径。
-
-        用途：右栏浏览器要按阅读样式展示 .md（浏览器直接打开 md 只显示源码
-        文本）。前端用与消息气泡同一套渲染器生成完整 HTML 后交这里落盘，
-        再走 browser_pane_navigate 打开该文件。与平台无关（不碰 WebView2），
-        非 Windows 也能用。
-        """
         try:
             from core.web_preview import write_preview_page as _write_preview_page
 
@@ -494,23 +462,38 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    # ------------------------------------------------ 内置浏览器自动化通道（JS 面入口：browser_pane_automation_endpoint）
+    def _confirm_embedded_browser_recreate(
+        self, session_name: str, current_url: str
+    ) -> bool:
+        from core.permission_broker import CANCELLED_RESULT, PermissionOption
+        import core.permission_broker as pb_mod
+
+        broker = pb_mod.permission_broker
+        if not broker.has_prompt_handlers():
+            return False
+        owner_id = str(session_name or self._current_session_safe())
+        req = broker.enqueue(
+            function_name="embedded_browser_recreate",
+            arguments={"url": str(current_url or "")[:240]},
+            owner_id=owner_id,
+            parent_turn_id=owner_id,
+            source="embedded_browser",
+            options=(
+                PermissionOption("allow_once", "刷新当前页面并接管自动化"),
+                PermissionOption("deny", "取消（保留当前页面）"),
+            ),
+        )
+        try:
+            choice = req.future.result(timeout=120.0)
+        except Exception:
+            broker.cancel_owner(owner_id)
+            return False
+        return choice != CANCELLED_RESULT and choice == 0
+
+    def _current_session_safe(self) -> str:
+        return str(getattr(self, "_current_session", "") or "")
 
     def embedded_browser_automation_endpoint(self, session_name: str = "") -> str:
-        """内置浏览器自动化入口——仅供内部调用（computer controller 的 embedded 分支）。
-
-        注意：本方法按链路"无降级"设计抛 ComputerControlError（gui_main 将其
-        以属性方式注入 controller 作为 endpoint provider，异常由 controller
-        归一为启动失败），虽经 js_api 暴露，但**不供前端/JS 直接调用**——JS
-        侧应调用 browser_pane_automation_endpoint（返回 dict，不抛穿 js_api）。
-
-        确保内嵌 WebView2 控件带 CDP 调试端口存在（幂等，必要时带端口重建），
-        并通知前端把面板切到浏览器页签、按当前项目分辨率做适应窗口呈现——
-        用户实时围观星瑶操作。session_name 为发起操控的会话名，随事件透传，
-        前端据此把浏览器页签开进发起会话的右面板（其他会话不受打扰）。
-        返回回环 endpoint；任何失败都抛 ComputerControlError（无降级：
-        绝不静默改走外部浏览器）。
-        """
         from core.computer.models import ComputerControlError
         from core.computer.settings import get_project_browser_viewport
         from core.workspace_context import get_workdir
@@ -522,8 +505,32 @@ class BrowserBridgeMixin:
                 "内置浏览器仅在 Windows 桌面端 GUI 中可用；"
                 "请在设置中把浏览器切换为 Edge 或 Chrome",
             )
-        result = ctrl.prepare_automation()
+        prepare_fn = ctrl.prepare_automation
+        try:
+            sig = inspect.signature(prepare_fn)
+            accepts_confirm = (
+                "confirm_recreate" in sig.parameters
+                or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                )
+            )
+        except (TypeError, ValueError):
+            accepts_confirm = False
+        if accepts_confirm:
+            result = prepare_fn(
+                confirm_recreate=lambda url: self._confirm_embedded_browser_recreate(
+                    session_name, url
+                )
+            )
+        else:
+            result = prepare_fn()
         if not result.get("ok"):
+            if result.get("error") == "recreate_confirmation_required":
+                raise ComputerControlError(
+                    "computer_embedded_recreate_required",
+                    str(result.get("msg") or "需要用户确认刷新内置浏览器后再接管自动化"),
+                )
             raise ComputerControlError(
                 "computer_embedded_unavailable",
                 f"内置浏览器自动化准备失败：{result.get('error')}",
@@ -544,25 +551,10 @@ class BrowserBridgeMixin:
                 },
             )
         except Exception:
-            # 面板呈现失败不阻断自动化链路：CDP 连接与截图不依赖前端状态，
-            # 仅影响"围观"体验。
             logger.debug("推送内置浏览器自动化面板事件失败", exc_info=True)
         return str(result["endpoint"])
 
     def browser_pane_automation_endpoint(self, session_name: str = "") -> Dict[str, Any]:
-        """browser_pane_* 桥面的自动化入口：包装 embedded_browser_automation_endpoint，
-        把 ComputerControlError 归一为结构化 dict，绝不抛穿 js_api。
-
-        取舍（为何不改原方法而加包装）：原方法的"抛 ComputerControlError"
-        异常语义被 computer controller 的 embedded 分支依赖（错误码随异常
-        传播、决定启动失败文案），且 gui_main 直接以属性方式注入该 provider、
-        既有测试按字符串/异常断言——改动原方法破坏面大。故新增本包装供
-        前端/JS 面调用：内部实现与所有既有调用方零改动。
-
-        成功：{'ok': True, 'endpoint': 'http://127.0.0.1:<port>'}；
-        失败：{'ok': False, 'error': <稳定错误码或异常文本>}，领域错误额外带
-        'message'（中文说明）。
-        """
         try:
             endpoint = self.embedded_browser_automation_endpoint(session_name)
         except Exception as exc:

@@ -1,22 +1,16 @@
-// renderer.js — 稳定优先版
-// 关键决策：待机/睡觉/落地锁单帧（原始立绘），动效用平滑几何变换；
-// 动作帧一律单图层硬切。双层 crossfade 会把两张不同姿势半透明叠成鬼影，那是闪烁主因。
 (() => {
   const stageEl = document.getElementById("stage");
   const breathEl = document.getElementById("breath");
   const frameEl = document.getElementById("frame");
   const bubbleEl = document.getElementById("bubble");
 
-  // 可见帧图也走匿名 CORS 加载：hitPet 会把它 drawImage 到 canvas 读像素，
-  // 少了这个属性画布会被判成跨源污染，getImageData 抛 SecurityError（CORS 头由素材协议侧回）
   frameEl.crossOrigin = "anonymous";
 
   let config = null;
-  // 素材根：assetBase 是当前宠物包，builtinBase 是随包内置素材（整状态回落时用）
   let assetBase = "";
   let builtinBase = "";
-  const frames = {};   // state -> [Image...]
-  const lines = {};    // state -> [string...]
+  const frames = {};
+  const lines = {};
   let state = "idle";
   let frameIdx = 0;
   let lastFrameAt = 0;
@@ -39,16 +33,12 @@
   let animate = true;
   let walkDir = -1;
   let lastActivityAt = performance.now();
-  // 尊重系统「减弱动态效果」无障碍开关
   const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 
-  // ---------- 素材加载与运行时校验 ----------
-  // 两个素材根都走 pet-asset 协议：与页面同源，画布不会被污染
   function assetUrl(rel, base) {
     return `${base || assetBase}/${rel}`;
   }
 
-  // 单个状态整组加载：只从给定素材根读，读到第一张缺帧就停（探测式，不需要预先知道帧数）
   async function loadFrames(st, base) {
     const list = [];
     for (let i = 0; i <= 64; i++) {
@@ -95,7 +85,7 @@
         if (res.ok) {
           lines[st] = (await res.text()).split("\n").map(s => s.trim()).filter(Boolean);
         }
-      } catch { /* 无台词也可运行 */ }
+      } catch { }
     }
     if (ok) {
       window.petAPI.rendererReady({ frames: report, configVersion: config.version });
@@ -107,9 +97,6 @@
   function loadImage(url) {
     return new Promise((resolve, reject) => {
       const img = new Image();
-      // 匿名跨源加载：帧图之后会被 drawImage 到 canvas 读像素做点击命中检测，
-      // 不声明 crossOrigin 会被判成污染源（协议侧已回 Access-Control-Allow-Origin）。
-      // 失败仍按 load fail reject：帧探测正是靠这个 reject 判断「没有更多帧」。
       img.crossOrigin = "anonymous";
       img.onload = () => resolve(img);
       img.onerror = () => reject(new Error("load fail"));
@@ -117,7 +104,6 @@
     });
   }
 
-  // 单图层硬切：画面上永远只有一张完整的图，无叠影、无明暗呼吸
   function showFrame(img) {
     if (!img || frameEl.src === img.src) return;
     frameEl.src = img.src;
@@ -133,14 +119,12 @@
     frameEl.classList.toggle("flipped", state === "walk" && walkDir > 0);
   }
 
-  // 互动反馈：复用落地动画（弹性缩放）当「被摸到」的即时反馈，不额外新增素材
   function bounceFeedback() {
     breathEl.classList.remove("landing");
-    void breathEl.offsetWidth;          // 强制重排，重启动画
+    void breathEl.offsetWidth;
     breathEl.classList.add("landing");
   }
 
-  // ---------- 状态机 ----------
   const SIT_LOOP = [1, 2, 1, 3];
   const IDLE_AUTO_ACTIONS = ["stretch", "sit", "warm_hands", "look_around"];
 
@@ -184,8 +168,8 @@
         autonomousCooldownUntil = Math.max(autonomousCooldownUntil, sleepSince + 2500);
       }
       if (next === "drop") {
-        void breathEl.offsetWidth;          // 强制重排，重启动画
-        breathEl.classList.add("landing");  // 落地冲击用几何弹性表达
+        void breathEl.offsetWidth;
+        breathEl.classList.add("landing");
       }
       if (!suppressBubble && !currentBubbleSticky) {
         if (next === "sleep") { sleepEnteredAt = performance.now(); showBubble("Zzz…"); }
@@ -258,7 +242,6 @@
     const arr = frames[state] || [];
     const interval = 1000 / (spec.fps || 4);
     const holdMs = spec.holdMs || arr.length * interval;
-    // still 状态 / 关闭动效：锁死第 0 帧，画面永不换像素
     const locked = !animate || !!spec.still || arr.length < 2;
     if (locked) {
       showFrame(arr[0]);
@@ -288,7 +271,6 @@
       if (frameIdx >= arr.length) {
         if (spec.loop) frameIdx = 0;
         else {
-          // 播完一轮后短暂停留再回 idle；有明确短动作（如 drop）不拖延 2 秒
           const tailPause = state === "drop" ? 80 : 900;
           if (now - stateEnteredAt >= holdMs + tailPause) {
             setState(spec.next || "idle");
@@ -323,21 +305,17 @@
         else setState("idle");
       }
     }
-    // idle 超时入睡（正显示常驻待确认提示时保持清醒等待）
     if (state === "idle" && !currentBubbleSticky && behaviors.idleTimeoutSec) {
       if (now - sleepSince > behaviors.idleTimeoutSec * 1000) setState("sleep");
     }
-    // 睡眠随机自动醒
     if (state === "sleep" && behaviors.sleepAutoWakeSec) {
       if (now - sleepEnteredAt > behaviors.sleepAutoWakeSec * 1000) setState("idle");
     }
-    // 闲置气泡（安静模式、间隔为 0 或正显示常驻待确认提示时抑制）
     const idleBubbleMs = (behaviors.idleBubbleSec ?? 8) * 1000;
     if (state === "idle" && !quiet && !currentBubbleSticky && idleBubbleMs > 0 && now - lastBubbleAt > idleBubbleMs && lines.idle && lines.idle.length) {
       showBubble(pick(lines.idle));
       lastBubbleAt = now;
     }
-    // 自主行为：散步 + 伸懒腰 / 坐下 / 暖手 / 张望（关闭动效、减弱动态或待确认时抑制）
     if (state === "idle" && !currentBubbleSticky && animate && !reducedMotion && now >= autonomousCooldownUntil) {
       if (behaviors.walkProbPerMinute && Math.random() < behaviors.walkProbPerMinute * (dt / 60000)) {
         setState("walk");
@@ -356,7 +334,6 @@
     return (walkDir < 0 && hitLeft) || (walkDir > 0 && hitRight);
   }
 
-  // ---------- 气泡 ----------
   let bubbleTimer = null;
   let currentBubbleKind = "";
   let currentBubbleSticky = false;
@@ -414,7 +391,6 @@
     bubbleTimer = null;
     if (info.emote) triggerNotifyEmote(info.emote);
     if (!sticky) {
-      // msOverride：外部（父进程 stdin 通道）指定的显示时长，缺省回落到 config
       const holdMs = (typeof msOverride === "number" && msOverride > 0 ? msOverride : (config.bubble.showMs || 2500));
       bubbleTimer = setTimeout(() => {
         currentBubbleKind = "";
@@ -424,7 +400,6 @@
     }
   }
 
-  // ---------- 拖拽与点击（focusable:false 下走 ipc 移窗） ----------
   let pressing = false, moved = false, lastPos = null, lastMoveAt = 0;
   const DRAG_THRESHOLD = 4;
   let clickCycle = 0;
@@ -443,7 +418,7 @@
       moved = true;
       if (canInterrupt(state, "drag")) setState("drag");
       document.body.classList.add("dragging");
-      stageEl.classList.remove("pressed"); // 拖拽期间不做任何缩放反馈
+      stageEl.classList.remove("pressed");
     }
     if (moved) {
       window.petAPI.moveBy(dx, dy);
@@ -451,15 +426,13 @@
     }
   });
 
-  // 统一结束出口：窗口跟着鼠标走时 mouseup 很容易落在窗口外而丢失，
-  // 一旦丢失 pressing 永远为 true，窗口会一直粘在鼠标上并持续触发移窗 → 越拖越大。
   function finishPointer() {
     if (!pressing) return;
     pressing = false;
     stageEl.classList.remove("pressed");
     document.body.classList.remove("dragging");
     if (moved) {
-      setState("drop"); // 落地 → next: idle
+      setState("drop");
     } else {
       if (currentBubbleSticky) clearBubble();
       setTimeout(() => {
@@ -484,7 +457,6 @@
   window.addEventListener("mouseup", () => finishPointer());
   window.addEventListener("blur", () => finishPointer());
   document.addEventListener("mouseleave", () => { if (moved) finishPointer(); });
-  // 看门狗：1.2s 内没有任何 mousemove 就视为已松手
   setInterval(() => {
     if (pressing && moved && performance.now() - lastMoveAt > 1200) finishPointer();
   }, 300);
@@ -492,9 +464,6 @@
     setState(state === "sleep" ? "greet" : "sleep");
   });
 
-  // ---------- 穿白区穿透（IPC 去重 + alpha 掩码缓存） ----------
-  // 原实现每个 mousemove 都发一次 IPC、重建一次 canvas 并读像素，拖拽时把主进程淹没，
-  // 移窗排队滞后会加重拖影。现在只在「在宠物上 / 不在宠物上」翻转时发 IPC。
   let lastThrough = null;
   let clickThroughHooked = false;
   let maskKey = "", maskData = null, maskW = 0, maskH = 0;
@@ -530,7 +499,6 @@
     return maskData[(y * maskW + x) * 4 + 3] > 20;
   }
 
-  // ---------- 动效总开关（托盘） ----------
   function setAnimate(on) {
     animate = !!on;
     document.body.classList.toggle("no-motion", !animate);
@@ -544,7 +512,6 @@
     applyFacing();
   }
 
-  // ---------- 首次引导（缩短到 2 句，高冷设定不连番冒泡） ----------
   async function runOnboarding() {
     const seq = ["……拖我能移动。", "双击，我要睡了。"];
     for (const t of seq) {
@@ -554,7 +521,6 @@
     window.petAPI.markOnboarded();
   }
 
-  // ---------- 调度：静止/睡眠降频，避免 60fps 空转 ----------
   function scheduleTick() {
     if (!animate || state === "sleep")
       setTimeout(() => tick(performance.now()), 250);
@@ -563,7 +529,6 @@
     else requestAnimationFrame(tick);
   }
 
-  // ---------- 启动 ----------
   (async () => {
     // 皮肤信息由主进程按 YCODE_PET_* 解析好（含配置合并），渲染端只管用，不再自己 fetch 配置。
     // getSkin 可能不存在（旧版 preload）或直接 reject，这里必须显式兜底：宁可静止也绝不白屏。
@@ -578,7 +543,6 @@
         window.petAPI.rendererError({ reason: "getSkin failed", error: String((err && err.message) || err) });
       }
     }
-    // 没有配置就无从得知画布尺寸、状态表与动效参数，空转只会抛错，直接收工
     if (!skin || !skin.config || !skin.config.animations) {
       if (window.petAPI && window.petAPI.rendererError) {
         window.petAPI.rendererError({ reason: "skin config unavailable" });
@@ -604,7 +568,6 @@
     });
     window.petAPI.onQuietChanged((on) => { quiet = on; });
     window.petAPI.onAnimateChanged((on) => setAnimate(on));
-    // 外部气泡通道：父进程经 stdin 发来的气泡，自带显示时长与样式/动作语义
     window.petAPI.onBubble((text, ms, meta) => showBubble(text, ms, meta));
     if (typeof window.petAPI.onBubbleClear === "function") {
       window.petAPI.onBubbleClear((kinds) => clearBubble(kinds));
@@ -613,7 +576,6 @@
       markActivity();
       setState(state === "sleep" ? "idle" : "sleep");
     });
-    // 右键菜单只发语义，动画与台词仍走状态机；talk 保持原行为，不切换动作。
     window.petAPI.onEmote((kind) => {
       markActivity();
       if (kind === "talk") {
@@ -625,16 +587,14 @@
       }
       const allowed = config && config.animations && config.animations[kind] ? kind : "interact";
       if (frames[allowed]) {
-        setState(allowed);      // setState 内部会按 lines[next] 自动冒一句台词
+        setState(allowed);
         if (allowed !== "walk" && allowed !== "sit") bounceFeedback();
       } else {
-        bounceFeedback();    // 皮肤包缺这个状态时至少给一个动作反馈
+        bounceFeedback();
       }
     });
     document.addEventListener("contextmenu", (e) => {
       e.preventDefault();
-      // 传窗口内容区坐标（clientX/clientY）：menu.popup 在 Windows 上按窗口坐标定位，
-      // 传 screenX/screenY 会让菜单被推到一个窗口外的偏移位置（离宠物很远）
       window.petAPI.contextMenu(e.clientX, e.clientY);
     });
 

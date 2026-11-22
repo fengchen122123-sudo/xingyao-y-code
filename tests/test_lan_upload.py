@@ -12,7 +12,7 @@ def bridge():
 
 
 def test_upload_file_ok(bridge, tmp_path, monkeypatch):
-    monkeypatch.setenv("TEMP", str(tmp_path))  # tempfile.gettempdir 走 TEMP
+    monkeypatch.setenv("TEMP", str(tmp_path))
     data = base64.b64encode(b"hello-image-bytes").decode()
     res = bridge.upload_file("photo.jpg", data)
     assert res["ok"] is True

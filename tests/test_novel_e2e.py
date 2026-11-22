@@ -1,16 +1,3 @@
-"""端到端链路测试：从零建书 → 写 3 章 → 提交追踪 → 确定性审查（覆盖伏笔埋设与回收）。
-
-整条链路只落在 tmp_path 里，不依赖网络、Node 与上游 story-setup 技能包：
-- ``init_novel_project`` 建目录树与 ``.novel.json``（上游缺失时按 skipped 降级，不跳过用例）；
-- 设定 / 大纲 / 正文由用例直接写文件，模拟作者与写作 Agent 的真实产出；
-- ``novel_track`` 转发 vendored ``tracking_commit.py``：init 一次 + append 三次；
-- ``novel_status`` / ``novel_audit`` 做只读核对，要求追踪与正文对齐（S1 必须为 0）。
-
-另有两条链路覆盖追加提交之外的分支：
-- ``mode="revision"``：同章改稿重提，追踪里该章条目被改写而不是新增一条；
-- ``novel_audit(scope="chapter", chapter=N)``：只审指定的第 N 章，finding 不串到别的章。
-"""
-
 from __future__ import annotations
 
 import json
@@ -19,10 +6,8 @@ from pathlib import Path
 
 from core import novel_service
 
-# 伏笔物件：第 001 章埋设，第 003 章由正文明确回收
 FORESHADOW_TEXT = "半枚铜钱"
 
-# 第 001 章：埋设"半枚铜钱"，结尾留出下一章的钩子
 CHAPTER_1 = """# 第001章 开端
 
 北城门在黄昏时最难挤。沈舟把斗笠压低，跟着一队驮盐的骡子往里走，脚底踩着冻硬的泥，一步一滑。
@@ -44,7 +29,6 @@ CHAPTER_1 = """# 第001章 开端
 沈舟举了举手。他要在天亮之前混进一支商队，出这座城，走到他该去的地方。
 """
 
-# 第 002 章：推进剧情，让读者看到伏笔在别人身上起了反应
 CHAPTER_2 = """# 第002章 推进
 
 天没亮车队就动了。沈舟被分到最后一辆车上，和盐袋挤在一起，车厢窄，他的膝盖顶着前面车板的木棱，颠一下疼一下。
@@ -68,7 +52,6 @@ CHAPTER_2 = """# 第002章 推进
 沈舟躺下时，听见隔壁有人在磨刀。他睁着眼睛，直到驿站最后一盏灯灭掉。
 """
 
-# 第 003 章：正文明确回收"半枚铜钱"（两半合上，断口吻合）
 CHAPTER_3 = """# 第003章 回收
 
 天亮时驿站起了雾。沈舟没睡好，起身时肩胛骨像被谁用石头压了一夜。
@@ -96,7 +79,6 @@ CHAPTER_3 = """# 第003章 回收
 
 
 def _write(root: Path, rel: str, text: str) -> Path:
-    """按项目相对路径写文本文件（父目录按需创建）。"""
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -104,7 +86,6 @@ def _write(root: Path, rel: str, text: str) -> Path:
 
 
 def _position(chapter: int) -> dict:
-    """tracking_commit.py 要求的 context.position（四个字段缺一不可）。"""
     return {
         "volume": "第001卷",
         "volume_start_chapter": 1,
@@ -114,7 +95,6 @@ def _position(chapter: int) -> dict:
 
 
 def _init_document() -> dict:
-    """novel_track(init) 的最小合法输入：0 章基线，无角色、无伏笔。"""
     return {
         "schema_version": 1,
         "book_title": "长夜行",
@@ -139,7 +119,6 @@ def _append_document(
     result: str,
     foreshadow_changes: list[dict] | None = None,
 ) -> dict:
-    """novel_track(append) 的最小合法事务：一次追加一章，修订号逐章递增。"""
     return {
         "schema_version": 1,
         "mode": "append",
@@ -167,7 +146,6 @@ def _append_document(
 
 
 def _foreshadow(status: str, planted: int = 1, planned: int | None = 3) -> dict:
-    """伏笔事务条目：第 001 章埋设，第 003 章回收（planned 不得早于 planted）。"""
     return {
         "action": "upsert",
         "id": "F001",
@@ -186,13 +164,6 @@ def _revision_document(
     chapter_title: str | None = None,
     foreshadow_changes: list[dict] | None = None,
 ) -> dict:
-    """novel_track(revision) 的事务：与 append 同构，只是 ``mode`` 不同。
-
-    脚本对 revision 的硬约束（读 tracking_commit.py 确认）：``chapter`` 必须是已提交章
-    （``chapter <= last_committed_chapter``），``expected_state_revision`` 必须等于当前
-    修订号，且上下文条目要整份重提、不得在修订里退役条目。本用例的上下文始终为空列表，
-    因此直接沿用 append 的事务骨架。
-    """
     document = _append_document(chapter, expected_revision, result, foreshadow_changes)
     document["mode"] = "revision"
     document["chapter_title"] = chapter_title or f"{('开端', '推进', '回收')[chapter - 1]}（改稿）"
@@ -200,7 +171,6 @@ def _revision_document(
 
 
 def _new_book(root: Path) -> Path:
-    """建一个最小书项目（建书 + 设定 + 卷纲）；正文与细纲由各用例按需补。"""
     init = novel_service.init_novel_project(
         str(root), "长夜行", genre="武侠", platform="起点", target_words=300000,
     )
@@ -232,7 +202,6 @@ def _new_book(root: Path) -> Path:
 
 
 def _write_detail_outline(root: Path, chapter: int, target: int) -> Path:
-    """按 大纲/细纲_第NNN章.md 契约写细纲；字数目标决定审计的字数下限。"""
     return _write(
         root,
         f"大纲/细纲_第{chapter:03d}章.md",
@@ -249,15 +218,12 @@ def _write_detail_outline(root: Path, chapter: int, target: int) -> Path:
 
 
 def _write_body(root: Path, chapter: int, name: str, text: str) -> Path:
-    """按 正文/第NNN章_章名.md 契约写一章正文。"""
     return _write(root, f"正文/第{chapter:03d}章_{name}.md", text)
 
 
 def test_novel_flow_init_write_commit_audit(tmp_path):
-    """建书 → 写设定/大纲/正文 → 三次追踪提交 → 状态与审计全链路验证。"""
     root = tmp_path / "长夜行"
 
-    # 1. 从零建书：目录树 + .novel.json（上游技能包不参与本用例的断言）
     init = novel_service.init_novel_project(
         str(root), "长夜行", genre="武侠", platform="起点", target_words=300000,
     )
@@ -266,11 +232,9 @@ def test_novel_flow_init_write_commit_audit(tmp_path):
     for rel in ("设定", "大纲", "正文", "追踪", "追踪/逐章记录"):
         assert (root / rel).is_dir(), f"建书缺少目录 {rel}"
 
-    # 2. 最小设定：题材定位与文风
     _write(root, "设定/题材定位.md", "# 题材定位\n\n- 类型：武侠\n- 主线：断掉的凭据要拼回来\n")
     _write(root, "设定/文风.md", "# 文风\n\n- 冷峻克制，短句为主\n- 情绪落在动作与物件上\n")
 
-    # 3. 卷纲 + 三章细纲（每章字数目标 800）
     _write(
         root,
         "大纲/卷纲_第001卷.md",
@@ -306,12 +270,10 @@ def test_novel_flow_init_write_commit_audit(tmp_path):
             ),
         )
 
-    # 卷纲取段链路：单元锚点能取到对应段（含卷级常任）
     outline = novel_service.novel_outline(str(root), unit_id="D1-01", stage="write")
     assert outline["ok"] is True, outline
     assert "剧情单元 D1-01 出城" in outline["text"]
 
-    # 4. 三章正文（每章 800 字以上；第 001 章埋伏笔，第 003 章正文回收）
     bodies = {1: CHAPTER_1, 2: CHAPTER_2, 3: CHAPTER_3}
     for chapter, name in ((1, "开端"), (2, "推进"), (3, "回收")):
         _write(root, f"正文/第{chapter:03d}章_{name}.md", bodies[chapter])
@@ -321,12 +283,10 @@ def test_novel_flow_init_write_commit_audit(tmp_path):
         assert counted["ok"] is True, counted
         assert counted["visible_chars"] >= 800, f"第 {chapter} 章正文不足 800 字"
 
-    # 第 001 章埋、第 002 章提及（别人有反应）、第 003 章正文明确回收
     assert FORESHADOW_TEXT in bodies[1]
     assert FORESHADOW_TEXT in bodies[3]
     assert "严丝合缝" in bodies[3]
 
-    # 5. 提交追踪：先 init，再三次 append（第 001 章埋、第 003 章回收同一伏笔）
     track = novel_service.novel_track(str(root), "init", _init_document())
     assert track["ok"] is True, track
     assert track["last_committed_chapter"] == 0
@@ -347,7 +307,6 @@ def test_novel_flow_init_write_commit_audit(tmp_path):
         assert payload["state_revision"] == chapter
         assert (root / "追踪" / "逐章记录" / f"第{chapter:03d}章.md").is_file()
 
-    # 事务临时文件不留在项目里
     assert not list(root.glob("novel-track-*.json"))
     state = json.loads(
         (root / "追踪" / novel_service.TRACKING_STATE_NAME).read_text(encoding="utf-8")
@@ -355,7 +314,6 @@ def test_novel_flow_init_write_commit_audit(tmp_path):
     assert state["last_committed_chapter"] == 3
     assert state["foreshadow"]["F001"]["status"] == "已回收"
 
-    # 6. 状态：三章已写、下一章为 4、有累计字数、没有未回收的活跃伏笔
     status = novel_service.novel_status(str(root))
     assert status["is_novel"] is True
     assert status["chapters_written"] == 3
@@ -364,25 +322,21 @@ def test_novel_flow_init_write_commit_audit(tmp_path):
     assert status["last_commit"] == 3
     assert status["active_foreshadows"] == 0
 
-    # 7. 审查：追踪与正文对齐（S1=0），且没有字数不达标 / 细纲缺口
     audit = novel_service.novel_audit(str(root), scope="all")
     assert audit["ok"] is True, audit
     assert audit["scope"] == "all"
     assert audit["summary"]["S1"] == 0, audit["findings"]
-    assert audit["summary"]["S2"] == 0, audit["findings"]  # 伏笔已在第 003 章回收
-    assert audit["summary"]["S3"] == 0, audit["findings"]  # 字数达标且无细纲缺口
+    assert audit["summary"]["S2"] == 0, audit["findings"]
+    assert audit["summary"]["S3"] == 0, audit["findings"]
     assert [f for f in audit["findings"] if f["type"] == "tracking_state"] == []
-    # AI 味检查已是本地确定性扫描：正文干净时不出 finding，也不再进 skipped
     assert [f for f in audit["findings"] if f["type"] == "ai_patterns"] == []
     assert not [s for s in audit["skipped"] if s["check"] == "ai_patterns"]
 
-    # 8. 回收可被正文验证：第 003 章明确写出伏笔物件
     chapter_3_text = (root / "正文" / "第003章_回收.md").read_text(encoding="utf-8")
     assert FORESHADOW_TEXT in chapter_3_text
 
 
 def test_novel_revision_updates_committed_chapter_entry(tmp_path):
-    """append 第 1 章 → 同章 revision 改稿：条目被改写而非新增，last_committed_chapter 不动。"""
     root = _new_book(tmp_path / "长夜行")
     _write_detail_outline(root, 1, 800)
     _write_body(root, 1, "开端", CHAPTER_1)
@@ -403,7 +357,6 @@ def test_novel_revision_updates_committed_chapter_entry(tmp_path):
     assert draft_result in delta_before
     assert "开端" in delta_before
 
-    # 改稿：结果文案与伏笔回收计划都改了（正文文件本身另由作者改写，这里只提交追踪）
     revised_result = "改稿：主角改从西门混入车队，删掉与主线无关的路人"
     revised_foreshadow = {
         **_foreshadow("已埋"),
@@ -416,11 +369,9 @@ def test_novel_revision_updates_committed_chapter_entry(tmp_path):
         _revision_document(1, 1, revised_result, foreshadow_changes=[revised_foreshadow]),
     )
     assert revision["ok"] is True, revision
-    # 修订不推进章号，只前进修订号
     assert revision["last_committed_chapter"] == 1
     assert revision["state_revision"] == 2
 
-    # 逐章记录里仍然只有第 001 章一条：是改写，不是新增
     assert sorted(p.name for p in (root / "追踪" / "逐章记录").glob("第*章.md")) == ["第001章.md"]
     delta_after = delta_path.read_text(encoding="utf-8")
     assert revised_result in delta_after
@@ -432,43 +383,34 @@ def test_novel_revision_updates_committed_chapter_entry(tmp_path):
     )
     assert state["last_committed_chapter"] == 1
     assert state["state_revision"] == 2
-    # 该章在上下文里的条目被就地更新（仍是一条）
     assert state["context"]["recent_chapters"] == [{"chapter": 1, "summary": revised_result}]
-    # 伏笔条目同样被更新，没有长出第二条
     assert list(state["foreshadow"]) == ["F001"]
     assert state["foreshadow"]["F001"]["summary"] == revised_foreshadow["summary"]
     assert state["foreshadow"]["F001"]["planned_resolution_chapter"] == 4
     assert state["foreshadow"]["F001"]["updated_chapter"] == 1
 
-    # 派生视图同步到新修订号；事务临时文件不留在项目里
     assert "状态修订：2" in (root / "追踪" / "上下文.md").read_text(encoding="utf-8")
     assert not list(root.glob("novel-track-*.json"))
 
-    # 修订后追踪仍与正文对齐：审计不报 S1
     audit = novel_service.novel_audit(str(root), scope="all")
     assert audit["ok"] is True, audit
     assert audit["summary"]["S1"] == 0, audit["findings"]
 
-    # revision 不能越界写入未提交章：第 2 章还没写，脚本按章号守卫拒绝
     out_of_range = novel_service.novel_track(
         str(root), "revision", _revision_document(2, 2, "越界修订"),
     )
     assert out_of_range["ok"] is False
     assert "cannot revise unwritten chapter" in (out_of_range["error"] + out_of_range["stderr"])
-    # 被拒事务不改状态
     assert json.loads(
         (root / "追踪" / novel_service.TRACKING_STATE_NAME).read_text(encoding="utf-8")
     )["state_revision"] == 2
 
 
 def test_novel_audit_chapter_scope_only_reports_specified_chapter(tmp_path):
-    """两章项目里只有第 2 章字数不足：chapter=2 的审计只出第 2 章的 finding。"""
     root = _new_book(tmp_path / "长夜行")
 
-    # 第 001 章：细纲目标 400，正文 800 字以上 → 达标，不产生 finding
     _write_detail_outline(root, 1, 400)
     _write_body(root, 1, "开端", CHAPTER_1)
-    # 第 002 章：细纲目标 2000，正文只有一句话 → 可见字数远低于 80%，是唯一的 finding 来源
     _write_detail_outline(root, 2, 2000)
     _write_body(root, 2, "推进", "# 第002章 推进\n\n天没亮车队就动了。\n")
 
@@ -481,7 +423,6 @@ def test_novel_audit_chapter_scope_only_reports_specified_chapter(tmp_path):
         assert track["ok"] is True, track
         assert track["last_committed_chapter"] == chapter
 
-    # 显式指定第 2 章：finding 只应指向该章
     audit = novel_service.novel_audit(str(root), scope="chapter", chapter=2)
     assert audit["ok"] is True, audit
     assert audit["scope"] == "chapter"
@@ -491,21 +432,17 @@ def test_novel_audit_chapter_scope_only_reports_specified_chapter(tmp_path):
     assert finding["level"] == "S3"
     assert finding["file"] == "正文/第002章_推进.md"
     assert "第2章" in finding["message"]
-    # 全部 findings 都落在指定章，不含其它章的条目
     assert {f["file"] for f in audit["findings"]} == {"正文/第002章_推进.md"}
     assert all("第001章" not in f["file"] for f in audit["findings"])
     assert all("第1章" not in f["message"] for f in audit["findings"])
     assert audit["summary"] == {"S1": 0, "S2": 0, "S3": 1, "S4": 0}
     assert not [s for s in audit["skipped"] if s["check"] == "ai_patterns"]
 
-    # 对照：同一项目指定第 1 章 → 没有任何 finding（若 chapter 参数被忽略而退化成"最新章"，
-    # 这里会报出第 2 章的问题，因此这条断言证明确实按章号收窄了范围）
     clean = novel_service.novel_audit(str(root), scope="chapter", chapter=1)
     assert clean["ok"] is True, clean
     assert clean["findings"] == []
     assert clean["summary"] == {"S1": 0, "S2": 0, "S3": 0, "S4": 0}
 
-    # 对照：scope=all 扫全项目，仍只有第 2 章那一条（第 1 章始终达标，无 S1 噪声）
     every = novel_service.novel_audit(str(root), scope="all")
     assert every["ok"] is True, every
     assert every["summary"] == {"S1": 0, "S2": 0, "S3": 1, "S4": 0}

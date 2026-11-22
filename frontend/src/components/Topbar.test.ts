@@ -130,7 +130,6 @@ describe('Topbar frameless window controls', () => {
     try {
       const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
       await wrapper.get('.titlebar-drag').trigger('mousedown', { button: 0 });
-      // 延迟判定：mousedown 后不立即移动，等待是否为双击
       expect((window as any).pywebview.api.window_begin_drag).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(450);
       expect((window as any).pywebview.api.window_begin_drag).toHaveBeenCalledOnce();

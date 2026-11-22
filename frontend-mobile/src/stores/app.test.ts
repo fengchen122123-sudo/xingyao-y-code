@@ -25,7 +25,6 @@ describe('mobile app store 事件语义', () => {
     expect(store.messages[0].turnId).toBe('t9');
     expect(store.isRunning).toBe(true);
 
-    // 重复 turn_start（同文本）不重复插入用户气泡
     store.applyEvent('turn_start', { session_name: 's1', user_text: '你好', turn_id: 't9' });
     expect(store.messages.filter((m) => m.role === 'user')).toHaveLength(1);
   });

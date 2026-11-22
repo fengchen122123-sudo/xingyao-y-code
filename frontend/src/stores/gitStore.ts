@@ -1,6 +1,3 @@
-// Git 工作台前端 store（规格 §11；实施计划跨阶段契约"GUI 契约"）。
-// 只保存当前界面快照与加载状态——Git 仓库是唯一事实源（规格 §4.1），
-// 任何写操作后都以后端返回的新快照刷新界面；外部变化事件只触发重读。
 import { defineStore } from 'pinia';
 import type {
   GitBranchDto,
@@ -21,11 +18,6 @@ interface GitConfirmState {
   typedInput: string;
 }
 
-// 工作区路径归一化比较：后端 git_state_changed 事件里的 workspace 经
-// normalize_repo_path 处理（Windows 下 normcase → 小写 + 反斜杠），而前端
-// workdir 来自后端下发的真实路径（保留磁盘大小写）。直接字符串比较会把
-// 同一工作区误判成"其他 Worktree"而丢弃通知，外部 Git 操作（终端提交/切换
-// 分支等）就永远刷不到界面（§10 外部变化重读失效）。
 function normalizeWorkspaceKey(path: string): string {
   return path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
 }
@@ -72,19 +64,9 @@ export const useGitStore = defineStore('git', {
     selectedStaged: false,
     diff: null as GitDiffDto | null,
     diffLoading: false,
-    // 两段式确认挂起状态（§13）：preview 已取回、等待用户确认
     pendingConfirm: null as GitConfirmState | null,
-    // 状态栏点击请求打开源代码管理页签（App.vue → RightPanel 联动）
     panelOpenNonce: 0,
-    // 冲突解决器当前打开的文件路径（空 = 关闭）
     conflictResolverPath: '',
-    // 刷新合并闸门（state 而非模块级）：慢环境下一次快照要数秒，监控失效
-    // 事件与面板操作会在数秒内堆起多个并发 git_get_status（同仓库在后端
-    // worktree_lock 串行执行，堆积让最新状态排队饿死）。在途期间同仓库的新
-    // 刷新记为待补，收尾后立即补发一次拿最新状态。放 state 的关键：换工作区
-    // 的 _setWorkdir 会 $reset 清闸——跨仓库切换立即放行（不同仓库后端是
-    // 不同的锁，可以并行，等旧仓库快照反而拖慢切换）；旧请求收尾时按串号
-    // 识别自己已过期，不再触碰这两个标志。
     _refreshInFlight: false,
     _refreshQueued: false,
   }),
@@ -155,12 +137,9 @@ export const useGitStore = defineStore('git', {
       this.loading = true;
       try {
         const res = await callApi<any>('git_get_status', workdir);
-        // 过期响应丢弃：已发起更新的快照请求，或 workdir 在途期间被切换/重置
         if (serial !== refreshSerial || this.workdir !== workdir) return;
         this._applyResult(res);
       } finally {
-        // 仅未被接替的请求有权收尾：被 $reset/新仓库接替的旧请求不触碰
-        // 闸门与 loading，由当前请求全权管理
         if (serial === refreshSerial) {
           this._refreshInFlight = false;
           this.loading = false;
@@ -239,7 +218,6 @@ export const useGitStore = defineStore('git', {
     },
 
     async discard(path: string) {
-      // Restore 未提交内容为高风险：走 preview → 确认 → execute（§13）
       const res = await callApi<any>('git_preview_risk', this.workdir, 'discard_changes', { paths: [path] });
       this._applyResult(res);
       if (res.ok) this._armConfirm('discard_changes', { paths: [path] }, res.preview);
@@ -313,8 +291,6 @@ export const useGitStore = defineStore('git', {
       }
     },
 
-    // ---- 两段式确认（§13）------------------------------------------------
-
     async previewConfirm(operation: string, params: Record<string, unknown>) {
       const res = await callApi<any>('git_preview_risk', this.workdir, operation, params);
       this._applyResult(res);
@@ -323,7 +299,6 @@ export const useGitStore = defineStore('git', {
 
     _armConfirm(operation: string, params: Record<string, unknown>, preview: GitRiskPreviewDto) {
       if (!preview.confirm_required) {
-        // 无需令牌：直接执行
         void this.executeConfirmed(operation, params, '');
         return;
       }
@@ -340,8 +315,6 @@ export const useGitStore = defineStore('git', {
     cancelConfirm() {
       this.pendingConfirm = null;
     },
-
-    // ---- 外部事件（§10）---------------------------------------------------
 
     onExternalChange(data: { workspace?: string }) {
       const ws = data && data.workspace;

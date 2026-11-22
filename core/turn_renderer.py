@@ -1,5 +1,3 @@
-"""Deterministic, terminal-only rendering for ordered turn events."""
-
 from __future__ import annotations
 
 import re
@@ -23,13 +21,6 @@ _DIFF_MARKER_RE = re.compile(r"^[\d\s]*([+\-])")
 
 
 def _count_diff_changes(diff_text: str) -> tuple[int, int]:
-    """粗略统计 diff 展示文本中的新增/删除行数，用于简短模式的单行摘要。
-
-    diff_text 既可能是原始 unified diff，也可能是渲染成 Rich 表格/面板后的
-    文本（core.llm._show_file_diff 生成，行首会带行号列与面板边框）。两种
-    形式在剥离 ANSI 转义码、去掉行号列/边框后，内容列仍然以原始的 +/-/空格
-    diff 前缀开头，因此可以用同一套启发式识别。
-    """
     added = 0
     removed = 0
     for raw_line in diff_text.split("\n"):
@@ -58,7 +49,6 @@ def _find_tag(text: str, tags: Iterable[str]) -> tuple[int, str] | None:
 
 
 def _safe_prefix_length(text: str, tags: Iterable[str]) -> int:
-    """Return the part that cannot be the beginning of a split tag."""
     tag_list = tuple(tags)
     max_tag_length = max((len(tag) for tag in tag_list), default=0)
     start = max(0, len(text) - max_tag_length + 1)
@@ -78,25 +68,17 @@ def sanitize_protocol_text(text: str) -> str:
     """清理输出文本中的内部协议标记、Advisor 调试头及裸露的 XML <tool_call> 标签。"""
     if not text or not isinstance(text, str):
         return text
-    # 空 assistant 正文的协议占位符：精确删除，不用宽泛 [System: ...] 规则
     text = text.replace(_EMPTY_CONTENT_PROTOCOL_MARKER, "")
     text = re.sub(r'<tool_call[^>]*>.*?</tool_call>', '', text, flags=re.DOTALL)
     text = re.sub(r'</?tool_call[^>]*>', '', text)
     text = re.sub(r'\[Advisor consultation[^\]]*\]', '', text)
     text = re.sub(r'\[Advisor review\]', '', text)
     text = re.sub(r'\[End of advisor consultation[^\]]*\]', '', text)
-    # 圆括号形式的 advisor 内部说明（如 "(advisor returned no content)"）也会泄漏到正文，
-    # 同样需要清理
     text = re.sub(r'\(\s*advisor[^\)]*\)', '', text, flags=re.IGNORECASE)
     return text
 
 
 def sanitize_stream_text(text: str) -> tuple[str, str]:
-    """流式场景清理：返回（可立即发出的已清理文本, 需暂扣等待后续分片的尾部）。
-
-    协议占位符可能横跨两次 delta 分片，逐片直接清理会漏掉跨片标记；
-    尾部若恰好是占位符前缀则暂扣，与下一批拼接后再判定。普通文本零暂扣。
-    """
     if not text:
         return "", ""
     safe = _safe_prefix_length(text, (_EMPTY_CONTENT_PROTOCOL_MARKER,))
@@ -130,7 +112,6 @@ class TurnRenderer:
 
         if kind == "thinking_delta":
             text = str(data.get("text", ""))
-            # 内部推理内容只消费不渲染
             for _ in self._thinking_stream.feed(text):
                 pass
         elif kind == "thinking_finished":
@@ -227,22 +208,15 @@ class TurnRenderer:
             think_opening = _find_tag(self._pending_text, _OPEN_TAGS)
             code_opening = _find_tag(self._pending_text, _CODE_BLOCK_FENCES)
 
-            # 代码块开始早于 think 开始：先处理代码块，跳过其中的 think 标签
             if code_opening is not None and (
                 think_opening is None or code_opening[0] < think_opening[0]
             ):
                 index, fence = code_opening
                 if index:
-                    # 递归处理代码块之前的普通文本（其中可能含 think 标签）
                     suffix = self._pending_text[index:]
                     self._pending_text = self._pending_text[:index]
                     self._consume_text("")
                     if self._pending_text:
-                        # 递归调用后仍保留了被保守持留的尾部（例如一个尚未完整的
-                        # <think> 标签前缀）。此时 fence 已经不再位于位置 0，不能
-                        # 再假设 self._pending_text[:len(fence)] 就是围栏本身——
-                        # 原样拼回并直接返回，等待下一块数据到达后重新判断；
-                        # 回合结束时 finish_incremental 会把剩余内容当纯文本冲刷。
                         self._pending_text += suffix
                         return
                     self._pending_text = suffix
@@ -300,7 +274,6 @@ class TurnRenderer:
             self._emitted.append("\n")
 
     def _flush_thinking(self) -> None:
-        # 内部推理内容只消费不渲染
         for _ in self._thinking_stream.finish():
             pass
 
@@ -335,7 +308,6 @@ class TurnRenderer:
         return list(self._emitted)
 
     def assistant_text(self) -> str:
-        """Return the complete visible assistant reply after think tags are removed."""
         if not self._has_meaningful_assistant_text:
             return ""
         return "".join(self._assistant_text_parts)

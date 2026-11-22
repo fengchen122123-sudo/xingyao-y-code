@@ -1,9 +1,3 @@
-"""remote JWT：只保留设备绑定的只读入口令牌（提取自旧网关 gateway/auth.py）。
-
-无账号、无 argon2、无 refresh。HS256，typ=remote，23 小时过期，
-与旧 REMOTE_ACCESS_SECONDS 一致。
-"""
-
 from __future__ import annotations
 
 import secrets
@@ -51,7 +45,6 @@ def read_remote_token(
         return None
     if payload.get("typ") != "remote" or str(payload.get("device_id") or "") != device_id:
         return None
-    # jwt.decode 已按真实时钟验过 exp；这里再按调用方时钟验一次（测试可注入 now）。
     if int(payload.get("exp") or 0) <= now:
         return None
     row = database.execute(

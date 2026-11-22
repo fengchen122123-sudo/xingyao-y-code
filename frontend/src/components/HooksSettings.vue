@@ -1,6 +1,5 @@
 <template>
   <div class="hooks-settings">
-    <!-- 表单视图：新建/编辑钩子（替换列表） -->
     <div v-if="hookForm.mode !== 'closed'" class="hook-form-page">
       <button class="hook-back" @click="closeHookForm"><AppIcon name="arrow-left" :size="12" /> 返回列表</button>
       <div class="hook-form-head">
@@ -62,7 +61,6 @@
       </div>
     </div>
 
-    <!-- 列表视图 -->
     <template v-else>
       <div class="sub-toolbar">
         <div class="src-filter">
@@ -113,7 +111,6 @@
             <div class="hr-meta">matcher: {{ h.matcher }} · 来源: {{ h.source_path }}</div>
           </div>
           <div class="hr-actions" @click.stop>
-            <!-- 待确认/配置已变更：需先信任才会执行，拒绝则显式屏蔽 -->
             <button
               v-if="h.status === 'pending' || h.status === 'stale'"
               class="btn primary sc-trust-btn"
@@ -179,12 +176,10 @@ function hookStatusText(status: HookInfo['status']) {
   }
 }
 
-// C13：Hook 手动配置——列表（作用域筛选/关键词搜索）+ 新建/编辑表单双视图
 type HookScopeFilterValue = 'all' | 'user' | 'project';
 const hookScopeFilter = ref<HookScopeFilterValue>('all');
 const hookQuery = ref('');
 
-// 关键词命中 event/command/matcher/status_message/source_path 任一字段即保留
 const filteredHooks = computed(() => {
   const kw = hookQuery.value.trim().toLowerCase();
   return store.hooks.filter((h) => {
@@ -197,7 +192,6 @@ const filteredHooks = computed(() => {
   });
 });
 
-// 表单三种形态：closed 显示列表；create/edit 时表单替换列表
 const hookForm = reactive({
   mode: 'closed' as 'closed' | 'create' | 'edit',
   editing: null as HookInfo | null,
@@ -227,7 +221,6 @@ function openHookEditor(h: HookInfo) {
   hookForm.editing = h;
   hookForm.event = h.event;
   hookForm.scope = h.scope === 'project' ? 'project' : 'user';
-  // matcher 为 "*"（匹配全部）时表单显示为空，保存时归一化回 "*"
   hookForm.matcher = h.matcher === '*' ? '' : h.matcher;
   hookForm.command = h.command;
   hookForm.timeoutSec = Math.max(1, Math.round((h.timeout_ms || 60000) / 1000));
@@ -241,7 +234,6 @@ function closeHookForm() {
   hookForm.saving = false;
 }
 
-// 保存：编辑附 source_path + digest（后端定位口径），新建附 scope（写入用户级/项目级文件）
 async function submitHookForm() {
   const command = hookForm.command.trim();
   if (!command) {
@@ -279,7 +271,6 @@ async function submitHookForm() {
   }
 }
 
-// 删除钩子（破坏性）：先复用项目统一的 askConfirm 二次确认，再调 store action
 async function onDeleteHook() {
   const h = hookForm.editing;
   if (!h) return;
@@ -298,13 +289,11 @@ async function onDeleteHook() {
   }
 }
 
-// 启停开关：checked = 启用，取反得到后端的 disabled 语义
 async function onToggleHookDisabled(h: HookInfo, checked: boolean) {
   const res = await store.setHookDisabled(h.source_path, h.digest, !checked);
   if (!res.ok) store.notifyModal('钩子启停', res.msg || '未知错误');
 }
 
-// 进入钩子分区时刷新一次最新状态（组件随分区 v-if 挂载，挂载即代表分区可见）
 onMounted(() => {
   store.refreshHooks();
 });
@@ -326,7 +315,6 @@ onMounted(() => {
 .toolbar-spacer {
   flex: 1;
 }
-/* 来源分段筛选：全部 / 用户 / 项目 */
 .src-filter {
   display: inline-flex;
   align-items: center;
@@ -420,7 +408,6 @@ onMounted(() => {
   color: #fff;
   font-weight: 600;
 }
-/* 开关 Pill */
 .switch {
   position: relative;
   display: inline-block;
@@ -464,7 +451,6 @@ onMounted(() => {
   background: #fff;
 }
 
-/* 钩子搜索框 / 单列列表 / 行卡片 */
 .hook-search {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -554,7 +540,6 @@ onMounted(() => {
   gap: 8px;
   flex-shrink: 0;
 }
-/* 行内开关紧跟操作按钮，不需要卡片布局的自动右推 */
 .hr-actions .switch {
   margin-left: 0;
 }
@@ -585,7 +570,6 @@ onMounted(() => {
   max-width: 460px;
 }
 
-/* 钩子状态徽标：按 status 分色 */
 .hook-status {
   margin-left: auto;
   flex-shrink: 0;
@@ -616,7 +600,6 @@ onMounted(() => {
   color: var(--text-faint);
 }
 
-/* 钩子新建/编辑表单 */
 .hook-form-page {
   width: 100%;
 }

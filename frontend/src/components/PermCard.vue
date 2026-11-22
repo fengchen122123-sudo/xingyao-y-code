@@ -1,5 +1,4 @@
 <template>
-  <!-- 内联交互卡片：对齐极简 v2（方案A）表面阶梯，覆盖权限审批、按回合撤销确认与 ask_user 澄清选择 -->
   <div
     v-if="store.permRequest.show"
     class="perm-card"
@@ -25,7 +24,6 @@
       </span>
     </div>
 
-    <!-- ask_user：清爽对话体提问 + 选项列表 -->
     <div v-if="isAskUser" class="pc-ask-wrap">
       <div class="pc-question" data-test="perm-question-body">{{ askUserQuestion }}</div>
       <div class="pc-choices">
@@ -63,7 +61,6 @@
       </div>
     </div>
 
-    <!-- 标准权限 / 撤销：中间内容带直接呈现命令或路径，不再套双层嵌套卡片 -->
     <template v-else>
       <div v-if="commandParts" class="pc-body is-command">
         <div v-if="commandParts.shellNote" class="pc-cmd-meta">{{ commandParts.shellNote }}</div>
@@ -84,7 +81,6 @@
       </div>
       <div v-else-if="showStandardBody" class="pc-body">{{ store.permRequest.summary }}</div>
 
-      <!-- 按回合撤销：undo_turn 卡片展示服务预检的影响摘要与警告 -->
       <div v-if="isUndoTurn && undoImpact" class="pc-undo-impact">
         <template v-if="undoImpact.available">
           <div class="pc-undo-line">
@@ -112,7 +108,6 @@
         </template>
       </div>
 
-      <!-- 标准权限底部操作栏：左放拒绝（克制弱化），右聚合所有放行动作 -->
       <div v-if="store.permRequest.permissionOptions.length" class="pc-foot">
         <div v-if="denyOptions.length" class="pc-foot-left">
           <button
@@ -254,7 +249,6 @@ const showStandardBody = computed(() => {
   return Boolean(String(store.permRequest.summary || '').trim());
 });
 
-// 按钮分层归组：拒绝放左侧克制呈现，次要放行与主放行聚合在右侧
 const denyOptions = computed(() =>
   store.permRequest.permissionOptions.filter((o) => o.key === 'deny'),
 );
@@ -265,7 +259,6 @@ const secondaryAllowOptions = computed(() =>
   store.permRequest.permissionOptions.filter((o) => o.key !== 'deny' && o.key !== 'allow_once'),
 );
 
-// ask_user 自定义回答输入
 const customAnswer = ref('');
 const customInputRef = ref<HTMLInputElement | null>(null);
 
@@ -280,8 +273,6 @@ function submitCustom() {
   store.respondPermissionChoice(-1, text);
 }
 
-// 新提问到达时清空上一题的未提交草稿：卡片常驻不销毁（根节点 v-if 只控制
-// 显隐），残留草稿会被误发给下一个问题
 watch(() => store.permRequest.reqId, () => {
   customAnswer.value = '';
 });
@@ -447,7 +438,6 @@ watch(() => store.permRequest.reqId, () => {
   color: var(--xy-text-2, var(--text-dim));
 }
 
-/* 按回合撤销：undo_turn 影响摘要 */
 .pc-undo-impact {
   padding: 11px 14px;
   background: var(--xy-canvas, var(--bg1));
@@ -471,7 +461,6 @@ watch(() => store.permRequest.reqId, () => {
   color: var(--xy-text-3, var(--text-faint));
 }
 
-/* 标准权限底部操作栏：28px 轻量按钮，左弱化拒绝、右聚合放行 */
 .pc-foot {
   padding: 9px 14px;
   background: var(--xy-surface, var(--bg2));
@@ -545,7 +534,6 @@ watch(() => store.permRequest.reqId, () => {
   color: var(--xy-rose, var(--red));
 }
 
-/* ask_user 澄清选择区域 */
 .pc-ask-wrap {
   padding: 12px 14px 14px;
   background: var(--xy-canvas, var(--bg1));

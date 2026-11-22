@@ -1,14 +1,3 @@
-"""CLI Git 工作台（规格 §12）。
-
-- ``handle_git_command``：严格解析 /git 子命令 → GitApplicationService 调用，
-  绝不透传任意参数（§12.3）；
-- 高风险操作两步确认：第一次执行返回 CONFIRMATION_REQUIRED 时展示 preview 并
-  暂存一次性令牌（60 秒 TTL，进程内存），用户追加 ``--confirm <目标>`` 后执行；
-- ``render_git_status_bar``：CLI 底部状态栏 Git 段（TTL 缓存，渲染永不抛错）；
-- ``open_git_manager``：全屏管理器（8 页签，prompt_toolkit 独立 Application，
-  模式照 core/session_selector.py）。
-"""
-
 from __future__ import annotations
 
 import html
@@ -20,16 +9,11 @@ from core.git.models import GitError, GitErrorCode, SnapshotVersions
 from core.git.repository import resolve_repository
 from core.git.runner import GitRunner
 
-_CONFIRM_TTL = 55.0  # 略小于服务端 60 秒令牌有效期
+_CONFIRM_TTL = 55.0
 
-# 两步确认的进程内暂存：op 名 → (token, params, expires_at)
 _pending_cli_confirm: dict = {}
 
 
-# ---------------------------------------------------------------- 输出助手
-
-# 可注入打印机（style: ansigray/ansired）；默认走 prompt_toolkit。
-# 测试注入收集器即可在无控制台环境验证输出。
 def _default_printer(text: str, style: str = "ansigray") -> None:
     from prompt_toolkit import print_formatted_text
     from prompt_toolkit.formatted_text import HTML
@@ -67,8 +51,6 @@ def _snapshot_or_error(ws: str):
     except GitError as error:
         return None, error
 
-
-# ---------------------------------------------------------------- 子命令实现
 
 def _cmd_status(ws: str, parts: List[str]) -> None:
     snap, error = _snapshot_or_error(ws)
@@ -118,7 +100,6 @@ def _cmd_diff(ws: str, parts: List[str]) -> None:
     text = doc.raw_text
     if len(text) > 4000:
         text = text[:4000] + "\n…（大 Diff 已截断）"
-    # diff 行内容原样输出（HTML 已转义），+/- 行加色
     from prompt_toolkit import print_formatted_text
     from prompt_toolkit.formatted_text import HTML
 
@@ -334,7 +315,6 @@ def _cmd_log(ws: str, parts: List[str]) -> None:
 
 
 def _cmd_worktree(ws: str, parts: List[str]) -> None:
-    # 保留既有 /worktree 命令入口（main.py），这里仅提示
     _print_html("worktree 管理请使用 /worktree 命令（list|create|remove|prune）")
 
 
@@ -391,7 +371,6 @@ def _cmd_clean(ws: str, parts: List[str]) -> None:
             _print_html(f"将删除以下未跟踪文件:\n{preview_text}\n确认无误后执行: /git clean --go")
             return
         preview_list = _preview_clean(svc, ws)
-        # 不可恢复操作要求输入分支名/短 Hash 二次确认（§13）：clean 以当前分支名为确认目标
         branch = _service().get_snapshot(ws).branch_name or "HEAD"
         _execute_with_cli_confirm(
             ws, "clean", {"confirmed_files": preview_list, "confirm_input": branch},
@@ -452,7 +431,6 @@ def _confirm_arg(parts: List[str]) -> Optional[str]:
 def _execute_with_cli_confirm(
     ws: str, operation: str, params: dict, confirm_target: str, *, confirmed: bool
 ) -> None:
-    """CLI 两步确认：首次调用 → preview + 暂存令牌；用户追加 --confirm 后执行。"""
     key = f"{ws}|{operation}"
     pending = _pending_cli_confirm.get(key)
     if pending and time.time() < pending["expires"] and confirmed:
@@ -468,7 +446,6 @@ def _execute_with_cli_confirm(
         except GitError as error:
             _print_error(error)
         return
-    # 首次：先 preview 取影响范围与令牌
     try:
         preview = _service().preview(ws, operation, params, session_id=_session())
     except GitError as error:
@@ -491,8 +468,6 @@ def _execute_with_cli_confirm(
         f"确认执行请追加 --confirm {confirm_target}（60 秒内有效）"
     )
 
-
-# ---------------------------------------------------------------- 命令分发
 
 _USAGE = (
     "用法: /git <子命令>\n"
@@ -562,8 +537,6 @@ def _workspace() -> str:
         return ""
 
 
-# ---------------------------------------------------------------- 状态栏
-
 _status_cache: dict = {"key": None, "at": 0.0, "text": ""}
 
 
@@ -601,14 +574,7 @@ def render_git_status_bar(workspace: str) -> str:
     return text
 
 
-# ---------------------------------------------------------------- 全屏管理器
-
 def open_git_manager(workspace: str) -> None:
-    """/git 全屏管理器（§12.2）：8 页签、键盘导航、q 退出。
-
-    独立 prompt_toolkit Application（模式照 core/session_selector.py），
-    只读展示 + 安全动作；写操作仍走 GitApplicationService 的完整门禁。
-    """
     from prompt_toolkit.application import Application
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import Layout

@@ -177,7 +177,6 @@ def test_builtin_qq2009_theme_is_available_and_valid(tmp_path):
     assert theme["tokens"]["accent"] == "#3A8FD0"
     assert theme["tokens"]["orange"] == "#F39C00"
     assert theme["native_titlebar"]["mode"] == "light"
-    # 复制路径会对清单走完整 Schema 校验：借此证明内置 QQ2009 的取值合法、可派生用户主题
     copy = repo.copy_theme("builtin.qq2009", "qq2009-copy", "QQ2009 副本")
     assert copy["builtin"] is False
     assert copy["extends"] == "builtin.qq2009"
@@ -201,7 +200,6 @@ def test_builtin_field_notes_theme_is_available_and_valid(tmp_path):
     assert theme["tokens"]["accent"] == "#E04E10"
     assert theme["tokens"]["background_app"] == "#EFEADB"
     assert theme["native_titlebar"]["mode"] == "dark"
-    # 复制路径会对清单走完整 Schema 校验：借此证明内置田野笔记的取值合法、可派生用户主题
     copy = repo.copy_theme("builtin.field-notes", "field-notes-copy", "田野笔记副本")
     assert copy["builtin"] is False
     assert copy["extends"] == "builtin.field-notes"
@@ -212,7 +210,6 @@ def test_builtin_field_notes_theme_is_available_and_valid(tmp_path):
 
 
 def test_removed_builtin_themes_are_gone(tmp_path):
-    # 深夜工位/晨光已从内置主题库下线：列表里不再出现，按 id 取也取不到
     repo = make_repo(tmp_path)
     assert [item["id"] for item in repo.list_themes()] == [
         "builtin.dark", "builtin.light", "builtin.qq2009", "builtin.field-notes",
@@ -330,7 +327,6 @@ def test_non_utf8_manifest_is_structured_invalid_manifest(tmp_path):
 def test_import_image_rejects_oversize_source_before_parsing(tmp_path):
     repo = make_repo_with_saved_theme(tmp_path, "rose")
     source = tmp_path / "oversize.bin"
-    # 全零内容不是合法图片：若大小检查没有先于内容解析，会得到 invalid_image
     source.write_bytes(b"\x00" * (10 * 1024 * 1024 + 1))
     with pytest.raises(ThemeError) as exc:
         repo.import_image("rose", "workspace", source)
@@ -354,7 +350,6 @@ def test_app_image_round_trip_and_included_in_references(tmp_path):
     assert relative_path.startswith("assets/")
     theme = repo.get_theme("rose")
     assert theme["app_image"]["image"] == relative_path
-    # 全局图计入引用集，可读回且导出时被收进 ZIP
     mime_type, _ = repo.read_asset("rose", relative_path)
     assert mime_type == "image/png"
     destination = tmp_path / "out.zip"
@@ -381,10 +376,9 @@ def test_app_image_invalid_scope_rejected(tmp_path):
 
 
 def test_old_theme_without_app_image_migrates_default(tmp_path):
-    # 旧清单无 app_image：读取时补默认值，活动主题不因新增字段损坏
     repo = make_repo(tmp_path)
     theme = minimal_theme("legacy")
-    theme.pop("app_image", None)  # minimal_theme 本就不含，确保显式缺失
+    theme.pop("app_image", None)
     theme_dir = repo.root / "legacy"
     theme_dir.mkdir(parents=True)
     (theme_dir / "theme.json").write_text(json.dumps(theme), encoding="utf-8")

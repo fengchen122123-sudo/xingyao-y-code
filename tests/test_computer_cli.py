@@ -1,10 +1,3 @@
-"""电脑操控命令解析与渲染的 core 层测试（/computer status|pause|resume|stop）。
-
-注意：CLI 已下线电脑/浏览器操控（轻量模式），main.py 不再分派 /computer；
-本文件只覆盖 core.computer.cli 的命令解析与文本渲染逻辑，供 GUI 或其他
-未来入口复用。测试全部经 fake 注入，绝不真实键鼠、截屏、热键、浏览器或网络。
-"""
-
 import json
 import threading
 
@@ -39,23 +32,10 @@ def _default_owner():
 
 
 def disabled_snapshot():
-    """设置未开启/无活动 run 时 controller.snapshot() 的形状（全默认值）。"""
     return ComputerRunSnapshot()
 
 
 class FakeController(_SharedFakeController):
-    """CLI 运行控制测试用 controller fake（继承共享 FakeController）。
-
-    - 无参构造（brief 样例逐字 ``FakeController()``），owner 缺省自动补齐；
-    - ``run_status``/``browser``/``target``/``action_count``/``error_code``
-      直接配置 snapshot 形状，snapshot() 返回真实 ComputerRunSnapshot；
-    - pause/resume 记录调用并镜像真实 controller 语义：未知 run id 抛
-      computer_invalid_state、provider_safety_required 拒绝 resume
-      （computer_provider_safety_required）、恢复后回 running；
-    - ``pause_error``/``resume_error`` 沿用父类 start_error/stop_error 的
-      注入模式；stop 沿用父类记录（stop_calls/stop_reasons）；
-    - 绝不触碰真实键鼠、浏览器或截屏。
-    """
 
     def __init__(self, *, owner=None, run_id="run-a", status="running",
                  target="browser", browser="edge", action_count=12, **kwargs):
@@ -112,11 +92,6 @@ class FakeController(_SharedFakeController):
     def stop(self, run_id, reason):
         self._require_run(run_id)
         return super().stop(run_id, reason)
-
-
-# ---------------------------------------------------------------------------
-# brief 样例测试（逐字）
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("command", ["/computer on", "/computer off", "/computer"])
@@ -177,7 +152,6 @@ def test_cli_browser_switches_when_no_active_run(monkeypatch):
         return _browser_settings_snapshot(browser="chrome")
 
     monkeypatch.setattr(settings_mod, "set_computer_browser", fake_set)
-    # run_id 为空 = 无活动 run，active_run 必须为 False
     result = handle_computer_command(
         "/computer browser chrome", FakeController(run_id="", status="idle")
     )
@@ -197,7 +171,6 @@ def test_cli_browser_rejected_during_active_run(monkeypatch):
         )
 
     monkeypatch.setattr(settings_mod, "set_computer_browser", fake_set)
-    # 默认 FakeController 即 running 活动态
     result = handle_computer_command("/computer browser edge", FakeController())
 
     assert result.ok is False
@@ -241,11 +214,6 @@ def test_cli_trace_never_prints_typed_text():
     text = render_computer_event({"action": "type_text", "text_length": 6, "text": "secret"})
     assert text == "电脑操控: 输入 6 个字符"
     assert "secret" not in text
-
-
-# ---------------------------------------------------------------------------
-# 严格 parser 与纯文本 renderer
-# ---------------------------------------------------------------------------
 
 
 def test_cli_rejects_extra_arguments():
@@ -329,11 +297,6 @@ def test_cli_renders_contain_no_markdown_emphasis(snapshot, event):
     assert "**" not in status_text
     assert "*" not in event_text
     assert "**" not in event_text
-
-
-# ---------------------------------------------------------------------------
-# pause/resume/stop 传当前 run id 与错误呈现
-# ---------------------------------------------------------------------------
 
 
 def test_cli_control_commands_pass_current_run_id():
@@ -453,11 +416,6 @@ def test_cli_event_listener_posts_displayable_actions_only():
     assert all(isinstance(event, ComputerCliEvent) for event in posted)
 
 
-# ---------------------------------------------------------------------------
-# 永久配置键不可被 CLI 命令修改
-# ---------------------------------------------------------------------------
-
-
 def test_cli_commands_never_touch_permanent_settings(tmp_path, monkeypatch):
     values = {
         "browser_control_enabled": True,
@@ -479,7 +437,6 @@ def test_cli_commands_never_touch_permanent_settings(tmp_path, monkeypatch):
     ):
         handle_computer_command(command, controller)
 
-    # 运行控制命令必须一个字节都不落盘；browser 子命令是唯一例外，单独测
     assert cfg.read_text(encoding="utf-8") == before
     saved = json.loads(before)
     assert saved["browser_control_enabled"] is True
@@ -488,7 +445,6 @@ def test_cli_commands_never_touch_permanent_settings(tmp_path, monkeypatch):
 
 
 def test_cli_browser_switch_updates_only_browser_key(tmp_path, monkeypatch):
-    """browser 子命令是 CLI 唯一允许修改的永久设置，且只允许改 computer_browser。"""
     values = {
         "browser_control_enabled": True,
         "computer_control_enabled": False,
@@ -521,11 +477,6 @@ def test_cli_browser_no_write_during_active_run(tmp_path, monkeypatch):
     assert result.ok is False
     assert "错误码" in result.text
     assert cfg.read_text(encoding="utf-8") == before
-
-
-# ---------------------------------------------------------------------------
-# Ctrl+C：先 controller.stop 再现有 Turn cancel
-# ---------------------------------------------------------------------------
 
 
 def test_stop_active_run_for_cancel_passes_cli_ctrl_c():
@@ -566,33 +517,19 @@ def test_ctrl_c_without_active_computer_run_is_noop(monkeypatch):
     assert controller.stop_reasons == []
 
 
-# ---------------------------------------------------------------------------
-# main.py 接线：斜杠分派、帮助表与 UI 事件通道
-# ---------------------------------------------------------------------------
-
-
-
-
-# ---------------------------------------------------------------------------
-# Task 14 审查裁决四项（Task 16 落地）：stopping 文案 / 状态栏段 / 补全表 / 兜底 except
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("sub", ["pause", "resume", "stop"])
 def test_cli_commands_during_stopping_window_return_friendly_text(sub):
-    """stopping 窗口内的控制命令：友好提示，绝不暴露内部状态机文案（裁决②）。"""
     controller = FakeController(status="stopping")
     result = handle_computer_command(f"/computer {sub}", controller)
     assert result.ok is False
     assert "停止中" in result.text
     assert "非法状态转换" not in result.text
-    assert controller.stop_calls == 0  # 已在停止中，不得重复 stop
+    assert controller.stop_calls == 0
     assert controller.pause_calls == []
     assert controller.resume_calls == []
 
 
 def test_status_bar_segment_only_for_active_runs():
-    """状态栏段（设计 17.2，裁决①）：活动 run 固定格式，idle/终态为空。"""
     from core.computer.cli import render_computer_status_bar
 
     running = ComputerRunSnapshot(
@@ -607,5 +544,4 @@ def test_status_bar_segment_only_for_active_runs():
     assert render_computer_status_bar(
         ComputerRunSnapshot(run_id="run-err", status="failed", error_code="computer_backend_error")
     ) == ""
-
 

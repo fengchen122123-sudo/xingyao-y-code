@@ -1,5 +1,3 @@
-"""undo_turn 自然语言撤销工具测试（规格 18 / 25.7）。"""
-
 import pytest
 from types import SimpleNamespace
 
@@ -34,7 +32,6 @@ def env(tmp_path, monkeypatch):
 
 
 def _make_ready_turn(env, turn, files: dict, bind_thread=False):
-    """构造一个已封闭 ready 的回合；files: path(bytes) -> 新内容 bytes。"""
     checkpoint, ctx = turn_undo_service.begin_turn(
         session_id=env["session_id"],
         turn_id=turn,
@@ -87,7 +84,6 @@ def test_undo_turn_conflict_zero_writes(env):
     f1 = env["ws"] / "t3.py"
     f1.write_bytes(b"old")
     checkpoint = _make_ready_turn(env, "turn-tool-c", {f1: (b"old", b"new")})
-    # 撤销前外部修改
     f1.write_bytes(b"external")
     result = undo_turn(checkpoint.turn_id[:8])
     assert "没有修改任何文件" in result
@@ -138,7 +134,6 @@ def test_permission_impact_summary_for_card(env):
     assert impact["restore_content_count"] == 1
     assert impact["delete_created_count"] == 1
     assert "created.bin" in impact["created_files"]
-    # 明确的 turn_id 也能解析
     impact2 = turn_undo_service.undo_turn_permission_impact(
         {"turn_id": checkpoint.turn_id[:8]}
     )
@@ -146,7 +141,6 @@ def test_permission_impact_summary_for_card(env):
 
 
 def test_undo_turn_risk_is_mutation_blocked_in_plan_mode():
-    """undo_turn 在权限管线中必须按变更处理（计划模式拒绝，不按只读放行）。"""
     from core.llm import _permission_risk
     from core.permission_policy import PermissionRisk
     from types import SimpleNamespace
@@ -157,7 +151,6 @@ def test_undo_turn_risk_is_mutation_blocked_in_plan_mode():
 
 
 def test_registry_declares_undo_turn_with_strict_schema():
-    """工具注册元数据校验：只允许 turn_id 参数，不允许路径/force。"""
     from core.tool_registry import build_default_registry
 
     registry = build_default_registry()
@@ -165,13 +158,12 @@ def test_registry_declares_undo_turn_with_strict_schema():
     assert spec is not None
     props = set((spec.input_schema or {}).get("properties", {}).keys())
     assert props == {"turn_id"}
-    assert "force" in spec.description.lower() or True  # 描述语义不依赖 force 参数
+    assert "force" in spec.description.lower() or True
     text = str(spec.input_schema)
     assert "file_path" not in text
 
 
 def test_recorder_coverage_validation_fails_for_uncovered_tool():
-    """新工具声明 mutates_files 却未接入记录器 → 启动校验失败（规格 9.5）。"""
     from core.turn_undo.service import validate_recorder_coverage
     from types import SimpleNamespace
 
@@ -185,7 +177,6 @@ def test_recorder_coverage_validation_fails_for_uncovered_tool():
 
 
 def test_default_registry_coverage_complete():
-    """默认注册表（含插件工具）全部 mutates_files 工具都已接入记录器。"""
     from core.tool_registry import build_default_registry
     from core.turn_undo.service import validate_recorder_coverage
 
@@ -230,8 +221,6 @@ def test_configure_fails_when_coverage_incomplete(tmp_path, monkeypatch):
 
 
 def test_late_subagent_write_refused_at_tool_level(tmp_path, monkeypatch):
-    """H2 端到端：父回合封闭后，仍绑定旧检查点的线程调用 write_file 必须在
-    触盘前失败（🚨），文件不变——工具层不得把"检查点已封闭"降级为裸写。"""
     import threading as _threading
 
     from core.memory import MemoryManager
@@ -255,7 +244,6 @@ def test_late_subagent_write_refused_at_tool_level(tmp_path, monkeypatch):
         workspace_root=str(ws),
         owner_kind=OwnerKind.FOREGROUND_TURN,
     )
-    # 子代理线程：绑定后阻塞，等父回合封闭
     target = ws / "late.txt"
     bound = _threading.Event()
     parent_closed = _threading.Event()

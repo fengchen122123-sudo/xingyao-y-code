@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""core.encrypted_secret_store 的单元测试。
-
-验证基于口令派生密钥（PBKDF2-HMAC-SHA256）的 AES-GCM 加解密：
-- 相同口令可往返还原，不同口令/篡改必须失败
-- 每次加密产生不同密文（随机盐 + 随机 nonce）
-- 边界情况：空口令、空明文、Unicode、超长明文
-"""
 import base64
 
 import pytest
@@ -21,7 +14,6 @@ TEST_PASSPHRASE = "qa-encryption-key"
 
 
 class TestDeriveKey:
-    """密钥派生：确定性 + 雪崩效应。"""
 
     def test_same_passphrase_and_salt_derive_same_key(self):
         assert derive_key(TEST_PASSPHRASE) == derive_key(TEST_PASSPHRASE)
@@ -43,7 +35,6 @@ class TestDeriveKey:
 
 
 class TestEncryptedSecretStoreRoundTrip:
-    """核心行为：带密钥的对称加解密。"""
 
     def setup_method(self):
         self.store = EncryptedSecretStore(TEST_PASSPHRASE)
@@ -64,9 +55,7 @@ class TestEncryptedSecretStoreRoundTrip:
         token = self.store.encrypt("hello")
         assert token.startswith(ENCRYPTED_PREFIX)
         payload = token[len(ENCRYPTED_PREFIX):]
-        # 必须是合法 ASCII Base64
         raw = base64.b64decode(payload, validate=True)
-        # 内部布局：salt(16) + nonce(12) + ciphertext+tag(至少 16)
         assert len(raw) >= 16 + 12 + 16
 
     def test_each_encryption_produces_different_ciphertext(self):
@@ -76,7 +65,6 @@ class TestEncryptedSecretStoreRoundTrip:
 
 
 class TestDecryptionFailures:
-    """解密必须能识别错误密钥与被篡改的数据。"""
 
     def setup_method(self):
         self.store = EncryptedSecretStore(TEST_PASSPHRASE)
@@ -90,7 +78,6 @@ class TestDecryptionFailures:
     def test_tampered_ciphertext_fails(self):
         token = self.store.encrypt("secret")
         raw = bytearray(base64.b64decode(token[len(ENCRYPTED_PREFIX):]))
-        # 破坏密文区（salt 16 + nonce 12 之后），触发 GCM 认证标签校验失败
         raw[-1] ^= 0xFF
         tampered = ENCRYPTED_PREFIX + base64.b64encode(bytes(raw)).decode("ascii")
         with pytest.raises(ValueError):
@@ -132,5 +119,4 @@ class TestHelpers:
         assert EncryptedSecretStore.is_encrypted("") is False
 
     def test_kdf_iterations_constant_is_hardened(self):
-        # 行业基线为 OWASP 推荐的 600000 次，防止有人手滑调回弱值
         assert DEFAULT_KDF_ITERATIONS >= 600_000

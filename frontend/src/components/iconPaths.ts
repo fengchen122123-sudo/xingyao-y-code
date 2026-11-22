@@ -1,5 +1,3 @@
-// 内联 SVG 图标路径库（lucide 风格：24x24 viewBox，描边由 AppIcon 统一控制）。
-// 保持纯字符串注册表：便于 tree-shaking 检查与体积控制，新图标直接加一行即可。
 
 export const ICON_PATHS: Record<string, string> = {
   brain: '<path d="M9.5 4A2.5 2.5 0 0 0 7 6.5v.5a3 3 0 0 0-2 5.83V13a3 3 0 0 0 2 5.83v.67A2.5 2.5 0 0 0 9.5 22H12V2H9.5A2.5 2.5 0 0 0 7 4.5"/><path d="M14.5 4A2.5 2.5 0 0 1 17 6.5v.5a3 3 0 0 1 2 5.83V13a3 3 0 0 1-2 5.83v.67a2.5 2.5 0 0 1-2.5 2.5H12V2h2.5A2.5 2.5 0 0 1 17 4.5"/><path d="M8 10h4"/><path d="M12 14h4"/>',
@@ -39,7 +37,6 @@ export const ICON_PATHS: Record<string, string> = {
   refresh:
     '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
   square: '<rect width="14" height="14" x="5" y="5" rx="2"/>',
-  // 窗口最大化：直角空心方块（圆角线帽会把直角抹圆，调用处需配 miter）
   'win-max': '<rect x="4.5" y="4.5" width="15" height="15"/>',
   pause: '<rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/>',
   play: '<polygon points="6 3 20 12 6 21 6 3"/>',
@@ -78,7 +75,6 @@ export const ICON_PATHS: Record<string, string> = {
     '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
   search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
   scan: '<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/>',
-  // 屏幕截图入口图标（lucide scissors：剪刀）
   scissors: '<circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/>',
   lightbulb: '<path d="M9 18h6"/><path d="M10 22h4"/><path d="M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2v.3h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z"/>',
   sparkle: '<polygon points="12 2 15 9 22 12 15 15 12 22 9 15 2 12 9 9"/>',

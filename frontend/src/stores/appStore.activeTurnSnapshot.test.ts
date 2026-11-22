@@ -15,7 +15,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
   it('restores in-flight turn from get_initial_state and seamlessly appends new token_delta', async () => {
     const store = useAppStore();
 
-    // 模拟手机扫码后 get_initial_state 返回了进行中回合的快照
     const fakeApi = {
       get_initial_state: async () => ({
         models: [],
@@ -26,7 +25,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
         sessions: [],
         workdir: 'GLOBAL',
         current_session: 'session_lan_test',
-        // 数据库里只有更早的历史消息（或当前消息的用户输入，但没有 assistant 消息）
         messages: [{ role: 'user', content: '早先的历史消息' }],
         active_sessions: ['session_lan_test'],
         active_turn_snapshot: {
@@ -55,11 +53,9 @@ describe('Active turn snapshot restore and streaming continuation', () => {
 
     await store.initFromBackend();
 
-    // 断言当前会话处于 running 态
     expect(store.running).toBe(true);
     expect(store.runningSessions).toContain('session_lan_test');
 
-    // 验证消息列表已还原：末尾包含用户输入及 running 助手卡片
     const msgs = store.messages;
     expect(msgs).toHaveLength(3);
     expect(msgs[1].role).toBe('user');
@@ -73,22 +69,18 @@ describe('Active turn snapshot restore and streaming continuation', () => {
     expect(assistant.tool_calls).toHaveLength(1);
     expect(assistant.tool_calls![0].id).toBe('call_1');
 
-    // 验证 store 的流式追踪状态已同步还原
     expect(store.currentStreamingText).toBe('这是正在生成的第一段内容');
     expect(store.currentThinkingText).toBe('思考中：首先分析结构...');
     expect(store.turnStartedAt).toBe(1700000000000);
 
-    // 模拟后续电脑端继续吐字，手机端收到新的 token_delta
     store.handleBridgeEvent(event('token_delta', {
       session_name: 'session_lan_test',
       text: '，这是追加的第二段。',
     }));
 
-    // 验证无缝继续追加！
     expect(assistant.content).toBe('这是正在生成的第一段内容，这是追加的第二段。');
     expect(store.currentStreamingText).toBe('这是正在生成的第一段内容，这是追加的第二段。');
 
-    // 模拟工具执行完毕
     store.handleBridgeEvent(event('tool_finish', {
       session_name: 'session_lan_test',
       id: 'call_1',
@@ -265,7 +257,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
     // 气泡数组里不得出现「轮1轮2」这类整回合拼接
     expect(store.messages.some(m => (m.content || '').includes('轮1轮2'))).toBe(false);
 
-    // 快照文本只落在运行中气泡上
     const running = store.messages.at(-1)!;
     expect(running.role).toBe('assistant');
     expect(running.execution_state).toBe('running');
@@ -274,7 +265,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
     expect(running.tool_calls![0].id).toBe('call_2');
     expect(store.currentStreamingText).toBe('轮2');
 
-    // 后续 token_delta 继续写进运行中气泡，不会回填到轮1
     store.handleBridgeEvent(event('token_delta', {
       session_name: 'session_snapshot_running',
       text: '续写',
@@ -290,10 +280,8 @@ describe('Active turn snapshot restore and streaming continuation', () => {
       { role: 'user', content: '第一问' },
       { role: 'assistant', content: '轮1正文', execution_state: 'completed' },
     ];
-    // 上一轮残留的流式累积文本（真实场景里由快照恢复/流式吐字留下）
     store.currentStreamingText = '轮1正文';
     store.currentThinkingText = '轮1思考';
-    // 轮次之间尾部混入非 assistant 消息：末尾不再是 assistant 气泡
     store.messages.push({ role: 'error', content: 'boom' });
 
     store.handleBridgeEvent(event('round_started', {
@@ -318,7 +306,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
       switch_session: async (sessionName: string) => ({
         ok: true,
         session_name: sessionName,
-        // 库里只有上一轮的已完成气泡（当前进行中轮次还没有本地气泡）
         messages: [
           { role: 'user', content: '第一问' },
           { role: 'assistant', content: '轮1', execution_state: 'completed' },
@@ -343,7 +330,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
 
     // 已完成的轮1气泡绝不能被整回合快照覆盖
     expect(store.messages[1].content).toBe('轮1');
-    // 快照内容落在新建的 running 气泡上
     expect(store.messages).toHaveLength(3);
     const running = store.messages.at(-1)!;
     expect(running.role).toBe('assistant');
@@ -352,7 +338,6 @@ describe('Active turn snapshot restore and streaming continuation', () => {
     expect(running.reasoning_content).toBe('整回合思考');
     expect(running.tool_calls).toHaveLength(1);
 
-    // 后续流式吐字继续写进新建气泡，不回填到已完成气泡
     store.handleBridgeEvent(event('token_delta', {
       session_name: 'session_snapshot_completed_tail',
       text: '追加',

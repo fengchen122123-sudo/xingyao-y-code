@@ -1,37 +1,8 @@
-"""飞书长连接帧编解码（本仓库自写，替代上游的 protobuf 生成代码）。
-
-为什么自己写：上游 lark-oapi 用 protoc 3.19 之前的老式生成代码（手工构造
-Descriptor），并为此在包内夹带了一整份 protobuf 运行时副本（约 50 个文件）。
-官方 protobuf ≥4.21 明确拒绝这种老式生成代码（实测报 "Descriptors cannot be
-created directly"），因此要么夹带旧 protobuf、要么把 protobuf 钉死在 3.20.x。
-本协议只有两个消息、九个字段，且只用 varint 与长度前缀两种线格式，手写更小、
-零依赖、可完整单测。
-
-上游 schema（pbbp2.proto，proto2）：
-    message Header { required string key = 1; required string value = 2; }
-    message Frame {
-      required uint64 SeqID            = 1;
-      required uint64 LogID            = 2;
-      required int32  service          = 3;
-      required int32  method           = 4;
-      repeated Header headers          = 5;
-      optional string payload_encoding = 6;
-      optional string payload_type     = 7;
-      optional bytes  payload          = 8;
-      optional string LogIDNew         = 9;
-    }
-
-对外接口与上游生成代码保持一致（Frame()/SerializeToString()/ParseFromString()/
-headers.add()），便于将来对照上游升级。
-"""
-
 from typing import List
 
-# 线格式
 _WIRE_VARINT = 0
 _WIRE_LEN = 2
 
-# 字段号
 _F_SEQ_ID = 1
 _F_LOG_ID = 2
 _F_SERVICE = 3
@@ -72,7 +43,6 @@ class HeaderList(list):
 
 def _encode_varint(value: int) -> bytes:
     if value < 0:
-        # int32 负数按 protobuf 语义以 64 位补码编码
         value &= _UINT64_MASK
     out = bytearray()
     while True:
@@ -151,8 +121,6 @@ class Frame:
         self.payload: bytes = b""
         self.LogIDNew: str = ""
 
-    # ---- 序列化 ----
-
     def SerializeToString(self) -> bytes:
         out = bytearray()
         out += _encode_varint_field(_F_SEQ_ID, int(self.SeqID or 0))
@@ -173,8 +141,6 @@ class Frame:
         if self.LogIDNew:
             out += _encode_string_field(_F_LOG_ID_NEW, self.LogIDNew)
         return bytes(out)
-
-    # ---- 反序列化 ----
 
     def ParseFromString(self, raw: bytes) -> None:
         self.SeqID = 0
@@ -224,10 +190,10 @@ class Frame:
                     self.LogIDNew = chunk.decode("utf-8", errors="replace")
                 continue
 
-            if wire_type == 1:  # 64 位定长
+            if wire_type == 1:
                 pos += 8
                 continue
-            if wire_type == 5:  # 32 位定长
+            if wire_type == 5:
                 pos += 4
                 continue
             raise ValueError(f"不支持的线格式 {wire_type}（字段 {field_number}）")

@@ -1,5 +1,3 @@
-"""第一批写代码效率与质量修复的端到端回归测试。"""
-
 from __future__ import annotations
 
 import json
@@ -22,7 +20,6 @@ def _clear_read_guard():
 
 
 def test_consecutive_edits_succeed_without_reread(tmp_path, monkeypatch):
-    """写/改成功后刷新 fresh_read_guard 指纹，连续 edit_file 不应误报文件已被改动。"""
     monkeypatch.chdir(tmp_path)
     _clear_read_guard()
     tool_cache.clear_all()
@@ -35,7 +32,6 @@ def test_consecutive_edits_succeed_without_reread(tmp_path, monkeypatch):
         res1 = edit_file(str(target), target_content="alpha = 1", replacement_content="alpha = 10")
         assert res1.startswith("✔"), res1
 
-        # 紧接着改同一文件的另一处，不重新 read_file 也必须成功
         res2 = edit_file(str(target), target_content="beta = 2", replacement_content="beta = 20")
         assert res2.startswith("✔"), res2
         assert "alpha = 10" in target.read_text(encoding="utf-8")
@@ -46,7 +42,6 @@ def test_consecutive_edits_succeed_without_reread(tmp_path, monkeypatch):
 
 
 def test_write_new_file_then_edit_succeeds(tmp_path, monkeypatch):
-    """write_file 新建后直接 edit_file，不需要多跑一轮 read_file。"""
     monkeypatch.chdir(tmp_path)
     _clear_read_guard()
     tool_cache.clear_all()
@@ -63,7 +58,6 @@ def test_write_new_file_then_edit_succeeds(tmp_path, monkeypatch):
 
 
 def test_tool_cache_invalidated_on_write_and_edit(tmp_path, monkeypatch):
-    """写/改文件后搜索/glob/LSP 与对应文件的读取缓存应立即失效。"""
     monkeypatch.chdir(tmp_path)
     tool_cache.clear_all()
     _clear_read_guard()
@@ -91,7 +85,6 @@ def test_tool_cache_invalidated_on_write_and_edit(tmp_path, monkeypatch):
 
 
 def test_command_policy_precision_and_safe_compounds():
-    """修正 -m/-p/-e 误判，支持安全组合查询，同时维持组合命令不入会话白名单合约。"""
     assert session_rule_for_command('git commit -m "fix bug"') == ("git", "commit")
     assert classify_command_risk("git log -p -n 3") is PermissionRisk.QUERY
     assert classify_command_risk("git branch -vv") is PermissionRisk.QUERY
@@ -103,7 +96,6 @@ def test_command_policy_precision_and_safe_compounds():
     assert classify_command_risk("ruff check --fix core/") is PermissionRisk.NORMAL_MUTATION
     assert classify_command_risk("tsc --noEmit") is PermissionRisk.QUERY
 
-    # 安全管道/条件串行拆解分类，但不进入 session_rule_for_command
     assert classify_command_risk("git status | head -n 10") is PermissionRisk.QUERY
     assert classify_command_risk("cd sub && git status") is PermissionRisk.QUERY
     assert classify_command_risk("cd sub && pytest tests/") is PermissionRisk.NORMAL_MUTATION
@@ -112,7 +104,6 @@ def test_command_policy_precision_and_safe_compounds():
 
 
 def test_execute_command_timeout_preserves_partial_output(tmp_path, monkeypatch):
-    """命令超时时应附带返回超时前已捕获的尾部输出。"""
     monkeypatch.chdir(tmp_path)
     res = execute_command(
         f'"{sys.executable}" -u -c "import time; print(\'TAIL_MARKER_123\', flush=True); time.sleep(5)"',
@@ -123,7 +114,6 @@ def test_execute_command_timeout_preserves_partial_output(tmp_path, monkeypatch)
 
 
 def test_tool_output_reducer_keeps_pytest_traceback_and_diff_hunks():
-    """pytest 精简保留 traceback 定位行；git diff 保留适量 +/- 代码变更。"""
     pytest_lines = [
         "============================= test session starts =============================",
         "collected 80 items",
@@ -165,7 +155,6 @@ def test_tool_output_reducer_keeps_pytest_traceback_and_diff_hunks():
 
 
 def test_hook_registry_caches_until_file_changes(tmp_path, monkeypatch):
-    """HookRegistry 未变更时复用缓存；hooks.json 修改后立刻失效并重载。"""
     user_path = tmp_path / "home" / "hooks.json"
     proj_path = tmp_path / "proj" / ".ycode" / "hooks.json"
     proj_path.parent.mkdir(parents=True)
@@ -189,7 +178,7 @@ def test_hook_registry_caches_until_file_changes(tmp_path, monkeypatch):
     second = registry.load(workspace_root=tmp_path / "proj")
     assert [r.command for r in first] == ["echo a"]
     assert [r.command for r in second] == ["echo a"]
-    assert load_calls == 1  # user_path 不存在（不调用 uncached）且 proj_path 第二次命中缓存
+    assert load_calls == 1
 
     # 改写文件内容，触发缓存失效
     time.sleep(0.02)
@@ -203,7 +192,6 @@ def test_hook_registry_caches_until_file_changes(tmp_path, monkeypatch):
 
 
 def test_llm_deterministic_failure_categories_and_win_shell_description(tmp_path, monkeypatch):
-    """确定性 API 报错类别含 model_unavailable/policy_refusal；Windows auto 描述明示 cmd.exe。"""
     import config
     from core import llm
 

@@ -19,10 +19,8 @@
         </div>
         <div class="cmd">{{ it.summary || it.functionName || '权限请求' }}</div>
         <div v-if="it.functionName && it.summary" class="detail mono">{{ it.functionName }}</div>
-        <!-- undo_turn 撤销影响摘要 -->
         <div v-if="it.undoImpact" class="imp">{{ impactText(it.undoImpact) }}</div>
 
-        <!-- ask_user 提问：选项列表 + 自由回答（对齐桌面 PermCard） -->
         <template v-if="isAsk(it)">
           <div v-if="it.options.length" class="choices">
             <button
@@ -38,7 +36,6 @@
           </div>
         </template>
 
-        <!-- 权限档位选项（permission_options） -->
         <div v-else-if="it.permissionOptions.length" class="acts">
           <van-button
             v-for="o in it.permissionOptions"
@@ -52,7 +49,6 @@
           <van-button size="small" class="reject-btn" :loading="busyKey === it.requestId" @click="decide(it, false)">拒绝</van-button>
         </div>
 
-        <!-- 普通命令/操作：允许 / 总是允许 / 拒绝 -->
         <div v-else class="acts">
           <van-button size="small" type="primary" :loading="busyKey === it.requestId" @click="decide(it, true)">允许</van-button>
           <van-button v-if="it.allowAlways" size="small" plain type="primary" :loading="busyKey === it.requestId" @click="decide(it, true, true)">总是允许</van-button>
@@ -68,7 +64,6 @@ import { reactive, ref } from 'vue';
 import { showConfirmDialog, showToast } from 'vant';
 import { useAppStore, type PermRequest } from '../stores/app';
 
-// 星瑶品牌 logo（public 静态资源，运行时引用；/m/ 前缀与 lan_server 托管路径一致）
 const logoUrl = '/m/icon.png';
 
 const store = useAppStore();
@@ -90,7 +85,6 @@ function l1Icon(it: PermRequest): string {
   if (it.permissionOptions.length) return 'i-shield';
   return 'i-warn';
 }
-/** undo_impact 服务预检摘要（结构由 core/turn_undo service 提供，宽松取字段） */
 function impactText(imp: any): string {
   if (!imp || typeof imp !== 'object') return '';
   if (typeof imp.summary === 'string' && imp.summary) return imp.summary;
@@ -143,7 +137,6 @@ async function decideChoice(it: PermRequest, index: number) {
   }
 }
 
-/** ask_user 自由文本回答（对齐桌面：respond_permission_choice(-1, text)） */
 async function submitCustom(it: PermRequest) {
   const text = (answers[it.requestId] || '').trim();
   if (!text) return;

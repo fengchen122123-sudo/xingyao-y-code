@@ -1,5 +1,3 @@
-"""tests/test_media_migration.py —— 历史消息 media_v1 迁移测试。"""
-
 import json
 import os
 
@@ -13,10 +11,6 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 @pytest.fixture(autouse=True)
 def _isolate_migration_gate(monkeypatch):
-    """隔离真实用户 config：门闩读写都替换为内存版，测试互不污染真实 ~/.ycode。
-
-    yield 出内存 store 供测试在需要时清除门闩标记。
-    """
     import core.media_migration as mm
 
     store: dict = {}
@@ -61,7 +55,7 @@ def test_migration_adds_manifest_and_keeps_body(manager, png_file, tmp_path):
     msgs = _get_content(manager, "s1")
     items = msgs[0]["_display"]["media_v1"]["items"]
     assert items[0]["kind"] == "image"
-    assert msgs[0]["content"] == body  # 正文文本字节不动
+    assert msgs[0]["content"] == body
 
 
 def test_migration_idempotent_and_gate(manager, png_file, tmp_path, _isolate_migration_gate):
@@ -70,11 +64,9 @@ def test_migration_idempotent_and_gate(manager, png_file, tmp_path, _isolate_mig
 
     first = run_media_migration_once(manager)
     assert first["updated"] == 1
-    # 模拟"门闩未置位"的中断场景重跑：消息已带 media_v1，天然跳过（幂等）
     _isolate_migration_gate.clear()
     second = run_media_migration_once(manager)
     assert second["updated"] == 0
-    # 门闩生效：置位后直接 skipped
     third = run_media_migration_once(manager)
     assert third.get("skipped") is True
 
@@ -83,9 +75,7 @@ def test_migration_skips_plain_text_and_tool_messages(manager, tmp_path, _isolat
     _add_assistant(manager, "s1", str(tmp_path), "普通回复，没有媒体")
     plain_stats = run_media_migration_once(manager)
     assert plain_stats["updated"] == 0
-    # 纯文本形态（非 JSON dict）的旧消息不迁移
     manager.add_messages("s1", [("assistant", "纯文本旧消息 ![图](x.png)")])
-    # 清除上一轮置位的门闩，验证第二轮逐条幂等仍为 0
     _isolate_migration_gate.clear()
     stats = run_media_migration_once(manager)
     assert stats["updated"] == 0

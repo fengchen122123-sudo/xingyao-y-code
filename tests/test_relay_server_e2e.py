@@ -1,9 +1,3 @@
-"""relay_server 真客户端联调（TDD 红灯阶段）。
-
-本机 uvicorn 线程 + 保留的 CloudRelayClient 真实套接字 + websockets.sync App 侧
-+ portal.request_ticket 换票。协议必须与保留客户端逐帧兼容。
-"""
-
 from __future__ import annotations
 
 import json
@@ -170,8 +164,6 @@ def test_event_broadcast_and_reconnect_replay(relay_env, device_client):
         assert frame["data"] == {"x": 1}
         assert isinstance(frame["seq"], int)
         seq = frame["seq"]
-    # 断线期间设备继续产出第二条事件；带 last_seq + last_boot_id 同 jwt 重连，
-    # 名额不泄漏，且 replay 必须只补发缺失的第 2 条事件。
     client.submit("e2e_event", {"x": 2})
     _wait(lambda: client.outbound.qsize() == 0, message="第二条事件未发往网关")
     time.sleep(0.05)

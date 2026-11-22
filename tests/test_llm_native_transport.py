@@ -1,8 +1,3 @@
-"""原生 HTTPX 流式传输核单元测试。
-
-验证 SSE 解析、流块归一化、硬中断关闭、Token 快速估算与方言策略映射。
-"""
-
 import json
 import pytest
 
@@ -30,7 +25,6 @@ from core.llm_native_transport import (
 
 
 def test_model_policy_resolution():
-    """测试不同模型名称与 URL 正确解析对应 Policy。"""
     p_deepseek = get_model_policy("deepseek-chat")
     assert p_deepseek.provider_kind == "deepseek"
 
@@ -49,7 +43,6 @@ def test_model_policy_resolution():
 
 
 def test_sse_decoder_parsing():
-    """测试 SSEDecoder 能够正确解析 SSE 文本流并跳过心跳与空行。"""
     raw_sse = (
         ": ping\n\n"
         "data: {\"choices\": [{\"delta\": {\"content\": \"Hello\"}}]}\n\n"
@@ -66,7 +59,6 @@ def test_sse_decoder_parsing():
 
 
 def test_chunk_normalizer_reasoning_and_tools():
-    """测试 ChunkNormalizer 正确提取推理链、工具调用与缓存明细。"""
     policy = POLICY_REGISTRY["deepseek"]
     normalizer = ChunkNormalizer(policy)
 
@@ -104,14 +96,12 @@ def test_chunk_normalizer_reasoning_and_tools():
     assert chunk is not None
     assert chunk.id == "chatcmpl-123"
 
-    # Choices & delta
     assert len(chunk.choices) == 1
     choice = chunk.choices[0]
     assert choice.delta.content == "Result"
     assert choice.delta.reasoning_content == "Step 1: thinking"
     assert choice.finish_reason == "tool_calls"
 
-    # Tool calls
     assert len(choice.delta.tool_calls) == 1
     tc = choice.delta.tool_calls[0]
     assert tc.index == 0
@@ -119,7 +109,6 @@ def test_chunk_normalizer_reasoning_and_tools():
     assert tc.function.name == "read_file"
     assert tc.function.arguments == '{"path": "a.py"}'
 
-    # Usage
     assert chunk.usage is not None
     assert chunk.usage.prompt_tokens == 100
     assert chunk.usage.prompt_tokens_details["cached_tokens"] == 64
@@ -127,7 +116,6 @@ def test_chunk_normalizer_reasoning_and_tools():
 
 
 def test_native_stream_close():
-    """测试 NativeStreamResponse 的 close 方法能安全幂等地关闭底层流。"""
     class FakeResponse:
         def __init__(self):
             self.closed = False
@@ -146,18 +134,15 @@ def test_native_stream_close():
     chunks = []
     for c in stream:
         chunks.append(c)
-        # 提前关闭（模拟用户急停中断）
         stream.close()
         break
 
     assert len(chunks) == 1
     assert fake_resp.closed is True
-    # 再次 close 不抛异常
     stream.close()
 
 
 def test_map_http_errors():
-    """测试 HTTP 异常正确映射为 NativeLLMError 派生类。"""
     class FakeHTTPResponse:
         def __init__(self, status_code, text):
             self.status_code = status_code
@@ -177,7 +162,6 @@ def test_map_http_errors():
 
 
 def test_fast_token_counter():
-    """测试微秒级启发式 token 估算器。"""
     messages = [
         {"role": "system", "content": "你是一个资深的 Python 架构师。"},
         {"role": "user", "content": "def hello_world(): return 'hello'"}
@@ -188,7 +172,6 @@ def test_fast_token_counter():
 
 
 def test_native_sync_response():
-    """测试 NativeSyncResponse 正确解析非流式响应的 choices 与 usage。"""
     from core.llm_native_transport import NativeSyncResponse
     policy = POLICY_REGISTRY["deepseek"]
     normalizer = ChunkNormalizer(policy)
@@ -224,10 +207,6 @@ def test_native_sync_response():
     assert resp.usage.prompt_cache_hit_tokens == 32
 
 
-
-# ---------------------------------------------------------------------------
-# native_completion 关键行为（stream 契约 / 参数透传 / 路由分流）
-# ---------------------------------------------------------------------------
 
 class _FakeHttpResponse:
     def __init__(self, payload=None, lines=None):
@@ -278,8 +257,6 @@ _SYNC_PAYLOAD = {
 
 
 def test_native_completion_defaults_to_non_stream(monkeypatch):
-    """不传 stream 时必须按非流式处理（completion 契约），
-    返回可直接取 .choices 的完整响应。"""
     client = _FakeClient(_FakeHttpResponse(payload=_SYNC_PAYLOAD))
     monkeypatch.setattr(nt, "_client_instance", client)
     result = nt.native_completion(
@@ -293,7 +270,6 @@ def test_native_completion_defaults_to_non_stream(monkeypatch):
 
 
 def test_native_completion_explicit_stream_true(monkeypatch):
-    """显式 stream=True 走流式并自动带 include_usage。"""
     lines = [
         'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}]}',
         "data: [DONE]",
@@ -312,7 +288,6 @@ def test_native_completion_explicit_stream_true(monkeypatch):
 
 
 def test_native_completion_passes_reasoning_effort_and_warns_unknown(monkeypatch, caplog):
-    """reasoning_effort 等标准参数必须透传；白名单外参数显式告警而非静默丢弃。"""
     import logging
 
     client = _FakeClient(_FakeHttpResponse(payload=_SYNC_PAYLOAD))
@@ -329,8 +304,6 @@ def test_native_completion_passes_reasoning_effort_and_warns_unknown(monkeypatch
 
 
 def test_native_completion_consumes_contract_stream_options_without_warning(monkeypatch, caplog):
-    """调用方契约带入的 stream_options（llm.py 固定形状）必须被显式识别：
-    不落入未识别参数告警，最终请求体由 policy 自加等价的 include_usage。"""
     import logging
 
     lines = [
@@ -352,9 +325,6 @@ def test_native_completion_consumes_contract_stream_options_without_warning(monk
 
 
 def test_dispatch_completion_routes_unsupported_models(monkeypatch):
-    """自研引擎路由契约：不支持的路由（o1/o3、azure/ 等厂商云路由）
-    显式抛 NativeLLMError（绝无静默兜底）；OpenAI 兼容与 anthropic/
-    前缀路由进 native。"""
     import pytest
 
     from core import llm_transport
@@ -368,7 +338,6 @@ def test_dispatch_completion_routes_unsupported_models(monkeypatch):
         with pytest.raises(NativeLLMError, match="不在自研引擎支持范围"):
             llm_transport._dispatch_completion(model=model, messages=[])
 
-    # 常规与 anthropic 路由进 native（native_completion 已被 mock 为哨兵）
     monkeypatch.setattr(nt, "native_completion", lambda **kw: "NATIVE_RESULT")
     assert llm_transport._dispatch_completion(
         model="deepseek-chat", messages=[]
@@ -382,14 +351,12 @@ def test_dispatch_completion_routes_unsupported_models(monkeypatch):
 
 
 def test_normalize_usage_derives_total_when_missing():
-    """provider 省略 total_tokens 时由 prompt+completion 推导，不记 0。"""
     normalizer = ChunkNormalizer(POLICY_REGISTRY["standard"])
     usage = normalizer.normalize_usage({"prompt_tokens": 30, "completion_tokens": 12})
     assert usage.total_tokens == 42
 
 
 def test_fast_token_counter_counts_tool_call_arguments():
-    """历史消息中的 tool_calls arguments 文本必须计入估算，避免长参数低估。"""
     big_args = "x" * 2000
     with_args = fast_token_counter("m", [{
         "role": "assistant",
@@ -400,13 +367,7 @@ def test_fast_token_counter_counts_tool_call_arguments():
     assert with_args > without + 100
 
 
-# ---------------------------------------------------------------------------
-# 基元律动（tokenrhythm.studio）客户端标识头：X-TokenRhythm-Agent
-# ---------------------------------------------------------------------------
-
 def test_openai_route_adds_tokenrhythm_agent_header():
-    """OpenAI 兼容路由打到基元律动端点时，请求头必须补 X-TokenRhythm-Agent，
-    值是纯客户端标识（不带版本号，版本信息由 User-Agent 承担）。"""
     policy = get_model_policy("deepseek-chat", api_base="https://tokenrhythm.studio/v1")
     url, headers, _ = nt._resolve_endpoint_and_headers(
         model="deepseek-chat",
@@ -420,7 +381,6 @@ def test_openai_route_adds_tokenrhythm_agent_header():
 
 
 def test_anthropic_route_adds_tokenrhythm_agent_header():
-    """Anthropic Messages 路由打到基元律动端点时同样补该标识头。"""
     _url, headers = nt._anthropic_resolve_endpoint(
         api_base="https://tokenrhythm.studio",
         api_key="k",
@@ -431,7 +391,6 @@ def test_anthropic_route_adds_tokenrhythm_agent_header():
 
 
 def test_non_tokenrhythm_bases_omit_tokenrhythm_agent_header():
-    """非基元律动端点（OpenAI 兼容与 Anthropic 两条路由）不得携带该头。"""
     policy = get_model_policy("deepseek-chat")
     _url, headers, _ = nt._resolve_endpoint_and_headers(
         model="deepseek-chat",
@@ -450,7 +409,6 @@ def test_non_tokenrhythm_bases_omit_tokenrhythm_agent_header():
 
 
 def test_native_completion_sends_tokenrhythm_agent_header(monkeypatch):
-    """端到端：经基元律动 API 基址的完整请求，实际发出的请求头包含该标识。"""
     client = _FakeClient(_FakeHttpResponse(payload=_SYNC_PAYLOAD))
     monkeypatch.setattr(nt, "_client_instance", client)
 
@@ -465,9 +423,7 @@ def test_native_completion_sends_tokenrhythm_agent_header(monkeypatch):
     assert client.last_headers["X-TokenRhythm-Agent"] == TOKENRHYTHM_AGENT_NAME
 
 
-# tests/test_llm_native_transport.py（守护现有合并顺序，不改代码）
 def test_extra_headers_win_over_hardcoded_tokenrhythm_header():
-    """配置的 X-TokenRhythm-Agent 必须压过硬编码值——由现有合并顺序保证。"""
     from core.llm_native_transport import _resolve_endpoint_and_headers
     from core.llm_policy import get_model_policy
 
@@ -482,12 +438,7 @@ def test_extra_headers_win_over_hardcoded_tokenrhythm_header():
     assert headers["X-TokenRhythm-Agent"] == "CustomAgent/1.0"
 
 
-# ---------------------------------------------------------------------------
-# 会话关联头：X-Session-Id（本地会话与服务端调用日志关联）
-# ---------------------------------------------------------------------------
-
 def test_session_id_header_added_when_thread_session_bound():
-    """绑定执行会话时，两条路由的请求头都带上 X-Session-Id。"""
     from core import app_context
 
     old = app_context.get_thread_session()
@@ -513,7 +464,6 @@ def test_session_id_header_added_when_thread_session_bound():
 
 
 def test_session_id_header_percent_encoded_for_non_ascii():
-    """中文会话名 percent-encode 成纯 ASCII 头值，服务端 URL-decode 可还原。"""
     from urllib.parse import unquote
 
     from core import app_context
@@ -537,7 +487,6 @@ def test_session_id_header_percent_encoded_for_non_ascii():
 
 
 def test_session_id_header_omitted_without_bound_session():
-    """无会话上下文（单测 / headless）不携带该头，保证既有请求字节不变。"""
     from core import app_context
 
     old = app_context.get_thread_session()
@@ -563,7 +512,6 @@ def test_session_id_header_omitted_without_bound_session():
 
 
 def test_extra_headers_win_over_builtin_session_id_header():
-    """配置的 extra_headers 可覆盖内置 X-Session-Id——由现有合并顺序保证。"""
     from core import app_context
 
     old = app_context.get_thread_session()
@@ -582,17 +530,7 @@ def test_extra_headers_win_over_builtin_session_id_header():
         app_context.set_thread_session(old)
 
 
-# ---------------------------------------------------------------------------
-# 渠道请求形态覆盖零影响（V2）：未配置 route_request_overrides 时请求头逐字节不变
-# ---------------------------------------------------------------------------
-
 def _mark_route_overrides_unconfigured(monkeypatch):
-    """把渠道请求形态覆盖置为「未配置」状态。
-
-    monkeypatch + _cache 置 None 的手法同 tests/test_route_overrides.py 的 _fake_config：
-    配置指纹只反映 loader 身份 + 配置文件 mtime，替换 loader 后必须手动失效缓存，
-    否则 10 秒 TTL 内可能读到上一组配置。
-    """
     import core.route_overrides as overrides
 
     monkeypatch.setattr(overrides, "_load_config_for_overrides", lambda: {})
@@ -600,12 +538,6 @@ def _mark_route_overrides_unconfigured(monkeypatch):
 
 
 def test_openai_route_headers_are_byte_golden_without_route_overrides(monkeypatch):
-    """未配置 route_request_overrides 时，OpenAI 兼容路由 headers 与改动前逐键全等。
-
-    渠道覆盖只经 _provider_request_options 的 extra_headers/extra_body 注入，
-    传输层零改动；本用例断言两条基线请求头快照（基元律动 / 普通网关）逐字节一致，
-    任何键的增删或取值变化都会挂。
-    """
     _mark_route_overrides_unconfigured(monkeypatch)
 
     url, tokenrhythm_headers, _clean = nt._resolve_endpoint_and_headers(
@@ -643,7 +575,6 @@ def test_openai_route_headers_are_byte_golden_without_route_overrides(monkeypatc
 
 
 def test_anthropic_route_headers_are_byte_golden_without_route_overrides(monkeypatch):
-    """未配置 route_request_overrides 时，Anthropic Messages 路由 headers 逐键全等。"""
     _mark_route_overrides_unconfigured(monkeypatch)
 
     url, headers = nt._anthropic_resolve_endpoint(

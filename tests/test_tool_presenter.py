@@ -58,7 +58,6 @@ def test_build_tool_display_rejects_non_dict_result(result):
 
 
 def test_build_tool_display_marks_background_start():
-    """D8：background 只认结构化入参，不依赖可变的结果文案。"""
     background_result = {
         "content": "后台进程已提交，任务 ID: task_ab12"
     }
@@ -196,8 +195,6 @@ def test_write_edit_and_command_copy_is_stable():
 
 
 def test_failed_tool_uses_neutral_copy_without_raw_error():
-    # 修复后：显示真实的错误信息，而非通用的"命令暂未完成"，
-    # 让用户/LLM 知道真正的原因以便修正
     text = summarize_tool_finished(
         "execute_command",
         {"command": "pytest -q"},
@@ -221,13 +218,10 @@ def test_failed_summary_strips_error_prefix_and_shows_command():
     assert not text.startswith("🚨")
     assert "pytest -q" in text
     assert "退出码 1" in text
-    # 不能出现“命令执行失败：命令执行失败”式的重复
     assert text.count("命令执行失败") == 1
 
 
 def test_failed_summary_dedupes_target_and_keeps_guidance():
-    # 错误文本里已包含目标路径时不重复拼接；
-    # 截断上限必须保留最关键的指导意见（"请使用 read_file 工具"）
     content = (
         "🚨 目录扫描失败：路径不存在 'D:\\proj\\missing_dir'，"
         "请检查路径是否正确，或先用 glob_files 查找目标。"
@@ -314,11 +308,6 @@ def test_subagent_activity_compacts_long_multiline_descriptions():
     assert len(text.removeprefix("星瑶正在调度子代理：")) <= 48
 
 
-# ── computer_action 展示投影（2026-10-21）────────────────────────────────
-# 目标：对话区把电脑动作渲染成「动词 + 目标」的紧凑行，而不是
-# "使用工具 computer_action"。这里锁住投影契约。
-
-
 def test_computer_action_display_uses_action_verb_and_element_ref():
     display = build_tool_display(
         "computer_action",
@@ -375,3 +364,26 @@ def test_computer_action_failure_keeps_sanitized_error_summary():
 
     assert display["error_summary"].startswith("用户已停止电脑操控")
     assert "🚨" not in display["error_summary"]
+
+
+def test_computer_action_wait_for_and_sequence_display():
+    wait_display = build_tool_display(
+        "computer_action",
+        {"kind": "wait_for", "target": "browser", "condition": "element_enabled", "element_ref": "el-3"},
+    )
+    assert wait_display["action"] == "等待条件"
+    assert wait_display["target"] == "el-3"
+
+    seq_display = build_tool_display(
+        "computer_action",
+        {
+            "kind": "sequence",
+            "target": "browser",
+            "steps": [
+                {"kind": "click_element", "target": "browser", "element_ref": "el-1"},
+                {"kind": "set_value_element", "target": "browser", "element_ref": "el-2", "text": "secret"},
+            ],
+        },
+    )
+    assert seq_display["action"] == "连续操作"
+    assert seq_display["target"] == "2 步"

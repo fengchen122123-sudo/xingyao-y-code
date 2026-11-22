@@ -1,14 +1,3 @@
-"""项目级工作区设置（KV）：<workdir>/.ycode_tasks/settings.json。
-
-为什么用项目内文件而不是全局 config 或 DB：
-- 浏览器分辨率等设置天然"属于项目"，跟随项目目录、跨会话复用；
-- CLI 与 GUI 使用不同 SQLite 文件（ycode.db / ycode_gui.db），项目文件
-  规避双 DB 分叉；与 core/plan.py 的 .ycode_tasks 先例保持一致。
-
-铁律：只存非敏感的 UI/自动化偏好（绝不存凭据/正文）；读路径损坏静默
-回退默认值，绝不让回合失败；写路径原子替换（临时文件 + os.replace）。
-"""
-
 from __future__ import annotations
 
 import json

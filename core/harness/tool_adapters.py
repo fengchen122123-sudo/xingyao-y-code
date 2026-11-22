@@ -1,5 +1,3 @@
-"""Fixed adapters for the model-visible tool execution boundary."""
-
 from __future__ import annotations
 
 import inspect
@@ -99,7 +97,6 @@ def _show_file_diff(
     truncated_note,
     tool_call_id="",
 ):
-    """Render the existing write/edit diff without changing its UI payload."""
     try:
         from core.diff_viewer import count_diff_changes, generate_diff, render_diff_table
         from prompt_toolkit.formatted_text import ANSI
@@ -111,10 +108,6 @@ def _show_file_diff(
             return
         added, removed = count_diff_changes(diff_text)
         lines = diff_text.split("\n")
-        # 终端 ANSI 面板保留 25 行截断（CLI 滚动区可读性）；
-        # 发给前端的 diff_text 传完整 diff（仅防失控上限）——前端
-        # diffView.ts 自带"改动 ±5 行上下文"裁剪，后端若先截 25 行，
-        # GUI「文件更改」面板里的大改动只能看到前 25 行。
         max_lines = 25
         display_text = (
             "\n".join(lines[:max_lines])
@@ -154,13 +147,11 @@ def _show_file_diff(
 
 
 def _get_imom_active_publish_root():
-    """Read the active imom publish root using the established on-disk format."""
     try:
         candidates = []
         env_dir = os.environ.get("YCODE_DATA_DIR")
         if env_dir and str(env_dir).strip():
             candidates.append(os.path.join(env_dir, "imom_projects.json"))
-        # 数据目录可能只是全局默认值；测试/隔离环境里项目清单仍在 ~/.ycode。
         candidates.append(os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json"))
         data = None
         for store_file in candidates:
@@ -296,7 +287,6 @@ def _sandbox_outside_guard(
     permission_error_type=Exception,
     session_name=None,
 ):
-    """Return the existing one-shot bypass context or a model-visible denial."""
     if not path_value:
         return None, None
     try:
@@ -321,10 +311,6 @@ def _sandbox_outside_guard(
         resolved = os.path.realpath(os.path.expanduser(str(path_value)))
         expanded = _win32_long_path(resolved)
         if is_ycode_data_path(expanded):
-            # 归一化到真实路径再比对：8.3 短名（confi~1.json）、尾部点/空格
-            # （config.json.）、./ 穿插等变体都指向同一凭据文件，裸 basename
-            # 字符串比对会被绕过，导致免询问改写 mcp.json / config.json
-            # Win32 文件名会吞掉尾部的点与空格，比对前同样归一化
             normalized = expanded.rstrip(". ")
             ycode_root = _win32_long_path(os.path.realpath(os.path.expanduser(str(YCODE_DIR))))
             basename = os.path.basename(normalized).lower()
@@ -336,8 +322,6 @@ def _sandbox_outside_guard(
                 basename in _YCODE_CREDENTIAL_BASENAMES
                 or (ambiguous_short and function_name in {"write_file", "edit_file", "multi_edit"})
             )
-            # 仅 ~/.ycode 顶层的凭据文件受限（子目录同名文件如
-            # plugins/x/config.json 不是应用配置，不弹逐次询问）
             if not is_credential_target:
                 return sandbox_bypass(), None
             # 凭据文件读取放行（诊断配置问题的常见需求），写入必须逐次询问——
@@ -349,9 +333,6 @@ def _sandbox_outside_guard(
         # 数据目录/凭据分类属于安全边界。无法确认时必须失败关闭，不能继续
         # 落入 allow_outside_workspace 的普通外部路径自动放行分支。
         return None, PATH_VALIDATION_ERROR_MESSAGE
-    # 沙盒开关（/sandbox on / GUI 沙盒解除，allow_outside_workspace=True）打开时：
-    # 项目外路径读写直接放行，不再逐次询问（用户选定语义）。
-    # 凭据写入不受开关影响，始终进入下方询问流程。
     if not credential_write:
         try:
             from core.model_manager import load_config
@@ -463,7 +444,6 @@ class ToolAdapterSet:
         self.safe_print = safe_print
         self.tool_call_id = tool_call_id
         self.permission_error_type = permission_error_type
-        # guard 签名探测缓存：None=未探测；for_call 的浅拷贝会带上已探测结果
         self._guard_accepts_extras = None
 
     def for_call(self, tool_call_id):
@@ -608,9 +588,6 @@ class ToolAdapterSet:
         if isinstance(write_result, str) and write_result.startswith(TOOL_ERROR_PREFIX):
             return ToolResult(write_result, is_error=True)
 
-        # 旧 set_undo_state 兼容记录已删除（规格 23.2）：默认处理器经
-        # FileMutationRecorder 记录按回合撤销快照；注入的覆盖处理器不接入
-        # 记录器，也不伪造快照。
         self.show_file_diff(
             str(resolved_path),
             old_content,
@@ -968,7 +945,6 @@ class ToolAdapterSet:
 
     def execute(self, resolved_tool, arguments, context) -> ToolResult:
         name = resolved_tool.spec.name
-        # 按回合撤销：登记当前工具名与 call_id（TLS），记录器采集修改来源
         try:
             from core.turn_undo import recorder as _tu_recorder
 

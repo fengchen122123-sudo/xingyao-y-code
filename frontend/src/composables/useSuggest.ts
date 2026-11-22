@@ -2,15 +2,6 @@ import { computed, ref, nextTick, type Ref } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import type { SuggestItem } from '../components/InputSuggest.vue';
 
-/**
- * 输入自动补全 composable：/ 斜杠（内置命令 + 技能 + MCP）与 @ 文件引用。
- * InputArea 与 KimiEmptyState 共用，确保空会话页也有补全能力。
- */
-/**
- * 输入框控件的最小契约。textarea 天然满足；富文本编辑器（ComposerEditor）
- * 用「文本序列化 + 光标坐标」实现同名成员，因此补全逻辑对两种输入框通用，
- * 不需要为了换控件重写检测/插入流程。
- */
 export interface ComposerTextControl {
   readonly value: string;
   readonly selectionStart: number;
@@ -28,9 +19,6 @@ export function useSuggest(
   const suggest = ref<{ mode: 'command' | 'file'; start: number; query: string } | null>(null);
   const suggestItems = ref<SuggestItem[]>([]);
   const suggestIndex = ref(0);
-  // @ 模式的空状态提示文案（'' = 不展示）。没有它时，检索结果为 0 条会让
-  // 面板整体 v-if 消失，用户看到的是「什么都没出现」，无法区分「没命中」
-  // 和「功能坏了」——这正是「删掉 @ 再输入就不出东西」的观感来源。
   const suggestEmpty = ref('');
   let fileSuggestTimer: number | undefined;
   // @ 提及的「长度退场」：@ 在中文正文里也常被当普通符号用（「@了他一下」），
@@ -60,7 +48,6 @@ export function useSuggest(
         icon: '⌘',
         label: c.name,
         desc: c.summary || c.usage,
-        // 选中后命令名后跟一个空格，用户可直接接着写参数（参数位置由后端解析）
         apply: c.name + ' ',
       });
       if (items.length >= 4) break;
@@ -104,10 +91,6 @@ export function useSuggest(
   // 说明用户已经改了 query（发起过新一轮请求），旧响应一律丢弃，
   // 否则旧 query 的候选会覆盖新 query 已经渲染出来的列表。
   let atSeq = 0;
-  // 同一次按键会连续触发 input / keyup（有时还有 click）三个事件，
-  // 三者落在同一个 token 上时只需检索一次——真机会话列表查询单次近百毫秒，
-  // 重复两次就是双倍卡顿。250ms 内的同 token 直接复用上一轮，
-  // 超过窗口（用户删掉 @ 又主动补回）则照常重新检索。
   let lastTokenKey = '';
   let lastTokenAt = 0;
 
@@ -127,14 +110,12 @@ export function useSuggest(
       return;
     }
 
-    // 两侧候选各自的落点：谁先返回谁先渲染，后到的再合并进来，互不覆盖。
     let sessionItems: SuggestItem[] = [];
     let fileItems: SuggestItem[] = [];
     // 两侧是否都已给出结论：只有都到齐才判断「空结果」，
     // 否则会话候选先到、文件还在防抖窗口里，会误报「没有匹配」。
     let sessionsSettled = typeof api.search_sessions !== 'function';
     let filesSettled = typeof api.search_workspace_files !== 'function';
-    // 检索接口异常（桥报错 / SQLite busy）与「确实没有命中」要给不同提示
     let sessionsFailed = false;
 
     // 异步响应写回前必须校验：① 仍是当前最新一轮请求（seq 未过期）；
@@ -150,20 +131,13 @@ export function useSuggest(
       );
     }
 
-    // 合并渲染：会话在前、文件在后，任一侧未返回时只展示已到达的一侧；
-    // 每侧响应只会触发一次 render（Promise 只 settle 一次），不会重复追加。
     function render() {
       if (!canWrite()) return;
-      // 会话候选最多占 4 个名额：后端已按「前缀命中优先 + 名字短的优先」排序，
-      // 前 4 条即最相关；若不设上限，命中会话一多就会把文件候选整体挤出面板，
-      // 反而回归了 @ 引用文件的能力（修复前两侧就是各 4 条的平衡）。
       const merged = [...sessionItems.slice(0, 4), ...fileItems].slice(0, 8);
       // 文件候选晚到会再次 render：只有索引越界才归零，避免把用户已经用
       // 方向键选好的高亮重置回第一项（那会让紧接着的 Enter 选错条目）。
       if (suggestIndex.value >= merged.length) suggestIndex.value = 0;
       suggestItems.value = merged;
-      // 空结果要给出明确提示：面板此前是 v-if="items.length"，0 条时整体消失，
-      // 用户看到的只是「什么都没出现」，会误判成功能坏了。
       if (!sessionsSettled || !filesSettled) {
         suggestEmpty.value = '';
       } else if (merged.length) {
@@ -191,12 +165,10 @@ export function useSuggest(
             icon: '💬',
             label: s.name,
             desc: `${s.count} 条消息`,
-            // 会话名内禁止出现花括号，插入时剥离
             apply: '@{' + s.name.replace(/[{}]/g, '') + '}',
             group: 'session',
           }));
           sessionsSettled = true;
-          // 会话候选一到就渲染，不等文件扫描
           render();
         })
         // 会话接口异常（桥报错等）静默忽略：绝不能清空文件候选，
@@ -229,7 +201,6 @@ export function useSuggest(
             group: 'file',
           }));
           filesSettled = true;
-          // 文件候选到达后与会话候选合并（会话在前），两侧都到即最终列表
           render();
         });
     }, 120);
@@ -245,10 +216,6 @@ export function useSuggest(
       suggest.value = null;
       return;
     }
-    // 以 textarea 的 DOM 值为准而不是 inputVal：输入法组词（composition）
-    // 期间 v-model 的 input 监听会被 composing 守卫跳过，此时 inputVal 还是
-    // 旧值，拿它 slice 会漏掉刚输入的 @，表现为「删掉 @ 再输入 @ 不出候选」。
-    // DOM 值始终是最新的，与 v-model 是否已同步无关。
     const raw = ta.value ?? inputVal.value;
     const pos = ta.selectionStart ?? raw.length;
     const before = raw.slice(0, pos);
@@ -272,8 +239,6 @@ export function useSuggest(
         suggestItems.value = [];
         return;
       }
-      // 无命中空态（两侧检索都完成且 0 条）下继续输入，说明用户在写正文；
-      // 一旦有候选命中就不走软阈值分支，逐字输入路径片段照样能看到候选。
       const emptyStuck = !suggestItems.value.length && !!suggestEmpty.value;
       if (
         query.length >= AT_QUERY_HARD_LIMIT ||
@@ -304,8 +269,6 @@ export function useSuggest(
       fetchAtItems(query);
       return;
     }
-    // token 结束（@ 被删掉、或后面出现空格/@）：清掉长度退场记忆，
-    // 下一次重新打 @ 是一段新 token，该重新检索就得重新检索
     suggest.value = null;
     suggestItems.value = [];
     suggestEmpty.value = '';
@@ -371,7 +334,6 @@ export function useSuggest(
     suggestEmpty.value = '';
   }
 
-  // 内置斜杠命令名称清单（与 slashCommands 同步，用于编辑器将 /goal 等渲染为命令胶囊）
   const commandIds = computed<string[]>(() => {
     const ids: string[] = [];
     for (const c of store.slashCommands) {
@@ -381,8 +343,6 @@ export function useSuggest(
     return ids;
   });
 
-  // 与 buildCommandItems 保持同一优先级：内置命令优先于同名技能，
-  // 只有实际会作为技能而非命令触发的 short_id 才允许在编辑器里渲染为技能胶囊
   const skillIds = computed<string[]>(() => {
     const cmdNames = new Set(commandIds.value.map(id => '/' + id.toLowerCase()));
     const ids: string[] = [];

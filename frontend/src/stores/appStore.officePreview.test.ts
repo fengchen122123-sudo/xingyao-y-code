@@ -32,8 +32,6 @@ it('xlsx 文件：先调 preview_office_doc 转换，成功后用缓存 PDF 路�
 
   expect(previewOffice).toHaveBeenCalledTimes(1);
   expect(previewOffice).toHaveBeenCalledWith('D:\\proj\\报告.xlsx');
-  // 交出去的是转换后的 PDF，不是源文件；第三个参数带上源文件路径，
-  // 「在文件夹中打开」才能定位到用户点的那个源文件
   expect(openLocal).toHaveBeenCalledTimes(1);
   expect(openLocal).toHaveBeenCalledWith(CACHED_PDF, '报告.xlsx', 'D:\\proj\\报告.xlsx');
   expect(store.officePreviewPending).toBeNull();
@@ -72,7 +70,6 @@ it('转换失败：不打断用户，改用系统默认程序打开源文件，�
   expect(openSys).toHaveBeenCalledWith('D:\\proj\\报告.xlsx');
   expect(openLocal).not.toHaveBeenCalled();
   expect(store.officePreviewPending).toBeNull();
-  // 失败路径不开浏览器页签导航（没有 PDF 可开）
   expect(store.browserNavNonce).toBe(0);
 });
 
@@ -169,7 +166,6 @@ it('转换期间 officePreviewPending 有值并摊开右栏，结束后清空', 
 
   const running = store.openInRightPanel('D:\\proj\\文档\\季度报告.xlsx');
 
-  // 转换挂起期间：提示已置位（界面据此显示「正在转换」浮层），右栏已摊开
   expect(store.officePreviewPending).toEqual({
     path: 'D:\\proj\\文档\\季度报告.xlsx',
     name: '季度报告.xlsx',
@@ -181,7 +177,6 @@ it('转换期间 officePreviewPending 有值并摊开右栏，结束后清空', 
   resolveConv({ ok: true, path: CACHED_PDF });
   await running;
 
-  // 结束后一定清空，浮层不会永远转圈；转出的 PDF 已写进「文档」页签的打开请求
   expect(store.officePreviewPending).toBeNull();
   expect(store.docPreviewRequest?.path).toBe(CACHED_PDF);
   expect(store.docPreviewRequest?.name).toBe('季度报告.xlsx');
@@ -215,7 +210,6 @@ it('docx 不转 PDF：直接把源文件交给「文档」页签，由前端 doc
 
   await store.openInRightPanel('D:\\proj\\方案.docx');
 
-  // 关键：不调转换桥、不置「正在转换」提示，直接把源文件开进「文档」页签
   expect(previewOffice).not.toHaveBeenCalled();
   expect(store.officePreviewPending).toBeNull();
   expect(openLocal).toHaveBeenCalledTimes(1);

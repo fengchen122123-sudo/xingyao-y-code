@@ -1,20 +1,3 @@
-"""压缩保真度测试：关键信息埋点 → 真实压缩 → 逐条对照保留率。
-
-方法：
-  1. 构造 ~14 轮真实形态的开发对话，早期轮次埋入 15 个独特可验证事实
-     （数字/路径/人名/错误码/决策/日期/约束），并用真实感填充文本推到 ~88% 水位；
-  2. 真实预压缩触发（生产路径 prepare_turn_messages，中转真实 LLM）；
-  3. 压缩完成后逐条检查摘要保留情况，按事实类型分组报告保留率；
-  4. 同时验证活跃区（保留的最近 4 条消息）原文完好无损。
-
-事实类型分布（模拟真实开发会话中的关键信息形态）：
-  数字类：端口 5433 / 预算 48000 / 超时 45s / p99<800ms / 日志 180 天
-  标识类：项目代号"海燕" / 客户"冯氏科技" / 表名 mq_dispatch / v2.3.1
-  路径类：core/billing/scheduler.py
-  人员类：陈工负责迁移
-  错误类：E4721 连接池耗尽
-  决策类：Redis 会话共享 / 5 年直线折旧 / 10 月 15 日上线
-"""
 import sys
 import os
 import time
@@ -32,7 +15,6 @@ import core.memory_compressor as mc
 WINDOW = 128000
 MODEL = "openai/qwen3.8-flash"
 
-# 15 个埋点事实：(编号, 事实文本, 摘要中应能找到的验证关键词组)
 FACTS = [
     ("F01", "项目代号：海燕（内部代号，勿外传）", ["海燕"]),
     ("F02", "数据库连接走 5433 端口，不是默认的 5432", ["5433"]),
@@ -73,7 +55,6 @@ def est_of(mgr, sess):
 
 
 def build_fact_rounds(mgr, sess):
-    """14 轮：每轮嵌 1~2 个事实 + 真实感填充。事实主要埋在前 12 轮（会被压缩）。"""
     fact_pool = list(FACTS)
     for i in range(12):
         fact_texts = []
@@ -108,7 +89,6 @@ def main():
     mgr.add_messages(sess, [("user", "开始技术评审会议")])
     build_fact_rounds(mgr, sess)
 
-    # 水位若未到 85%，继续灌纯填充轮（不含新事实）
     i = 20
     while est_of(mgr, sess) <= WINDOW * 0.88:
         mgr.add_messages(sess, [
@@ -121,7 +101,6 @@ def main():
     print("[埋点完成] %d 条消息，水位 %.1f%%（%d token）；埋点事实 %d 条 + 哨兵 2 条"
           % (n_msgs, 100 * est / WINDOW, est, len(FACTS)))
 
-    # 真实预压缩触发
     notices = []
     t0 = time.time()
     agent_service.prepare_turn_messages(
@@ -152,7 +131,6 @@ def main():
     print(summary)
     print("-" * 66)
 
-    # 逐条对照
     kept, lost = [], []
     for fid, ftext, keys in FACTS:
         hit = any(k in (summary or "") for k in keys)
@@ -171,7 +149,6 @@ def main():
     sent_ok = any("哨兵内容A" in str(m.get("content")) for m in hist[-4:])
     print("活跃区哨兵：%s（最近轮次原文应完好）" % ("完好 ✔" if sent_ok else "丢失 ✘"))
 
-    # DB 原文完整性：17 个关键词逐一检查是否仍全部在库
     keys = ["海燕", "5433", "冯氏科技", "48000", "scheduler.py", "陈工",
             "10 月 15", "E4721", "Redis", "2.3.1", "45 秒", "mq_dispatch",
             "180 天", "5 年直线", "800 毫秒", "Q3", "沪ICP备2026锦88"]

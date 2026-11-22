@@ -1,8 +1,3 @@
-"""星瑶工作流模块测试：frontmatter 解析 / args 校验 / store 存取 / 技能生成。
-
-全部用 tmp 目录构造（store 的函数接受 ``home=`` 参数，绝不触碰真实用户目录）。
-"""
-
 from __future__ import annotations
 
 import json
@@ -46,9 +41,6 @@ return 1;
 """
 
 
-# ── frontmatter ────────────────────────────────────────────────
-
-
 def test_parse_ok_with_args_and_body_offset():
     parsed = parse_frontmatter(_SAMPLE)
     assert parsed.description == "Review changed files and report findings."
@@ -59,9 +51,7 @@ def test_parse_ok_with_args_and_body_offset():
         "required": True,
     }
     assert parsed.args["maxRounds"] == {"type": "number", "default": 3}
-    # 脚本逐字节跟在 */ 行之后（含尾换行；终止行自己的 \n 已被吃掉）
     assert parsed.body == 'phase("Collect");\nreturn 1;\n'
-    # 正文第一行 = 文件第 13 行（1-based）→ offset = 12
     assert parsed.body_line_offset == 12
 
 
@@ -90,9 +80,6 @@ def test_parse_errors_carry_zcode_kind_names(text, kind):
     assert exc_info.value.kind == kind
 
 
-# ── args 校验（ZCode 语义）────────────────────────────────────
-
-
 def test_args_unknown_parameter_rejected():
     declarations = {"base": {"type": "string", "required": True}}
     errors, _ = validate_workflow_args(declarations, {"base": "main", "extra": 1})
@@ -108,7 +95,7 @@ def test_args_collects_all_errors_at_once():
     errors, effective = validate_workflow_args(
         declarations, {"n": "not-a-number", "flag": 0, "oops": True}
     )
-    assert len(errors) == 4  # 缺 base + n 类型 + flag 类型 + 未声明 oops
+    assert len(errors) == 4
     assert effective == {}
 
 
@@ -117,7 +104,6 @@ def test_args_default_filled_and_validated_same_path():
     errors, effective = validate_workflow_args(declarations, {})
     assert errors == []
     assert effective == {"maxRounds": 3}
-    # default 本身类型错 → 生效那一刻报错（保存时不判别）
     bad = {"maxRounds": {"type": "number", "default": "three"}}
     errors, _ = validate_workflow_args(bad, {})
     assert errors
@@ -136,16 +122,13 @@ def test_args_type_rules_number_boolean_json():
     assert len(errors) == 1 and "NaN" in errors[0]
     assert effective == {"flag": True, "payload": {"any": [1, None]}}
     errors, _ = validate_workflow_args(declarations, {"flag": 1})
-    assert errors  # boolean 拒 0/1
+    assert errors
 
 
 def test_args_optional_missing_not_injected():
     declarations = {"opt": {"type": "string"}}
     errors, effective = validate_workflow_args(declarations, {})
     assert errors == [] and effective == {}
-
-
-# ── store：目录布局 / 遮蔽 / 命名 ─────────────────────────────
 
 
 def _write_workflow(directory: Path, name: str, text: str) -> None:
@@ -194,15 +177,13 @@ def test_import_from_zcode_copies_bytes_and_generates_skill(tmp_path):
     assert [item["name"] for item in report["invalid"]] == ["broken"]
 
     copied = workflows_dir("user", str(root), home=home) / "pr-review.dwf.ts"
-    assert copied.read_text(encoding="utf-8") == original  # 逐字节一致
+    assert copied.read_text(encoding="utf-8") == original
 
-    # 技能生成：简单 frontmatter + 执行指引
     skill_text = Path(report["imported"][0]["skill"]).read_text(encoding="utf-8")
     assert skill_text.startswith("---")
     assert "name: pr-review" in skill_text
     assert "workflow_run" in skill_text
 
-    # 二次导入默认跳过；overwrite=True 覆盖
     report_again = import_from_zcode(str(root), home=home, scopes=("user",))
     assert report_again["skipped"] and not report_again["imported"]
     report_overwrite = import_from_zcode(str(root), home=home, scopes=("user",), overwrite=True)
@@ -219,10 +200,7 @@ def test_import_report_is_json_serializable(tmp_path):
     home, root = tmp_path / "home", tmp_path / "proj"
     _write_workflow(zcode_workflows_dir("user", str(root), home=home), "x", _SAMPLE)
     report = import_from_zcode(str(root), home=home, scopes=("user",))
-    json.dumps(report)  # 不抛即可
-
-
-# ── save / delete / 单文件导入（创建能力）─────────────────────
+    json.dumps(report)
 
 
 def test_save_workflow_creates_editable_and_regenerates_skill(tmp_path):
@@ -240,15 +218,12 @@ def test_save_workflow_creates_editable_and_regenerates_skill(tmp_path):
     assert error == ""
     target = workflows_dir("project", str(root), home=home) / "my-flow.dwf.ts"
     text = target.read_text(encoding="utf-8")
-    # 键序 description → whenToUse → args；正文逐字节在 */ 之后
     assert text.index("description:") < text.index("whenToUse:") < text.index("args:")
     parsed = parse_frontmatter(text)
     assert parsed.args["base"]["required"] is True
     assert parsed.body == 'phase("Run");\nreturn String(args.base);\n'
-    # 技能同步生成
     assert (skill_dir_of(home, "my-flow") / "SKILL.md").is_file()
 
-    # 更新（overwrite）后技能内容跟随刷新
     error = save_workflow(
         "my-flow",
         description="My flow v2.",
@@ -281,7 +256,6 @@ def test_save_workflow_duplicate_gate_and_validation(tmp_path):
     error = save_workflow("dup", **kwargs)
     assert "已存在同名" in error
     assert save_workflow("dup", **kwargs, overwrite=True) == ""
-    # 校验：空描述 / 空脚本 / 坏名字 / 坏 scope
     assert "description" in save_workflow("x", description="  ", body="b", scope="user", home=home)
     assert "脚本" in save_workflow("x", description="d", body="  ", scope="user", home=home)
     assert "名字" in save_workflow("..", description="d", body="b", scope="user", home=home)
@@ -301,7 +275,6 @@ def test_delete_workflow_removes_file_and_skill(tmp_path):
     assert delete_workflow("gone", "user", home=home) == ""
     assert not (home / ".ycode" / "workflows" / "gone.dwf.ts").exists()
     assert not skill_dir_of(home, "gone").exists()
-    # 再删报「没有」；坏 scope 报错
     assert "没有工作流" in delete_workflow("gone", "user", home=home)
     assert "scope" in delete_workflow("gone", "bogus", home=home)
 
@@ -324,9 +297,7 @@ def test_import_workflow_file_validates_and_copies(tmp_path):
     assert not import_workflow_file(picked / "nope.txt", scope="user", home=home)["ok"]
     broken = import_workflow_file(picked / "broken.dwf.ts", scope="user", home=home)
     assert not broken["ok"] and "missing_frontmatter" in broken["error"]
-    # 显式导入坏文件不落盘
     assert not (workflows_dir("user", home=home) / "broken.dwf.ts").exists()
-    # 同名 exists 标记；overwrite=True 放行
     dup = import_workflow_file(good, scope="project", workspace_root=str(root), home=home)
     assert not dup["ok"] and dup.get("exists") is True
     assert import_workflow_file(

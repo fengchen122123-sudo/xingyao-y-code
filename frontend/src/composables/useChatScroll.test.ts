@@ -23,7 +23,6 @@ function makeEl(overrides: Partial<FakeEl> = {}): FakeEl & HTMLElement {
   return el as unknown as FakeEl & HTMLElement;
 }
 
-// scrollToBottom 里用 requestAnimationFrame 合并到下一帧，flush 后再断言
 async function flushRaf() {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -40,7 +39,7 @@ describe('isNearBottom / distanceFromBottom', () => {
       scrollTop: 400,
       scrollHeight: 1000,
       clientHeight: 500,
-    }); // 距离底部 100px > 80
+    });
     expect(distanceFromBottom(el)).toBe(100);
     expect(isNearBottom(el)).toBe(false);
   });
@@ -50,7 +49,7 @@ describe('isNearBottom / distanceFromBottom', () => {
       scrollTop: 430,
       scrollHeight: 1000,
       clientHeight: 500,
-    }); // 距离底部 70px < 80
+    });
     expect(isNearBottom(el, BOTTOM_THRESHOLD)).toBe(true);
   });
 });
@@ -63,7 +62,6 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
     api.scrollToBottom();
     await flushRaf();
 
-    // scrollToBottom 直接把 scrollTop 设为 scrollHeight（浏览器会 clamp 到底部）
     expect(el.scrollTop).toBe(el.scrollHeight);
     expect(api.stickToBottom.value).toBe(true);
   });
@@ -72,20 +70,17 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
 
-    // 用户向上滚动 200px，离开底部
     api.noteUserScrollIntent('awayFromBottom');
     el.scrollTop = 200;
     const fromUser = api.handleScroll();
-    expect(fromUser).toBe(true); // 用户来源：按落点更新跟随态
+    expect(fromUser).toBe(true);
     expect(api.stickToBottom.value).toBe(false);
     expect(api.showJumpButton.value).toBe(true);
 
-    // 流式输出触发自动滚动：应保持用户位置不动
     api.scrollToBottom();
     await flushRaf();
     expect(el.scrollTop).toBe(200);
 
-    // 手动滑回底部：恢复跟随
     api.noteUserScrollIntent('towardBottom');
     el.scrollTop = 500;
     expect(api.handleScroll()).toBe(true);
@@ -97,11 +92,10 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
 
-    // 贴底跟随中；跳转/补偿等程序化滚动把 scrollTop 挪到中间
     el.scrollTop = 200;
     const fromUser = api.handleScroll();
-    expect(fromUser).toBe(false); // 非用户来源
-    expect(api.stickToBottom.value).toBe(true); // 跟随权不被程序化滚动骗走
+    expect(fromUser).toBe(false);
+    expect(api.stickToBottom.value).toBe(true);
   });
 
   it('用户上滚意图立即退出跟随（不等 scroll 事件）', () => {
@@ -116,12 +110,11 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
 
-    // 用户上滚的 wheel 已到达、scroll 事件尚未派发时，内容变化 commit 先到
     api.noteUserScrollIntent('awayFromBottom');
     api.scrollToBottom();
     await flushRaf();
 
-    expect(el.scrollTop).toBe(0); // 未被吸底拽回
+    expect(el.scrollTop).toBe(0);
   });
 
   it('force 滚动忽略跟随模式并恢复跟随', async () => {
@@ -153,8 +146,8 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
 
-    api.scrollToBottom(); // 排队到下一帧
-    api.commitFollowing(false); // 帧执行前退出跟随（如跳转发起）
+    api.scrollToBottom();
+    api.commitFollowing(false);
     await flushRaf();
     expect(el.scrollTop).toBe(0);
   });
@@ -170,7 +163,6 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
   it('syncStick 按当前 scrollTop 重算跟随状态', () => {
     const el = makeEl({ scrollTop: 500 });
     const api = useChatScroll(() => el);
-    // 初始为 true；构造时 scrollTop 已贴底，syncStick 保持 true
     api.syncStick();
     expect(api.stickToBottom.value).toBe(true);
 
@@ -182,7 +174,6 @@ describe('useChatScroll 跟随模式（滚动权状态机）', () => {
   it('卸载后清理未执行的 rAF', async () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
-    // 模拟组件卸载：无法直接触发 onUnmounted，这里仅验证 flush 不抛错
     api.scrollToBottom();
     await flushRaf();
     expect(el.scrollTop).toBe(el.scrollHeight);

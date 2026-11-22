@@ -1,30 +1,10 @@
-"""受管浏览器执行进程的 IPC 协议（R2 第二段）。
-
-父进程与子进程之间只传结构化 JSON 行（stdin/stdout 各一条管道）：
-
-- 请求：``{"id": int, "op": "observe"|"execute"|"release"|"close", ...}``；
-  操作白名单固定，不传 Callable、eval 或 shell 字符串；
-- 响应：``{"id": int, "ok": bool, "error_code": str, "error_message": str,
-  ...}``；
-- 事件（子进程 → 父进程，无 id）：``{"event": "ready"|"boot_failed", ...}``。
-
-观察截图绝不跨管道传输：子进程把 PNG 写入自己创建的短期目录并在 ready
-事件里报告目录路径，响应只携带 png_path/sha256 等元数据；PNG 永不进入
-日志。动作 payload 只在本机管道内存中存在，协议层不写任何日志。
-
-Playwright 对象全部留在子进程内；父进程不持有任何 Playwright 对象，
-线程/进程归属由进程边界天然保证（设计 12.1 的进程版）。
-"""
-
 from __future__ import annotations
 
 import json
 from typing import Any
 
-# 操作白名单：父进程能命令子进程做的全部事情。
-OPERATIONS = ("observe", "execute", "release", "close")
+OPERATIONS = ("observe", "execute", "sync_frame", "release", "close")
 
-# ComputerObservation 中子进程回传父进程的字段（不含 png 字节与内部对象）。
 OBSERVATION_FIELDS = (
     "run_id",
     "target",
@@ -49,10 +29,11 @@ OBSERVATION_FIELDS = (
     "screenshot_error",
     "surface_id",
     "surface_generation",
+    "frame_id",
+    "viewport_generation",
     "elements",
 )
 
-# ComputerAction 中经 JSON 往返后需要还原为 tuple 的字段。
 _TUPLE_FIELDS = {
     "keys": (str,),
     "path": ((int, float), (int, float)),
@@ -101,12 +82,6 @@ def decode_response(line: str) -> dict:
 
 
 def normalize_action_payload(payload: dict) -> dict:
-    """把 asdict(ComputerAction) 的 JSON 形态还原为可构造 ComputerAction 的形态。
-
-    JSON 往返会把 tuple 变成 list；这里把 path/keys 还原为 tuple（path 元素
-    还原为 int——round-trip 中 int 不会变 float，float 只可能来自非法输入，
-    由下游既有严格校验拒绝）。
-    """
     normalized = dict(payload)
     keys = normalized.get("keys")
     if isinstance(keys, list):
@@ -125,7 +100,6 @@ def observation_payload(observation) -> dict:
 
 
 def _safe_int(value) -> int:
-    """bounds 分量防御归一化：非法值取 0。"""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -167,3 +141,50 @@ def normalize_observation_payload(payload: dict) -> dict:
             })
     normalized["elements"] = tuple(listing)
     return normalized
+
+
+FRAME_FIELDS = (
+    "frame_id",
+    "run_id",
+    "target",
+    "surface_id",
+    "surface_generation",
+    "viewport_generation",
+    "origin_x",
+    "origin_y",
+    "crop_width",
+    "crop_height",
+    "image_width",
+    "image_height",
+    "model_to_css_x",
+    "model_to_css_y",
+    "coordinate_input_enabled",
+    "disabled_reason",
+)
+
+
+def frame_payload(frame) -> dict:
+    """ObservationFrame → 协议字段字典。"""
+    return {field: getattr(frame, field) for field in FRAME_FIELDS}
+
+
+def normalize_frame_payload(payload: dict) -> dict:
+    """把 JSON 往返后的 frame payload 归一化为可构造 ObservationFrame 的字段。"""
+    return {
+        "frame_id": str(payload.get("frame_id") or ""),
+        "run_id": str(payload.get("run_id") or ""),
+        "target": str(payload.get("target") or ""),
+        "surface_id": str(payload.get("surface_id") or ""),
+        "surface_generation": _safe_int(payload.get("surface_generation")),
+        "viewport_generation": _safe_int(payload.get("viewport_generation")),
+        "origin_x": _safe_int(payload.get("origin_x")),
+        "origin_y": _safe_int(payload.get("origin_y")),
+        "crop_width": _safe_int(payload.get("crop_width")),
+        "crop_height": _safe_int(payload.get("crop_height")),
+        "image_width": _safe_int(payload.get("image_width")),
+        "image_height": _safe_int(payload.get("image_height")),
+        "model_to_css_x": float(payload.get("model_to_css_x") or 1.0),
+        "model_to_css_y": float(payload.get("model_to_css_y") or 1.0),
+        "coordinate_input_enabled": bool(payload.get("coordinate_input_enabled", True)),
+        "disabled_reason": str(payload.get("disabled_reason") or ""),
+    }

@@ -1,9 +1,3 @@
-"""秘书派活台账：派活落库 + 回合收尾回写 + notice 文案升级。
-
-风格对齐 tests/test_secretary_dispatch.py：ApiBridge.__new__ 裸实例 + 桩函数，
-但台账用真 DispatchStore（临时 sqlite 的 MemoryManager），不 mock 存储层——
-要验的正是「派活写进库 → 收尾按终态改库 → notice 带上库里的结论」这条链路。
-"""
 import os
 import sys
 import threading
@@ -22,7 +16,6 @@ from gui_bridge import ApiBridge
 
 @pytest.fixture(autouse=True)
 def _clean_singleton():
-    """每个用例前后清理模块级单例，避免用例互相污染。"""
     secretary_dispatch.unregister()
     yield
     secretary_dispatch.unregister()
@@ -30,7 +23,6 @@ def _clean_singleton():
 
 @pytest.fixture()
 def manager(tmp_path):
-    """独立临时 DB 的 MemoryManager，并注册为 app_context 当前管理器。"""
     m = MemoryManager(str(tmp_path / "ycode.db"))
     prev_ctx = app_context.get()
     prev_manager = app_context.get_manager()
@@ -49,10 +41,8 @@ def manager(tmp_path):
 
 
 def _make_bridge(manager, *, is_turn_active=False):
-    """构造仅含调度所需内部状态的裸桥实例，并注册调度服务句柄。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
-    # 秘书会话是派发的发起方：完成通知按它路由
     bridge._current_session = "s_secretary"
     bridge._turn_start_lock = threading.Lock()
     bridge._message_queues = {}
@@ -95,7 +85,6 @@ def _only_row(manager):
 
 
 def _secretary_notices(events):
-    """只取派活完成通知（按发起会话 s_secretary 路由的那些）。"""
     return [
         e[1]["message"]
         for e in events
@@ -104,7 +93,6 @@ def _secretary_notices(events):
 
 
 class _WorkerHarness:
-    """为 _run_turn_worker 桩掉模型入口与事件出口（照 test_secretary_dispatch）。"""
 
     def __init__(self, bridge, manager, tmp_path, *, consume_return=False,
                  terminal_error=""):
@@ -165,12 +153,7 @@ class _WorkerHarness:
         return False
 
 
-# ---------------------------------------------------------------------------
-# 派活落库：running / queued
-# ---------------------------------------------------------------------------
-
 def test_dispatch_new_session_writes_running_ledger(manager, tmp_path):
-    """新会话派活：台账出现一条 running，字段与派活入参一致。"""
     project = tmp_path / "proj-ledger"
     project.mkdir()
     bridge, spawned, _ = _make_bridge(manager)
@@ -198,7 +181,6 @@ def test_dispatch_new_session_writes_running_ledger(manager, tmp_path):
     assert row["result_excerpt"] == ""
     assert row["error"] == ""
 
-    # 台账 id 必须随 dispatch_context 交给回合，收尾才能回写
     ctx = spawned[0][1]["secretary_dispatch_context"]
     assert ctx["dispatch_id"] == dispatch_id
     assert ctx["task_title"] == prompt[:40]
@@ -206,7 +188,6 @@ def test_dispatch_new_session_writes_running_ledger(manager, tmp_path):
 
 
 def test_dispatch_explicit_task_title_wins(manager):
-    """显式 task_title 优先于 prompt 截断。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager)
 
@@ -220,7 +201,6 @@ def test_dispatch_explicit_task_title_wins(manager):
 
 
 def test_dispatch_busy_target_writes_queued_ledger(manager):
-    """目标会话忙：台账状态为 queued，排队条目带上台账 id 供补发回填。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager, is_turn_active=True)
 
@@ -239,7 +219,6 @@ def test_dispatch_busy_target_writes_queued_ledger(manager):
 
 
 def test_queued_dispatch_forwards_ledger_id_on_drain(manager):
-    """排队条目补发时，dispatch_context 仍带同一个台账 id。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager, is_turn_active=True)
     res = secretary_dispatch.get().dispatch_task(target="项目甲", prompt="排队跑一下")
@@ -254,16 +233,10 @@ def test_queued_dispatch_forwards_ledger_id_on_drain(manager):
     assert ctx["notify_session"] == "s_secretary"
 
 
-# ---------------------------------------------------------------------------
-# 收尾回写：done / failed / cancelled
-# ---------------------------------------------------------------------------
-
-#: 单行、无首尾空白，长度 > 800（用于验截断）
 LONG_ANSWER = "结论：" + "".join(f"第{i}步已完成。" for i in range(120))
 
 
 def test_finish_done_writes_result_excerpt(manager, tmp_path):
-    """done：result_excerpt 取目标会话最后一条 assistant 正文（截 800 字）。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, events = _make_bridge(manager)
     res = secretary_dispatch.get().dispatch_task(target="项目甲", prompt="补 README")
@@ -286,7 +259,6 @@ def test_finish_done_writes_result_excerpt(manager, tmp_path):
 
 
 def test_finish_done_without_assistant_falls_back_to_legacy_notice(manager, tmp_path):
-    """done 但目标会话没有 assistant 正文：摘要留空，notice 回落原文案 + 编号。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     manager.add_messages("项目甲", [("user", "先聊两句")])
     bridge, spawned, events = _make_bridge(manager)
@@ -307,7 +279,6 @@ def test_finish_done_without_assistant_falls_back_to_legacy_notice(manager, tmp_
 
 
 def test_finish_failed_writes_error(manager, tmp_path):
-    """terminal_error 非空：台账 status=failed 且写入截断后的 error。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, events = _make_bridge(manager)
     res = secretary_dispatch.get().dispatch_task(target="项目甲", prompt="跑迁移")
@@ -330,7 +301,6 @@ def test_finish_failed_writes_error(manager, tmp_path):
 
 
 def test_finish_cancelled_marks_ledger(manager, tmp_path):
-    """用户取消：台账 status=cancelled，notice 用取消文案。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     manager.add_messages("项目甲", [("assistant", "干到一半")])
     bridge, spawned, events = _make_bridge(manager)
@@ -348,12 +318,7 @@ def test_finish_cancelled_marks_ledger(manager, tmp_path):
     assert _secretary_notices(events) == [f"「项目甲」已取消（任务 #{res['dispatch_id']}）"]
 
 
-# ---------------------------------------------------------------------------
-# 台账故障：派活照常成功、收尾照常通知
-# ---------------------------------------------------------------------------
-
 class _BrokenStore:
-    """模拟台账不可用：任何读写都抛异常。"""
 
     def create(self, **kwargs):
         raise RuntimeError("台账库被锁死")
@@ -363,7 +328,6 @@ class _BrokenStore:
 
 
 def test_dispatch_survives_missing_store(manager, tmp_path):
-    """store 为 None：派活仍成功，无台账编号，notice 回落原文案（无编号）。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, events = _make_bridge(manager)
     service = secretary_dispatch.get()
@@ -381,12 +345,10 @@ def test_dispatch_survives_missing_store(manager, tmp_path):
             "照常派活", "项目甲",
             secretary_dispatch_context=spawned[0][1]["secretary_dispatch_context"],
         )
-    # 没有台账编号 → 不加「（任务 #N）」后缀，保持旧文案
     assert _secretary_notices(events) == ["任务已在「项目甲」会话执行完成"]
 
 
 def test_dispatch_survives_store_create_error(manager):
-    """store.create 抛异常：派活仍返回 ok=True，台账为空。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, _ = _make_bridge(manager)
     service = secretary_dispatch.get()
@@ -402,7 +364,6 @@ def test_dispatch_survives_store_create_error(manager):
 
 
 def test_finalize_survives_store_mark_status_error(manager, tmp_path):
-    """回写抛异常：收尾不外抛，notice 仍按终态推送（编号照旧）。"""
     manager.create_session_explicit("项目甲", workdir="GLOBAL", source="GUI")
     bridge, spawned, events = _make_bridge(manager)
     service = secretary_dispatch.get()
@@ -418,12 +379,7 @@ def test_finalize_survives_store_mark_status_error(manager, tmp_path):
     ]
 
 
-# ---------------------------------------------------------------------------
-# 设计 5.1：收尾追加项目「任务流水」
-# ---------------------------------------------------------------------------
-
 def test_finish_done_appends_project_task_log(manager, tmp_path, monkeypatch):
-    """done 收尾必须往该项目画像的「任务流水」追加一行（设计 5.1）。"""
     # 画像路径按 HOME / YCODE_DATA_DIR 在调用时解析：重定向到 tmp，绝不碰真实 ~/.ycode
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
@@ -451,7 +407,6 @@ def test_finish_done_appends_project_task_log(manager, tmp_path, monkeypatch):
     assert "「把 README 补一版」" in profile, profile
     assert "done" in profile, profile
     assert "README 已补全" in profile, profile
-    # 一次收尾只追加一条流水（不重复写）
     log_lines = [
         line
         for line in profile.splitlines()
@@ -461,7 +416,6 @@ def test_finish_done_appends_project_task_log(manager, tmp_path, monkeypatch):
 
 
 def test_finish_skips_task_log_for_global_workdir(manager, tmp_path, monkeypatch):
-    """workdir 为 GLOBAL（无项目归属）时不写流水：不产生画像文件。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("YCODE_DATA_DIR", str(tmp_path / ".ycode"))
@@ -474,8 +428,6 @@ def test_finish_skips_task_log_for_global_workdir(manager, tmp_path, monkeypatch
     with _WorkerHarness(bridge, manager, tmp_path):
         bridge._run_turn_worker("跑一下", "项目甲", secretary_dispatch_context=ctx)
 
-    # 台账确实落库且状态是 done
     assert _store(manager).get(res["dispatch_id"])["status"] == "done"
-    # 但没有画像文件被创建（GLOBAL 无项目归属）
     projects_dir = tmp_path / ".ycode" / "memory" / "projects"
     assert list(projects_dir.glob("*.md")) == []

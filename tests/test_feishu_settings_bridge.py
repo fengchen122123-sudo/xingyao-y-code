@@ -1,5 +1,3 @@
-"""T7：飞书设置的读写接口单测（密钥加密、快照不回明文、配置变更生效）。不触网。"""
-
 import json
 
 
@@ -10,9 +8,6 @@ from gui_bridge import ApiBridge
 
 def _use_isolated_config(tmp_path, monkeypatch, data=None):
     cfg = tmp_path / "config.json"
-    # 未显式给内容时写一份「最小合法空配置」（与安装器 seed 的结构一致），
-    # 而不是 {}：配置读写闸门把「能解析但顶层空对象」判为读失败，
-    # 用 {} 会让 set_feishu_settings 的写入被整份拒绝，与本文件要测的飞书设置无关。
     payload = data if data else {"active_model_id": None, "providers": []}
     cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
@@ -40,8 +35,6 @@ class _FakeService:
         self.restarted += 1
         return True
 
-
-# ---------------------------------------------------------------- 读取
 
 def test_get_settings_hides_secret(tmp_path, monkeypatch):
     _use_isolated_config(tmp_path, monkeypatch, {
@@ -76,8 +69,6 @@ def test_get_secret_returns_plaintext_on_demand(tmp_path, monkeypatch):
     assert result == {"ok": True, "app_secret": "super_secret"}
 
 
-# ---------------------------------------------------------------- 写入
-
 def test_set_settings_encrypts_secret_and_round_trips(tmp_path, monkeypatch):
     cfg_path = _use_isolated_config(tmp_path, monkeypatch, {})
     monkeypatch.setattr(ApiBridge, "_ensure_feishu_service", lambda self: None)
@@ -97,10 +88,8 @@ def test_set_settings_encrypts_secret_and_round_trips(tmp_path, monkeypatch):
     assert stored["feishu_app_id"] == "cli_demo"
     assert stored["feishu_approvers"] == ["ou_a", "ou_b"]
     assert stored["feishu_notify_chat_id"] == "oc_x"
-    # 密钥必须加密落盘，且能读回明文
     assert stored["feishu_app_secret"] != "plain_secret"
     assert feishu_config.load_feishu_config().app_secret == "plain_secret"
-    # 快照不回明文
     assert "plain_secret" not in json.dumps(result, ensure_ascii=False)
 
 
@@ -148,8 +137,6 @@ def test_set_settings_keeps_service_when_still_configured(tmp_path, monkeypatch)
     assert service.restarted == 1
     assert service.stopped == 0
 
-
-# ---------------------------------------------------------------- 测试连接
 
 def test_test_connection_requires_credentials(tmp_path, monkeypatch):
     _use_isolated_config(tmp_path, monkeypatch, {})

@@ -1,19 +1,3 @@
-"""core/mcp_server.py（手机端 MCP 服务端）的单元测试。
-
-覆盖三层：
-
-1. **纯函数层**：``handle_message`` 的 JSON-RPC 分发与 ``authorize`` 的凭据校验
-   （返回形状为 ``(HTTP 状态码, 应答体 | None)``，``None`` 表示通知不回包）。
-2. **真实 HTTP 链路**：``port=0`` 起真服务 + ``http.client`` 打 127.0.0.1，端到端
-   验证路由 / 鉴权 / 工具执行边界。全部本机回环，不碰外网、不碰真实 GUI/模型。
-3. **生命周期与安全**：start/stop 幂等、端口占用降级、token 每次请求现取（可轮换）、
-   访问日志不泄露 ``?token=``。
-
-bridge 用裸类 ``FakeBridge`` 替身：签名与 ``ApiBridge.send_user_message`` 同形
-（7 个关键字参数、``turn_source`` 默认 "local"），记录每次调用的 kwargs，
-既能断言 ``turn_source="mcp"`` 的注入，也不会替实现掩盖参数绑定错误。
-"""
-
 import http.client
 import json
 import logging
@@ -29,22 +13,14 @@ from core.mcp_server import (
     McpServer,
 )
 
-# 测试用固定 token（真 token 由上层签发，这里只要可比较即可）
 TOKEN = "tok-123"
 WRONG_TOKEN = "tok-999"
 
 
 class FakeBridge:
-    """``ApiBridge.send_user_message`` 的替身：记录 kwargs，可配置返回/抛异常.
-
-    签名与真实入口严格同形（7 个关键字参数 + turn_source 默认 "local"），
-    不接 **kwargs——未知键会以 TypeError 暴露，避免实现哪天传错参数名还被
-    ``**kwargs`` 吞掉导致断言空转。
-    """
 
     def __init__(self, result=None, exc=None):
         self.calls = []
-        # 默认受理成功；需要失败语义时显式传入
         self.result = {"ok": True} if result is None else result
         self.exc = exc
 
@@ -86,11 +62,6 @@ def bridge():
 
 @pytest.fixture
 def server(bridge):
-    """真实起一个回环服务（port=0 由内核分配），用例结束必定 stop()。
-
-    绑 127.0.0.1 而非默认 0.0.0.0：单测不需要对外可达，还避免触发系统防火墙
-    弹窗。``_dial_host`` 的通配地址映射另有纯函数用例覆盖。
-    """
     srv = McpServer(bridge=bridge, port=0, host="127.0.0.1", token_provider=lambda: TOKEN)
     info = srv.start()
     assert info["ok"], info
@@ -98,11 +69,6 @@ def server(bridge):
         yield srv
     finally:
         srv.stop()
-
-
-# ---------------------------------------------------------------------------
-# HTTP 小工具（本机回环，一次请求一连接，避免 keep-alive 串包）
-# ---------------------------------------------------------------------------
 
 
 def _http(srv, method, path, body=None, headers=None):
@@ -124,7 +90,6 @@ def _post(srv, payload, token=TOKEN, path="/mcp"):
 
 
 def _rpc(srv, payload, token=TOKEN, path="/mcp"):
-    """POST 一条 JSON-RPC，返回 ``(状态码, 解析后的 body 或 None)``."""
     status, _headers, raw = _post(srv, payload, token=token, path=path)
     return status, (json.loads(raw.decode("utf-8")) if raw else None)
 
@@ -143,7 +108,6 @@ def _call_tool(srv, name, arguments, token=TOKEN):
 
 
 def _tool_result(body):
-    """断言是工具级结果（不是 JSON-RPC 协议错误）并取出 result."""
     assert "error" not in body, body
     result = body["result"]
     assert isinstance(result["content"], list) and result["content"]
@@ -157,11 +121,6 @@ def _free_port():
         return s.getsockname()[1]
     finally:
         s.close()
-
-
-# ---------------------------------------------------------------------------
-# 1. 纯函数层：handle_message（返回 (status, body|None)）
-# ---------------------------------------------------------------------------
 
 
 def test_handle_message_non_object_payload_is_parse_error():
@@ -187,7 +146,6 @@ def test_handle_message_notification_returns_no_body():
 
 
 def test_handle_message_tools_call_rejects_non_object_arguments():
-    """arguments 不是对象属于「请求不合法」，必须是协议错误而非 isError 结果。"""
     srv = McpServer(bridge=None)
     status, body = srv.handle_message(
         {
@@ -202,7 +160,6 @@ def test_handle_message_tools_call_rejects_non_object_arguments():
 
 
 def test_handle_message_without_bridge_reports_tool_error():
-    """未注入 bridge 时工具级失败（不是协议错误），且绝不伪装成功。"""
     srv = McpServer(bridge=None)
     status, body = srv.handle_message(
         {
@@ -233,13 +190,7 @@ def test_initialize_falls_back_to_default_version_for_unknown():
         assert srv.initialize_result(params)["protocolVersion"] == DEFAULT_PROTOCOL_VERSION
 
 
-# ---------------------------------------------------------------------------
-# 2. authorize：Bearer 头优先，?token= 查询参数兜底，一致性比较
-# ---------------------------------------------------------------------------
-
-
 def test_authorize_without_provider_is_open():
-    """token_provider 为 None 表示不鉴权（仅测试/内部直连场景）。"""
     srv = McpServer(bridge=None)
     assert srv.authorize(None, {}) is True
 
@@ -247,12 +198,10 @@ def test_authorize_without_provider_is_open():
 def test_authorize_accepts_bearer_header():
     srv = McpServer(bridge=None, token_provider=lambda: TOKEN)
     assert srv.authorize(f"Bearer {TOKEN}", {}) is True
-    # 大小写不敏感（HTTP 头值里的 scheme 常被客户端写成小写）
     assert srv.authorize(f"bearer {TOKEN}", {}) is True
 
 
 def test_authorize_accepts_query_token_fallback():
-    """手机端 MCP 客户端只填 URL，查询参数是唯一可行通道。"""
     srv = McpServer(bridge=None, token_provider=lambda: TOKEN)
     assert srv.authorize(None, {"token": [TOKEN]}) is True
     assert srv.authorize(None, {"token": [WRONG_TOKEN]}) is False
@@ -268,7 +217,6 @@ def test_authorize_rejects_missing_and_malformed_credentials():
 
 
 def test_authorize_fail_closed_when_provider_yields_nothing_or_raises():
-    """provider 取不到有效 token（尚未签发/读配置失败）时必须拒绝，不能放行。"""
     assert McpServer(bridge=None, token_provider=lambda: b"").authorize(f"Bearer {TOKEN}", {}) is False
     assert McpServer(bridge=None, token_provider=lambda: None).authorize(f"Bearer {TOKEN}", {}) is False
 
@@ -283,11 +231,6 @@ def test_authorize_accepts_str_token_from_provider():
     assert srv.authorize("Bearer str-tok", {}) is True
 
 
-# ---------------------------------------------------------------------------
-# 3. 真实 HTTP 链路
-# ---------------------------------------------------------------------------
-
-
 def test_start_returns_real_port_and_dial_url(server):
     assert server.port != 0
     info = server._started_info()
@@ -298,7 +241,6 @@ def test_start_returns_real_port_and_dial_url(server):
 
 
 def test_started_info_maps_wildcard_host_to_loopback():
-    """绑 0.0.0.0 时 url 必须回 127.0.0.1（通配地址不可拨号）。"""
     srv = McpServer(port=4999, host="0.0.0.0")
     assert srv._started_info()["url"] == "http://127.0.0.1:4999/mcp"
 
@@ -315,7 +257,6 @@ def test_post_without_authorization_is_401_jsonrpc_error(server):
     assert status == 401
     body = json.loads(raw.decode("utf-8"))
     assert body["error"]["code"] == -32001
-    # 401 必须是 JSON-RPC 形态：部分客户端只会按 JSON 解析应答
     assert headers.get("Content-Type", "").startswith("application/json")
     assert "Bearer" in headers.get("WWW-Authenticate", "")
 
@@ -381,7 +322,6 @@ def test_tools_call_send_message_success(server, bridge):
     assert status == 200
     result = _tool_result(body)
     assert result["isError"] is False
-    # bridge 必须收到关键字参数、来源注入为 mcp、未指定会话时为 None
     assert bridge.calls == [
         {
             "text": "看看今天的天气",
@@ -412,7 +352,6 @@ def test_tools_call_blank_session_name_is_normalized_to_none(server, bridge):
 
 
 def test_tools_call_reports_bridge_rejection(server, bridge):
-    """bridge 拒绝必须是 isError=true + 原样透出 msg，不能伪造成功。"""
     bridge.result = {"ok": False, "msg": "无效的回合来源"}
     status, body = _call_tool(server, SEND_MESSAGE_TOOL_NAME, {"text": "看看今天的天气"})
     assert status == 200
@@ -424,7 +363,6 @@ def test_tools_call_reports_bridge_rejection(server, bridge):
 def test_tools_call_reports_bridge_exception(server, bridge):
     bridge.exc = RuntimeError("桌面端未就绪")
     status, body = _call_tool(server, SEND_MESSAGE_TOOL_NAME, {"text": "看看今天的天气"})
-    # 异常不得穿透成 500（手机端会得到无信息错误）
     assert status == 200
     result = _tool_result(body)
     assert result["isError"] is True
@@ -445,7 +383,6 @@ def test_tools_call_empty_text_is_tool_error_without_bridge_call(server, bridge,
     result = _tool_result(body)
     assert result["isError"] is True
     assert "text" in result["content"][0]["text"]
-    # 空任务不该打扰桌面端排队
     assert bridge.calls == []
 
 
@@ -492,7 +429,6 @@ def test_unknown_path_is_404(server):
 
 
 def test_oversized_body_is_rejected_before_read(server):
-    """Content-Length 超上限时先回 413，不把畸形大请求读进内存。"""
     status, _headers, raw = _http(
         server,
         "POST",
@@ -506,11 +442,6 @@ def test_oversized_body_is_rejected_before_read(server):
     )
     assert status == 413
     assert json.loads(raw.decode("utf-8"))["error"]["code"] == -32600
-
-
-# ---------------------------------------------------------------------------
-# 4. token 轮换：每次请求现取 provider，改值即刻生效
-# ---------------------------------------------------------------------------
 
 
 def test_token_rotation_takes_effect_on_next_request():
@@ -530,22 +461,15 @@ def test_token_rotation_takes_effect_on_next_request():
         state["token"] = "tok-new"
         assert _rpc(srv, ping, token="tok-old")[0] == 401
         assert _rpc(srv, ping, token="tok-new")[0] == 200
-        # 每次请求都现取，而不是 start() 时快照
         assert state["calls"] >= 3
     finally:
         srv.stop()
-
-
-# ---------------------------------------------------------------------------
-# 5. 生命周期：start/stop 幂等、端口占用降级
-# ---------------------------------------------------------------------------
 
 
 def test_start_twice_is_idempotent(server):
     second = server.start()
     assert second["ok"] is True
     assert second["port"] == server.port
-    # 仍是同一个监听：服务继续正常应答
     status, body = _rpc(server, {"jsonrpc": "2.0", "id": 1, "method": "ping"})
     assert status == 200
     assert body["result"] == {}
@@ -553,13 +477,12 @@ def test_start_twice_is_idempotent(server):
 
 def test_stop_is_idempotent_and_safe_before_start():
     srv = McpServer(bridge=FakeBridge())
-    srv.stop()  # 未启动直接停：空操作
+    srv.stop()
     info = srv.start()
     assert info["ok"], info
     port = srv.port
     srv.stop()
     srv.stop()
-    # 端口已释放：同一端口可以重新绑定
     probe = socket.socket()
     try:
         probe.bind(("127.0.0.1", port))
@@ -568,7 +491,6 @@ def test_stop_is_idempotent_and_safe_before_start():
 
 
 def test_start_reports_failure_when_port_occupied():
-    """端口被占用属运行时状况：回 {"ok": False, "msg": ...}，不抛异常。"""
     blocker = socket.socket()
     srv = McpServer(port=0, host="127.0.0.1", bridge=FakeBridge())
     try:
@@ -579,21 +501,14 @@ def test_start_reports_failure_when_port_occupied():
         info = srv.start()
         assert info["ok"] is False
         assert "端口绑定失败" in info["msg"]
-        # 失败后不残留半成品服务，stop() 仍是安全空操作
         assert srv._server is None
         srv.stop()
     finally:
         blocker.close()
 
 
-# ---------------------------------------------------------------------------
-# 6. 日志脱敏：访问日志不含 token
-# ---------------------------------------------------------------------------
-
-
 def test_access_log_never_leaks_token(server, caplog):
     caplog.set_level(logging.DEBUG, logger="core.mcp_server")
-    # 探活 + 用 ?token= 走一次业务路径，覆盖 log_message 与 _respond 两条日志
     assert _http(server, "GET", f"/health?token={TOKEN}")[0] == 200
     assert _rpc(
         server,

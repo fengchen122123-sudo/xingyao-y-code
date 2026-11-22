@@ -13,8 +13,6 @@ def _bare_bridge():
 
 def _use_tmp_config(tmp_path, monkeypatch, data):
     cfg = tmp_path / "config.json"
-    # config.py 写闸门把「存在但解析为空对象」判为读失败并拒写，
-    # 因此空 fixture 也要写入可用的最小结构。
     payload = data if data else {"active_model_id": None, "providers": []}
     cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
@@ -22,7 +20,6 @@ def _use_tmp_config(tmp_path, monkeypatch, data):
 
 
 def _use_isolated_config(tmp_path, monkeypatch, data):
-    """Task 12：同时隔离 JSON 与 TOML overlay，避免开发机 config.toml 污染断言。"""
     cfg = _use_tmp_config(tmp_path, monkeypatch, data)
     monkeypatch.setattr(config, "_TOML_CONFIG_FILE", str(tmp_path / "config.toml"))
     return cfg
@@ -105,7 +102,6 @@ def test_bridge_rejects_invalid_turn_step_limit_without_changing_config(
 
 
 def test_system_settings_snapshot_exposes_context_watermark_base(tmp_path, monkeypatch):
-    """未配置水位基准时快照给 None（跟随真实窗口），并附带合法区间。"""
     _use_isolated_config(tmp_path, monkeypatch, {})
 
     result = _bare_bridge().get_system_settings()
@@ -127,7 +123,6 @@ def test_bridge_persists_valid_context_watermark_base(tmp_path, monkeypatch):
 
 
 def test_bridge_accepts_zero_context_watermark_base_as_unset(tmp_path, monkeypatch):
-    """0 与 None 同义：不设基准，快照回落 None（配置文件里存 0）。"""
     cfg = _use_isolated_config(tmp_path, monkeypatch, {})
 
     result = _bare_bridge().set_context_watermark_base(0)
@@ -150,7 +145,6 @@ def test_bridge_rejects_invalid_context_watermark_base_without_changing_config(
         result = bridge.set_context_watermark_base(bad)
         assert result["ok"] is False
         assert result["msg"]
-        # 失败时不写盘：快照与配置文件都保持原值
         assert result["settings"]["context_watermark_base"] == 300000
 
     stored = json.loads(cfg.read_text(encoding="utf-8"))["memory_compression"]
@@ -162,12 +156,10 @@ def test_system_settings_snapshot_exposes_computer_control_settings(tmp_path, mo
 
     result = _bare_bridge().get_system_settings()
 
-    # 缺失键安全默认：两个开关关闭、默认浏览器 edge
     assert result["browser_control_enabled"] is False
     assert result["computer_control_enabled"] is False
     assert result["computer_browser"] == "edge"
     options = {item["browser"]: item for item in result["computer_browser_options"]}
-    # embedded = GUI 内置 WebView2（CDP 直连），与外部浏览器并列可选项
     assert set(options) == {"edge", "chrome", "embedded"}
     for item in options.values():
         assert set(item) == {"browser", "label", "available", "executable", "unavailable_reason"}
@@ -195,7 +187,6 @@ def test_system_settings_snapshot_exposes_computer_hotkey_state(tmp_path, monkey
 
     result = _bare_bridge().get_system_settings()
 
-    # 无活动热键实例时保守上报不可用；键名固定 Ctrl+Alt+Esc
     assert result["computer_hotkey_available"] is False
     assert result["computer_hotkey"] == "Ctrl+Alt+Esc"
 
@@ -221,7 +212,6 @@ def test_system_settings_snapshot_exposes_computer_run(tmp_path, monkeypatch):
     result = _bare_bridge().get_system_settings()
 
     run = result["computer_run"]
-    # 无活动 run 时为 idle 默认快照；字段与 ComputerRunSnapshot.to_public_dict 一致
     assert run["status"] == "idle"
     assert run["run_id"] == ""
     for key in (
@@ -231,18 +221,11 @@ def test_system_settings_snapshot_exposes_computer_run(tmp_path, monkeypatch):
         "error_code", "hotkey_available",
     ):
         assert key in run
-    # 快照不得包含输入正文、截图 base64 或本地路径字段
     assert "png_path" not in run
     json.dumps(run)
 
 
-# ---------------------------------------------------------------------------
-# 电脑操控严格 setter（Task 12：Bridge 只调领域函数，失败不吞为 success）
-# ---------------------------------------------------------------------------
-
-
 class _FakeControllerService:
-    """ComputerControlService 最小 fake：快照可注入活动 run，stop 只记录调用。"""
 
     def __init__(self, run_id: str = "", status: str = "idle", target: str = ""):
         self._snapshot = ComputerRunSnapshot(
@@ -255,7 +238,6 @@ class _FakeControllerService:
 
     def stop(self, run_id: str, reason: str) -> ComputerRunSnapshot:
         self.stop_calls.append((run_id, reason))
-        # 刻意不改状态：模拟“清理尚在进行”，开关快照仍必须已是 false
         return self._snapshot
 
 
@@ -289,7 +271,6 @@ def test_bridge_browser_enable_persists_after_preflight(tmp_path, monkeypatch):
 
 
 def test_browser_enable_preflight_combines_selected_browser_and_hotkey(tmp_path, monkeypatch):
-    """开启 preflight 组合所选浏览器可用 + 全局热键检查；热键不可用即不落盘。"""
     cfg = _use_isolated_config(tmp_path, monkeypatch, {})
     bridge = _bare_bridge()
     monkeypatch.setattr(
@@ -323,7 +304,6 @@ def test_browser_enable_preflight_rejects_unavailable_selected_browser(tmp_path,
 
 
 def test_computer_enable_preflight_runs_windows_backend_checks(tmp_path, monkeypatch):
-    """完整电脑操控 preflight 必须跑 Windows backend 检查（平台/DPI/桌面/热键）。"""
     from core.computer.models import ComputerControlError as DomainError
 
     cfg = _use_isolated_config(tmp_path, monkeypatch, {})
@@ -365,7 +345,6 @@ def test_computer_enable_persists_after_windows_preflight(tmp_path, monkeypatch)
 
 
 def test_bridge_disable_persists_false_and_stops_browser_run(tmp_path, monkeypatch):
-    """关闭成功后调用 controller.stop；即使清理尚在进行，快照开关已为 false。"""
     cfg = _use_isolated_config(tmp_path, monkeypatch, {"browser_control_enabled": True})
     bridge = _bare_bridge()
     service = _FakeControllerService(run_id="run-1", status="running", target="browser")
@@ -379,12 +358,10 @@ def test_bridge_disable_persists_false_and_stops_browser_run(tmp_path, monkeypat
     assert result["settings"]["browser_control_enabled"] is False
     assert json.loads(cfg.read_text(encoding="utf-8"))["browser_control_enabled"] is False
     assert service.stop_calls == [("run-1", "settings_disabled")]
-    # fake 的 stop 刻意不变更状态：run 仍在清理中，开关快照已是 false
     assert result["settings"]["computer_run"]["status"] == "running"
 
 
 def test_bridge_disable_computer_switch_keeps_browser_run(tmp_path, monkeypatch):
-    """两个开关独立（设计 8.4）：关闭完整电脑操控不打断 browser target 的 run。"""
     cfg = _use_isolated_config(tmp_path, monkeypatch, {"computer_control_enabled": True})
     bridge = _bare_bridge()
     service = _FakeControllerService(run_id="run-1", status="running", target="browser")
@@ -401,7 +378,6 @@ def test_bridge_disable_computer_switch_keeps_browser_run(tmp_path, monkeypatch)
 
 
 def test_bridge_switch_enable_refreshes_emergency_hotkey(tmp_path, monkeypatch):
-    """开关切换成功后同步全局紧急停止热键（Task 16：用户开启时首次注册）。"""
     _use_isolated_config(tmp_path, monkeypatch, {})
     bridge = _bare_bridge()
     monkeypatch.setattr(bridge, "_browser_control_preflight", lambda: None)
@@ -418,7 +394,6 @@ def test_bridge_switch_enable_refreshes_emergency_hotkey(tmp_path, monkeypatch):
 
 
 def test_bridge_switch_disable_also_refreshes_hotkey(tmp_path, monkeypatch):
-    """关闭开关同样触发热键同步（可能需要注销；活动 run 语义由 refresh 判定）。"""
     _use_isolated_config(tmp_path, monkeypatch, {"computer_control_enabled": True})
     bridge = _bare_bridge()
     service = _FakeControllerService(run_id="run-1", status="running", target="desktop")
@@ -438,7 +413,6 @@ def test_bridge_switch_disable_also_refreshes_hotkey(tmp_path, monkeypatch):
 
 
 def test_bridge_switch_failure_skips_hotkey_refresh(tmp_path, monkeypatch):
-    """setter 失败（配置未落盘）绝不触发热键同步。"""
     _use_isolated_config(tmp_path, monkeypatch, {})
     bridge = _bare_bridge()
     monkeypatch.setattr(
@@ -458,7 +432,6 @@ def test_bridge_switch_failure_skips_hotkey_refresh(tmp_path, monkeypatch):
 
 
 def test_bridge_hotkey_refresh_failure_does_not_fail_setter(tmp_path, monkeypatch):
-    """热键同步失败只留痕：配置已落盘，开关结果仍成功（能力单独降级）。"""
     _use_isolated_config(tmp_path, monkeypatch, {})
     bridge = _bare_bridge()
     monkeypatch.setattr(bridge, "_browser_control_preflight", lambda: None)
@@ -474,7 +447,6 @@ def test_bridge_hotkey_refresh_failure_does_not_fail_setter(tmp_path, monkeypatc
 
 
 def test_bridge_browser_select_fails_during_active_run(tmp_path, monkeypatch):
-    """浏览器选择在活动会话中不可修改（设计 8.1），失败且配置不变。"""
     cfg = _use_isolated_config(tmp_path, monkeypatch, {"computer_browser": "edge"})
     bridge = _bare_bridge()
     service = _FakeControllerService(run_id="run-1", status="running", target="browser")

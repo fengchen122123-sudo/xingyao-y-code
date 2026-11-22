@@ -1,10 +1,3 @@
-"""渠道请求形态覆盖：按域名给指定渠道追加请求头与请求体参数。
-
-设计约束（见 待开发/网关请求形态覆盖/设计规格与实施计划.md §4）：
-- 只做形态覆盖，不参与任何缓存机制判定；
-- 白名单拒绝策略为键级剔除，请求必定照常发出；
-- 生效值参与指纹（route_override_sha256），便于事后归因。
-"""
 from __future__ import annotations
 
 import hashlib
@@ -25,8 +18,6 @@ BODY_DENY_KEYS = frozenset({
 })
 _ENV_REF = re.compile(r"^\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}$")
 _TTL_SECONDS = 10.0
-# 条目格式与 _keepalive_routes_cfg_cache 一致：(过期时间, stamp, entries)。
-# 测试可直接把 entry 置 None 强制重读配置。
 _cache = {"entry": None}
 
 
@@ -36,10 +27,6 @@ def _load_config_for_overrides():
 
 
 def _config_stamp():
-    """配置来源指纹（loader 身份 + config 文件 mtime），口径同 _qwen_cache_config_stamp。
-
-    拿不到时返回 None：此时 stamp 恒等，只能靠 TTL 兜底（宁可不缓存，也不给出过期结论）。
-    """
     try:
         from core.llm_dialects import _qwen_cache_config_stamp
         return _qwen_cache_config_stamp()
@@ -103,11 +90,6 @@ def _cached_entries():
 
 
 def resolve_route_override(model_name, api_base):
-    """返回该渠道生效的覆盖项；无匹配时三项均为空（零影响）。
-
-    model_name 目前不参与匹配（按域名匹配即可），保留形参只为与
-    _provider_request_options 的调用形状对齐，并为将来"按模型细分覆盖"留口子。
-    """
     empty = {"headers": {}, "body": {}, "fingerprint": ""}
     host = _normalize_route_match_key(api_base)
     for match, headers, body in _cached_entries():

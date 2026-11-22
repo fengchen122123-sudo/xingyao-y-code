@@ -1,22 +1,3 @@
-"""星瑶桌面宠物（Electron 桌宠）的 Electron 运行时：按需自动下载与安装。
-
-为什么要单独成一个模块：
-- 桌宠的源码（pets/xingyao_pet，几百 KB）随安装包分发，但 Electron 运行时解压后
-  约 368MB，塞进安装包会让每个用户都白等一次大体积下载。所以运行时改成"首次启用
-  桌宠时才装"，本模块就是这条通道。
-- 安装目标必须落在**用户可写目录**：安装包会装到 Program Files，那里普通用户没有
-  写权限，所以运行时统一放 ~/.ycode/pet-runtime/electron/dist/，与程序安装目录解耦。
-- 下载是长时间 IO（151MB），绝不能占用调用线程（那是 pywebview 的 js_api 线程，
-  卡住就是整个界面假死）。因此 install() 只负责置状态 + 起后台线程并立刻返回
-  status()，界面那侧轮询 status() 画进度条即可。
-- 和 pet_manager 一样的原则：任何异常都不许穿透出去，一律转成 state=failed 的
-  结构化 status（msg 里写清原因与手动兜底方案：设置页直接填 electron.exe 路径）。
-- 只用标准库：urllib.request 足够做断点续传与超时控制，zipfile 足够做校验与解压，
-  不为一个安装器引入新依赖。
-
-状态机：idle → downloading → verifying → extracting → done / failed
-"""
-
 from __future__ import annotations
 
 import logging
@@ -43,9 +24,6 @@ ELECTRON_ROOT = RUNTIME_ROOT / "electron"
 DIST_DIR = ELECTRON_ROOT / "dist"
 DOWNLOAD_DIR = RUNTIME_ROOT / "download"
 
-# ---------- 版本与下载源 ----------
-# 默认版本与 pets/xingyao_pet/node_modules/electron/dist/version 保持一致；
-# 需要换版本时不改代码，改配置项 pet_electron_version 即可。
 DEFAULT_VERSION = "44.11.3"
 VERSION = DEFAULT_VERSION
 
@@ -53,17 +31,15 @@ VERSION = DEFAULT_VERSION
 MIRROR_BASE = "https://npmmirror.com/mirrors/electron"
 GITHUB_BASE = "https://github.com/electron/electron/releases/download"
 
-# ---------- 超时与分块 ----------
-_CONNECT_TIMEOUT = 20.0      # 建连
-_READ_TIMEOUT = 60.0         # 单次 socket 读
-_CHUNK = 256 * 1024          # 每读 256KB 刷一次进度
-_NO_PROGRESS_LIMIT = 600.0   # 10 分钟没有任何新字节就判失败，避免挂死
+_CONNECT_TIMEOUT = 20.0
+_READ_TIMEOUT = 60.0
+_CHUNK = 256 * 1024
+_NO_PROGRESS_LIMIT = 600.0
 
 _UA = "XingyaoPetRuntime/1.0"
 
 _PUBLIC_KEYS = ("state", "downloaded", "total", "percent", "msg", "version", "mirror")
 
-# 平台 → Electron release 的平台段；架构同理。Electron 只发这几个组合。
 _PLATFORM_MAP = {"win32": "win32", "darwin": "darwin", "linux": "linux"}
 _ARCH_MAP = {
     "x86_64": "x64",
@@ -81,9 +57,6 @@ _SUPPORTED_TAGS = (
     "linux-arm64",
 )
 
-# ---------- 内存状态 ----------
-# 模块级状态字典 + 一把锁：读（status）与写（下载线程）都要过锁，避免界面读到半更新
-# 的快照。_INSTALL_LOCK 是"任务锁"，保证同一时刻只有一个安装线程。
 _STATE_LOCK = threading.Lock()
 _INSTALL_LOCK = threading.Lock()
 _WORKER: Optional[threading.Thread] = None
@@ -106,13 +79,7 @@ class PetRuntimeError(Exception):
     """运行时安装失败（内部用，最终都会被转成 state=failed 的 status）。"""
 
 
-# ---------- 配置读取 ----------
 def _config_value(key: str, default=None):
-    """读单个配置项（先用模块属性，再回落 config.json 载荷），与 pet_manager 一致。
-
-    config 模块的 __getattr__ 对未注册名字会抛 AttributeError，这里全部吞掉：
-    读不到配置只影响"用默认值"，不该让装运行时这一步失败。
-    """
     try:
         import config
     except Exception:
@@ -141,12 +108,10 @@ def _active_version() -> str:
 
 
 def _mirror_base() -> str:
-    """镜像基址，允许配置项 pet_electron_mirror 覆盖（例如内网镜像）。"""
     raw = str(_config_value("pet_electron_mirror", "") or "").strip().strip('"')
     return (raw or MIRROR_BASE).rstrip("/")
 
 
-# ---------- 状态读写 ----------
 def _recompute_percent_locked() -> None:
     total = int(_STATE.get("total") or 0)
     done = int(_STATE.get("downloaded") or 0)
@@ -205,13 +170,11 @@ def reset_for_test() -> None:
     _PROGRESS = None
 
 
-# ---------- 工具 ----------
 def _exe_name() -> str:
     return "electron.exe" if sys.platform.startswith("win") else "electron"
 
 
 def _dir_size(path: Path) -> int:
-    """目录总字节数；任何 OSError 都算 0（统计失败不该影响安装判断）。"""
     total = 0
     try:
         for item in path.rglob("*"):
@@ -244,7 +207,6 @@ def _safe_rmtree(path: Path) -> None:
 
 
 def _platform_tag() -> str:
-    """把 sys.platform + platform.machine() 归一成 Electron 的发布标签。"""
     raw = (sys.platform or "").lower()
     if raw.startswith("win"):
         base = _PLATFORM_MAP["win32"]
@@ -273,7 +235,6 @@ def _platform_tag() -> str:
 
 
 def _candidate_sources(version: str, tag: str) -> list:
-    """下载源顺序：镜像基址 → 官方 GitHub。域名用于 status.mirror 展示。"""
     zip_name = f"electron-v{version}-{tag}.zip"
     return [
         (f"{_mirror_base()}/{version}/{zip_name}", f"{zip_name}"),
@@ -289,11 +250,6 @@ def _host_of(url: str) -> str:
 
 
 def _relax_read_timeout(resp, seconds: float) -> None:
-    """把建连用的 20s 超时放宽到单次读 60s。
-
-    urllib 只有一个 timeout 参数，建连和读共用它。这里在建连成功后顺手把底层
-    socket 超时调大；拿不到 socket（不同 Python 实现）就保持 20s —— 更严格但安全。
-    """
     try:
         sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
         if sock is not None:
@@ -302,13 +258,7 @@ def _relax_read_timeout(resp, seconds: float) -> None:
         logger.debug("调整 socket 读超时失败，沿用建连超时", exc_info=True)
 
 
-# ---------- 探测 ----------
 def detect() -> dict:
-    """探测 RUNTIME_ROOT 下是否已有可用的 Electron 运行时。
-
-    只看我们自己装的这份（~/.ycode/pet-runtime/electron/dist），
-    桌宠目录里 node_modules 自带的运行时不在此列。
-    """
     exe = DIST_DIR / _exe_name()
     installed = False
     try:
@@ -328,12 +278,7 @@ def detect() -> dict:
     }
 
 
-# ---------- 下载 ----------
 def _download_once(url: str, part: Path) -> int:
-    """把 url 下到 part（.part 已存在则断点续传），返回最终字节数。
-
-    失败抛异常由上层决定是否换源；不在这里做清理（清理统一在失败收口处）。
-    """
     offset = 0
     try:
         if part.is_file():
@@ -350,7 +295,6 @@ def _download_once(url: str, part: Path) -> int:
     try:
         code = int(getattr(resp, "status", None) or resp.getcode() or 200)
         if code == 416 and offset > 0:
-            # 本地 .part 已经完整或与服务端对不上：丢掉重来，不给用户留下坏包。
             resp.close()
             _safe_unlink(part)
             return _download_once_no_range(url, part)
@@ -414,7 +358,6 @@ def _download_once(url: str, part: Path) -> int:
 
 
 def _download_once_no_range(url: str, part: Path) -> int:
-    """416 之后的无条件重下（不带 Range，等价于从零开始）。"""
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     resp = urllib.request.urlopen(req, timeout=_CONNECT_TIMEOUT)
     _relax_read_timeout(resp, _READ_TIMEOUT)
@@ -458,7 +401,6 @@ def _download_once_no_range(url: str, part: Path) -> int:
 
 
 def _download_with_fallback(version: str, tag: str, part: Path) -> Path:
-    """先镜像后官方；任一源失败都清掉半包再换源，避免两个源的字节混在一起。"""
     errors = []
     for url, zip_name in _candidate_sources(version, tag):
         host = _host_of(url)
@@ -489,9 +431,7 @@ def _download_with_fallback(version: str, tag: str, part: Path) -> Path:
     )
 
 
-# ---------- 校验与解压 ----------
 def _swap_into_place(tmp: Path) -> None:
-    """把 dist.tmp-<pid> 换成 dist。旧目录先改名再删，避免出现半成品 dist。"""
     old = None
     if DIST_DIR.exists():
         old = ELECTRON_ROOT / f"dist.old-{os.getpid()}"
@@ -519,7 +459,6 @@ def _swap_into_place(tmp: Path) -> None:
 
 
 def _install_from_zip(zip_path: Path, version: str) -> dict:
-    """校验 zip → 解压到临时目录 → 原子替换 dist → 写 path.txt / version。"""
     _update(state="verifying", msg="正在校验安装包…")
     try:
         zf = zipfile.ZipFile(zip_path)
@@ -557,7 +496,6 @@ def _install_from_zip(zip_path: Path, version: str) -> dict:
         (ELECTRON_ROOT / "path.txt").write_text(exe_name, encoding="utf-8")
         (ELECTRON_ROOT / "version").write_text(version + "\n", encoding="utf-8")
     except OSError as exc:
-        # 只影响元信息展示，运行时本身已经就位，不必判定安装失败。
         logger.warning("写入运行时元信息失败: %s", exc)
     return detect()
 
@@ -580,16 +518,14 @@ def _cleanup_artifacts() -> None:
 
 
 def _fail(msg: str) -> None:
-    """失败统一出口：先清理残留文件，再落 state=failed（msg 给人看）。"""
     _cleanup_artifacts()
     logger.warning("Electron 运行时安装失败：%s", msg)
     _update(state="failed", msg=str(msg or "安装失败"))
 
 
-# ---------- 安装主流程（后台线程） ----------
 def _do_install() -> None:
     version = _active_version()
-    tag = _platform_tag()  # 不支持的平台直接抛，由 _install_worker 收口成 failed
+    tag = _platform_tag()
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     ELECTRON_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -605,7 +541,6 @@ def _do_install() -> None:
     _download_with_fallback(version, tag, part)
     _install_from_zip(part, version)
 
-    # 装好了就把 151MB 安装包删掉，别白占用户磁盘；需要重装时再下一次。
     _safe_unlink(part)
 
     info = detect()
@@ -639,14 +574,7 @@ def _install_worker() -> None:
             _cleanup_artifacts()
 
 
-# ---------- 对外入口 ----------
 def install(progress: Optional[Callable[[dict], None]] = None) -> dict:
-    """启动后台安装并立刻返回当前状态（幂等）。
-
-    - 已装好：直接返回 state=done，不重复下载。
-    - 正在装：返回当前 status()，不会起第二个线程。
-    - 其余情况：置 downloading 并起后台线程，立刻返回刚要开始的状态。
-    """
     global _WORKER, _PROGRESS
     try:
         with _INSTALL_LOCK:

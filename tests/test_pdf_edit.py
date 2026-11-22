@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""core/pdf_edit.apply_edits 与 gui_bridge.save_pdf_edits 的测试。
-
-坐标口径：PDF point，原点在页面左上角，y 向下，page 为 1-based（与前端 pdf.js
-getViewport({scale:1}) 一致）。测试用的源 PDF 由 reportlab 现造，带中文文字，
-便于断言「原文保留 + 叠加层可见」。
-"""
 
 import os
 import sys
@@ -31,7 +25,6 @@ _FONT_CANDIDATES = (
 
 
 def _fixture_font() -> str:
-    """注册测试用中文字体；系统没有任何中文字体时跳过（否则断言中文提取无意义）。"""
     for path, subfont_index in _FONT_CANDIDATES:
         if not os.path.isfile(path):
             continue
@@ -47,7 +40,6 @@ def _fixture_font() -> str:
 
 
 def _make_source_pdf(path, texts=("第一页 正文内容", "第二页 正文内容", "第三页 正文内容")):
-    """造一份 pages=len(texts) 的源 PDF，每页写一行中文。"""
     font = _fixture_font()
     pdf = canvas.Canvas(str(path), pagesize=(PAGE_W, PAGE_H))
     for text in texts:
@@ -61,11 +53,6 @@ def _make_source_pdf(path, texts=("第一页 正文内容", "第二页 正文内
 @pytest.fixture()
 def source_pdf(tmp_path):
     return _make_source_pdf(tmp_path / "source.pdf")
-
-
-# ---------------------------------------------------------------------------
-# 用例 1：页面级操作（删除 / 旋转 / 插空白页）
-# ---------------------------------------------------------------------------
 
 
 def test_page_ops_delete_rotate_and_insert_blank(source_pdf, tmp_path):
@@ -82,11 +69,8 @@ def test_page_ops_delete_rotate_and_insert_blank(source_pdf, tmp_path):
     assert os.path.isfile(out_path)
     reader = PdfReader(out_path)
     assert len(reader.pages) == 3
-    # 页 1：原第 1 页被旋转 90°（/Rotate 写在页面字典上）
     assert int(reader.pages[0].get("/Rotate", 0)) == 90
-    # 页 2：新插入的空白页（插在原第 1 页之后）
     assert reader.pages[1].extract_text().strip() == ""
-    # 页 3：原来的第 3 页，第 2 页已被删除
     assert "第三页" in reader.pages[2].extract_text()
     assert "第二页" not in "".join(page.extract_text() for page in reader.pages)
 
@@ -101,11 +85,6 @@ def test_move_page_reorders(source_pdf, tmp_path):
     assert len(reader.pages) == 3
     assert "第三页" in reader.pages[0].extract_text()
     assert "第一页" in reader.pages[1].extract_text()
-
-
-# ---------------------------------------------------------------------------
-# 用例 2：批注 / 遮盖 / 文本框叠加，不改页面尺寸与原文
-# ---------------------------------------------------------------------------
 
 
 def test_annotations_preserve_page_and_add_visible_text(source_pdf, tmp_path):
@@ -137,11 +116,11 @@ def test_annotations_preserve_page_and_add_visible_text(source_pdf, tmp_path):
     assert result["pages"] == 3
     assert os.path.isfile(out_path)
     reader = PdfReader(out_path)
-    assert len(reader.pages) == 3  # 批注不增删页
+    assert len(reader.pages) == 3
     assert [float(v) for v in reader.pages[0].mediabox] == src_mediabox
     text = reader.pages[0].extract_text()
-    assert "改写后的文字测试" in text  # 文本框内容可提取（中文未丢）
-    assert "第一页" in text  # 原文内容仍保留
+    assert "改写后的文字测试" in text
+    assert "第一页" in text
 
 
 def test_text_block_wrapping_warns_when_too_many_lines(source_pdf, tmp_path):
@@ -159,11 +138,6 @@ def test_text_block_wrapping_warns_when_too_many_lines(source_pdf, tmp_path):
     assert os.path.isfile(out_path)
     assert any("丢弃" in item for item in result["warnings"])
     assert "warning" in result
-
-
-# ---------------------------------------------------------------------------
-# 用例 3：非法输入一律 ValueError
-# ---------------------------------------------------------------------------
 
 
 def test_page_out_of_range_raises(source_pdf, tmp_path):
@@ -198,13 +172,7 @@ def test_invalid_rotate_degrees_raises(source_pdf, tmp_path):
         pdf_edit.apply_edits(source_pdf, ops, str(tmp_path / "bad.pdf"))
 
 
-# ---------------------------------------------------------------------------
-# 用例 4：桥方法 save_pdf_edits（copy / overwrite 两条保存路径）
-# ---------------------------------------------------------------------------
-
-
 def _make_bridge(workspace):
-    """参照 tests/test_read_file_preview.py 的桥构造写法（不启动 MCP / GUI）。"""
     from gui_bridge import ApiBridge
 
     bridge = ApiBridge(mcp_manager=None)
@@ -236,7 +204,7 @@ def test_bridge_copy_mode_writes_new_file_without_touching_source(tmp_path, monk
     assert os.path.abspath(result["path"]) != os.path.abspath(source)
     assert os.path.isfile(result["path"])
     assert "已编辑" in os.path.basename(result["path"])
-    assert open(source, "rb").read() == original  # 源文件一个字节都没动
+    assert open(source, "rb").read() == original
     assert len(PdfReader(result["path"]).pages) == 2
 
 
@@ -255,8 +223,8 @@ def test_bridge_overwrite_mode_backs_up_and_updates_source(tmp_path, monkeypatch
     backup = result["backup"]
     assert backup and os.path.isfile(backup)
     assert ".bak_" in os.path.basename(backup)
-    assert open(backup, "rb").read() == original  # 备份就是原文件
-    assert open(source, "rb").read() != original  # 源文件已被更新
+    assert open(backup, "rb").read() == original
+    assert open(source, "rb").read() != original
     assert len(PdfReader(source).pages) == 2
 
 
@@ -292,7 +260,6 @@ def test_bridge_denies_path_outside_workspace_with_sandbox_off(tmp_path, monkeyp
     assert "工作区" in result["msg"]
 
 def test_rect_stroke_width_takes_effect(source_pdf, tmp_path):
-    """前端一直下发 width（默认 1.5），后端必须真的用上，不能静默忽略。"""
     out_default = tmp_path / "default.pdf"
     out_wide = tmp_path / "wide.pdf"
     base = {
@@ -321,7 +288,6 @@ def test_invalid_stroke_width_raises(source_pdf, tmp_path):
 
 
 def test_bridge_copy_mode_denies_out_path_outside_workspace(tmp_path, monkeypatch):
-    """copy 模式下，输出路径同样要过路径策略（桥层可能被非常规调用）。"""
     import core.gui_path_policy as gpp
 
     monkeypatch.setattr(gpp, "_ycode_dir_override", str(tmp_path / "ydata"))

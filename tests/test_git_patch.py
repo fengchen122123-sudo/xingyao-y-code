@@ -1,5 +1,3 @@
-"""Patch 生成/预检/应用测试（规格 §5.3/§5.13/§17.1，真实临时仓库）。"""
-
 import pytest
 
 from core.git import mutation, patch as git_patch
@@ -19,17 +17,14 @@ def env(tmp_path):
 
 
 def test_stage_hunk_via_patch(env):
-    """行级暂存：只有被选中的 Hunk 进入暂存区。"""
     identity, repo, runner = env
     (repo / "f1.txt").write_bytes(b"content 1\nline2\nline3\n")
     run_git(repo, "add", "f1.txt")
     run_git(repo, "commit", "-q", "-m", "three lines")
-    # 两处独立修改
     (repo / "f1.txt").write_bytes(b"content 1 CHANGED\nline2\nline3 CHANGED\n")
     doc = diff_document(runner, identity)
     hunks = doc.hunks
     if len(hunks) < 2:
-        # 若 git 合并为一个 hunk，则退化为整 hunk 暂存断言
         assert len(hunks) == 1
     patch_text = git_patch.build_stage_hunk_patch(
         doc.raw_text, [0], parse_unified_diff(doc.raw_text)
@@ -41,7 +36,6 @@ def test_stage_hunk_via_patch(env):
 
 def test_patch_check_rejects_stale_context(env):
     identity, repo, runner = env
-    # 构造一个上下文与当前文件不匹配的 patch
     stale_patch = (
         "diff --git a/f1.txt b/f1.txt\n"
         "--- a/f1.txt\n"
@@ -57,7 +51,6 @@ def test_patch_check_rejects_stale_context(env):
 
 def test_check_patch_applies_dry_run(env):
     identity, repo, runner = env
-    # 生成 patch 后把工作区还原，patch 处于"未应用"状态才可预检
     (repo / "f1.txt").write_bytes(b"content 1 CHANGED\n")
     doc = diff_document(runner, identity)
     good = doc.raw_text
@@ -72,7 +65,6 @@ def test_export_patch_roundtrip_between_repos(env, tmp_path):
     (repo / "f1.txt").write_bytes(b"exported change\n")
     patch_text = git_patch.export_patch(runner, identity)
     assert "f1.txt" in patch_text
-    # 应用到另一个相同历史的仓库
     repo2 = make_repo(tmp_path, name="repo2", commits=1)
     identity2 = resolve_repository(str(repo2), GitRunner())
     git_patch.apply_patch_text(runner, identity2, patch_text)

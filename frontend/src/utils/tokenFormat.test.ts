@@ -23,7 +23,6 @@ describe('formatTokenCount（精确数值，千分位分隔）', () => {
 describe('sessionHitRate / buildSessionTokenSummary（本会话口径）', () => {
   it('命中率分母只取已报告缓存明细的轮次（cache_prompt）', () => {
     expect(sessionHitRate({ cached: 740, cache_prompt: 1000 })).toBeCloseTo(74);
-    // 未报告轮次不进分母：prompt 更大也不稀释命中率
     expect(sessionHitRate({ cached: 740, cache_prompt: 1000 })).toBeLessThan(74.001);
   });
 

@@ -1,5 +1,3 @@
-"""固定内核的平台选择入口；不提供插件注册或跨平台降级。"""
-
 import sys
 
 from core.computer.platforms.base import ComputerPlatformAdapter, UnavailablePlatformAdapter

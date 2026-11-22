@@ -1,24 +1,3 @@
-"""星瑶桌面宠物（Electron 桌宠 xingyao_pet）的进程生命周期管理。
-
-为什么要单独成一个模块：
-- 桌宠是一个独立 Electron 进程，pywebview 只是它的"开关面板"。把 Popen、
-  探活、清理集中在这里，js_api 层只做参数透传，不必重复实现进程管理细节，
-  也保证任何异常都转成 {"ok": False, "msg": ...} 返回，而不会穿透到 pywebview
-  的 js_api 线程（那会让整个界面失去响应）。
-- 单实例：桌宠 main.js 里调了 app.requestSingleInstanceLock()，同一时刻只允许
-  一个实例，后来者会自己退出。所以既不能盲目重复拉起（第二个进程会"启动成功
-  但立刻退出"），拉起后立刻退出时也要把这条最可能的原因提示出来；模块级 _LOCK
-  保证设置页连点两次不会并发拉起两个进程。
-- 探活不引入 psutil：只用 tasklist（Windows 自带）按 PID 查进程名是否含
-  electron，避免为一个状态查询多一个依赖；tasklist 不可用时退化成"有 pid 记录
-  就当存活"，宁可多给一次 terminate，也不要因为查不到就崩。
-- 句柄 + pid 文件双轨：本进程拉起的实例直接用 Popen 句柄 poll/terminate；跨进程
-  （上次异常退出留下的实例）只能靠 ~/.ycode/pet.pid 的记录去 taskkill。
-- 除了"管理进程"，还留了一条单向写通道：push_bubble 往桌宠 stdin 写一行 UTF-8
-  JSON（{"text": 文案, "ms": 停留毫秒}），桌宠读到就冒一个气泡提示（如"正在读
-  文件…"）。方向与 stdout/stderr 相反（父写子读），所以 stdin 用 PIPE 是安全的。
-"""
-
 from __future__ import annotations
 
 import atexit
@@ -35,19 +14,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 本进程拉起的桌宠进程句柄。模块级单例：星瑶是单进程应用，桌宠只应有一个实例。
 _PROC: Optional[subprocess.Popen] = None
 
 # 关键段互斥（start/stop/get_status 全走这把锁；用 RLock 是因为 start/stop 内部
 # 还会再调一次 get_status 取最新状态）。
 _LOCK = threading.RLock()
 
-# 启动后等待窗口：Electron 冷启动（首次扫描 resources、加载 node_modules）通常
-# 0.4~0.8s 就稳定，1.2s 足够覆盖慢机器，又不至于让面板点击明显卡顿。
 _START_WAIT = 1.2
-# 优雅退出等待：Electron 收到关闭请求后还要落地 pet-state.json，4s 足够；超时才
-# taskkill /F /T 强杀整棵进程树（Electron 会派生 GPU/renderer 子进程，不带 /T
-# 会留下孤儿进程，继续占着单实例锁让下次启动失败）。
 _STOP_WAIT = 4.0
 
 # Windows 下不弹控制台窗口；非 Windows 该常量不存在，取 0。
@@ -56,9 +29,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _atexit_registered = False
 
 
-# ---------- 路径解析 ----------
 def _pet_dir_candidates():
-    """按优先级给出桌宠目录候选：环境变量 → 打包后位置 → 源码树。"""
     env_dir = (os.environ.get("YCODE_PET_DIR") or "").strip()
     if env_dir:
         yield Path(env_dir)
@@ -74,7 +45,6 @@ def _pet_dir_candidates():
 
 
 def _resolve_pet_dir() -> Path:
-    """返回第一个真实存在的候选目录；都不存在时返回优先级最高的那个（供报错展示）。"""
     first = None
     for cand in _pet_dir_candidates():
         if first is None:
@@ -104,12 +74,6 @@ def _pet_dir() -> Path:
 
 
 def pet_dir_path() -> Path:
-    """桌宠目录（等价于 _pet_dir()），供其它模块复用同一套路径解析规则。
-
-    core/pet_skins.py 也要按同样规则解析桌宠目录（内置星瑶的 assets / 配置都相对
-    它定位）。公开这个函数是为了不重复实现路径优先级（环境变量 → 打包位置 →
-    源码树）：两处各写一遍，改安装布局时必然有一处悄悄失效。
-    """
     return _pet_dir()
 
 
@@ -147,8 +111,6 @@ def _active_skin_safe() -> dict:
         return fallback
     if not isinstance(skin, dict):
         return fallback
-    # 字段缺失/为 None 时逐项回落；assets_dir、config_path 允许为空（含义是"用内置
-    # 那份"），由调用方决定不传，这里不擅自填成内置路径免得名字与形象错配。
     try:
         return {
             "id": str(skin.get("id") or fallback["id"]),
@@ -161,11 +123,6 @@ def _active_skin_safe() -> dict:
 
 
 def _config_value(key: str, default=None):
-    """读单个配置项（先看模块级属性，再回落 config.json 的载荷）。
-
-    config 模块的 __getattr__ 对未注册名字会抛 AttributeError，这里全部吞掉：
-    读不到配置只影响"用默认路径"，不该让桌宠开关整体失败。
-    """
     try:
         import config
     except Exception:
@@ -183,13 +140,6 @@ def _config_value(key: str, default=None):
 
 
 def _runtime_electron_candidates():
-    """用户级运行时目录下的 electron 候选（安装包分发的用户走的就是这一份）。
-
-    路径定义只认 core/pet_runtime.py 的 DIST_DIR：运行时"装到哪"和这里"去哪找"
-    必须是同一个常量，否则以后改安装根，这里会悄悄失效却没人发现。
-    导入失败（裁剪构建、循环导入等）时返回空列表：只是少一条候选、回落到 PATH，
-    绝不能让桌宠开关因为 import 问题整体报错。
-    """
     dist = None
     for mod_name in ("core.pet_runtime", "pet_runtime"):
         try:
@@ -205,19 +155,6 @@ def _runtime_electron_candidates():
 
 
 def _resolve_electron(explicit: str = "") -> Optional[Path]:
-    """找 Electron 可执行文件，按以下顺序逐级回落，返回第一个真实存在的文件：
-
-    1. 显式参数 electron_path（用户在设置页手填的绝对路径）；
-    2. 配置项 pet_electron_path（持久化的同一条路径）；
-    3. 桌宠包内自带：<桌宠目录>/node_modules/electron/dist/electron(.exe)
-       ——源码开发机 npm install 过就有这一份，优先用它是为了避免多下一遍；
-    4. 用户级运行时目录：~/.ycode/pet-runtime/electron/dist/electron(.exe)
-       ——安装包只带桌宠源码，用户点开关时由 core/pet_runtime.py 下载安装的那份
-       （路径取自 pet_runtime.DIST_DIR，不在这里另写一遍）；
-    5. 最后才回落到 PATH 里的 electron 命令（全局安装的情况）。
-
-    全都找不到时返回 None，由调用方给出"填路径 / 装 electron"的可操作指引。
-    """
     candidates = []
     for raw in (explicit, _config_value("pet_electron_path", "") or ""):
         raw = str(raw or "").strip().strip('"')
@@ -227,7 +164,6 @@ def _resolve_electron(explicit: str = "") -> Optional[Path]:
     dist = pet / "node_modules" / "electron" / "dist"
     candidates.append(dist / "electron.exe")
     candidates.append(dist / "electron")
-    # 包内没有（安装包场景）就回落到用户级自动下载目录，最后才是 PATH。
     candidates.extend(_runtime_electron_candidates())
     for cand in candidates:
         try:
@@ -239,7 +175,6 @@ def _resolve_electron(explicit: str = "") -> Optional[Path]:
     return Path(found) if found else None
 
 
-# ---------- pid 记录 ----------
 def _norm_path(value) -> str:
     """把路径归一化成可比较的形态（Windows 下大小写不敏感）。"""
     try:
@@ -300,7 +235,6 @@ def _write_pid_record(pid: int) -> None:
             json.dumps(payload, ensure_ascii=False), encoding="utf-8"
         )
     except Exception:
-        # pid 记录只是"跨进程探活"的辅助手段，写失败不该让启动整体失败。
         logger.debug("写桌宠 pid 记录失败: %s", path, exc_info=True)
 
 
@@ -315,11 +249,6 @@ def _clear_pid_record() -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """pid 是否指向一个存活的 electron 进程。
-
-    找不到 tasklist（非 Windows / 精简系统）时只能按 pid 假设存活：false negative
-    会让 stop 放弃清理，false positive 最多多打一次 taskkill，后者代价更小。
-    """
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -342,12 +271,10 @@ def _pid_alive(pid: int) -> bool:
         return True
     out = (res.stdout or "").lower()
     if not out.strip():
-        # 无输出说明 PID 不存在（tasklist 对不存在的 PID 只会把提示打到 stderr）。
         return False
     return "electron" in out
 
 
-# ---------- 对外接口 ----------
 def get_status() -> dict:
     """查询桌宠状态。只读：不启动进程，最多跑一次 tasklist 校验 pid。"""
     with _LOCK:
@@ -383,7 +310,6 @@ def get_status() -> dict:
             "electron_path": str(electron) if electron is not None else None,
             "pet_dir": str(pet),
             "available": available,
-            # 当前激活的桌宠形象：前端设置页可直接显示，不必自己再调 pet_skins。
             "skin_id": str(skin.get("id") or "xingyao"),
             "skin_name": str(skin.get("name") or "星瑶"),
         }
@@ -405,7 +331,6 @@ def get_status() -> dict:
 
 
 def _safe_status() -> dict:
-    """异常路径也要能带上 status：连状态都查不出来时给个最小骨架。"""
     try:
         return get_status()
     except Exception:
@@ -464,8 +389,6 @@ def _start_locked(electron_path: str) -> dict:
 
     global _PROC
     env = os.environ.copy()
-    # 关键：ELECTRON_RUN_AS_NODE 会让 electron.exe 退化成一个 node 解释器去执行
-    # 文件名参数，窗口永远不会出现，且进程能一直活着骗过探活。
     env.pop("ELECTRON_RUN_AS_NODE", None)
     # 当前皮肤通过环境变量传给渲染层：桌宠那边只认环境变量，路径解析（环境变量 →
     # 打包位置 → 源码树）全部留在 Python 侧，避免 Electron 里再写一套目录优先级。
@@ -474,7 +397,6 @@ def _start_locked(electron_path: str) -> dict:
     env["YCODE_PET_NAME"] = str(skin.get("name") or "星瑶")
     assets_dir = str(skin.get("assets_dir") or "")
     if assets_dir:
-        # 空串不传：Electron 收到空值不会自己回落，不设置该键才是"用内置那份"。
         env["YCODE_PET_ASSETS"] = assets_dir
     config_path = str(skin.get("config_path") or "")
     if config_path:
@@ -484,10 +406,6 @@ def _start_locked(electron_path: str) -> dict:
         [str(electron), str(pet)],
         cwd=str(pet),
         env=env,
-        # stdout/stderr 用 DEVNULL 而不是 PIPE：这两路是「子进程写、父进程读」，
-        # 没人读的管道写满后会把子进程阻塞死。stdin 方向正好相反（父进程写、
-        # 子进程读），且是 push_bubble 推气泡的唯一通道；父进程每次只写一行几十
-        # 字节并立刻 flush，不存在「写满阻塞子进程」的风险，所以 stdin 用 PIPE。
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -506,7 +424,6 @@ def _start_locked(electron_path: str) -> dict:
             "status": _safe_status(),
         }
 
-    # 启动即退出：最常见是单实例锁（已有实例在跑）或运行时资源缺失。
     _PROC = None
     _clear_pid_record()
     logger.warning("桌宠启动后立即退出 returncode=%s", returncode)
@@ -540,8 +457,6 @@ def _taskkill(pid: int, force: bool = False, tree: bool = False) -> bool:
 
 
 def _wait_exit(proc: Optional[subprocess.Popen], pid: int, timeout: float) -> bool:
-    """等到进程真正消失（或超时）。句柄退出不够：Electron 的 pid 可能还被
-    子进程继承着，统一用 tasklist 复核一次。"""
     deadline = time.time() + max(0.0, timeout)
     while time.time() < deadline:
         exited = True
@@ -585,7 +500,6 @@ def _stop_locked() -> dict:
         _clear_pid_record()
         return {"ok": True, "msg": "桌宠未在运行", "status": _safe_status()}
 
-    # 1) 先礼：有句柄就 terminate，只有 pid 就走 taskkill / SIGTERM。
     if proc is not None and pid == getattr(proc, "pid", None):
         try:
             proc.terminate()
@@ -600,7 +514,6 @@ def _stop_locked() -> dict:
             logger.debug("SIGTERM 桌宠失败 pid=%s", pid, exc_info=True)
 
     if not _wait_exit(proc, pid, _STOP_WAIT):
-        # 2) 后兵：强杀整棵进程树，避免 GPU/renderer 子进程残留占着单实例锁。
         logger.warning("桌宠 %s 未在 %.1fs 内退出，强制结束", pid, _STOP_WAIT)
         if os.name == "nt":
             _taskkill(pid, force=True, tree=True)
@@ -628,7 +541,6 @@ def _stop_locked() -> dict:
     return {"ok": True, "msg": f"桌宠已停止（pid {pid}）", "status": _safe_status()}
 
 
-# 气泡参数边界：文案太长会把气泡撑出屏幕，停留时间太短看不清、太长挡住界面。
 _BUBBLE_MAX_CHARS = 80
 _BUBBLE_DEFAULT_MS = 2600
 _BUBBLE_MIN_MS = 800
@@ -636,11 +548,6 @@ _BUBBLE_MAX_MS = 15000
 
 
 def _drop_dead_proc_locked() -> None:
-    """丢掉已死的进程句柄，避免后续 get_status 继续把它当"运行中"。
-
-    调用方须持有 _LOCK。只清理 pid 记录与这个死句柄 pid 相同的情况：若记录已被
-    别的实例覆盖，说明那是用户手动开的桌宠，不能顺手删掉。
-    """
     global _PROC
     proc = _PROC
     _PROC = None
@@ -662,7 +569,6 @@ def _drop_dead_proc_locked() -> None:
 
 def _write_pet_stdin(payload_obj: dict, *, check_external_pid: bool = True) -> dict:
     """向本进程拉起的桌宠 stdin 写入一条 JSON 指令，绝不外抛。"""
-    # 1) 先看本进程有没有活句柄。锁内只做 poll，不跑 tasklist 这类等待型操作。
     with _LOCK:
         proc = _PROC
         alive = False
@@ -675,7 +581,6 @@ def _write_pet_stdin(payload_obj: dict, *, check_external_pid: bool = True) -> d
                 _drop_dead_proc_locked()
     if not alive:
         if check_external_pid:
-            # 锁外探活（tasklist 最慢要几百毫秒），别让它拖住 start/stop。
             record = _read_pid_record()
             if record and _pid_alive(record["pid"]):
                 return {"ok": False, "msg": "桌宠不是本进程拉起的，无法推送提示"}
@@ -711,17 +616,6 @@ def push_bubble(
     emote: str = "",
     sticky: bool = False,
 ) -> dict:
-    """往桌宠推一条气泡提示（"任务完成啦…"这类状态提示）。
-
-    通道：往桌宠 stdin 写一行 UTF-8 JSON {"text": ..., "ms": ...} + "\\n"
-    （可选附带 kind/emote/sticky 供桌宠做样式强调与动作反应）。桌宠侧把 fd 0
-    当作一行一帧的 JSON 流来读（Electron 的 process.stdin 在 Windows 上会立刻
-    EOF，所以那边直接用 net.Socket 接管 fd 0），写完即返回，不等它回包。
-
-    只对"本进程拉起的实例"有效：跨进程遗留的实例拿不到 stdin 句柄，只能报错提示。
-    任何异常都转成 {"ok": False, "msg": ...}，绝不外抛（调用方可能正在 js_api 线程）。
-    """
-    # 内容规整：空串直接拒；超长截断（气泡宽度有限）；停留时间钳进合理区间。
     try:
         body = str(text if text is not None else "").strip()
     except Exception:
@@ -771,7 +665,6 @@ def ensure_started_if_enabled() -> dict:
     enabled = False
     if config is not None:
         try:
-            # config 模块 __getattr__ 对未注册名字会抛 AttributeError，getattr 带默认值兜住。
             enabled = bool(getattr(config, "pet_enabled", False))
         except Exception:
             enabled = False
@@ -787,11 +680,6 @@ def ensure_started_if_enabled() -> dict:
 
 
 def shutdown() -> None:
-    """星瑶退出时的清理入口：只停本进程拉起的桌宠。
-
-    不动 pid 记录里属于"别人"的实例（用户可能手动开着桌宠），避免退出星瑶
-    时把用户的桌宠一起带走。
-    """
     global _PROC
     try:
         if _PROC is None:

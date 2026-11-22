@@ -1,15 +1,7 @@
-"""AI 生成内容目录设置项：系统设置快照字段与 GUI 桥接行为。
-
-对应实施计划 Task 4（docs/superpowers/plans/2026-09-20-ai-output-dir.md）。
-测试全程 monkeypatch `core.ai_output_paths` 的读写探测函数，
-绝不触碰真实 ~/.ycode/config.json。
-"""
-
 from core import ai_output_paths as aop
 
 
 def _stub_snapshot():
-    """替身快照：只需证明桥接把 settings 原样回传，不依赖真实配置。"""
     return {
         "ai_output_dir": "X:/ai_out",
         "ai_output_dir_setting": "X:/ai_out",
@@ -18,7 +10,6 @@ def _stub_snapshot():
 
 
 def test_system_settings_snapshot_contains_ai_output_fields(tmp_path, monkeypatch):
-    """快照必须同时给出生效值、原始配置值与默认值三个字段。"""
     from core.command_shell import get_system_settings
 
     target = tmp_path / "ai_out"
@@ -30,7 +21,6 @@ def test_system_settings_snapshot_contains_ai_output_fields(tmp_path, monkeypatc
 
 
 def test_system_settings_default_respects_data_dir(tmp_path, monkeypatch):
-    """默认目录走 config.YCODE_DIR，必须跟随 YCODE_DATA_DIR 覆盖。"""
     import config
     from core.command_shell import get_system_settings
 
@@ -42,7 +32,6 @@ def test_system_settings_default_respects_data_dir(tmp_path, monkeypatch):
 
 
 def test_set_ai_output_dir_rejects_unwritable(tmp_path, monkeypatch):
-    """不可写目录必须显式拒绝（ok is False）且不写盘，不做静默降级。"""
     from gui_bridge import ApiBridge
 
     blocked = tmp_path / "blocked"
@@ -61,7 +50,6 @@ def test_set_ai_output_dir_rejects_unwritable(tmp_path, monkeypatch):
 
 
 def test_set_ai_output_dir_success_returns_effective_dir(tmp_path, monkeypatch):
-    """可写目录：写盘成功，返回 ok=True 与新快照。"""
     from gui_bridge import ApiBridge
 
     saved = {}

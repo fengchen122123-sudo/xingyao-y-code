@@ -44,7 +44,6 @@ it('automation_tasks_changed 事件幂等替换任务列表', () => {
   expect(store.automationTasks).toHaveLength(1);
   expect(store.automationTasks[0].name).toBe('每日摘要');
 
-  // 后端全量快照覆盖本地（不增量合并）
   store.handleBridgeEvent({ type: 'automation_tasks_changed', data: { tasks: [] } } as any);
   expect(store.automationTasks).toHaveLength(0);
 });
@@ -56,12 +55,10 @@ it('automation_run_updated 插入历史头部、按 id 幂等替换并封顶 50 
   store.handleBridgeEvent({ type: 'automation_run_updated', data: { run: _run('r2', 'running') } } as any);
   expect(store.automationRuns['task-1'].map(r => r.id)).toEqual(['r2', 'r1']);
 
-  // 同 id 状态更新：原位替换，不重复插入
   store.handleBridgeEvent({ type: 'automation_run_updated', data: { run: _run('r1', 'completed') } } as any);
   expect(store.automationRuns['task-1'].map(r => r.id)).toEqual(['r2', 'r1']);
   expect(store.automationRuns['task-1'].find(r => r.id === 'r1')?.status).toBe('completed');
 
-  // 上限 50 条
   for (let i = 0; i < 55; i++) {
     store.handleBridgeEvent({
       type: 'automation_run_updated',

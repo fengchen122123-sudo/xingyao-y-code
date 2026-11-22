@@ -358,13 +358,11 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
     const absolutePaths = images.map(p => path.isAbsolute(p) ? p : path.resolve(process.cwd(), p));
     console.log(`[wechat-browser] Images: ${absolutePaths.join(', ')}`);
 
-    // --- PRIMARY approach: intercept file chooser dialog ---
     let uploadSuccess = false;
     try {
       console.log('[wechat-browser] [primary] Enabling file chooser interception...');
       await cdp.send('Page.setInterceptFileChooserDialog', { enabled: true }, { sessionId });
 
-      // Set up listener for file chooser opened event BEFORE clicking
       const fileChooserPromise = new Promise<{ backendNodeId: number; mode: string }>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error('File chooser dialog not opened within 10s')), 10_000);
         cdp!.on('Page.fileChooserOpened', (params: unknown) => {
@@ -375,7 +373,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
         });
       });
 
-      // Trigger file chooser by calling .click() on the file input with userGesture
       const fileInputSelectors = [
         '.js_upload_btn_container input[type=file]',
         'input[type=file][multiple][accept*="image"]',
@@ -413,7 +410,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
         throw new Error(`File input not found: ${clickStatus.error}`);
       }
 
-      // Wait for the file chooser event
       console.log('[wechat-browser] [primary] Waiting for file chooser dialog...');
       const chooser = await fileChooserPromise;
 
@@ -426,11 +422,9 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
       uploadSuccess = true;
     } catch (primaryErr) {
       console.log(`[wechat-browser] [primary] File chooser approach failed: ${primaryErr instanceof Error ? primaryErr.message : String(primaryErr)}`);
-      // Disable interception before falling back
       try { await cdp.send('Page.setInterceptFileChooserDialog', { enabled: false }, { sessionId }); } catch {}
     }
 
-    // --- FALLBACK approach: direct DOM.setFileInputFiles on nodeId ---
     if (!uploadSuccess) {
       console.log('[wechat-browser] [fallback] Trying direct DOM.setFileInputFiles...');
       const { root } = await cdp.send<{ root: { nodeId: number } }>('DOM.getDocument', {}, { sessionId });
@@ -458,7 +452,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
       await cdp.send('DOM.setFileInputFiles', { nodeId, files: absolutePaths }, { sessionId });
       console.log('[wechat-browser] [fallback] Files set via nodeId');
 
-      // Dispatch change event
       await cdp.send('Runtime.evaluate', {
         expression: `
           (function() {
@@ -479,7 +472,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
       console.log('[wechat-browser] [fallback] Change event dispatched');
     }
 
-    // Wait for images to upload
     console.log('[wechat-browser] Waiting for images to upload...');
     const targetCount = absolutePaths.length;
     for (let i = 0; i < 30; i++) {
@@ -513,7 +505,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
     await sleep(500);
 
     console.log('[wechat-browser] Filling content...');
-    // Try ProseMirror editor first (new WeChat UI), then fallback to old editor
     const contentResult = await cdp.send<{ result: { value: string } }>('Runtime.evaluate', {
       expression: `
         (function() {
@@ -546,7 +537,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
       throw new Error('Content editor not found');
     }
 
-    // Fallback: old editor uses keyboard simulation
     if (contentStatus.startsWith('{')) {
       const editorClickPos = JSON.parse(contentStatus);
       if (editorClickPos.type === 'old') {
@@ -629,7 +619,6 @@ export async function postToWeChat(options: WeChatBrowserOptions): Promise<void>
       console.log(`[wechat-browser] Submit result: ${submitResult.result.value}`);
       await sleep(3000);
 
-      // Verify save success by checking for toast
       const toastCheck = await cdp.send<{ result: { value: string } }>('Runtime.evaluate', {
         expression: `
           const toasts = document.querySelectorAll('.weui-desktop-toast, [class*=toast]');

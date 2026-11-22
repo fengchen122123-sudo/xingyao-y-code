@@ -56,12 +56,9 @@
   --mono: var(--theme-font-mono);
   --sans: var(--theme-font-sans);
 
-  /* 搜索命中词高亮标记（mark）语义配色（深色默认） */
   --search-mark-bg: rgba(245, 158, 11, 0.28);
   --search-mark-text: #fde047;
 
-  /* 星瑶Code 极简设计稿 v2（方案A）语义变量：自定义主题默认回落到 --theme-*，
-     内置浅/深色在下方按 data-gui-theme-id 精确赋值为设计稿色板。 */
   --xy-bg: var(--theme-background-app);
   --xy-sidebar: var(--theme-background-panel);
   --xy-canvas: var(--theme-background-panel);
@@ -120,7 +117,6 @@ html[data-chat-width="full"] #center > * {
   --empty-col-width: clamp(660px, 72cqw, 1120px);
 }
 
-/* 内置深色 / 未指定主题：精确对齐 xingyao-clean-ui.html data-xy-theme="dark" */
 :root:not([data-gui-theme-id]):not(.light),
 html[data-gui-theme-id="builtin.dark"] {
   --xy-bg: #141416;
@@ -168,7 +164,6 @@ html[data-gui-theme-id="builtin.dark"] {
   --mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
 }
 
-/* 内置浅色：精确对齐 xingyao-clean-ui.html data-xy-theme="light" */
 :root.light:not([data-gui-theme-id]),
 html[data-gui-theme-id="builtin.light"] {
   --xy-bg: #f4f4f1;
@@ -216,7 +211,6 @@ html[data-gui-theme-id="builtin.light"] {
   --mono: "JetBrains Mono", "Cascadia Code", "Consolas", ui-monospace, SFMono-Regular, monospace;
 }
 
-/* 内置浅/深色分区映射：顶栏与左侧栏融入外框底色，右侧工作面板为通透画布底色 */
 html[data-gui-theme-id="builtin.light"] [data-theme-region="app_header"],
 html[data-gui-theme-id="builtin.dark"] [data-theme-region="app_header"] {
   --theme-region-bg: var(--xy-bg);
@@ -281,11 +275,6 @@ html {
   background: var(--xy-bg, var(--theme-background-app));
 }
 
-/* ---------- GUI 主题分区接线 ----------
-   运行时在 documentElement 上写入 --theme-<region>-* 变量（region 下划线转连字符，
-   如 app_header → --theme-app-header-*）。每个分区先把自身变量别名到统一的
-   --theme-region-*，未加载主题时回落到全局语义 token。禁止按主题生成动态
-   class 或注入 style 字符串，全部通过 CSS 变量驱动。 */
 [data-theme-region="app_header"] {
   --theme-region-bg: var(--theme-app-header-bg, var(--theme-background-panel));
   --theme-region-text: var(--theme-app-header-text, var(--theme-text-primary));
@@ -379,23 +368,15 @@ html {
   position: relative;
   isolation: isolate;
   color: var(--theme-region-text);
-  /* 分区内旧别名改指向分区值：文字、边框、强调色随分区生效 */
   --text: var(--theme-region-text);
   --text-bright: var(--theme-region-text);
   --border: var(--theme-region-border);
   --accent: var(--theme-region-accent);
-  /* 表面色（气泡/卡片/输入框底色）：默认取卡片语义色，opacity=1 时实色不透图，
-     调低分区背景透明度时表面随之半透明，让分区背景图透进气泡区域 */
   --theme-region-surface: color-mix(in srgb, var(--theme-background-card) var(--theme-region-bg-opacity-pct), transparent);
   --theme-region-surface-panel: color-mix(in srgb, var(--theme-background-panel) var(--theme-region-bg-opacity-pct), transparent);
   --theme-region-surface-code: color-mix(in srgb, var(--theme-code-background) var(--theme-region-bg-opacity-pct), transparent);
 }
 
-/* 分区前景表面接管：气泡/输入框/权限卡的实色背景改随分区背景透明度。
-   代码块（--code-bg）、按钮等小元素保持实色以保证可读；主遮挡面才透图。
-   特异性说明：目标是 scoped 组件样式（.bubble[data-v-hash] = 0,3,0，且组件
-   CSS 在 style.css 之后加载）。此处用 [data-theme-region] + 类 + [class] 叠加到
-   (0,4,0)，确保覆盖 scoped 的 var(--bg2)/var(--bg1)。 */
 [data-theme-region="workspace"] .msg-user .bubble[class],
 [data-theme-region="workspace"] .perm-card[class] {
   background: var(--theme-region-surface-panel) !important;
@@ -403,17 +384,12 @@ html {
 [data-theme-region="composer"] #input-box[id] {
   background: var(--theme-region-surface) !important;
 }
-/* MD 代码块与"文件更改"面板同样随分区背景透明度透图：全局背景图模式下
-   不再以实色块突兀遮挡，代码块用 code 语义色参与透明混合 */
 [data-theme-region="workspace"] .md-body pre {
   background: var(--theme-region-surface-code) !important;
 }
 [data-theme-region="workspace"] .cfp[class] {
   background: var(--theme-region-surface-panel) !important;
 }
-/* 对话内提示卡 / 错误卡（权限调整、切模型、运行错误等）同样随分区背景
-   透明度透图：保留语义色混合（accent/red 7%）与左边框提示，仅把其中的实色
-   基底换成随分区透明度混合的 surface，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .notice-card[class] {
   background: var(--theme-region-surface-panel) !important;
 }
@@ -428,12 +404,10 @@ html {
   inset: 0;
   pointer-events: none;
 }
-/* 背景色层（最底）：按 bg-opacity 决定透明度，1 时实色不透全局图 */
 [data-theme-region]::after {
   z-index: -2;
   background: color-mix(in srgb, var(--theme-region-bg) var(--theme-region-bg-opacity-pct), transparent);
 }
-/* 背景图层（在背景色之上、内容之下）：图片透明度独立于背景色 */
 [data-theme-region]::before {
   z-index: -1;
   background-image: var(--theme-region-image);
@@ -443,14 +417,7 @@ html {
   opacity: var(--theme-region-image-opacity);
 }
 
-/* 滚动容器特判：overflow-y:auto 的分区（workspace），负 z-index 伪元素会被
-   滚动内容盖住（Chromium 对滚动容器层叠的标准行为，诊断已证实 ::before 画了
-   图但被压在滚动内容下）。改用元素自身 background 承载背景图，永远在内容之下。 */
 [data-theme-region="workspace"] {
-  /* 元素自身多重背景（上层在前）：
-     1) 图片遮罩层——用背景色按 (1-image_opacity) 罩淡图片，模拟独立图片透明度
-     2) 背景图层
-     background-color 承载按 bg-opacity 混合的分区背景色（最底）。 */
   background-image:
     linear-gradient(
       color-mix(in srgb, var(--theme-region-bg) var(--theme-workspace-image-mask-pct, 0%), transparent),
@@ -468,11 +435,6 @@ html {
   content: none;
 }
 
-/* 分区 isolation 会让分区内的下拉/浮层困在分区层级，被 DOM 靠后的
-   兄弟分区盖住。带弹出浮层的分区按需提升 z-index：
-   会话工具栏（导出菜单，向下弹）> 输入区（补全面板向上弹，须盖过工作区
-   底部；模型/权限下拉向下弹）> 工作区（空状态建议面板）> 其余分区；
-   全部低于全屏 Subpage(50) 与模态层（1000+）。 */
 [data-theme-region="conversation_toolbar"] {
   z-index: 10;
 }
@@ -484,8 +446,6 @@ html {
 }
 
 body {
-  /* 不设实色背景：全局背景图（body::before）在最底层透出；
-     无图时由 --theme-background-app 语义色经 html/body 默认背景供应 */
   color: var(--text);
   font-family: var(--sans);
   font-size: 14.5px;
@@ -493,12 +453,8 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  /* 建立层叠上下文：body::before 的 z-index:-1 默认会穿透到 html 画布背景
-     （不透明实色）之下导致全局图被盖住。position:relative 把伪元素层叠限制在
-     body 内部，使全局图保持在 html 背景之上、各分区之下。 */
   position: relative;
   isolation: isolate;
-  /* 不强制 antialiased：细体渲染会让小字发虚，用系统默认次像素渲染字形更饱满 */
 }
 
 /* Win10 frameless 窗口：系统无 API 隐藏 THICKFRAME 外框（core/frameless.py 只能
@@ -508,8 +464,6 @@ body {
   box-shadow: inset 0 0 0 1px var(--border);
 }
 
-/* 全局背景图：最底层，垫在所有分区之下。fixed 视口定位、负 z-index、
-   pointer-events 关闭，分区有自己的背景图时盖在它上面，无图分区透出它。 */
 body::before {
   content: '';
   position: fixed;
@@ -523,14 +477,6 @@ body::before {
   opacity: var(--theme-app-image-opacity, 1);
 }
 
-/* ── 全屏玻璃层：夹在「全局背景图」与「界面内容」之间 ────────────────────
-   背景图是 body::before（z-index:-1）；这里用 body::after 同层级、树序在后，
-   于是玻璃层恰好盖在壁纸之上、又被所有内容（z-index auto/0）盖住 ——
-   观感就是"壁纸之上糊了一层磨砂玻璃"，各半透明分区再叠上来。
-   透明度与模糊强度由 设置 → 外观与主题 → 玻璃效果 调整，
-   通过 --app-glass-opacity / --app-glass-blur 两个变量驱动（默认 0 = 完全不生效）。
-   注：本项目 body::after 此前未被占用（背景图在 body::before），故沿用原生伪元素，
-   与源实现保持同一层叠口径。 */
 body::after {
   content: '';
   position: fixed;
@@ -573,7 +519,6 @@ button {
   font-family: var(--mono);
 }
 
-/* 顶栏按钮与 Pill */
 .pill {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -623,7 +568,6 @@ button {
   color: var(--text);
 }
 
-/* Kimi 风格卡片（对齐极简设计稿 v2 新会话页） */
 .kimi-empty-container {
   display: flex;
   flex-direction: column;
@@ -668,7 +612,6 @@ button {
 }
 
 .kimi-card {
-  /* 补全面板 .suggest-panel 以此为绝对定位锚点（缺失会漂到窗口顶部） */
   position: relative;
   width: 100%;
   max-width: var(--empty-col-width, 660px);
@@ -736,13 +679,11 @@ button {
   gap: 6px;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
-  /* CJK 文本逐字换行会把按钮撑成多行竖条，文字一律单行 */
   white-space: nowrap;
   flex-shrink: 0;
   height: 28px;
 }
 
-/* 首页模型按钮：档位间隙里唯一可收缩的按钮，空间不足省略号截断 */
 .kimi-card-bar .model-chip {
   max-width: 170px;
   min-width: 0;
@@ -834,7 +775,6 @@ button {
 
 .kimi-footer-workdir {
   margin-top: 16px;
-  /* 中间列被两侧面板挤窄时不超过容器宽度，超长文案走省略号（不折行、不撑宽） */
   max-width: 100%;
   box-sizing: border-box;
   display: inline-flex;
@@ -897,7 +837,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   background: var(--xy-surface, var(--bg2));
 }
 
-/* 动效 */
 @keyframes fadein {
   from {
     opacity: 0;
@@ -909,7 +848,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   }
 }
 
-/* 高清精细 Markdown 样式 */
 .md-body {
   font-size: 13.5px;
   line-height: 1.68;
@@ -953,8 +891,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   color: var(--text);
 }
 
-/* 行内代码随分区背景透明度透图：实色基底换成半透明混合，
-   文字保持实色保证可读性，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .md-body code {
   background: color-mix(in srgb, var(--bg3) 70%, transparent) !important;
 }
@@ -974,7 +910,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   padding: 0;
   color: var(--text);
 }
-/* 代码块复制按钮：容器定位 + 悬停浮现 */
 .md-body .code-block {
   position: relative;
   margin: 10px 0;
@@ -1036,8 +971,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   background: var(--bg2);
 }
 
-/* 表格随分区背景透明度透图：表头/斑马纹用 surface 半透明混合（不透明度
-   跟随主题设置），文字保持实色保证可读性，全局背景图模式下不再以实色块遮挡 */
 [data-theme-region="workspace"] .md-body th {
   background: color-mix(in srgb, var(--bg3) 65%, transparent) !important;
 }
@@ -1060,10 +993,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   }
 }
 
-/* 浅色主题：参考 ZCode 暖白——近白不刺眼、纯白卡片、边框极柔和。
-   默认值挂在 :root.light（html 元素）上：运行时把 light 类同步到 html，
-   主题变量以 inline 形式写入 documentElement 时可覆盖这里的默认值；
-   若仍挂在 body.light 上，body 自身声明会盖过从 html 继承的主题变量。 */
 :root.light {
   --theme-background-app: #f4f4f1;
   --theme-background-panel: #ffffff;
@@ -1089,7 +1018,6 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   --xy-shadow-pop: 0 12px 32px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
   --xy-modal-mask: rgba(15, 23, 42, 0.24);
 
-  /* 浅色主题下的搜索关键词高亮标记：高对比深琥珀字色与柔和黄色底色 */
   --search-mark-bg: #fef08a;
   --search-mark-text: #854d0e;
 }
@@ -1097,7 +1025,6 @@ body.light .tool-head .tname {
   color: var(--text);
 }
 
-/* ---------- highlight.js 语法高亮配色（默认深色，body.light 浅色） ---------- */
 .fp-pre .hljs {
   background: transparent;
   color: #c9d1d9;
@@ -1167,18 +1094,10 @@ body.light .fp-pre .hljs-selector-id { color: #8250df; }
 body.light .fp-pre .hljs-addition { color: #116329; }
 body.light .fp-pre .hljs-deletion { color: #82071e; }
 
-/* ============================================================================
-   移动端响应式布局（<=768px）
-   手机端通过 mobile-shim.js 加载同一套 dist 前端，此处只做布局/尺寸适配，
-   不改任何主题 CSS 变量（--accent/--border/--bg* 等），主题与桌面一致。
-   ========================================================================== */
 @media (max-width: 768px) {
-  /* 侧栏：改为 fixed 覆盖层，不占横向空间；默认收起（初始态由 appStore 按
-     视口判定），展开时从左侧滑入，收起滑出。选择器加 #main 前缀以覆盖
-     Sidebar.vue scoped 样式（scoped 为 #sidebar[data-v-hash]，特异性更高）。 */
   #main > #sidebar {
     position: fixed;
-    top: 42px; /* 顶栏高度 */
+    top: 42px;
     bottom: 0;
     left: 0;
     width: min(300px, 86vw);
@@ -1198,7 +1117,6 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     box-shadow: none;
   }
 
-  /* 隐藏桌面专属控件：自绘窗口控制、标题栏拖拽区、软件更新按钮、右面板切换 */
   #topbar .window-controls,
   #topbar .titlebar-drag,
   #topbar .update-topbar-btn,
@@ -1206,13 +1124,10 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     display: none;
   }
 
-  /* 右面板：手机上默认隐藏（无切换入口，内容经全屏 Subpage 可达） */
   #main #rightbar {
     display: none;
   }
 
-  /* 手机端底栏对齐桌面方案A的极简风格：正常态隐藏与顶栏/输入栏重复的
-     连接/模型/工作区/沙盒/权限等项，只留断开警告（断连时）、AI 轻提示与运行状态 */
   #statusbar {
     box-sizing: border-box;
     height: calc(24px + env(safe-area-inset-bottom));
@@ -1259,14 +1174,12 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
   }
-  /* 触屏优化：表单控件字号 >=16px，防 iOS 聚焦时自动放大页面 */
   textarea,
   input,
   select {
     font-size: 16px !important;
   }
 
-  /* 手机端顶栏与输入栏按钮保持轻量统一高度 */
   .icon-btn {
     min-width: 34px;
     min-height: 34px;
@@ -1279,7 +1192,6 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     min-height: 28px;
   }
 
-  /* 对话区窄屏压缩左右留白，消息气泡不溢出 */
   #center #chat-scroll {
     padding: 16px 14px 10px;
   }
@@ -1287,7 +1199,6 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     max-width: 88%;
   }
 
-  /* 代码块窄屏横向滚动，不撑破页面 */
   .md-body {
     overflow-wrap: break-word;
     word-break: break-word;

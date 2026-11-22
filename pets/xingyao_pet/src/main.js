@@ -1,5 +1,3 @@
-// main.js — 桌宠主进程：窗口、托盘、持久化、门禁记录。
-// 平台差异一律调 platform.js，本文件零 process.platform 判断。
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, protocol, net, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
@@ -27,8 +25,6 @@ protocol.registerSchemesAsPrivileged([
   { scheme: "pet-asset", privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true } }
 ]);
 
-// ---------- 皮肤（宠物包） ----------
-// 五个环境变量由星瑶后端启动桌宠时注入；用户手动 node 启动调试时全都不存在，一律回落内置形象。
 const SKIN_ID = (process.env.YCODE_PET_SKIN || "").trim() || "xingyao";
 const SKIN_NAME = (process.env.YCODE_PET_NAME || "").trim() || "星瑶";
 const BUILTIN_ASSETS = path.join(__dirname, "..", "assets");
@@ -45,7 +41,7 @@ function readJsonFile(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch {
-    return null; // 不存在 / 不是合法 JSON：调用方一律按「没配」处理，不影响启动
+    return null;
   }
 }
 
@@ -56,17 +52,13 @@ function loadSkinConfig() {
   gateLog(`[gate] CONFIG builtin=${BUILTIN_CONFIG} baseKeys=${Object.keys(base).join(",")}`);
   if (!SKIN_CONFIG || path.resolve(SKIN_CONFIG) === path.resolve(BUILTIN_CONFIG)) return base;
   const skin = readJsonFile(SKIN_CONFIG);
-  if (!skin || typeof skin !== "object") return base; // 皮肤配置缺失或坏掉：整体回落内置
+  if (!skin || typeof skin !== "object") return base;
 
-  // language / version / anchor 这类标量直接把皮肤值盖上去
   const merged = { ...base, ...skin };
-  // canvas / motion / bubble / behaviors：逐键覆盖，皮肤只改它想改的那几个键
   for (const key of ["canvas", "motion", "bubble", "behaviors"]) {
     const v = skin[key];
     if (v && typeof v === "object") merged[key] = { ...(base[key] || {}), ...v };
   }
-  // animations：逐状态覆盖，同名状态整段替换（fps/loop/still/next 是成套的，逐键混会出半套配置），
-  // 内置有、皮肤没提的状态保留内置版本。
   if (skin.animations && typeof skin.animations === "object") {
     const anim = { ...(base.animations || {}) };
     for (const [st, spec] of Object.entries(skin.animations)) {
@@ -77,13 +69,6 @@ function loadSkinConfig() {
   return merged;
 }
 
-// ---------- 皮肤素材协议 ----------
-// 请求形如 pet-asset://skin/pet/idle/frame_000.png，host 决定查哪个素材根：
-//   skin    → 当前宠物包目录（严格只查这一处）
-//   builtin → 随包内置的星瑶素材
-// 为什么不在这里「先皮肤再内置」逐文件兜底：素材没画全的宠物包会把皮肤帧和内置帧
-// 混进同一个动作（待机第 1 帧自绘、第 2 帧突然变回星瑶）。回落必须由渲染层按
-// 「整个状态」判断，协议只负责把两个素材根分开，语义单一才不会串台。
 function registerPetAssetProtocol() {
   protocol.handle("pet-asset", async (request) => {
     let parsed = null;
@@ -92,10 +77,10 @@ function registerPetAssetProtocol() {
       parsed = new URL(request.url);
       rel = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
     } catch {
-      return new Response("", { status: 400 }); // 畸形 URL 直接拒，不往下拼路径
+      return new Response("", { status: 400 });
     }
     const root = parsed.host === "builtin" ? BUILTIN_ASSETS : parsed.host === "skin" ? SKIN_ASSETS : "";
-    if (!root) return new Response("", { status: 404 }); // 未知 host 直接拒，不暴露别的目录
+    if (!root) return new Response("", { status: 404 });
     const rootAbs = path.resolve(root);
     const fileAbs = path.resolve(path.join(root, rel));
     // 前缀校验必须带上分隔符，否则根目录的兄弟目录（如 /x/pet-evil）会被误判成子路径
@@ -108,8 +93,6 @@ function registerPetAssetProtocol() {
     try {
       const res = await net.fetch(pathToFileURL(fileAbs).toString());
       const headers = new Headers(res.headers);
-      // 渲染端帧图是 crossOrigin="anonymous" 加载的：缺 CORS 头图片会落进不透明源，
-      // canvas 读像素抛 SecurityError，点击命中检测与空白穿透会一起失效。
       headers.set("Access-Control-Allow-Origin", "*");
       return new Response(res.body, { status: res.status, headers });
     } catch {
@@ -118,7 +101,7 @@ function registerPetAssetProtocol() {
   });
 }
 
-const BASE_SIZE = 128; // 256@2x 显示为 128pt
+const BASE_SIZE = 128;
 // 气泡专用顶部带：窗口在角色正方形之上再加这段高度，气泡只画在这条带里，绝不压到头部。
 // 角色区仍是「窗口宽 × 窗口宽」的正方形且贴底，角色显示尺寸与旧版完全一致。
 const BUBBLE_BAND = 56;
@@ -140,7 +123,6 @@ function clampSize(v, fallback) {
   return Number.isFinite(v) ? Math.min(Math.max(Math.round(v), 64), 480) : fallback;
 }
 
-// ---------- 持久化 ----------
 function statePath() {
   return path.join(app.getPath("userData"), STATE_FILE);
 }
@@ -164,7 +146,6 @@ function saveState(patch) {
   }, 500);
 }
 
-// ---------- 门禁记录 ----------
 function gateLog(line) {
   try {
     fs.appendFileSync(path.join(app.getPath("userData"), GATE_LOG), line + "\n", "utf8");
@@ -172,13 +153,12 @@ function gateLog(line) {
   console.log(line);
 }
 
-// ---------- 尺寸（模块级：托盘菜单与 IPC 共用；原先定义在 registerIpc 内会 ReferenceError） ----------
 function resizePet(pt) {
   if (!win) return;
   const d = screen.getPrimaryDisplay();
   const s = clampSize(platform.windowSize(d, pt), BASE_SIZE);
   const b = win.getBounds();
-  const bottom = b.y + b.height;  // 底部锚定：换尺寸后角色脚底在屏幕上的位置不变
+  const bottom = b.y + b.height;
   lockedSize = { width: s, height: s + BUBBLE_BAND };
   win.setBounds({
     x: b.x, y: bottom - lockedSize.height,
@@ -187,7 +167,6 @@ function resizePet(pt) {
   saveState({ width: s });        // 只存正方形边长，避免把 s+BUBBLE_BAND 当边长读回
 }
 
-// ---------- G3 窗口自检（模块级，普通启动与回归自检共用） ----------
 function runG3Check() {
   if (!win) return;
   const b = win.getBounds();
@@ -208,11 +187,9 @@ function runG3Check() {
   gateLog(`[gate] G3 ${pass ? "PASS" : "FAIL"} ${JSON.stringify(checks)}`);
 }
 
-// ---------- 移窗尺寸锁回归自检（仅 PET_SELFTEST=1 触发） ----------
 function runMoveSelfTest() {
   if (!win) return;
-  // 只把透明度设为 0（不 hide）：窗口仍视为可见，G3 能拿到真实状态，同时不打扰桌面
-  try { win.setOpacity(0); } catch { /* 平台不支持时保持可见 */ }
+  try { win.setOpacity(0); } catch { }
   const before = win.getBounds();
   let n = 0, maxShift = 0;
   const t = setInterval(() => {
@@ -236,23 +213,18 @@ function runMoveSelfTest() {
   }, 2);
 }
 
-// ---------- 窗口 ----------
 function createWindow() {
   const display = screen.getPrimaryDisplay();
   const size = platform.windowSize(display, BASE_SIZE);
   const saved = loadState();
   const wa = display.workArea;
 
-  // 角色区保持正方形；窗口额外在顶部加 BUBBLE_BAND 给气泡，角色本身不缩小。
-  // 持久化里若有异常尺寸（旧版漂移遗留）在此钳回合理范围。
   const s0 = clampSize(saved.width, size);
   lockedSize = { width: s0, height: s0 + BUBBLE_BAND };
 
   // 计算初始位置；若保存位置不在任何显示器内（如显示器已断开），回退到主屏右下角
   const maxY = wa.y + wa.height - lockedSize.height - 8;
   let x = Number.isFinite(saved.x) ? saved.x : wa.x + wa.width - s0 - 40;
-  // 旧版存的是「正方形窗口」顶部 y；窗口加高后照旧复用会把角色脚底推到屏幕外，
-  // 因此按新高度把 y 钳回工作区（只钳一次，不会逐次累积上移）。
   let y = Number.isFinite(saved.y) ? Math.min(saved.y, maxY) : maxY - 12;
   const onAnyScreen = screen.getAllDisplays().some((d) => {
     const a = d.workArea;
@@ -307,7 +279,6 @@ function createWindow() {
   });
 }
 
-// ---------- 托盘 ----------
 function makeTrayIcon() {
   // 无图标资源时，用代码内嵌的橙色圆点作为托盘图标（避免 macOS 缺失图标崩溃）
   const { nativeImage } = require("electron");
@@ -394,20 +365,11 @@ function createTray() {
   tray.setContextMenu(menu);
 }
 
-// 右键宠物本体弹出的快捷菜单（由渲染端坐标触发）
-// 坐标必须是「窗口内容区」坐标（渲染端 clientX/clientY）：Windows 上 menu.popup 的 x/y
-// 相对窗口而不是屏幕，早先传的是 screenX/screenY，菜单就被推到了窗口外老远处。
-// 显式传 window：桌宠窗口 focusable=false，永远不是「当前焦点窗口」，不带 window 时
-// 定位基准会落到别的窗口上。
-// 把一次「互动」转给渲染层：菜单只是触发器，动画与台词都由渲染层按现有状态机执行，
-// 主进程不重复实现一套动画逻辑
 function sendEmote(kind) {
   if (!win || win.webContents.isDestroyed()) return;
   win.webContents.send("pet:emote", kind);
 }
 
-// 把窗口挪回主屏右下角：用户把宠物拖出屏幕或换显示器后，右键一下就能找回来。
-// 用 lockedSize 而不是读回窗口尺寸——读回再写会在 150% DPI 下把角色越拖越大
 function dockToBottomRight() {
   if (!win || !lockedSize.width) return;
   const wa = screen.getPrimaryDisplay().workArea;
@@ -431,7 +393,6 @@ function openPetsDir() {
 function showPetContextMenu(x, y) {
   if (!win) return;
   const menu = Menu.buildFromTemplate([
-    // 顶部用禁用项当标题，一眼能确认当前生效的是哪个宠物包
     { label: `${SKIN_NAME} · 桌宠`, enabled: false },
     { type: "separator" },
     { label: "摸摸头", click: () => sendEmote("greet") },
@@ -497,7 +458,6 @@ function showPetContextMenu(x, y) {
           }
         },
         {
-          // 动效是「关掉后完全静止」的硬开关：渲染层收到后锁死单帧
           label: "动效（关掉后完全静止）",
           type: "checkbox",
           checked: settings.animate,
@@ -520,7 +480,6 @@ function showPetContextMenu(x, y) {
   menu.popup({ window: win, x: px, y: py });
 }
 
-// ---------- IPC ----------
 function registerIpc() {
   ipcMain.on("renderer-ready", (_e, payload) => {
     gateReady = true;
@@ -548,7 +507,6 @@ function registerIpc() {
   });
   ipcMain.on("window:setSize", (_e, pt) => resizePet(pt));
   ipcMain.on("click-through:apply", (_e, on) => {
-    // on: 空白处穿透；鼠标悬停在宠物本体上时渲染端会恢复可点
     if (on) {
       win.setIgnoreMouseEvents(true, { forward: true });
     } else {
@@ -556,8 +514,6 @@ function registerIpc() {
     }
   });
   ipcMain.on("pet:contextmenu", (_e, x, y) => showPetContextMenu(x, y));
-  // 皮肤信息：渲染端不做任何推导，两个素材根 + 「内置与皮肤包合并后的 config」一次给全，
-  // 渲染层据此决定每个状态用皮肤帧，还是整组回落内置帧
   ipcMain.handle("pet:get-skin", () => ({
     id: SKIN_ID,
     name: SKIN_NAME,
@@ -568,7 +524,6 @@ function registerIpc() {
   ipcMain.handle("settings:get", () => settings);
   ipcMain.handle("app:onboarded", () => !!loadState().onboarded);
   ipcMain.on("app:onboarded", () => saveState({ onboarded: true }));
-  // G4 取证：截取宠物窗口存到 userData，返回路径（双平台通用，替代外部截图命令）
   ipcMain.handle("app:capture", async () => {
     if (!win) return null;
     try {
@@ -591,7 +546,7 @@ function setupStdinBridge() {
   function handleLine(line) {
     if (!line) return;
     let msg;
-    try { msg = JSON.parse(line); } catch { return; }   // 非法 JSON：忽略该行
+    try { msg = JSON.parse(line); } catch { return; }
     if (!msg || typeof msg !== "object") return;
     if (msg.clear === true) {
       const kinds = Array.isArray(msg.kinds)
@@ -604,11 +559,11 @@ function setupStdinBridge() {
       return;
     }
     if (typeof msg.text !== "string") return;
-    const text = msg.text.trim().slice(0, 80);          // 气泡宽度有限，过长截断
+    const text = msg.text.trim().slice(0, 80);
     if (!text) return;
     let ms = Number(msg.ms);
-    if (!Number.isFinite(ms)) ms = 2600;                 // 缺省显示时长
-    ms = Math.min(Math.max(Math.round(ms), 800), 15000); // 钳到合理区间
+    if (!Number.isFinite(ms)) ms = 2600;
+    ms = Math.min(Math.max(Math.round(ms), 800), 15000);
     const meta = {};
     if (typeof msg.kind === "string" && msg.kind.trim()) meta.kind = msg.kind.trim();
     if (typeof msg.emote === "string" && msg.emote.trim()) meta.emote = msg.emote.trim();
@@ -625,15 +580,14 @@ function setupStdinBridge() {
     while ((idx = buf.indexOf("\n")) >= 0) {
       const line = buf.slice(0, idx).trim();
       buf = buf.slice(idx + 1);
-      if (!line) continue;                                // 空行跳过
-      try { handleLine(line); } catch { /* 单行出错不影响后续 */ }
+      if (!line) continue;
+      try { handleLine(line); } catch { }
     }
   }
 
   function attach(stream) {
     stream.setEncoding("utf8");
     stream.on("data", onData);
-    // 父进程断开后 EOF/报错只记日志，桌宠继续独立运行
     stream.on("error", (e) => {
       gateLog(`[gate] STDIN-ERROR ${e && e.message ? e.message : e}`);
     });
@@ -641,15 +595,12 @@ function setupStdinBridge() {
   }
 
   try {
-    // Electron 主进程的 process.stdin 在 Windows 上一挂上就 EOF（Chromium 收掉了这个流），
-    // 但 fd 0 仍连着父进程的管道：用 net.Socket 包一层才能真正收到数据。
-    // 先试 fd 0，失败再退回 process.stdin（非 Electron 环境 / 有真实 TTY 时）。
     let attached = false;
     try {
       const net = require("net");
       attach(new net.Socket({ fd: 0, readable: true, writable: false }));
       attached = true;
-    } catch { /* 继续尝试 process.stdin */ }
+    } catch { }
     if (!attached) {
       if (!process.stdin) return;
       attach(process.stdin);
@@ -657,19 +608,16 @@ function setupStdinBridge() {
   } catch { /* 没有 stdin（用户从终端手动启动）时静默降级 */ }
 }
 
-// ---------- 应用生命周期 ----------
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
   app.whenReady().then(() => {
-    // 恢复上次的设置（置顶/穿透/安静），让 config.json 的 persist.settings 名副其实
     const savedSettings = loadState().settings;
     if (savedSettings && typeof savedSettings === "object") {
       settings = { ...settings, ...savedSettings };
     }
     gateLog(`[gate] app starting ${app.getVersion()}`);
-    // 一行说清当前用的皮肤与素材根，排查「为什么显示的还是旧形象」时先看这行
     gateLog(`[gate] SKIN id=${SKIN_ID} name=${SKIN_NAME} assets=${SKIN_ASSETS} config=${SKIN_CONFIG}`);
     registerPetAssetProtocol(); // 必须早于 createWindow（loadFile 之后渲染端就会请求素材）
     registerIpc();
@@ -680,6 +628,5 @@ if (!gotLock) {
   });
 
   app.on("window-all-closed", () => {
-    // 桌宠常驻：关窗不退出，从托盘退出
   });
 }

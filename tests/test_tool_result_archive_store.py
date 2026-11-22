@@ -1,17 +1,3 @@
-"""归档存储层回归：内容寻址句柄 / 压缩编码 / 容量与 TTL 淘汰。
-
-覆盖不变量：
-1. 小文本按 utf-8 明文落库，读回逐字节一致；
-2. 300KB 结果编码为 gzip+base64，读回逐字节一致；
-3. 9MB 结果按头尾各 4MB 截断归档，bytes 仍是真实原始长度；
-4. 同一段原文重复归档（两个会话）只存一行，两条 marker 句柄相同；
-5. 句柄真碰撞（同 handle、sha256 不同）时回退随机句柄；
-6. TTL 过期由 sweep_tool_result_archive 删除；
-7. 预算淘汰按 accessed_at 升序，最近访问过的记录受保护；
-8. 旧库（缺 sha256/stored_bytes/encoding/accessed_at 列）升级后旧记录仍可读；
-9. reducer 分支的句柄同样由原文内容派生，归档的也是原文。
-"""
-
 import base64
 import datetime
 import gzip
@@ -60,11 +46,6 @@ def _archive(
     created_at=None,
     accessed_at=None,
 ):
-    """走生产同一条落库路径写一条归档，返回句柄。
-
-    句柄用 content_handle（内容寻址），落库行用 build_archive_row 加工，
-    最后执行归档表唯一写入口的 INSERT 语句——与 maintain_tool_results 一致。
-    """
     created = created_at or _now_text()
     accessed = accessed_at or created
     with manager._lock:
@@ -73,14 +54,12 @@ def _archive(
         row = build_archive_row(
             (handle, session_id, msg_id, tool_name, len(text.encode("utf-8")), text, created)
         )
-        # accessed_at 由调用方指定（build_archive_row 默认与 created_at 对齐）
         cursor.execute(_TOOL_RESULT_ARCHIVE_INSERT_SQL, tuple(row[:10]) + (accessed,))
         manager.conn.commit()
     return handle
 
 
 def _stored_row(manager, handle):
-    """按句柄取原始落库行（dict），用于断言编码/容量等存储细节。"""
     with manager._lock:
         cursor = manager.conn.execute(
             "SELECT * FROM tool_result_archive WHERE handle = ?", (handle,)
@@ -97,12 +76,10 @@ def _archive_count(manager):
 
 
 def _big_text(tag, lines=300):
-    """300 行长文本：任何 snip 策略都一定会命中。"""
     return "\n".join(f"{tag}-line-{i} " + "x" * 40 for i in range(lines))
 
 
 def _fill_tool_session(manager, session, texts):
-    """构造 1 条 user + N 组 (assistant tool_call, tool 结果) + 尾部保护消息。"""
     manager.add_message(session, "user", "开始")
     for idx, text in enumerate(texts):
         manager.add_messages(session, [
@@ -112,12 +89,10 @@ def _fill_tool_session(manager, session, texts):
             ("tool", {"role": "tool", "tool_call_id": f"{session}-call-{idx}",
                       "name": "read_file", "content": text}),
         ])
-    # 尾部再垫一条消息：让所有工具结果都落在可改写区（保护 tokens 只圈最后一条）
     manager.add_message(session, "user", "继续")
 
 
 def _tool_texts(manager, session):
-    """按 id 正序返回该会话的工具结果正文（从入库 JSON 里解出）。"""
     with manager._lock:
         rows = manager.conn.execute(
             "SELECT id, content FROM messages WHERE role = 'tool' AND session_id = "
@@ -131,11 +106,6 @@ def _tool_texts(manager, session):
     return out
 
 
-# ---------------------------------------------------------------------------
-# 1. 小文本：utf-8 明文
-# ---------------------------------------------------------------------------
-
-
 def test_small_text_is_stored_as_utf8(manager):
     text = "小文本工具结果：ok\n" + "行内容 " * 30
     assert len(text.encode("utf-8")) <= COMPRESS_THRESHOLD_BYTES
@@ -143,7 +113,7 @@ def test_small_text_is_stored_as_utf8(manager):
 
     stored = _stored_row(manager, handle)
     assert stored["encoding"] == "utf-8"
-    assert stored["content"] == text  # 明文落库，不压缩
+    assert stored["content"] == text
     assert stored["stored_bytes"] == len(text)
     assert stored["sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
     assert stored["accessed_at"] == stored["created_at"]
@@ -151,11 +121,6 @@ def test_small_text_is_stored_as_utf8(manager):
     archive = manager.get_tool_result_archive(handle)
     assert archive["content"] == text
     assert archive["bytes"] == len(text.encode("utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# 2. 300KB：gzip+base64
-# ---------------------------------------------------------------------------
 
 
 def test_large_text_is_gzip_base64_encoded(manager):
@@ -168,18 +133,12 @@ def test_large_text_is_gzip_base64_encoded(manager):
     assert stored["encoding"] == "gzip+base64"
     assert stored["content"] != text
     assert stored["stored_bytes"] == len(stored["content"])
-    assert len(stored["content"]) < len(raw)  # 压缩确实省了体积
-    # 落库文本本身可独立解回原文（编码格式自洽，不依赖读取路径）
+    assert len(stored["content"]) < len(raw)
     assert gzip.decompress(base64.b64decode(stored["content"])).decode("utf-8") == text
 
     archive = manager.get_tool_result_archive(handle)
-    assert archive["content"] == text  # 逐字节一致
+    assert archive["content"] == text
     assert archive["bytes"] == len(raw)
-
-
-# ---------------------------------------------------------------------------
-# 3. 9MB：头尾各 4MB + 省略提示，bytes 仍是真实长度
-# ---------------------------------------------------------------------------
 
 
 def test_oversized_text_is_truncated_while_bytes_keeps_original_length(manager):
@@ -194,7 +153,7 @@ def test_oversized_text_is_truncated_while_bytes_keeps_original_length(manager):
 
     stored = _stored_row(manager, handle)
     assert stored["encoding"] == "truncated"
-    assert stored["bytes"] == raw_len  # 对外语义不变：真实原始长度
+    assert stored["bytes"] == raw_len
     assert stored["sha256"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     archive = manager.get_tool_result_archive(handle)
@@ -204,11 +163,6 @@ def test_oversized_text_is_truncated_while_bytes_keeps_original_length(manager):
     assert content.endswith("-TAIL-MARKER")
     assert f"[... {raw_len} 字节超过单条归档上限，中间部分未归档 ...]" in content
     assert len(content.encode("utf-8")) < raw_len
-
-
-# ---------------------------------------------------------------------------
-# 4. 同内容重复归档：一行 + 同一句柄
-# ---------------------------------------------------------------------------
 
 
 def test_same_content_archived_twice_keeps_one_row_and_same_handle(manager):
@@ -223,16 +177,11 @@ def test_same_content_archived_twice_keeps_one_row_and_same_handle(manager):
     handles_a = [extract_handle(t) for t in _tool_texts(manager, "dup-a")]
     handles_b = [extract_handle(t) for t in _tool_texts(manager, "dup-b")]
     assert handles_a == [sha[:8]]
-    assert handles_b == handles_a  # 同内容 → 同句柄
-    assert _archive_count(manager) == 1  # INSERT OR IGNORE 自动去重
+    assert handles_b == handles_a
+    assert _archive_count(manager) == 1
     stored = _stored_row(manager, sha[:8])
     assert stored["sha256"] == sha
     assert manager.get_tool_result_archive(sha[:8])["content"] == big
-
-
-# ---------------------------------------------------------------------------
-# 5. 句柄真碰撞：回退随机句柄
-# ---------------------------------------------------------------------------
 
 
 def test_handle_collision_falls_back_to_random_handle(manager):
@@ -242,7 +191,6 @@ def test_handle_collision_falls_back_to_random_handle(manager):
     now = _now_text()
     with manager._lock:
         cursor = manager.conn.cursor()
-        # 手工占位：同 handle 但 sha256 完全不同 → 真碰撞
         cursor.execute(
             "INSERT INTO tool_result_archive "
             "(handle, session_id, msg_id, tool_name, bytes, content, created_at, "
@@ -251,24 +199,17 @@ def test_handle_collision_falls_back_to_random_handle(manager):
             (occupied, 9, 9, "read_file", 15, "别的原文", now, "0" * 64, 4, "utf-8", now),
         )
         manager.conn.commit()
-        # 碰撞检测本身：候选 handle 已被不同内容占用 → 回退随机句柄
         candidate = content_handle(cursor, target)
 
     assert candidate != occupied
     assert re.fullmatch(r"[0-9a-f]{8}", candidate)
 
-    # 落库也走回退句柄：新内容能正常归档，旧的占位行不被覆盖
     handle = _archive(manager, target, msg_id=2)
     assert handle != occupied
     assert re.fullmatch(r"[0-9a-f]{8}", handle)
     assert _archive_count(manager) == 2
     assert manager.get_tool_result_archive(handle)["content"] == target
     assert manager.get_tool_result_archive(occupied)["content"] == "别的原文"
-
-
-# ---------------------------------------------------------------------------
-# 6. TTL 过期
-# ---------------------------------------------------------------------------
 
 
 def test_sweep_deletes_expired_records(manager):
@@ -281,14 +222,9 @@ def test_sweep_deletes_expired_records(manager):
     stats = manager.sweep_tool_result_archive()
 
     assert stats["expired"] >= 1
-    assert stats["evicted"] == 0  # 两条小记录远不到 256MB 预算
+    assert stats["evicted"] == 0
     assert manager.get_tool_result_archive(stale) is None
     assert manager.get_tool_result_archive(fresh) is not None
-
-
-# ---------------------------------------------------------------------------
-# 7. 预算淘汰：冷的最先走，刚访问过的受保护
-# ---------------------------------------------------------------------------
 
 
 def test_sweep_evicts_coldest_and_protects_recently_accessed(manager):
@@ -297,15 +233,10 @@ def test_sweep_evicts_coldest_and_protects_recently_accessed(manager):
 
     stats = manager.sweep_tool_result_archive(budget_bytes=1, protect_seconds=3600)
 
-    assert stats["expired"] == 0  # 两条都是刚创建，未过期
-    assert stats["evicted"] == 1  # 只淘汰冷记录：热记录在保护窗口内被跳过
+    assert stats["expired"] == 0
+    assert stats["evicted"] == 1
     assert manager.get_tool_result_archive(cold) is None
     assert manager.get_tool_result_archive(hot) is not None
-
-
-# ---------------------------------------------------------------------------
-# 8. 旧库升级：缺列自动补齐，旧记录仍可读
-# ---------------------------------------------------------------------------
 
 
 def test_legacy_table_without_new_columns_is_upgraded_and_readable(tmp_path):
@@ -345,11 +276,6 @@ def test_legacy_table_without_new_columns_is_upgraded_and_readable(tmp_path):
         manager.close()
 
 
-# ---------------------------------------------------------------------------
-# 9. reducer 分支：句柄由 reducer 之前的原文派生
-# ---------------------------------------------------------------------------
-
-
 def test_reducer_branch_handle_is_content_addressed(manager):
     noisy = "\n".join(["重复行 same line"] * 400)
     _fill_tool_session(manager, "reduce", [noisy])
@@ -364,13 +290,8 @@ def test_reducer_branch_handle_is_content_addressed(manager):
     assert handle == hashlib.sha256(noisy.encode("utf-8")).hexdigest()[:8]
 
     archive = manager.get_tool_result_archive(handle)
-    assert archive["content"] == noisy  # 归档的是 reducer 之前的原文
+    assert archive["content"] == noisy
     assert archive["bytes"] == len(noisy.encode("utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# 10. 解码容错：坏数据不能让读取崩
-# ---------------------------------------------------------------------------
 
 
 def test_decode_payload_tolerates_unknown_encoding_and_corrupt_gzip():

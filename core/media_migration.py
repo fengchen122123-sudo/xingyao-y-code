@@ -1,17 +1,3 @@
-"""core/media_migration.py
-=========================
-历史消息媒体清单一次性迁移（幂等，DB 层）。
-
-设计见 docs/superpowers/specs/2026-08-30-media-display-design.md §4.7：
-- 门闩：config 的 ``media_v1_migration_done``；整体成功后置位。
-- 候选：JSON dict 形态、无 media_v1 的 assistant 消息（memory 层已过滤）。
-- 每条消息正文文本字节不动，只补写 ``_display.media_v1``；
-  归档失败的路径生成 kind=error 清单项，正文不展示降级。
-- 仓库不可写等基础设施错误：中止本轮且不置门闩，下次启动自动重试
-  （已更新的消息天然跳过，重跑安全）。
-- 相对路径按消息所属会话的 workdir 解析；GLOBAL 会话回退用户主目录。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -28,7 +14,6 @@ _MIGRATION_FLAG = "media_v1_migration_done"
 
 
 def _fast_text_prefilter(content: str) -> bool:
-    """返回 True 表示正文中不可能存在媒体语法（直接跳过，无需解析）。"""
     return (
         "![" not in content
         and "video" not in content.lower()
@@ -63,7 +48,6 @@ def run_media_migration_once(manager) -> dict:
         try:
             manifest = build_media_manifest(content, workdir)
         except MediaStoreError as exc:
-            # 基础设施错误：中止且不置门闩，下次启动重试（已更新行天然跳过）
             logger.warning(
                 "媒体清单迁移因仓库错误中止: %s (message_id=%s)", exc.error_code, msg_id
             )

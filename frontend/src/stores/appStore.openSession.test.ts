@@ -11,7 +11,6 @@ beforeEach(() => {
   (window as any).pywebview = undefined;
 });
 
-/** 挂一个最小可用桥：switch_session + get_active_agent_name（生效名来源） */
 function mockApi(switchImpl: (name: string, workdir?: string) => Promise<unknown>) {
   const switchSession = vi.fn().mockImplementation(switchImpl);
   const getActiveAgentName = vi.fn().mockResolvedValue({ agent_name: '妖妖' });
@@ -35,13 +34,11 @@ it('open_session：复用 switchSession 切到目标会话、拉历史并刷新�
     data: { session_name: 'session_ab12cd', display_name: '妖妖', workdir: 'D:\\proj\\imom' },
   } as any);
 
-  // 走的就是用户点会话那条路：目标会话名 + 无 workdir（归属目录以后端为准）
   await vi.waitFor(() => expect(switchSession).toHaveBeenCalledWith('session_ab12cd', undefined));
   await vi.waitFor(() => expect(store.agentName).toBe('妖妖'));
 
   expect(store.currentSessionName).toBe('session_ab12cd');
   expect(store.currentSessionDisplayName).toBe('妖妖');
-  // 消息区被目标会话历史重置（不是另写一套切换逻辑的空壳状态）
   expect(store.messages.map(m => m.content)).toEqual(['目标会话历史']);
   expect(store.sessionSwitching).toBe(false);
 });
@@ -54,7 +51,6 @@ it('open_session：payload 缺 session_name 时不发切换请求、不抛错', 
   expect(() => {
     store.handleBridgeEvent({ type: 'open_session', data: { display_name: '妖妖' } } as any);
   }).not.toThrow();
-  // 等一轮微任务：确认没有被 void 出去的切换请求悄悄发出
   await Promise.resolve();
   await Promise.resolve();
 

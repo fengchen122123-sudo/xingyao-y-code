@@ -35,8 +35,6 @@
         </span>
       </div>
 
-      <!-- 门禁看「有没有记录」而不是「今天有没有」：昨天有决策、今天没有时
-           列表仍应展示最近的记录（本会话总数与今日计数并列，跨天不影响可见性） -->
       <div v-if="hasRecords" class="stats-grid" data-test="decision-pop-stats">
         <div class="stat-cell accent" data-test="decision-pop-session-total">
           <span class="k">本会话</span>
@@ -178,7 +176,6 @@ const enabled = ref(false);
 const modelId = ref('');
 const displayLimit = ref(10);
 
-/** 场景中文标签：涵盖配置型场景与任务执行期自动场景 */
 const SCENE_LABELS: Record<string, string> = {
   router: '路由（选模型）',
   secretary: '秘书（派会话）',
@@ -272,9 +269,6 @@ const footHint = computed(() => {
   return '审计按日保存在本地';
 });
 
-// ---------------------------------------------------------------------------
-// 点开一条记录：按 trace_id 回查「发给 JEV 的请求」与「JEV 的判定」原文
-// ---------------------------------------------------------------------------
 const expandedIndex = ref<number | null>(null);
 const detail = ref<DecisionRecordDetail['record'] | null>(null);
 const detailLoading = ref(false);
@@ -314,7 +308,6 @@ async function toggle(index: number, item: DecisionAuditRecentItem) {
       return;
     }
     const res = await api.get_decision_record_detail(traceId);
-    // 已经展开别的记录或已收起：丢弃这次响应
     if (seq !== detailRequestSeq) return;
     if (res?.ok && res.record) {
       detail.value = res.record;
@@ -328,7 +321,6 @@ async function toggle(index: number, item: DecisionAuditRecentItem) {
   }
 }
 
-/** 请求体：只展示真正发出去的三个字段，缺失的省略成 null 而不是报错 */
 function prettyRequest(record: DecisionRecordDetail['record']): string {
   if (!record) return '';
   const request = record.request || {};
@@ -343,7 +335,6 @@ function prettyRequest(record: DecisionRecordDetail['record']): string {
   );
 }
 
-/** 响应体：上游原样返回的 answers（含 choice 与 probabilities） */
 function prettyAnswers(record: DecisionRecordDetail['record']): string {
   if (!record) return '';
   return JSON.stringify(record.answers ?? null, null, 2);
@@ -371,12 +362,9 @@ async function loadSummary() {
       return;
     }
     const res = await api.get_decision_audit_summary(displayLimit.value, sessionName, true);
-    // 已经切到别的会话：丢弃这次结果
     if (seq !== summaryRequestSeq) return;
-    // 直接转发后端结果：手抄字段会丢掉 has_business_records / session_scoped
     summary.value = res?.ok ? res : null;
   } catch {
-    // 静默：请求失败时清空快照，宁可显示空态也不展示上一个会话的记录
     if (seq === summaryRequestSeq) summary.value = null;
   }
 }
@@ -391,7 +379,6 @@ async function loadSettings() {
       modelId.value = String(res.settings.model_id ?? '');
     }
   } catch {
-    // 静默
   }
 }
 
@@ -401,7 +388,6 @@ async function openAuditDir() {
     if (!api?.open_decision_audit_dir) return;
     await api.open_decision_audit_dir();
   } catch {
-    // 静默
   }
 }
 
@@ -414,11 +400,9 @@ function openSettings() {
 onMounted(() => {
   loadSummary();
   loadSettings();
-  // 打开面板即视为已读：清零头部徽章
   store.decisionUnread = 0;
 });
 
-// 面板开启期间有新决策落盘（decision_recorded 事件）：立即刷新记录并保持已读
 watch(
   () => store.decisionEventTick,
   () => {
@@ -432,7 +416,6 @@ function loadMore() {
   void loadSummary();
 }
 
-// 切换会话：记录按会话隔离，重置分页上限并重新拉取本会话的决策记录
 watch(
   () => store.currentSessionName,
   () => {
@@ -518,7 +501,6 @@ watch(
   color: var(--xy-text, var(--text));
 }
 
-/* 顶部固定概览区：运行状态 + 4 格统计卡片 */
 .pop-overview {
   padding: 10px 14px;
   border-bottom: 1px solid var(--xy-border, var(--border));
@@ -718,7 +700,6 @@ watch(
   transform: rotate(90deg);
 }
 
-/* 事由与判定：全文自然折行、结论徽章独立常驻 */
 .rec-content {
   margin-top: 6px;
   min-width: 0;
@@ -783,7 +764,6 @@ watch(
   opacity: 1;
 }
 
-/* 点开后的详情：请求体与响应体原文，等宽、限高、纵向可滚动 */
 .rec-detail {
   margin-top: 8px;
   padding-top: 8px;
@@ -838,7 +818,6 @@ watch(
   padding: 12px 4px;
 }
 
-/* 底部操作栏与独立样式按钮 */
 .pop-foot {
   display: flex;
   align-items: center;

@@ -27,7 +27,6 @@ function makeGlobal() {
   return { folder_path: 'GLOBAL', folder_name: '对话', is_global: true, is_current: false, sessions: [] };
 }
 
-/** api 传 undefined 表示"没有 pywebview 桥"（CLI/纯浏览器场景） */
 function mountSidebar(groups: any[], api?: Record<string, any>) {
   if (api) (window as any).pywebview = { api };
   const pinia = createPinia();
@@ -87,7 +86,6 @@ it('启动时用后端快照校正：localStorage 被清掉也能恢复分组顺
   await flushPromises();
 
   expect(orderOf(w)).toEqual(['GLOBAL', PROJECT_B, PROJECT_A]);
-  // 校正结果回写本地缓存，下次首屏不必等后端
   expect(JSON.parse(localStorage.getItem(GROUP_KEY) as string)).toEqual([PROJECT_B, PROJECT_A]);
   w.unmount();
 });
@@ -208,7 +206,7 @@ it('桥延迟就绪时也能校正：api 先注入空对象，方法后注入并
   w.unmount();
 });
 
-it('没有 pywebview 桥（或后端报错）时静默降级，排序仍走 localStorage', async () => {  // 无桥
+it('没有 pywebview 桥（或后端报错）时静默降级，排序仍走 localStorage', async () => {
   const w1 = mountSidebar([makeGlobal(), makeGroup(PROJECT_A, ['a1']), makeGroup(PROJECT_B, ['b1'])]);
   await flushPromises();
   await dragGroup(w1, PROJECT_B);
@@ -218,7 +216,6 @@ it('没有 pywebview 桥（或后端报错）时静默降级，排序仍走 loca
 
   localStorage.clear();
 
-  // 后端抛错
   const api = {
     get_ui_layout: vi.fn().mockRejectedValue(new Error('backend down')),
     save_ui_layout: vi.fn().mockRejectedValue(new Error('backend down')),

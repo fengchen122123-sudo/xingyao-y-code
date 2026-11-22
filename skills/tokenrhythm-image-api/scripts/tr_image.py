@@ -1,21 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""TokenRhythm（基元律动）生图 / 垫图改图 命令行工具。
-
-零第三方依赖：只用 Python 3 标准库（urllib / json / argparse），
-适合随 Skill 一起分发 —— 对方只要装了 Python 3，填个 Key 就能跑。
-
-用法：
-    python tr_image.py gen  -p "一只戴墨镜的橘猫，赛博朋克霓虹背景"
-    python tr_image.py gen  -p "雪山日出" -s 1280x720 -m wan2.7-image -n 2 -o ./out
-    python tr_image.py edit -p "把背景换成雪景" -i ./cat.png
-    python tr_image.py gen  --help
-
-Key 配置（优先级从高到低）：
-    1) 命令行   --api-key sk_tr_xxx
-    2) 环境变量 TOKENRHYTHM_API_KEY
-    3) 本文件顶部 API_KEY 常量  ← 分发时让使用者填这里最省事
-"""
 
 import argparse
 import json
@@ -27,17 +11,12 @@ import urllib.request
 import uuid
 from datetime import datetime
 
-# ============================================================================
-# ★★★ 使用者唯一需要改的地方：把 Key 填进引号里 ★★★
-# 获取方式：登录 tokenrhythm.studio → API Keys → 新建 → 复制完整 Key
-# ============================================================================
 API_KEY = ""
 BASE_URL = "https://tokenrhythm.studio"
-# ============================================================================
 
 SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280", "1024x1792", "1792x1024")
 MODELS = ("qwen-image-2.0", "wan2.7-image")
-DEFAULT_TIMEOUT = 300  # 秒，生图偶发慢，别设太短
+DEFAULT_TIMEOUT = 300
 
 
 def _setup_stdout() -> None:
@@ -70,7 +49,6 @@ def resolve_key(cli_key) -> str:
 
 
 def _send(req: urllib.request.Request, timeout: int):
-    """发请求并统一处理 HTTP 错误，返回 (status, body_bytes)。"""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()

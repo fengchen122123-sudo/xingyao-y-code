@@ -1,9 +1,3 @@
-"""工作区项目感知提示词推荐（新会话空态用，纯只读）。
-
-根据显式传入的 workdir、可选 Git 快照及工作区近况，生成 0~3 条直接可执行的
-提示词建议。对 GLOBAL、空路径或不存在目录一律返回空列表，保持自由对话干净留白。
-"""
-
 from __future__ import annotations
 
 import json
@@ -29,7 +23,6 @@ def _short_title(text: str, limit: int = 16) -> str:
 
 
 def _detect_novel_suggestions(root: Path) -> list[dict[str, str]]:
-    """探测小说项目并生成章节核对、表达清理、续写建议。"""
     discovered = novel_service.discover_novel_projects(root, max_depth=1, limit=5)
     projects = discovered.get("projects") if discovered.get("ok") else None
     if not projects:
@@ -79,7 +72,6 @@ def _detect_novel_suggestions(root: Path) -> list[dict[str, str]]:
 
 
 def _extract_git_counts(git_snapshot: Mapping[str, Any] | None) -> tuple[str, int, int, int]:
-    """从前端已持有的 GitSnapshot 提取 (branch, conflicts, dirty, ahead)。"""
     if not isinstance(git_snapshot, Mapping):
         return "", 0, 0, 0
     branch = str(git_snapshot.get("branch_name") or "").strip()
@@ -207,7 +199,6 @@ def _detect_code_suggestions(
 def _detect_general_suggestions(
     root: Path, recent_session_titles: Sequence[str] | None
 ) -> list[dict[str, str]]:
-    """非小说、非典型代码仓库的一般目录：根据近况文件与最近会话生成建议。"""
     try:
         entries = [
             p for p in root.iterdir()
@@ -262,11 +253,6 @@ def build_workspace_prompt_suggestions(
     git_snapshot: Mapping[str, Any] | None = None,
     recent_session_titles: Sequence[str] | None = None,
 ) -> list[dict[str, str]]:
-    """为指定工作区生成最多 3 条项目相关的推荐提示词。
-
-    - workdir 为空、'GLOBAL' 或不存在目录时返回 []。
-    - 优先级：小说项目 > 代码/Git 工程 > 普通非空目录。
-    """
     raw = str(workdir or "").strip()
     if not raw or raw.upper() == "GLOBAL":
         return []

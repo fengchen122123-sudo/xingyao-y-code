@@ -386,7 +386,6 @@ def test_plan_verification_uses_the_selected_interpreter(tmp_path, monkeypatch):
 
 
 def test_system_settings_include_active_model_computer_capability(monkeypatch, tmp_path):
-    """设置负载携带活动模型电脑操控资格（与 Turn 起点同一判定函数）。"""
     from tests.computer_fakes import use_temp_config
     import core.computer.settings as computer_settings
     from core.computer.capability import resolve_computer_capability
@@ -411,11 +410,9 @@ def test_system_settings_include_active_model_computer_capability(monkeypatch, t
     payload = command_shell.get_system_settings()
     hint = payload["computer_active_model_capability"]
     assert hint["model"] == "test-vision-model"
-    # 开关默认关闭 → 不合格原因是未开启开关，而不是模型缺能力
     assert hint["eligible"] is False
     assert hint["error_code"] == "computer_disabled"
 
-    # 打开开关后模型合格
     config_data = {
         "active_model_id": "m1",
         "browser_control_enabled": True,
@@ -439,7 +436,6 @@ def test_system_settings_include_active_model_computer_capability(monkeypatch, t
 
 
 def test_system_settings_capability_hint_follows_caller_model(monkeypatch, tmp_path):
-    """GUI 传入会话生效模型时按它判定，缺省仍读全局默认。"""
     from tests.computer_fakes import use_temp_config
     import core.computer.settings as computer_settings
 
@@ -468,20 +464,17 @@ def test_system_settings_capability_hint_follows_caller_model(monkeypatch, tmp_p
 
     from core import command_shell
 
-    # 会话绑定的模型是纯文本模型，全局仍是视觉模型：必须按会话模型判定
     hint = command_shell.get_system_settings(
         active_model_id="m-text"
     )["computer_active_model_capability"]
     assert hint["model"] == "text-model"
     assert hint["eligible"] is False
 
-    # 不传（CLI 场景）沿用全局默认
     hint = command_shell.get_system_settings()["computer_active_model_capability"]
     assert hint["model"] == "vision-model"
 
 
 def test_system_settings_capability_hint_fail_closed_when_model_missing(monkeypatch, tmp_path):
-    """未选择模型/模型缺能力：提示不合格且不拖垮设置页。"""
     from tests.computer_fakes import use_temp_config
     import core.computer.settings as computer_settings
 

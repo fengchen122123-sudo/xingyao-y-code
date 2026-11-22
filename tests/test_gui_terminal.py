@@ -1,10 +1,3 @@
-"""GUI 内嵌交互式终端（底部面板）桥接层测试。
-
-覆盖 pty_terminal_* 桥接方法的会话复用/重建/清理语义、事件推送链路
-（pty_data / pty_exit 经 _js_queue 派发）与 core.gui_terminal 的真实
-ConPTY 会话往返（Windows）。
-"""
-
 import os
 import queue
 import threading
@@ -17,7 +10,6 @@ from core.gui_terminal import clamp_terminal_size
 
 
 class _FakePtySession:
-    """桥接层单测用的假常驻 shell 会话。"""
 
     def __init__(self, pid=4242, cwd=r"C:\fake_proj", alive=True):
         self.pid = pid
@@ -41,14 +33,9 @@ class _FakePtySession:
 
 
 def _make_bridge():
-    """构造仅含内嵌终端桥接所需内部状态的裸桥实例。
-
-    _js_dispatcher 指向主线程（恒 alive）：阻止 _ensure_js_dispatcher 在
-    测试内启动真实派发线程抢空队列，drain_js_queue 断言才稳定。
-    """
     instance = ApiBridge.__new__(ApiBridge)
     instance._shutting_down = False
-    instance._window = object()  # _emit_raw 只判非空
+    instance._window = object()
     instance._js_queue = queue.Queue(maxsize=JS_QUEUE_MAXSIZE)
     instance._js_dispatcher = threading.current_thread()
     instance._js_dispatcher_lock = threading.Lock()
@@ -60,7 +47,6 @@ def _make_bridge():
     instance._pty_session = None
     instance._pty_lock = threading.Lock()
     instance._current_session = "s1"
-    # 会话 workdir 必须是真实存在目录：桥会做 isdir 兜底回退
     instance._session_workdir = lambda name: os.getcwd()
     return instance
 
@@ -161,7 +147,6 @@ def test_pty_terminal_kill_clears_session(bridge):
     bridge._pty_session = session
     res = bridge.pty_terminal_kill()
     assert res["ok"] and session.killed and bridge._pty_session is None
-    # 未启动时再次 kill 幂等
     assert bridge.pty_terminal_kill()["ok"] is True
 
 
@@ -191,7 +176,6 @@ def test_pty_data_and_exit_events_reach_js_queue(bridge, monkeypatch):
 def test_shutdown_kills_pty_session(bridge):
     session = _FakePtySession()
     bridge._pty_session = session
-    # 复用 shutdown 的清理片段：直接模拟其内部逻辑（不跑完整 shutdown 链）
     with bridge._pty_lock:
         grabbed = bridge._pty_session
         bridge._pty_session = None
@@ -207,7 +191,6 @@ def test_clamp_terminal_size_bounds():
 
 @pytest.mark.skipif(os.name != "nt", reason="ConPTY 仅 Windows")
 def test_real_pty_session_roundtrip():
-    """真实 ConPTY 往返：spawn PowerShell → echo → exit，输出与退出码齐全。"""
     from core.gui_terminal import create_pty_terminal
 
     out = []

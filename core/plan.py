@@ -1,5 +1,3 @@
-"""Persisted dependency-aware execution plans for one active session."""
-
 from __future__ import annotations
 
 import json
@@ -27,18 +25,10 @@ VALID_STAGES = frozenset({"plan", "build", "review"})
 VALID_KINDS = frozenset({"execution", "input_preparation"})
 VALID_VERIFICATION_TYPES = frozenset({"result", "command"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled"})
-# 计划项执行租约：delegated=子代理执行中，main_takeover=主 Agent 接管执行中，
-# takeover_queued=超时后排队等待主 Agent 接管（FIFO）
 VALID_EXECUTION_MODES = frozenset({"", "delegated", "main_takeover", "takeover_queued"})
 PlanEventCallback = Callable[[str, dict[str, Any]], None]
 
 
-# ---------------------------------------------------------------------------
-# 计划续推抑制：用户主动取消回合后，llm 收尾时的"计划尚未执行完毕，请继续
-# run_subagent" nudge 会把刚取消的任务复活。suppress 后不再自动续推；
-# 计划项再次进入 in_progress（用户明确要求继续、模型重新派发）或计划清空时
-# 自动解除（见 clear_plan_auto_continue_suppression 的调用点）。
-# ---------------------------------------------------------------------------
 _PLAN_AUTO_CONTINUE_SUPPRESSED: set[str] = set()
 _PLAN_AUTO_CONTINUE_LOCK = threading.Lock()
 
@@ -69,13 +59,9 @@ def _starts_with_cjk(text: str) -> bool:
 
 
 def _contains_cjk(text: str) -> bool:
-    """检查文本是否包含任何 CJK 统一表意文字（中日韩汉字）。"""
     return any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in str(text or ""))
 
 
-# 会话 ID 由用户消息派生（首行截断），可能含 `/` `\` `:` `*` 等 Windows 非法
-# 文件名字符。直接拿会话 ID 当计划文件名会让持久化抛 WinError 123，而计划落盘
-# 失败会连带卡死计划门禁（主 Agent 工具被锁、连计划都清不掉），因此统一清洗。
 _UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_FILENAMES = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -86,13 +72,6 @@ SAFE_SESSION_FILENAME_MAX_CHARS = 100
 
 
 def safe_session_filename(session_id: str) -> str:
-    """把会话 ID 转成合法且稳定的计划文件名（不含扩展名）。
-
-    非法字符替换为下划线；去掉首尾空白与结尾的点（Windows 不允许）；命中 Windows
-    保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）时加前缀；清洗后为空回落 "session"；
-    超长按 100 字符截断。合法会话名（如 "session-1"）清洗后不变，保证既有计划
-    文件仍能正常加载。
-    """
     name = _UNSAFE_FILENAME_CHARS.sub("_", str(session_id or "")).strip().rstrip(".")
     name = name[:SAFE_SESSION_FILENAME_MAX_CHARS].rstrip(". ")
     if not name:
@@ -115,8 +94,6 @@ class PlanManager:
         self._event_callback = event_callback
         self._session_id = str(session_id).strip() if session_id else None
         if storage_dir is None:
-            # 存储目录跟随当前线程的工作目录（回合线程内即会话归属项目目录），
-            # 不再冻结在进程启动目录——GUI 多项目会话的计划各自落在各自项目下
             from core.workspace_context import get_workdir
 
             storage_dir = Path(get_workdir()) / ".ycode_tasks" / "plans"
@@ -301,15 +278,6 @@ class PlanManager:
         error: str | None = None,
         result: str | None = None,
     ) -> dict[str, Any] | None:
-        """在 PlanManager 自身锁内按 expected status/mode 做 CAS，一次提交全部执行租约字段。
-
-        execution_mode / handoff_task_id / handoff_reason / takeover_turn_id /
-        takeover_sequence / delegation_count 只能经此方法批量变更：
-        调度器（TaskScheduler）用它原子完成委派、超时移交与 FIFO 提升，
-        避免连续调用普通 update() 时向观察者暴露半状态；
-        模型可见的 plan_update 工具不暴露这些字段，无法伪造接管状态。
-        校验失败或 CAS 不匹配返回 None，且不产生任何部分写入。
-        """
         with self._lock:
             item = next((item for item in self._items if item["id"] == item_id), None)
             if item is None:
@@ -357,7 +325,6 @@ class PlanManager:
                 return None
             if delegation_count is not None and int(delegation_count) < 0:
                 return None
-            # 校验全部通过后一次性应用，最后统一持久化
             if status is not None:
                 item["status"] = status
             if execution_mode is not None:
@@ -428,8 +395,6 @@ class PlanManager:
     def storage_path(self) -> Path | None:
         if not self._session_id:
             return None
-        # 会话 ID 可能派生自用户消息（含非法文件名字符），落盘前统一清洗；
-        # 合法会话名清洗后不变，既有计划文件照常命中。
         return self._storage_dir / f"{safe_session_filename(self._session_id)}.json"
 
     def _normalize_item(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -500,7 +465,6 @@ class PlanManager:
         visiting: set[str] = set()
         visited: set[str] = set()
 
-        # 迭代式 DFS：超长依赖链（>1000 项）不会触发 RecursionError
         for start in graph:
             if start in visited:
                 continue
@@ -552,7 +516,6 @@ class PlanManager:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(raw, list):
-                # 合法 JSON 但不是计划项列表（如 dict/数字）同样视为损坏
                 raise ValueError("plan file must contain a JSON list of items")
             normalized: list[dict[str, Any]] = []
             seen: set[str] = set()
@@ -563,8 +526,6 @@ class PlanManager:
                 seen.add(normalized_item["id"])
                 normalized.append(normalized_item)
             self._validate_graph(normalized)
-        # UnicodeDecodeError 是 ValueError 子类（read_text 解码失败），AttributeError
-        # 覆盖列表元素不是 dict 时 _normalize_item 的 .get 调用失败
         except (ValueError, TypeError, AttributeError) as error:
             # 计划文件损坏：备份为 .corrupt 后以空计划启动，避免构造/bind_session 直接崩溃
             corrupt_path = path.with_name(path.name + ".corrupt")
@@ -590,8 +551,6 @@ class PlanManager:
                 item["execution_mode"] = "takeover_queued"
                 item["takeover_turn_id"] = ""
             elif was_in_progress and item["execution_mode"] == "delegated":
-                # 普通子 Agent 随进程退出后，原 task id/owner 已是死亡租约。
-                # 与 TaskScheduler._reset_orphaned_in_progress 保持同一恢复语义。
                 item["execution_mode"] = ""
                 item["owner"] = ""
                 item["handoff_task_id"] = ""
@@ -603,26 +562,12 @@ class PlanManager:
 
 _DEFAULT_PLAN_MANAGER = PlanManager()
 
-# ---------------------------------------------------------------------------
-# 多会话并行：按会话实例化的计划管理器注册表 + 线程本地路由
-# ---------------------------------------------------------------------------
-# 进程级单例 _DEFAULT_PLAN_MANAGER 只服务未绑定线程（CLI 主流程 / 测试主线程），
-# 语义与单会话时代完全一致（bind_default_plan_session 就地重绑）。
-# GUI 回合线程 / 子代理线程通过 set_current_plan_session 绑定自己的会话，
-# get_default_plan_manager 按线程路由到该会话专属的 PlanManager 实例：
-# 并行回合各自读写各自的管理器（实例内 RLock 串行化同一会话的并发访问，
-# 不同会话之间零共享临界区），彻底消除 A 回合读到/改写 B 计划的串扰。
 _PLAN_MANAGERS: dict[str, PlanManager] = {}
 _PLAN_MANAGERS_LOCK = threading.RLock()
 _plan_route_tls = threading.local()
 
 
 def set_current_plan_session(session_id: str | None, *, storage_dir=None) -> None:
-    """绑定当前线程的计划会话路由（GUI 回合线程 / 子代理线程入口调用）。
-
-    回合 finally 中传 None 解绑。storage_dir 可显式指定计划存储目录，
-    缺省在首次创建该会话管理器时按当前线程工作目录推导。
-    """
     _plan_route_tls.session_id = (
         str(session_id).strip() if session_id else None
     )
@@ -636,22 +581,10 @@ def get_bound_plan_session() -> str | None:
 
 
 def get_plan_route() -> tuple[str | None, str | None]:
-    """返回当前线程的计划路由快照 (session_id, storage_dir)。
-
-    供并行工具线程在派发入口显式继承计划会话路由（线程本地状态不会自动
-    进入新线程）。storage_dir 必须一并携带：会话管理器若尚未注册，缺省会
-    按新线程的工作目录重新推导落盘位置，可能指向错误目录。未绑定时返回
-    (None, None)，语义与 get_bound_plan_session 一致（走进程级单例）。
-    """
     return get_bound_plan_session(), getattr(_plan_route_tls, "storage_dir", None)
 
 
 def get_plan_manager_for(session_id: str, *, storage_dir=None) -> PlanManager:
-    """取（或惰性创建）指定会话的专属计划管理器。
-
-    每次变更都会落盘（_commit_locked），因此即使注册表条目被清理后重建，
-    也能从磁盘完整恢复该会话的计划状态。
-    """
     key = str(session_id).strip()
     with _PLAN_MANAGERS_LOCK:
         manager = _PLAN_MANAGERS.get(key)
@@ -677,16 +610,6 @@ def get_default_plan_manager() -> PlanManager:
 
 
 def plan_state_fingerprint(session_id: str | None = None) -> str:
-    """计划 canonical 快照指纹（SHA-256），供 TurnProgressGuard 判定真实进展。
-
-    只纳入影响调度的确定性字段：plan session id、每个计划项的
-    id/status/depends_on/execution_mode、当前 in-progress 项、
-    auto-continue suppression 状态。展示文案（subject/result/error 等）、
-    动态 handoff task id / reason / takeover turn id / sequence 与时间戳
-    不参与，避免无业务变化却不断重置停滞计数。
-    显式 session_id 只 peek 注册表已有条目，绝不惰性创建（与
-    maybe_clear_completed_plan 的早退防护同理）。
-    """
     import hashlib
 
     manager = None
@@ -738,26 +661,6 @@ def plan_state_fingerprint(session_id: str | None = None) -> str:
 
 
 def maybe_clear_completed_plan(session_id: str | None = None) -> bool:
-    """回合结束时调用：若指定会话（缺省取当前路由）的计划所有项都进入
-    终态（completed/failed/blocked/cancelled），清空计划快照并返回 True
-    （发生了清空）；否则返回 False。
-
-    任务完成后计划面板/任务规划自动归零，避免已完成计划长期残留。
-    只要还有 pending/in_progress 项（任务未完成）就不清空，保证跨回合任务
-    的计划不会被提前抹掉。
-
-    session_id 必须由 GUI 回合结束路径显式传入：finish_once 执行时计划会话
-    TLS 路由已解绑（_run_turn_worker finally 前段），get_default_plan_manager()
-    会退回进程级单例——多会话并行下该单例可能已被 _set_current_session 重绑
-    到其他会话，裸用会清错会话的计划。显式 session_id 只 peek 注册表已有条目
-    （条目在回合内创建后跨回合存活，storage_dir 正确），绝不惰性创建：
-    回合可能在 TLS 绑定前早退（无激活模型 / 项目目录缺失 / 中途异常），
-    此时 workdir scope 未进入，get_plan_manager_for 会以进程 cwd 推导
-    storage_dir 创建指向错误路径的污染条目并永久占据注册表 key，
-    导致该会话后续所有回合的计划工具命中污染条目（plan_read 永远空、
-    plan_write 落错误位置），计划功能静默失效。
-    CLI 单会话顺序执行，不传 session_id 走 get_default_plan_manager() 默认路由。
-    """
     if session_id:
         key = str(session_id).strip()
         with _PLAN_MANAGERS_LOCK:
@@ -896,7 +799,6 @@ def plan_update(
             + guidance
         )
     if _plan_item_execution_locked(item):
-        # in_progress / takeover_queued 处于执行租约保护期，元数据冻结
         return (
             f"计划项 '{item_id}' 正在执行租约保护期"
             f"（status={item.get('status')}, "
@@ -904,7 +806,6 @@ def plan_update(
             "执行租约期间不可修改 subject、depends_on、files、verification、"
             "stage 或 kind；待项结束后再调整。"
         )
-    # 其余状态只允许修改元数据字段
     updated = manager.update(
         item_id,
         subject=subject,
@@ -921,14 +822,6 @@ def plan_update(
 
 
 def plan_retry(item_id: str, force: bool = False) -> str:
-    """将失败/阻塞/取消/已完成但需要重跑的计划项重置为 pending，允许重新调度。
-
-    防盲目重试：当 attempts >= 2 且上次失败原因仍然存在时，调用方必须
-    显式传 force=True，确认已经分析根因后才能重试。
-
-    completed 项同样可重开：子代理把「工具不可用」写成结论时会被误判为完成，
-    而重建计划被门禁拒绝，只能靠重开这一项走出死锁。
-    """
     from core.task_scheduler import get_default_scheduler
 
     scheduler = get_default_scheduler()
@@ -946,7 +839,6 @@ def plan_retry(item_id: str, force: bool = False) -> str:
     attempts = int(item.get("attempts", 0))
     last_error = str(item.get("error", "")).strip()
 
-    # 盲目重试防护：已失败 2 次以上时，要求主 Agent 先分析根因
     if attempts >= 2 and last_error and not force:
         return (
             f"⚠️ 计划项 '{item_id}' 已失败 {attempts} 次，上次失败原因：\n"
@@ -958,7 +850,6 @@ def plan_retry(item_id: str, force: bool = False) -> str:
             f"  4. 确认修改后再调用 plan_retry(item_id='{item_id}', force=True) 强制重试。"
         )
 
-    # JEV plan_recovery：对 failed/blocked 且有报错的项，在无 force 重试前判断恢复策略
     if item.get("status") in {"failed", "blocked"} and last_error and not force:
         try:
             from core.task_decision_hooks import decide_plan_recovery
@@ -1082,15 +973,6 @@ def plan_finish(
     event_callback: PlanEventCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> str:
-    """显式完成主 Agent 正在接管的计划项（超时接管收尾专用）。
-
-    只有 active takeover（status=in_progress + execution_mode=main_takeover +
-    takeover_turn_id 与当前回合一致）允许收尾：验证通过 → completed 并自动
-    FIFO 提升下一排队接管项；验证失败 → failed，不重新委派子代理。
-    queued/普通/终态项一律拒绝——模型不能用本工具伪造完成。
-    运行上下文（parent_turn_id/permission_owner/cancel_event/event_callback）
-    由 ToolAdapterSet.execute_plan_finish 注入，不暴露给模型 schema。
-    """
     from core.task_scheduler import get_default_scheduler, takeover_handoff_payload
 
     if not str(parent_turn_id or "").strip():

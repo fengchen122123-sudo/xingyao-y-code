@@ -1,5 +1,3 @@
-"""P1a1：server 来源可以开浏览器，Linux 只用无头 Chromium。"""
-
 from __future__ import annotations
 
 import json

@@ -1,22 +1,3 @@
-"""零成本模拟三：水位阶梯全场景 F~K（dev-compact 全量验证收官）。
-
-生产路径全部真实（prepare_turn_messages 完整四级水位阶梯 + Tier3 全链路 +
-真实 SQLite / tiktoken / marker 冻结 / 保护区 / I4 / 物理折叠 / 滑窗淘汰），
-唯一替换点仍是 core.llm._dispatch_completion 桩，零 API 成本。
-
-  F  Tier1/Tier2 本地工具结果维护
-     F1 60% 水位 → snip（head+tail 截断），冻结后不重写、错误结果不改写；
-     F2 80% 水位 → elide（占位符化，snipped 可升级），仍跳过错误与冻结。
-  G  0.95 同步压缩全程（分段提示/增量落库/水位回落/腾字数统计）。
-  H  Tier3 压缩失败 → 熔断语义：停止自动淘汰 + 1.2×window 内仍微调淘汰 + I4 内存裁剪兜底。
-  I  组合极限（H 场景之上）：预压缩后台进行中 + 压缩失败熔断叠加 160% 超窗
-     → already_running 分支（不推水位）→ I4 把载荷裁进窗口，请求照常发出。
-  J  主动轮换代边界：非 DeepSeek 路由不登记；「保留区均为工具结果」拒绝压缩
-     （pairing_protect，绝不制造孤儿 tool）。
-  K  压缩经济性：本地 snip/elide 已把压力拉回线下时 Tier3 跳过付费摘要。
-
-时间尺度压缩说明：桩 LLM 0.0004s/字符；全部为生产原逻辑，无快捷路径。
-"""
 import sys
 import os
 import time
@@ -34,10 +15,9 @@ import core.agent_service as agent_service
 import core.memory_compressor as mc
 import core.llm as llm
 
-# 水位线常量与生产保持同源（改生产常量时脚本同步跟随）
-SNIP_LINE = agent_service.SNIP_RATIO      # 0.60
-ELIDE_LINE = agent_service.ELIDE_RATIO    # 0.80
-SUMMARY_LINE = agent_service.SUMMARIZE_RATIO  # 0.95
+SNIP_LINE = agent_service.SNIP_RATIO
+ELIDE_LINE = agent_service.ELIDE_RATIO
+SUMMARY_LINE = agent_service.SUMMARIZE_RATIO
 
 WINDOW = 128000
 DEEPSEEK_MODEL = "openai/deepseek-v4"
@@ -53,7 +33,6 @@ BASE_CFG = {
     "max_chunk_token_budget": 24000,
     "max_total_seconds": 900.0,
     "precompress_ratio": 0.0,
-    # 预截断三键：生产默认值（memory_compressor._load_compression_config）
     "tool_result_truncate_threshold_chars": 2000,
     "tool_result_preview_limit_chars": 800,
     "tool_result_token_limit": 600,
@@ -176,14 +155,13 @@ def part_f(tmp):
     mgr.add_messages(sess, [("user", "开始")])
     i = 0
     while est_of(mgr, sess) <= WINDOW * SNIP_LINE:  # 必须真正越过 60% 阈值
-        add_tool_round(mgr, sess, i, 12000, err=(i % 4 == 3))  # 1/4 是错误结果
+        add_tool_round(mgr, sess, i, 12000, err=(i % 4 == 3))
         i += 1
     print("F0 构造完成：水位 %.0f%%，%d 轮（每 4 轮 1 个错误结果）"
           % (est_of(mgr, sess) / WINDOW * 100, i))
     s0, e0, o0 = counts(mgr, sess)
     print("    初始状态：snipped=%d elided=%d 原样=%d" % (s0, e0, o0))
 
-    # ---- F1: 60% 水位 → Tier1 snip ----
     notices = []
     run_turn(mgr, sess, notices=notices)
     s1, e1, o1 = counts(mgr, sess)
@@ -191,26 +169,17 @@ def part_f(tmp):
           % (s1, s0, e1, o1,
              next((txt(m) for _, m in notices if "折叠" in m), "无")))
     assert s1 > s0 and e1 == 0, "Tier1 应只 snip 不 elide"
-    # 冻结与错误豁免：snip 后的与错误的都应在"原样"里
-    run_turn(mgr, sess)  # 再跑一轮同水位：冻结的结果不会被重复改写
+    run_turn(mgr, sess)
     s1b, e1b, o1b = counts(mgr, sess)
     assert (s1b, e1b) == (s1, e1), "已冻结的 snipped 不应被重复改写"
     print("    幂等：同水位再跑一轮 snipped=%d 不变 ✔" % s1b)
 
-    # ---- F2: 80% 水位 → Tier2 elide ----
-    # 关键事实（诊断证实）：Tier1 的 snip 极为高效——大工具结果被压到 ~1/3
-    # 以下，靠工具结果本身永远到不了"snip 后仍 >80%"。要触发 Tier2，必须让
-    # snip 消化不掉的底座（纯文本 user/assistant，永不被改写）先垫到 80%+，
-    # 再叠工具结果：Tier1 snip 新结果后水位仍 >80% → Tier2 把保护区外所有
-    # ≥1024 字符的未冻结结果（含 snipped）整体占位符化（elide 升级）。
-    # 闭环水位：底座 84% → 叠 2 轮大结果到 ~134% → snip 后 ~97% (>80% 且 >95%
-    # 不行——会走 Tier3；调低底座让 snip 后落在 (80%,95%) 窗口)。
     i = 100
-    while est_of(mgr, sess) <= WINDOW * 0.82:  # 纯文本底座 82%
+    while est_of(mgr, sess) <= WINDOW * 0.82:
         add_text_round(mgr, sess, i, 3000, 2800)
         i += 1
     for k in range(2):
-        add_big_tool_round(mgr, sess, 500 + k)  # 每轮 snip 后剩 ~2k token
+        add_big_tool_round(mgr, sess, 500 + k)
     print("    灌入后水位 %.0f%%（snip 消化前；底座 82%% 为不可 snip 纯文本）"
           % (100 * est_of(mgr, sess) / WINDOW))
     notices = []
@@ -234,7 +203,7 @@ def part_g(tmp):
     mgr, sess = make_mgr(tmp, "g"), "sess_g"
     mgr.add_messages(sess, [("user", "开始")])
     i = 0
-    while est_of(mgr, sess) <= WINDOW * SUMMARY_LINE:  # 真正越过 95%
+    while est_of(mgr, sess) <= WINDOW * SUMMARY_LINE:
         add_text_round(mgr, sess, i)
         i += 1
     stub = StubLLM()
@@ -258,11 +227,10 @@ def part_h(tmp):
     stub = StubLLM()
     stub.fail_all = True
     with patched(stub):
-        # ---- H1: 96%~120% 区间：失败但低于熔断线 → 仍允许微调淘汰 ----
         mgr1, s1 = make_mgr(tmp, "h1"), "sess_h1"
         mgr1.add_messages(s1, [("user", "开始")])
         i = 0
-        while est_of(mgr1, s1) <= WINDOW * 0.98:  # 96%~120% 区间
+        while est_of(mgr1, s1) <= WINDOW * 0.98:
             add_text_round(mgr1, s1, i)
             i += 1
         notices = []
@@ -280,11 +248,10 @@ def part_h(tmp):
               % row[0])
         assert row[0], "低于熔断线应允许微调淘汰"
 
-        # ---- H2: >1.2×window：熔断 → 停止自动淘汰 + I4 兜底 ----
         mgr2, s2 = make_mgr(tmp, "h2"), "sess_h2"
         mgr2.add_messages(s2, [("user", "开始")])
         i = 0
-        while est_of(mgr2, s2) <= WINDOW * 1.30:  # >1.2×window 熔断区
+        while est_of(mgr2, s2) <= WINDOW * 1.30:
             add_text_round(mgr2, s2, i)
             i += 1
         notices = []
@@ -314,10 +281,10 @@ def part_i(tmp):
     mgr, sess = make_mgr(tmp, "i"), "sess_i"
     mgr.add_messages(sess, [("user", "开始")])
     i = 0
-    while est_of(mgr, sess) <= WINDOW * 0.88:  # 先到 88%（预压缩区间内）
+    while est_of(mgr, sess) <= WINDOW * 0.88:
         add_text_round(mgr, sess, i)
         i += 1
-    slow = StubLLM(spc=0.004)  # 慢桩：后台预压缩迟迟不结束
+    slow = StubLLM(spc=0.004)
     orig_trigger = agent_service._trigger_background_precompress
     started = []
     def slow_trigger(*a, **k):
@@ -330,18 +297,15 @@ def part_i(tmp):
         with patched(slow):
             cfg = dict(BASE_CFG); cfg["precompress_ratio"] = 0.85
             mc._load_compression_config = lambda: cfg
-            # 回合 1：88% 水位 → 触发后台预压缩（慢桩，消息即时发出）
             notices = []
             t1, _ = run_turn(mgr, sess, notices=notices)
             assert started, "88% 水位应触发预压缩"
             assert mc.is_session_compressing(mgr, sess), "后台预压缩应运行中"
             print("I1 88%% 水位回合 1：等待 %.2fs（预压缩转后台 ✔，慢桩运行中）" % t1)
-            # 趁后台未完成，用户快节奏灌增量到 160%（模拟极端连续对话）
             j = 500
             while est_of(mgr, sess) <= WINDOW * 1.58:
                 add_text_round(mgr, sess, j)
                 j += 1
-            # 回合 2：160% 水位 → Tier3 同步压缩命中 already_running
             notices = []
             _, msgs = run_turn(mgr, sess, notices=notices)
             running = [m for _, m in notices if "仍在进行中" in m]
@@ -358,7 +322,6 @@ def part_i(tmp):
                     (sess,)).fetchone()
             assert not row[0], "already_running 严禁推水位"
             print("    水位未推进（绝不打翻后台压缩的乐观锁）✔")
-            # 等慢桩预压缩自然结束（它压的是 88% 时的历史，成果照常落库）
             t0 = time.time()
             while mc.is_session_compressing(mgr, sess):
                 time.sleep(0.2)
@@ -366,7 +329,6 @@ def part_i(tmp):
                     raise RuntimeError("等待后台预压缩超时")
             print("I3 后台慢压缩自然完成（%.0fs），落库后水位 %.0f%%"
                   % (time.time() - started[0], 100 * est_of(mgr, sess) / WINDOW))
-            # 回合 3：预压缩成果已在，水位应回落，正常轮
             notices = []
             t3, _ = run_turn(mgr, sess, notices=notices)
             lv = est_of(mgr, sess) / WINDOW
@@ -385,7 +347,6 @@ def part_j(tmp):
     print("=" * 70)
     print("J · 边界：非账本路由不登记 / 孤儿 tool 保护")
     print("=" * 70)
-    # J1: 非 DeepSeek 路由 → 不登记
     mgr, sess = make_mgr(tmp, "j1"), "sess_j1"
     mgr.add_messages(sess, [("user", "开始")])
     i = 0
@@ -453,8 +414,8 @@ def part_k(tmp):
     mgr, sess = make_mgr(tmp, "k"), "sess_k"
     mgr.add_messages(sess, [("user", "开始")])
     i = 0
-    while est_of(mgr, sess) <= WINDOW * 0.93:  # 93% 起：snip 后预计落回 60% 内
-        add_tool_round(mgr, sess, i, 20000)  # 超大工具结果
+    while est_of(mgr, sess) <= WINDOW * 0.93:
+        add_tool_round(mgr, sess, i, 20000)
         i += 1
     print("K0 构造：%.0f%% 水位（大工具结果构成，snip 后预计大幅回落）"
           % (100 * est_of(mgr, sess) / WINDOW))

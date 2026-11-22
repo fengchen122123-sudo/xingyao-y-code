@@ -1,26 +1,4 @@
 # -*- coding: utf-8 -*-
-"""P2 角色链路真跑探针（人工受控执行，绝不由自动化无确认跑）。
-
-复验「角色库与角色带入」的图像阶段端到端行为：桥层拼装函数与插件工具不改，
-这里用同一份 compose_character_prompt + tokenrhythm_edit_image 走真实 API。
-GUI 桥（pywebview）无法 headless 起，桥内编排改由单元测试覆盖；本探针只补
-「拼装后的 prompt + 主参考垫图真的喂给 API，模型服从度如何」。
-
-流程（全部最便宜档，合计预估 ¥0.4）：
-    1. 文生图：写实少女半身像（tokenrhythm_generate_image，¥0.2）
-    2. 建角色档案 + 存主参考（character_store + media_store 归档拿 digest，¥0）
-    3. compose_character_prompt 拼装 → tokenrhythm_edit_image 垫图改图（¥0.2）
-    4. 生成台账落库 + MAE(文生图, 定妆图) 参考指标
-    5. 产物路径打印（定妆图给 probe_tokenrhythm_video --frame 做阶段 A/B 复验）
-
-用法：
-    venv\\Scripts\\python.exe scripts\\probe_p2_character.py --yes
-
-判定标准：
-    1. 定妆图 prompt 服从：产物与主参考是同一个人（人工核对，肉眼项）
-    2. 生成台账记录齐全：prompt / final_prompt / digest 快照 / 费用 / 路径
-    3. MAE(文生图, 定妆图) 只作参考——改图本来就要求内容变化，小不了，不设阈值
-"""
 
 from __future__ import annotations
 
@@ -45,7 +23,6 @@ def _load_module(rel_path: str, name: str):
 
 
 def _mae(image_a: str, image_b: str, size: int = 512) -> float | None:
-    """与 probe_tokenrhythm_video 同口径的 MAE（512×512，0~255）。"""
     try:
         import numpy as np
         from PIL import Image
@@ -80,7 +57,6 @@ def main() -> int:
 
     image_plugin = _load_module("plugins/tokenrhythm_image/plugin.py", "tr_image_plugin")
 
-    # 1. 文生图：写实少女像（之后当主参考）
     portrait = str(args.frame or "").strip()
     if portrait:
         if not os.path.isfile(portrait):
@@ -137,7 +113,6 @@ def main() -> int:
     print(f"[2] 角色 id={character['id']} 主参考 digest={item['digest'][:16]}…"
           f"（replaced_primary={out['replaced_primary']}）")
 
-    # 3. 拼装 + 垫图改图（走真实 edits 接口，与桥层同一份拼装函数）
     final_prompt = compose_character_prompt("正面半身定妆照，浅浅微笑", character)
     print(f"[3] final_prompt：\n{final_prompt}\n")
     print("[3] 角色定妆图（¥0.2）…")
@@ -150,7 +125,6 @@ def main() -> int:
     print(f"[3] 定妆图：{mugshot}")
     print(f"[3] metadata.oss_url 存在：{bool(edit_meta.get('oss_url'))} cost={edit_meta.get('cost_cny')}")
 
-    # 4. 生成台账落库 + 校验
     storage.record_generation({
         "kind": "image", "status": "success", "character_ids": [character["id"]],
         "prompt": "正面半身定妆照，浅浅微笑", "final_prompt": final_prompt,

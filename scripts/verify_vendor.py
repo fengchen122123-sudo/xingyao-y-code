@@ -1,32 +1,3 @@
-"""scripts/verify_vendor.py
-==========================
-vendor/ 随包第三方资源（ripgrep / mermaid 等）的来源与完整性校验脚本。
-
-背景（系统审查报告-2026-10-10 B8-03）：vendor/ 下的二进制与前端资源此前
-既无来源记录、也无哈希校验——供应链攻击面与不可复现构建两个问题并存。
-本脚本配合 vendor/VENDOR_MANIFEST.json（来源 URL + 版本 + SHA256 记录）把关：
-
-  1. 记录文件必须存在且 JSON 结构完整；
-  2. 记录中的每个文件必须真实存在；
-  3. 实际文件哈希必须与记录一致（不一致 = 篡改/漂移，直接失败）；
-  4. vendor/ 下不允许出现记录之外的文件（新增资源必须先登记来源再入库）。
-
-hash_mode 说明：
-  - binary  ：逐字节 SHA256（二进制文件）；
-  - text_lf ：先做 CRLF→LF 归一化再算 SHA256。用于文本类资源（如
-    mermaid min.js），规避 git core.autocrlf=true 检出时改变的换行
-    风格导致误报；真实的单字节内容篡改仍然会被检出。
-
-用法（仓库根目录）：
-  venv\\Scripts\\python.exe scripts/verify_vendor.py                # 校验
-  venv\\Scripts\\python.exe scripts/verify_vendor.py --print-hashes # 打印实际哈希（供回填记录）
-  venv\\Scripts\\python.exe scripts/verify_vendor.py --root <目录>   # 指定根目录（测试用）
-
-退出码：0 = 全部通过；1 = 存在不一致 / 缺失 / 未登记文件。
-
-约束：仅标准库、不新增依赖；绝不自动改写记录文件——哈希不一致时必须先人工
-核查来源与是否存在篡改，确认后才更新 vendor/VENDOR_MANIFEST.json。
-"""
 from __future__ import annotations
 
 import argparse
@@ -42,7 +13,6 @@ _HEX_DIGITS = set("0123456789abcdef")
 
 
 def _default_root() -> str:
-    """默认根目录 = 本脚本所在 scripts/ 的上一级（仓库根）。"""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -51,16 +21,11 @@ def hash_file(path: str, mode: str = "binary"):
     with open(path, "rb") as f:
         data = f.read()
     if mode == "text_lf":
-        # CRLF→LF 归一化：同一内容在不同 autocrlf 设置下检出也能比对
         data = data.replace(b"\r\n", b"\n")
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
 def load_manifest(manifest_path: str):
-    """读取并粗校验记录文件；返回 (records, problems)。
-
-    records: {相对路径: {"sha256": ..., "hash_mode": ...}}；读取失败时 records 为空。
-    """
     problems: list[str] = []
     if not os.path.isfile(manifest_path):
         return {}, [f"记录文件不存在: {manifest_path}"]
@@ -113,10 +78,6 @@ def load_manifest(manifest_path: str):
 
 
 def _iter_vendor_files(root: str):
-    """列出 vendor/ 下全部实际文件（相对路径，"\\" 已归一化为 "/"）。
-
-    含子目录、含隐藏文件；不含记录文件自身（无法自哈希）。
-    """
     vendor_dir = os.path.join(root, *VENDOR_REL.split("/"))
     found: list[str] = []
     if not os.path.isdir(vendor_dir):
@@ -145,8 +106,6 @@ def verify_vendor(root: str | None = None, manifest_path: str | None = None,
         full = os.path.join(root, *rel.split("/"))
         if not os.path.isfile(full):
             if rec.get("optional"):
-                # 可选资源：构建机未下载属正常状态（.gitignore 已排除大文件），
-                # 仍要提示，因为最终产物会因此缺少该能力。
                 printer(f"[SKIP] {rel}: 可选资源未提供，本次构建不随包")
                 continue
             problems.append(f"{rel}: 记录存在但文件缺失")

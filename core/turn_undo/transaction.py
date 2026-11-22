@@ -1,16 +1,3 @@
-"""星瑶按回合撤销：预检、一次性确认令牌与多文件恢复事务。
-
-规格 11/12 的实现。核心不变式：
-- 预检只通过 session_id + turn_id 定位权威恢复集合；任一文件冲突不生成
-  可执行令牌。
-- 令牌绑定会话/回合/工作区/操作种类/检查点版本/实际指纹集与当前 boot_id，
-  数据库只存哈希；执行时在工作区锁内重算指纹后 CAS 消费。
-- 多文件恢复是"整体预检 + 每文件原子替换 + 每步持久化日志 + 全部验证后才
-  宣告成功"；不声称跨文件操作系统级单次原子提交。
-- preparing 阶段失败是确定性 failed（未触碰目标）；开始应用后任何不确定性
-  进入 interrupted。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -48,10 +35,6 @@ from core.turn_undo.storage import (
 _STAGE_PREFIX = ".ycode-undo-stage-"
 
 
-# ---------------------------------------------------------------------------
-# 指纹与工作区身份
-# ---------------------------------------------------------------------------
-
 def fingerprint_line(canonical_path: str, state) -> str:
     return "|".join((
         canonical_path,
@@ -73,10 +56,6 @@ def fingerprint_set_sha256(pairs) -> str:
     return digest.hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# 撤销动作推导
-# ---------------------------------------------------------------------------
-
 def classify_undo_action(before_kind: NodeKind, after_kind: NodeKind) -> RollbackKind:
     """按最初 before 与最终 after 推导单文件恢复动作。"""
     before_exists = before_kind is not NodeKind.MISSING
@@ -87,7 +66,6 @@ def classify_undo_action(before_kind: NodeKind, after_kind: NodeKind) -> Rollbac
         return RollbackKind.RESTORE_DELETED
     if before_exists and after_exists:
         return RollbackKind.RESTORE_CONTENT
-    # before 与 after 都是 missing：记录不应存在（写入前拒绝过），显式失败
     raise TurnUndoError(
         UndoErrorCode.INVALID_STATE_TRANSITION,
         "文件记录的 before/after 均缺失，无法推导恢复动作",
@@ -100,10 +78,6 @@ def _node_from_file_row_side(row, side: str):
         return None
     return recorder_mod.state_from_row_side(row, side)
 
-
-# ---------------------------------------------------------------------------
-# 预检
-# ---------------------------------------------------------------------------
 
 def preview_revert(
     storage: TurnUndoStorage,
@@ -160,7 +134,6 @@ def preview_revert(
             UndoErrorCode.CHECKPOINT_UNAVAILABLE,
             checkpoint.last_error_message or "该回合的撤销记录不可用",
         )
-    # ready / conflicted / failed：允许（重新）预检
 
     if checkpoint.availability_enum is SnapshotAvailability.EXPIRED:
         raise TurnUndoError(
@@ -185,8 +158,6 @@ def preview_revert(
             "该回合没有受控文件修改记录",
         )
 
-    # 逐文件重查实际状态（规格 11.2）
-    # 因回合内被外部修改而退出撤销范围的文件不参与冲突判定，只在预检里列出。
     conflicts: list[FileConflict] = []
     skipped_files: list[str] = []
     pairs = []
@@ -228,14 +199,12 @@ def preview_revert(
             restore_content += 1
 
     if not pairs:
-        # 所有文件都因回合内外部修改退出撤销范围：没有可执行的还原动作
         raise TurnUndoError(
             UndoErrorCode.CHECKPOINT_UNAVAILABLE,
             "该回合没有可撤销的文件（全部因回合内外部修改被跳过）",
         )
 
     if conflicts:
-        # 结构化冲突：不生成令牌；状态转 conflicted（可重新预检）
         if status is not TurnUndoStatus.CONFLICTED:
             storage.transition_checkpoint(
                 checkpoint.checkpoint_id,
@@ -266,7 +235,6 @@ def preview_revert(
         )
         return preview, ""
 
-    # 无冲突：conflicted/failed -> ready，然后签发 previewed 操作 + 令牌
     if status in (TurnUndoStatus.CONFLICTED, TurnUndoStatus.FAILED):
         storage.transition_checkpoint(checkpoint.checkpoint_id, TurnUndoStatus.READY)
         checkpoint = storage.get_checkpoint(checkpoint.checkpoint_id)
@@ -311,7 +279,6 @@ def preview_revert(
 
 
 def _compare_states(expected, actual) -> list[str]:
-    """精确比较计划 after 与实际状态；返回结构化原因列表。"""
     reasons: list[str] = []
     if expected.kind is not actual.kind:
         reasons.append(f"节点类型不一致: 预期 {expected.kind.value} 实际 {actual.kind.value}")
@@ -337,10 +304,6 @@ def _compare_states(expected, actual) -> list[str]:
     return reasons
 
 
-# ---------------------------------------------------------------------------
-# 执行
-# ---------------------------------------------------------------------------
-
 def _operation_dir(storage: TurnUndoStorage, operation_id: str) -> Path:
     from core.turn_undo.storage import _default_data_dir
 
@@ -350,11 +313,9 @@ def _operation_dir(storage: TurnUndoStorage, operation_id: str) -> Path:
 
 
 def _rollback_plan_for_row(row) -> tuple[RollbackKind, str | None, int | None, NodeKind]:
-    """推导 (undo 动作, 撤销前回滚 blob, 撤销前 mode, 目标状态)。"""
     before_kind = NodeKind(row.before_kind)
     after_kind = NodeKind(row.after_kind) if row.after_kind else NodeKind.MISSING
     action = classify_undo_action(before_kind, after_kind)
-    # 回滚（cancel_revert 用）= 用户点击撤销之前的状态 = 已验证 after
     rollback_blob = row.after_blob_sha256 if after_kind is not NodeKind.MISSING else None
     rollback_mode = row.after_mode
     return action, rollback_blob, rollback_mode, before_kind
@@ -362,7 +323,6 @@ def _rollback_plan_for_row(row) -> tuple[RollbackKind, str | None, int | None, N
 
 def _write_stage_file(storage: TurnUndoStorage, operation_id: str, ordinal: int,
                       row, blob_sha: str) -> Path:
-    """从源 blob 生成阶段文件（目标同目录），刷新并校验。"""
     target = Path(row.canonical_path)
     data = storage.blob_store.read_bytes(blob_sha)
     stage_path = target.parent / f"{_STAGE_PREFIX}{operation_id}-{ordinal}{target.suffix}"
@@ -375,7 +335,7 @@ def _write_stage_file(storage: TurnUndoStorage, operation_id: str, ordinal: int,
             try:
                 os.chmod(stage_path, row.before_mode)
             except OSError:
-                pass  # 平台不支持完整 chmod（Windows）时按尽力而为语义
+                pass
         if hashlib.sha256(stage_path.read_bytes()).hexdigest() != blob_sha:
             raise TurnUndoError(
                 UndoErrorCode.SNAPSHOT_CORRUPT,
@@ -394,7 +354,6 @@ def _write_stage_file(storage: TurnUndoStorage, operation_id: str, ordinal: int,
 
 
 def _undo_action_quiet(row) -> RollbackKind:
-    """排序用：推导恢复动作，不抛异常（both-missing 理论上不存在）。"""
     try:
         return classify_undo_action(
             NodeKind(row.before_kind),
@@ -409,7 +368,6 @@ def _insert_operation_files(
     operation: "object",
     files: list,
 ) -> list[tuple[object, object]]:
-    """构建恢复集合：每文件独立记录 expected 指纹、回滚材料与应用顺序。"""
     rows = []
     entries = []
     ordered = sorted(
@@ -489,8 +447,6 @@ def execute_revert(
         )
 
     with coordinator.workspace_lock(root):
-        # 锁内复核：活跃回合互斥（规格 21）。后台任务不参与前台写入互斥，
-        # 但它此刻可能正在写文件，撤销同样必须避开。
         if coordinator.has_active_turn(root):
             raise TurnUndoError(
                 UndoErrorCode.WORKSPACE_BUSY,
@@ -514,7 +470,6 @@ def execute_revert(
                 "检查点版本已变化，令牌失效，请重新预检",
             )
 
-        # 锁内重算全部指纹（规格 11.3）；已退出撤销范围的文件不参与
         files = storage.list_files(checkpoint.checkpoint_id)
         pairs = [
             (row.canonical_path, recorder_mod.capture_node_state(row.canonical_path))
@@ -574,7 +529,6 @@ def execute_revert(
 
 
 def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) -> TurnUndoResult:
-    """prepared → applying → verifying → committed；失败进入中断恢复。"""
     operation_id = operation.operation_id
     entries = _insert_operation_files(
         storage, operation,
@@ -582,7 +536,6 @@ def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) 
     )
     op_files = {row.file_id: row for row in storage.list_operation_files(operation_id)}
 
-    # prepared：阶段文件全部生成并校验（不触碰目标）
     stages: dict[str, Path] = {}
     try:
         for ordinal, (row, action, rollback_blob, rollback_mode, expected) in enumerate(entries):
@@ -612,7 +565,6 @@ def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) 
                 storage.conn.rollback()
                 raise
     except TurnUndoError as error:
-        # preparing 失败：确定性 failed（未触碰目标），检查点回到 failed
         storage.transition_operation(
             operation_id, OperationStatus.FAILED,
             last_error_code=error.code, last_error_message=error.message,
@@ -625,7 +577,6 @@ def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) 
         _cleanup_stages(stages)
         raise
 
-    # applying：按确定性顺序逐文件应用
     storage.transition_operation(operation_id, OperationStatus.APPLYING)
     restored: list[str] = []
     deleted_created: list[str] = []
@@ -650,7 +601,6 @@ def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) 
     try:
         for row, action, rollback_blob, rollback_mode, expected in entries:
             op_file = op_files[row.file_id]
-            # 应用前再次检查当前状态 == 预期指纹
             actual = recorder_mod.capture_node_state(row.canonical_path)
             if _compare_states(expected, actual):
                 raise _interrupt(TurnUndoError(
@@ -729,7 +679,6 @@ def _run_revert_transaction(storage, coordinator, checkpoint, operation, files) 
         _cleanup_stages(stages)
         raise
 
-    # verifying → committed：检查点 reverted + 操作 committed + 纠正记录同事务
     storage.transition_operation(operation_id, OperationStatus.VERIFYING)
     reverted_at = now_ms()
     correction_values = {

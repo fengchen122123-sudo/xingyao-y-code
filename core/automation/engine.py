@@ -1,12 +1,3 @@
-"""星轨自动化任务：GUI 常驻调度引擎。
-
-职责边界（设计规格 5.3 / 4.6）：
-- 只做「读钟 → 原子认领 → 交给分发回调」，绝不发起 LLM 请求、绝不触碰 JS 桥；
-- 单任务分发异常隔离：该运行记 error，引擎继续服务其他任务；
-- 认领整体异常（如数据库抖动）只记日志，本轮跳过，不停摆；
-- 线程 daemon、名 automation-engine；start/stop 幂等；notify_changed 即时唤醒。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -42,11 +33,7 @@ class AutomationEngine:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._first_iteration = True
-        # 本轮进程（引擎生命周期）的启动时刻：startup 任务按它与认领标记比较，
-        # 保证每个进程启动恰好触发一次，而不是标记写过一次就永久失效。
         self._process_started_at = float(self._time_fn())
-
-    # -- 生命周期 --
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -76,8 +63,6 @@ class AutomationEngine:
         """任务增删改/启停/手动执行后调用，让变更绕过轮询间隔即时生效。"""
         self._wake.set()
 
-    # -- 主循环 --
-
     def _loop(self) -> None:
         while not self._stop.is_set():
             now = self._time_fn()
@@ -87,7 +72,6 @@ class AutomationEngine:
             self._wake.clear()
 
     def _run_iteration(self) -> None:
-        """单轮认领+分发。独立方法便于测试同步调用，不依赖线程时序。"""
         include_first = self._first_iteration
         self._first_iteration = False
         try:
@@ -114,7 +98,6 @@ class AutomationEngine:
                     logger.exception("自动化运行 %s 错误终态写入失败", run_id)
 
     def _next_wake_timeout(self, now: float) -> float:
-        """取「最近的 next_run_at」与轮询间隔的较小者，夹在 [0, poll_seconds]。"""
         try:
             earliest = self._storage.earliest_next_run()
         except Exception:

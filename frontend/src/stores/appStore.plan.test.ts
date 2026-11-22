@@ -37,7 +37,6 @@ describe('appStore plan panel', () => {
       data: { title: '当前任务计划', items: {}, session_name: 's1' },
     } as any)).not.toThrow();
 
-    // 非数组载荷不进入分支，面板保持原状
     expect(store.planData.items).toHaveLength(1);
   });
 });
@@ -71,7 +70,6 @@ describe('appStore plan_item_handoff', () => {
     expect((store.planData.items[0] as any).owner).toBe('main:turn-1');
     expect((store.planData.items[0] as any).handoff_note).toContain('主 Agent 正在接管');
 
-    // 并行会话 s2 的同名计划项事件绑定到 s2 运行时，不覆盖 s1 的接管状态
     store.handleBridgeEvent({
       type: 'plan_item_handoff',
       data: {
@@ -86,12 +84,10 @@ describe('appStore plan_item_handoff', () => {
       },
     } as any);
 
-    // s2 事件只写入 s2 运行时（reducer 处理完非当前会话事件后恢复当前视图）
     const s2Plan = (store.sessionRuntimeByName['s2'] as any).planData;
     expect((s2Plan.items[0] as any).execution_mode).toBe('takeover_queued');
     expect((s2Plan.items[0] as any).handoff_note).toContain('队列第 2 项');
 
-    // 当前视图（s1）未被 s2 事件污染
     expect((store.planData.items[0] as any).execution_mode).toBe('main_takeover');
     store._bindSessionRuntime('s1');
     expect((store.planData.items[0] as any).execution_mode).toBe('main_takeover');

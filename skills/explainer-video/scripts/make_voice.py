@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""竖屏讲解视频配音器。
-
-用法: python make_voice.py <工作目录>
-  读 <工作目录>/script.json，逐段 TTS 合成，产出:
-    audio/scene_NN.mp3 + audio/scene_NN.wav
-    timeline.json  每段的真实音频时长、段间停顿、起止时间
-    voice_full.wav 按时间轴落位的整条音轨
-  可调常量: VOICE(音色) / RATE(语速) / GAP(段间停顿) / TAIL(尾部留白) / SR(采样率)。
-"""
 import asyncio
 import json
 import os
@@ -59,7 +50,6 @@ def main():
         script = json.load(f)
     scenes = script["scenes"]
 
-    # 1) 合成 mp3
     failures = []
     for sc in scenes:
         n = int(sc["id"])
@@ -86,7 +76,6 @@ def main():
         print("FAILURES: %s" % failures)
         sys.exit(2)
 
-    # 2) 转 wav
     wavs = []
     for sc in scenes:
         n = int(sc["id"])
@@ -96,7 +85,6 @@ def main():
              "-ar", str(SR), "-ac", "1", "-sample_fmt", "s16", wav])
         wavs.append(wav)
 
-    # 3) 时间轴
     durations = [probe(w) for w in wavs]
     out_scenes = []
     t = 0.0
@@ -121,7 +109,6 @@ def main():
         json.dump({"fps": FPS, "gap": GAP, "total_duration": total,
                    "scenes": out_scenes}, f, ensure_ascii=False, indent=2)
 
-    # 4) 拼接总音轨
     total_samples = int(round(total * SR))
     track = np.zeros(total_samples, dtype=np.int16)
     for i, sc in enumerate(out_scenes):
@@ -133,7 +120,6 @@ def main():
         endpos = off + len(data)
         if endpos > total_samples:
             raise RuntimeError("scene %d overflows track" % sc["id"])
-        # 重叠检查
         if np.any(track[off:endpos] != 0):
             raise RuntimeError("scene %d overlaps previous audio" % sc["id"])
         track[off:endpos] = data

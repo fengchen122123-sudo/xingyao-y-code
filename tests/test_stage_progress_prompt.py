@@ -1,5 +1,3 @@
-"""系统提示词阶段汇报规则回归：GUI 与 CLI 均需定义公开阶段汇报并排除私有推理与逐工具播报。"""
-
 from core.agent_service import load_system_prompt
 
 

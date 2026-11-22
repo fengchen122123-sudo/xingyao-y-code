@@ -1,5 +1,3 @@
-"""browser_set_viewport 工具包装函数（core/tool_registry.py）的行为测试。"""
-
 from core.tool_registry import _browser_set_viewport_wrapper
 
 

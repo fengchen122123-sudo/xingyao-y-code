@@ -1,25 +1,3 @@
-"""电脑操控进程级运行时：轻量启动容器与确定性退出（设计 23.2，Task 16）。
-
-- ``start_computer_runtime()``：进程级轻量容器（幂等单例）。启动只读本模块
-  与 settings/hotkey——任一开关开启时按已开启配置注册全局紧急停止热键
-  Ctrl+Alt+Esc（注册失败能力不可用但不改写配置）；两开关全关不注册。
-  默认关闭路径不导入 Playwright、不启动浏览器、不启动截图、不注册
-  computer tools（controller 单例也不创建）。
-- ``ComputerRuntime.publish_observation``：观察截图的惰性预览发布器（GUI
-  专属，经 ``attach_preview_publisher`` 接到 controller；首次发布才启动
-  loopback 预览服务）。
-- ``shutdown_computer_runtime(controller, preview, hotkey)``：统一关闭入口
-  （brief Step 1 逐字协议），固定顺序 controller.stop（活动 run 停止：owner
-  cancel → Provider 流中断 → backend release/close，retained browser 一并
-  清理）→ preview.stop（删除临时 PNG）→ hotkey.close（注销热键）。每步独立
-  try/except 留痕，绝不向上传播；不触碰共享 HTTP 连接池，不自动恢复
-  interrupted run。
-- ``shutdown_process_computer_runtime(reason)``：GUI close / CLI 退出 / 异常
-  finally 的进程级入口——收集单例后按上述顺序统一关闭。
-
-本模块顶层绝不 import controller/Playwright/预览服务；重依赖全部惰性导入。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -31,10 +9,8 @@ from core.computer.models import ComputerControlError
 
 _LOGGER = logging.getLogger(__name__)
 
-# run 已终态的快照状态：紧急停止回调据此跳过已收尾的 run。
 _TERMINAL_RUN_STATUSES = frozenset({"completed", "stopped", "failed"})
 
-# 预览 PNG 的进程级根目录（每次 publish 惰性启动，stop 删除本进程目录）。
 _PREVIEW_ROOT_DIRNAME = "ycode-computer-preview"
 
 _RUNTIME_LOCK = threading.Lock()
@@ -202,7 +178,6 @@ def _emergency_stop(controller_provider):
 
 
 def _build_runtime(*, settings_loader, hotkey_factory, controller_provider):
-    """读取设置并构建容器：开关开启才注册热键；读取失败按全关处理。"""
     settings = None
     try:
         settings = settings_loader()
@@ -219,11 +194,6 @@ def _build_runtime(*, settings_loader, hotkey_factory, controller_provider):
 
 
 def _make_hotkey(hotkey_factory, controller_provider):
-    """构建并启动紧急停止热键；失败（含平台不支持）留痕返回 None。
-
-    注册失败不改写已开启的配置（fail-closed 展示，用户可在设置页看到
-    热键不可用；重试入口是重启或重新开启开关）。
-    """
     from core.computer.hotkey import EmergencyStopHotkey
 
     try:
@@ -246,7 +216,6 @@ def _make_hotkey(hotkey_factory, controller_provider):
 
 
 def _controller_has_active_run(controller_provider) -> bool:
-    """controller 是否有活动 run；读取失败按活动处理（保持热键，fail-closed）。"""
     try:
         snapshot = controller_provider().snapshot()
     except Exception:
@@ -297,14 +266,6 @@ def refresh_computer_runtime_hotkey(
     hotkey_factory=None,
     controller_provider=None,
 ) -> None:
-    """开关切换后按当前设置同步全局紧急停止热键（Task 16 生命周期接线）。
-
-    语义（Task 5 移交 → Task 16 / 设计 8.1）：用户开启设置时首次注册；
-    任一开关开启或存在活动 run（"活动能力存在时保持"）保持注册；两开关
-    全关且无活动 run 时注销；退出注销由 ``shutdown_computer_runtime``
-    统一承担。运行时容器未启动时零副作用（不自动启动、不读设置——GUI
-    启动路径负责创建容器，缺失即热键能力本轮不可用，fail-closed）。
-    """
     with _RUNTIME_LOCK:
         runtime = _RUNTIME
     if runtime is None:
@@ -333,7 +294,7 @@ def refresh_computer_runtime_hotkey(
             runtime._hotkey = _make_hotkey(hotkey_factory, controller_provider)
         elif not needed and current is not None:
             if _controller_has_active_run(controller_provider):
-                return  # 活动 run 收尾中：保持热键直到退出统一注销
+                return
             try:
                 current.close()
             except Exception:
@@ -342,12 +303,6 @@ def refresh_computer_runtime_hotkey(
 
 
 def attach_preview_publisher(runtime: "ComputerRuntime | None" = None) -> None:
-    """把 runtime 的预览发布器接到 controller 单例（GUI 专属，Task 16）。
-
-    观察截图发布到 loopback 预览服务（惰性启动）；CLI 不接线（无预览 UI，
-    避免多余的网络服务与临时文件）。controller 单例由此创建（轻量：顶层
-    不触碰 Playwright/浏览器/截图）。
-    """
     if runtime is None:
         runtime = get_computer_runtime()
     if runtime is None:
@@ -366,14 +321,6 @@ def shutdown_computer_runtime(
     hotkey=None,
     reason: str = "application_exit",
 ) -> None:
-    """统一确定性关闭入口（brief Step 1 逐字协议，Task 16）。
-
-    固定顺序 controller.stop（活动 run 停止 + Provider 流中断 + backend
-    release/close，retained browser 一并清理）→ preview.stop（关闭 loopback
-    服务并删除本进程全部临时 PNG）→ hotkey.close（注销全局热键）。每步独立
-    try/except 留痕，绝不向上传播、绝不掩盖后续清理；不触碰共享
-    连接池，不自动恢复 interrupted run。
-    """
     if controller is not None:
         try:
             controller.stop(reason=reason)

@@ -16,8 +16,6 @@
       <AppIcon name="loader" :size="12" :stroke-width="2" class="bg-spin" /><span class="chip-label">后台</span><span class="bg-entry-badge" data-test="bg-bar-count">{{ store.currentSessionBackgroundTasks.length }}</span>
     </button>
 
-    <!-- 后台任务下拉面板：锚定在会话头部按钮下方（与「星链 / 决策」同款悬浮卡片），
-         不再占输入框上方整行或悬浮在对话区底部 -->
     <div v-if="isOpen" class="bg-pop" data-test="bg-card" @click.stop>
       <div class="bg-pop-head">
         <div class="bg-pop-head-l">
@@ -62,10 +60,6 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 
-// 会话头部“后台任务”入口：只显示当前会话发起的任务（渲染源
-// currentSessionBackgroundTasks 按 session_id 过滤全局快照，其他会话/CLI
-// 启动的任务不串显）；快照由 App.vue 每 5 秒轮询刷新。
-// 点击在按钮下方展开任务下拉卡片，支持跳转右侧工作台看日志或直接终止。
 const props = withDefaults(defineProps<{
   open?: boolean | null;
 }>(), {
@@ -141,8 +135,6 @@ onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown);
 });
 
-// 详情：打开右侧面板后台任务页签查看该任务执行过程，任务卡保持展开
-// （bgTaskOpenNonce 每次自增，同一任务重复点击也能从其他页签切回）
 function openDetail(id: string) {
   store.openBackgroundTaskDetail(id);
 }

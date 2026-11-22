@@ -1,5 +1,3 @@
-"""云中转：默认关闭、来源固定为 lan、序号缓冲和设备代际。"""
-
 from __future__ import annotations
 
 import json
@@ -122,10 +120,8 @@ def test_desktop_only_events_skipped_and_send_failure_is_safe():
     client.submit("window_maximize_state", {"maximized": True})
     assert client.outbound.qsize() == 0
 
-    # 发送失败不能把异常抛回事件生产者，且应主动置为断线
     client.submit("notice", {"message": "important"})
     assert client.connected is False
-    # 该帧尚未成功送达，未进入 _replayed_seqs，重连后可由 handle_registered 补发
     delivered = []
     client._send = delivered.append
     client.handle_registered({"data": {"connection_generation": 2}})

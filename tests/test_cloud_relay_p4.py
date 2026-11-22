@@ -1,5 +1,3 @@
-"""P4 云中转桌面侧：客户端丢帧上报、连接状态暴露与 relay 路径的 dispatch_rpc 黑名单。"""
-
 from __future__ import annotations
 
 import json
@@ -8,9 +6,6 @@ import pytest
 
 from core.cloud_relay.client import OUTBOUND_LIMIT, CloudRelayClient
 from core.cloud_relay.service import CloudRelayService
-
-
-# ---------------------------------------------------------------- 客户端
 
 
 def test_client_reports_lost_frames_after_registration():
@@ -42,10 +37,8 @@ def test_client_reports_lost_frames_after_registration():
     client.pump(socket, "device-token", "dev")
     kinds = [json.loads(item)["type"] for item in sent]
     assert json.loads(socket.sent[0])["type"] == "relay_register"
-    # 队列丢过帧就不能装作补齐：注册成功后必须发 relay_lost 让 App 整态自愈。
     assert "relay_lost" in kinds
     assert client.generation == 3
-    # 只上报一次，重连不会反复刷。
     assert client.report_loss() is False
     assert client.status()["device_id"] == "dev"
 
@@ -80,16 +73,13 @@ def test_service_status_exposes_connection_state(monkeypatch):
     assert service.status()["state"] == "stopped"
 
 
-# ---------------------------------------------------------------- relay 路径的黑名单
-
-
 @pytest.mark.parametrize("method", [
-    "get_provider_api_key",   # 凭据读取
+    "get_provider_api_key",
     "get_feishu_secret",
-    "save_hook",              # hook 注入
+    "save_hook",
     "grant_hook_trust",
-    "shutdown",               # 桌面生命周期
-    "pty_terminal_write",     # 终端写入
+    "shutdown",
+    "pty_terminal_write",
     "pty_terminal_kill",
 ])
 def test_relay_dispatch_keeps_the_blacklist(monkeypatch, method):
@@ -192,7 +182,6 @@ def test_background_factory_sets_large_max_size_skips_dead_flush_and_reuses_rpc_
     time.sleep(0.05)
 
     assert connect_calls and connect_calls[0][1]["max_size"] == MAX_WS_FRAME_BYTES >= 70 * 1024 * 1024
-    # 两次 RPC 只初始化一次 LanServer 宿主（避免每条 RPC 重新探测局域网 IP）
     assert len(lan_inits) == 1
     assert "error" not in states
     replies = {json.loads(p)["id"]: json.loads(p) for p in sock.sent if '"id"' in p}
@@ -270,7 +259,6 @@ def test_configure_cloud_relay_runtime_status_and_hot_reload(monkeypatch, tmp_pa
     assert started_clients[0] == ("wss://example.com/relay/device", "secret-tok")
     assert bridge._cloud_relay_service is not None
 
-    # mtime 未变时幂等不重连
     bridge._sync_cloud_relay_from_disk()
     assert len(started_clients) == 1
 
@@ -280,7 +268,6 @@ def test_configure_cloud_relay_runtime_status_and_hot_reload(monkeypatch, tmp_pa
     assert st["settings"]["connected"] is True
     assert "secret-tok" not in json.dumps(st)
 
-    # 关闭后写盘应触发热停止
     svc_mod.configure_cloud_relay("wss://example.com/relay/device", "dev-1", enabled=False)
     os.utime(cfg_path, ns=(os.stat(cfg_path).st_atime_ns, os.stat(cfg_path).st_mtime_ns + 1_000_000))
     bridge._sync_cloud_relay_from_disk()

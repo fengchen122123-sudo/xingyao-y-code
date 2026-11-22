@@ -1,9 +1,3 @@
-"""Y-code 原生 HTTPX 同步流式传输核与解析引擎。
-
-摒弃 LiteLLM，采用原生 httpx.Client 连接池与 SSEDecoder 解析器，
-实现零黑盒丢参、100% 前缀字节锁定、微秒级 Token 估算与物理级硬中断。
-"""
-
 from __future__ import annotations
 
 import json
@@ -25,10 +19,6 @@ from core.llm_policy import (
 
 logger = logging.getLogger(__name__)
 
-
-# ==============================================================================
-# 1. 统一异常体系 (标准错误类，与系统错误映射器无缝对接)
-# ==============================================================================
 
 class NativeLLMError(Exception):
     """原生 LLM 通信基础异常。"""
@@ -71,10 +61,6 @@ class APIError(NativeLLMError):
     """其他通用 API 异常。"""
     pass
 
-
-# ==============================================================================
-# 2. 轻量级流数据对象 (兼容 StreamAssembler 的属性访问与字典提取)
-# ==============================================================================
 
 class ToolCallFunction:
     __slots__ = ("name", "arguments")
@@ -124,11 +110,6 @@ class ChunkDelta:
 
 
 class _ChoiceMessage:
-    """非流式响应的 message 形状（litellm ModelResponse.choices[0].message 兼容）。
-
-    部分调用方（视觉副模型/记忆压缩/Kairos）按 .message.content 消费非流式
-    响应，与流式 delta 形状并存，二者字段同源。
-    """
 
     __slots__ = ("role", "content", "reasoning_content", "tool_calls")
 
@@ -161,7 +142,6 @@ class ChunkChoice:
         self.delta = delta
         self.finish_reason = finish_reason
         self.index = index
-        # 流式 chunk 无 message 形状；仅 NativeSyncResponse 填充
         self.message = message
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -217,10 +197,6 @@ class StreamChunk:
         return getattr(self, key, default)
 
 
-# ==============================================================================
-# 3. 原生 SSE 解析器与流数据归一化
-# ==============================================================================
-
 class SSEDecoder:
     """标准 Server-Sent Events (SSE) 流式解析器。"""
 
@@ -230,7 +206,6 @@ class SSEDecoder:
         for line in line_iterator:
             line = line.strip()
             if not line or line.startswith(":"):
-                # 忽略心跳注释与空行
                 continue
             if line.startswith("data:"):
                 data = line[5:].strip()
@@ -281,10 +256,8 @@ class ChunkNormalizer:
         if not isinstance(raw, dict):
             return None
 
-        # 1. 解析 Usage（重点支持 DeepSeek/Kimi 原生缓存明细）
         usage_obj = self.normalize_usage(raw.get("usage"))
 
-        # 2. 解析 Choices
         raw_choices = raw.get("choices") or []
         choices_list: List[ChunkChoice] = []
 
@@ -293,7 +266,6 @@ class ChunkNormalizer:
                 continue
             delta_dict = choice.get("delta") or {}
 
-            # 正文内容
             content = delta_dict.get("content") or ""
 
             # 思维链抽取 (按 policy.reasoning_field 优先，其余字段兜底)
@@ -305,7 +277,6 @@ class ChunkNormalizer:
                 or ""
             )
 
-            # 工具调用增量
             tool_calls_list: List[ChunkToolCall] = []
             for tc in delta_dict.get("tool_calls") or []:
                 if not isinstance(tc, dict):
@@ -356,7 +327,6 @@ class NativeStreamResponse:
         self._normalizer = normalizer
         self._closed = False
         self._lock = threading.Lock()
-        # 记录收到的所有 chunks，以支持 core.llm 从尾部抓取最终 usage
         self.chunks: List[StreamChunk] = []
 
     def __iter__(self) -> Iterator[StreamChunk]:
@@ -442,16 +412,11 @@ class NativeSyncResponse:
         return getattr(self, key, default)
 
 
-# ==============================================================================
-# 4. HTTP 连接池管理与请求派发
-# ==============================================================================
-
 _client_instance: Optional[httpx.Client] = None
 _client_lock = threading.Lock()
 
 
 def _http2_enabled() -> bool:
-    """检查是否允许启用 HTTP/2（需要已安装 h2，且未被环境变量或配置显式关闭）。"""
     env_flag = os.environ.get("YCODE_HTTP2", "").strip().lower()
     if env_flag in ("0", "false", "no", "off"):
         return False
@@ -471,7 +436,6 @@ def _http2_enabled() -> bool:
 
 
 def _get_shared_client() -> httpx.Client:
-    """获取/初始化共享的高性能 httpx 同步长连接池。"""
     global _client_instance
     if _client_instance is not None:
         return _client_instance
@@ -502,13 +466,6 @@ def _dispatch_request(
     timeout_arg: Optional[httpx.Timeout],
     normalizer: Any,
 ):
-    """公共请求派发：发出 POST、映射 HTTP 错误，按流/非流返回统一响应对象。
-
-    OpenAI 兼容与 Anthropic Messages 两条协议路由共用本段——请求级超时必须经
-    build_request 的 timeout 参数写入 request.extensions（httpx 官方按请求
-    超时通道）：Client.send() 的 timeout 形参在 httpx 0.28 已被移除，传入即
-    TypeError，会让每个请求都在发出前崩溃（历史 bug：静默降级 litellm）。
-    """
     client = _get_shared_client()
     req = client.build_request(
         "POST", url, headers=headers, json=payload, timeout=timeout_arg
@@ -534,7 +491,6 @@ def _dispatch_request(
     try:
         raw_json = resp.json()
     except httpx.HTTPError as exc:
-        # 网络层读失败不换通道重发（同请求双发风险），直接按连接错误上抛
         raise APIConnectionError(f"非流式响应体读取失败: {exc}") from exc
     return normalizer.finalize_sync(raw_json)
 
@@ -546,16 +502,12 @@ def _resolve_endpoint_and_headers(
     policy: ModelPolicy,
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Dict[str, str], str]:
-    """解析出最终的 URL、请求头与实际模型名称。"""
-    # 提取实际模型名称（去除 provider 前缀，如 deepseek/deepseek-chat -> deepseek-chat）
     clean_model = model
     if "/" in model:
         prefix, remainder = model.split("/", 1)
-        # 若前缀是 provider 标识而非模型名的一部分，予以剥离
         if prefix.lower() in ("deepseek", "moonshot", "zhipu", "openai", "dashscope", "minimax"):
             clean_model = remainder
 
-    # 确定请求 URL
     if api_base:
         base = api_base.rstrip("/")
         if base.endswith("/chat/completions"):
@@ -563,7 +515,6 @@ def _resolve_endpoint_and_headers(
         else:
             url = f"{base}/chat/completions"
     else:
-        # 按方言默认官方端点
         kind = policy.provider_kind
         if kind == "deepseek":
             url = "https://api.deepseek.com/chat/completions"
@@ -580,12 +531,10 @@ def _resolve_endpoint_and_headers(
         else:
             url = "https://api.openai.com/v1/chat/completions"
 
-    # 组装请求头
     headers = {
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
     }
-    # 从参数或环境变量提取 key
     effective_key = api_key
     if not effective_key:
         env_keys = {
@@ -602,7 +551,6 @@ def _resolve_endpoint_and_headers(
     if effective_key:
         headers["Authorization"] = f"Bearer {effective_key}"
 
-    # 合并方言默认头、基元律动标识头、会话关联头与外部追加头
     headers.update(policy.default_headers)
     headers.update(tokenrhythm_agent_headers(url))
     headers.update(session_id_headers())
@@ -613,7 +561,6 @@ def _resolve_endpoint_and_headers(
 
 
 def _map_http_error(resp: httpx.Response) -> NativeLLMError:
-    """将 HTTP 错误状态码及响应体映射为标准系统异常。"""
     code = resp.status_code
     body = resp.text
     clean_body = body[:500] if body else ""
@@ -657,11 +604,6 @@ def _map_http_error(resp: httpx.Response) -> NativeLLMError:
     )
 
 
-# ==============================================================================
-# 5. 核心入口: native_completion
-# ==============================================================================
-
-# native 载荷构建直接消费的调用方参数（含 litellm 元参数与传输控制参数）
 _NATIVE_KNOWN_KWARGS = frozenset({
     "model", "api_key", "api_base", "messages", "stream",
     "temperature", "tools", "tool_choice",
@@ -681,11 +623,6 @@ _NATIVE_PASSTHROUGH_KEYS = frozenset({
 
 
 def native_completion(**kwargs) -> NativeStreamResponse:
-    """原生流式请求主入口（OpenAI 兼容 + Anthropic Messages 双协议）。
-
-    替代 litellm.completion，保证 100% 原始字段透传与零黑盒干扰；
-    anthropic/ 前缀路由由 _anthropic_completion 翻译为 /v1/messages 协议。
-    """
     model = kwargs.get("model") or ""
     if _is_anthropic_route(model):
         return _anthropic_completion(**kwargs)
@@ -701,11 +638,6 @@ def native_completion(**kwargs) -> NativeStreamResponse:
         extra_headers=kwargs.get("extra_headers"),
     )
 
-    # litellm 专属元参数：native 侧无对应语义，显式消费避免落进未知参数告警。
-    # - num_retries：请求内重试由上层重试循环承担，native 不做；
-    # - allowed_openai_params：litellm 客户端参数校验白名单，native 全量透传无需校验；
-    # - metadata：litellm pass-through（Kimi Anthropic 路由亲和 user_id），
-    #   OpenAI 兼容路由的缓存亲和材料走 extra_body，已在下方合并。
     for litellm_meta_key in ("num_retries", "allowed_openai_params", "metadata"):
         kwargs.pop(litellm_meta_key, None)
 
@@ -713,10 +645,7 @@ def native_completion(**kwargs) -> NativeStreamResponse:
     # 统一决定并自加（与调用方契约值等价），显式消费避免落进未知参数告警。
     kwargs.pop("stream_options", None)
 
-    # 与 litellm.completion 契约一致：调用方不传 stream 时为非流式请求，
-    # 返回完整 NativeSyncResponse（stream=True 仅由主聊天路径显式传入）。
     is_stream = bool(kwargs.get("stream", False))
-    # 构建发送载荷 (严格保真)
     payload: Dict[str, Any] = {
         "model": clean_model,
         "messages": kwargs.get("messages") or [],
@@ -727,11 +656,9 @@ def native_completion(**kwargs) -> NativeStreamResponse:
     if is_stream and policy.supports_stream_options:
         payload["stream_options"] = {"include_usage": True}
 
-    # 温度
     if policy.supports_temperature and kwargs.get("temperature") is not None:
         payload["temperature"] = kwargs.get("temperature")
 
-    # 工具参数
     if kwargs.get("tools"):
         payload["tools"] = kwargs["tools"]
         if kwargs.get("tool_choice"):
@@ -739,7 +666,6 @@ def native_completion(**kwargs) -> NativeStreamResponse:
         else:
             payload["tool_choice"] = "auto"
 
-    # Token 限制：max_completion_tokens 优先（OpenAI 新式参数，二者互斥）
     max_completion_tokens = kwargs.get("max_completion_tokens")
     if max_completion_tokens is not None:
         payload["max_completion_tokens"] = max_completion_tokens
@@ -760,7 +686,6 @@ def native_completion(**kwargs) -> NativeStreamResponse:
         if value is not None:
             payload[passthrough_key] = value
 
-    # 未识别的顶层参数显式告警：静默丢参会让推理强度、缓存亲和等语义悄悄失效
     known_keys = _NATIVE_KNOWN_KWARGS | _NATIVE_PASSTHROUGH_KEYS
     unknown_keys = sorted(set(kwargs) - known_keys)
     if unknown_keys:
@@ -769,7 +694,6 @@ def native_completion(**kwargs) -> NativeStreamResponse:
             ", ".join(unknown_keys),
         )
 
-    # 合并 extra_body (如 thinking、缓存亲和等扩展参数)
     payload.update(policy.default_extra_body)
     extra_body = kwargs.get("extra_body")
     if isinstance(extra_body, dict):
@@ -780,11 +704,6 @@ def native_completion(**kwargs) -> NativeStreamResponse:
     if req_timeout is not None:
         timeout_arg = httpx.Timeout(
             connect=min(15.0, float(req_timeout)),
-            # 流式 read 不设 None：httpx 的 read 超时同时覆盖“等待响应头”与
-            # “chunk 间隔”，必须有界才能保证首字节 give-up 后请求线程最终
-            # 自愈退出，不永久滞留连接池名额。600s 与上层看门狗
-            # REQUEST_WAIT_GIVE_UP_SECONDS 对齐——看门狗先/同时触发，
-            # 正常长思考流不受影响。
             read=600.0 if is_stream else float(req_timeout),
             write=30.0,
             pool=10.0,
@@ -795,21 +714,10 @@ def native_completion(**kwargs) -> NativeStreamResponse:
     )
 
 
-# ==============================================================================
-# 6. 微秒级快速 Token 估算器 (替代 litellm.token_counter)
-# ==============================================================================
-
 _RE_CHINESE = re.compile(r"[\u4e00-\u9fff]")
 
 
 def fast_token_counter(model: str, messages: Any) -> int:
-    """微秒级启发式 Token 估算器。
-
-    根据中英文字符比率估算，单次计算仅耗时 ~0.05ms，摆脱 litellm.token_counter
-    的查表卡顿。中文按 ~0.75 tokens/字符（约 1.33 字符/token）换算，
-    英文/代码/符号按 ~0.28 tokens/字符（约 3.5 字符/token）换算。
-    工具调用增量与历史消息的 arguments 文本一并计入，避免长参数低估。
-    """
     if not messages:
         return 0
 
@@ -843,25 +751,15 @@ def fast_token_counter(model: str, messages: Any) -> int:
         total_len = len(text)
         cn_chars = len(_RE_CHINESE.findall(text))
         en_chars = total_len - cn_chars
-        # 中文 ~0.75 tokens/字符；英文/代码 ~0.28 tokens/字符
         tokens = int(cn_chars * 0.75 + en_chars * 0.28)
         total_tokens += max(1, tokens)
 
     return max(1, total_tokens)
 
 
-# ==============================================================================
-# 7. Anthropic Messages 协议适配（/v1/messages，anthropic/ 前缀路由）
-# ==============================================================================
-# 覆盖 anthropic 兼容端点（阶跃 step_plan、api.kimi.com/coding 等）。
-# 请求侧把 OpenAI chat 形状（messages/tools/tool_calls/reasoning_content）
-# 翻译为 Messages API 形状；响应侧把 SSE 事件流/完整 JSON 归一化回
-# StreamChunk / NativeSyncResponse，供上层零改动消费。
-
 _ANTHROPIC_VERSION = "2023-06-01"
 _ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
 
-# stop_reason → OpenAI finish_reason
 _ANTHROPIC_STOP_REASON_MAP = {
     "end_turn": "stop",
     "stop_sequence": "stop",
@@ -871,7 +769,6 @@ _ANTHROPIC_STOP_REASON_MAP = {
     "pause_turn": "stop",
 }
 
-# 流内 error 事件 type → 异常类
 _ANTHROPIC_STREAM_ERROR_MAP = {
     "rate_limit_error": RateLimitError,
     "authentication_error": AuthenticationError,
@@ -885,7 +782,6 @@ _ANTHROPIC_STREAM_ERROR_MAP = {
 
 
 def _is_anthropic_route(model: str) -> bool:
-    """判断模型是否走 Anthropic Messages 协议（litellm 时代的 anthropic/ 前缀约定）。"""
     return str(model or "").strip().lower().startswith("anthropic/")
 
 
@@ -894,7 +790,6 @@ def _anthropic_resolve_endpoint(
     api_key: Optional[str],
     extra_headers: Optional[Dict[str, str]],
 ) -> Tuple[str, Dict[str, str]]:
-    """解析 /v1/messages 端点与请求头（x-api-key + anthropic-version）。"""
     base = (api_base or "https://api.anthropic.com").rstrip("/")
     if base.endswith("/v1/messages"):
         url = base
@@ -920,7 +815,6 @@ def _anthropic_resolve_endpoint(
 
 
 def _anthropic_image_block(url: str) -> Optional[Dict[str, Any]]:
-    """OpenAI image_url → Anthropic image 块（base64 data URI 与 http URL 两种来源）。"""
     url = str(url or "")
     if url.startswith("data:"):
         head, _, b64 = url.partition(",")
@@ -934,7 +828,6 @@ def _anthropic_image_block(url: str) -> Optional[Dict[str, Any]]:
 
 
 def _anthropic_content_blocks(content: Any) -> List[Dict[str, Any]]:
-    """OpenAI content（str 或多模态块列表）→ Anthropic 内容块列表。"""
     if content is None:
         return []
     if isinstance(content, str):
@@ -954,21 +847,11 @@ def _anthropic_content_blocks(content: Any) -> List[Dict[str, Any]]:
             if image_block is not None:
                 blocks.append(image_block)
         elif item_type == "image":
-            blocks.append(item)  # 已是 Anthropic 形状，原样保留
+            blocks.append(item)
     return blocks
 
 
 def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Dict[str, Any]]]:
-    """OpenAI chat messages → (system, anthropic messages)。
-
-    - system 消息提取为顶层 system（纯文本时用字符串，带 cache_control 时用块列表）
-    - role=tool 翻译为 tool_result 块；连续 tool 结果合并进单条 user 消息，
-      满足 Anthropic 的角色交替约束
-    - assistant.tool_calls → tool_use 块（arguments 解析为 JSON 对象）
-    - assistant.reasoning_content → thinking 块（anthropic 路由历史保真，
-      对应 llm_dialects 对 anthropic 前缀的 keep_thinking_blocks 语义）
-    - 消息级 cache_control（litellm 时代由其翻译）挂到该消息最后一个内容块
-    """
     system_blocks: List[Dict[str, Any]] = []
     out: List[Dict[str, Any]] = []
 
@@ -1002,7 +885,6 @@ def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Di
                 "tool_use_id": str(msg.get("tool_call_id") or ""),
                 "content": result_content,
             }
-            # 连续 tool 结果并入同一条 user 消息（协议要求角色交替）
             prev = out[-1] if out else None
             if (
                 isinstance(prev, dict)
@@ -1047,7 +929,6 @@ def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Di
             out.append({"role": "assistant", "content": blocks})
             continue
 
-        # user（含多模态）及其他角色
         if isinstance(content, list):
             blocks = _anthropic_content_blocks(content)
         elif content:
@@ -1058,11 +939,6 @@ def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Di
             blocks = [{"type": "text", "text": ""}]
         if cache_ctrl:
             blocks[-1]["cache_control"] = cache_ctrl
-        # 相邻 user 消息并入前一条：OpenAI 序列 assistant(tool_calls) → tool(...)
-        # → user(编排提醒/follow-up 注入) 翻译后会出现 user(tool_result) 与
-        # user(text) 相邻，Anthropic 严格角色交替校验直接 400
-        # "roles must alternate"，故文本块追加进前一条 user 的块列表
-        # （tool_result 在前、文本在后）。
         prev = out[-1] if out else None
         if (
             isinstance(prev, dict)
@@ -1083,7 +959,6 @@ def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Di
 
 
 def _anthropic_translate_tools(tools: Any) -> List[Dict[str, Any]]:
-    """OpenAI function tools → Anthropic tools（input_schema 形状）。"""
     anthropic_tools: List[Dict[str, Any]] = []
     for tool in tools or []:
         if not isinstance(tool, dict):
@@ -1103,7 +978,6 @@ def _anthropic_translate_tools(tools: Any) -> List[Dict[str, Any]]:
 
 
 def _anthropic_translate_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any]]:
-    """OpenAI tool_choice → Anthropic tool_choice（{"type": auto|any|tool}）。"""
     if tool_choice is None or tool_choice == "auto":
         return {"type": "auto"}
     if tool_choice == "required" or tool_choice == "any":
@@ -1118,11 +992,6 @@ def _anthropic_translate_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any
 
 
 def _anthropic_usage_to_openai(usage_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Anthropic usage → OpenAI usage 字典（缓存读命中映射到 hit 字段）。
-
-    Anthropic 的 input_tokens 不含缓存部分，prompt_tokens 按
-    input + cache_read + cache_creation 汇总，保证界面输入计数与 DeepSeek 语义一致。
-    """
     input_tokens = int(usage_raw.get("input_tokens") or 0)
     cache_read = int(usage_raw.get("cache_read_input_tokens") or 0)
     cache_creation = int(usage_raw.get("cache_creation_input_tokens") or 0)
@@ -1135,14 +1004,11 @@ def _anthropic_usage_to_openai(usage_raw: Dict[str, Any]) -> Dict[str, Any]:
         "prompt_tokens_details": {"cached_tokens": cache_read} if cache_read else None,
         "prompt_cache_hit_tokens": cache_read or None,
         "prompt_cache_miss_tokens": input_tokens or None,
-        # Task 7（跨渠道缓存命中率修复）：写入量单独暴露给记账层，供读写分列；
-        # 未报告 → None。上面 prompt_tokens 的汇总口径保持不变。
         "cache_creation_input_tokens": cache_creation or None,
     }
 
 
 def _anthropic_sync_to_openai(raw: dict) -> dict:
-    """Anthropic 完整响应 JSON → OpenAI chat completion 形状字典。"""
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
@@ -1182,14 +1048,6 @@ def _anthropic_sync_to_openai(raw: dict) -> dict:
 
 
 class AnthropicStreamNormalizer:
-    """Anthropic /v1/messages SSE 事件流 → StreamChunk 的有状态归一化器。
-
-    事件序：message_start（请求 id/输入 usage）→ 若干 content_block_start/
-    content_block_delta/content_block_stop（text/thinking/tool_use）→
-    message_delta（stop_reason + 输出 usage）→ message_stop。
-    归一化输出与 OpenAI chunk 相同形状（content/reasoning_content/tool_calls/
-    finish_reason/usage），上层 chunk 消费方零改动。
-    """
 
     def __init__(self):
         self._request_id: Optional[str] = None
@@ -1268,7 +1126,6 @@ class AnthropicStreamNormalizer:
                     model=self._model,
                     choices=[ChunkChoice(delta=ChunkDelta(tool_calls=[tool_call]))],
                 )
-            # signature_delta 等未知增量：忽略
             return None
         if event_type == "message_delta":
             delta = raw.get("delta") or {}
@@ -1300,7 +1157,6 @@ class AnthropicStreamNormalizer:
                     prompt_cache_miss_tokens=usage_dict["prompt_cache_miss_tokens"],
                 ),
             )
-        # content_block_stop / 未知事件：忽略
         return None
 
     def finalize_sync(self, raw: dict) -> "NativeSyncResponse":
@@ -1321,7 +1177,6 @@ _ANTHROPIC_KNOWN_KWARGS = {
 
 
 def _anthropic_completion(**kwargs):
-    """Anthropic Messages 协议请求入口（anthropic/ 前缀路由专用）。"""
     model = str(kwargs.get("model") or "")
     clean_model = model.split("/", 1)[1] if "/" in model else model
     url, headers = _anthropic_resolve_endpoint(
@@ -1371,8 +1226,6 @@ def _anthropic_completion(**kwargs):
         payload["top_k"] = kwargs.get("top_k")
     if kwargs.get("metadata") is not None:
         payload["metadata"] = kwargs.get("metadata")
-    # Anthropic 协议原生形状的思考参数与厂商扩展（阶跃 output_config.effort）
-    # 由 llm_dialects 按 anthropic_route 组装，这里原样透传。
     for anthropic_key in ("thinking", "output_config"):
         if kwargs.get(anthropic_key) is not None:
             payload[anthropic_key] = kwargs.get(anthropic_key)

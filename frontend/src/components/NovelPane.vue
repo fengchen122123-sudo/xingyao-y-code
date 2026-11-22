@@ -1,12 +1,10 @@
 <template>
   <div class="novel-wrap" data-test="novel-pane">
-    <!-- 加载中：只在首次拉取、且还没有任何快照时占位，重拉时保留旧内容避免闪白 -->
     <div v-if="phase === 'loading'" class="novel-hint" data-test="novel-loading">
       <AppIcon name="loader" class="icon-spin" :size="14" />
       <span>正在读取小说项目状态…</span>
     </div>
 
-    <!-- 出错（含目录不存在 / 追踪文件损坏等结构化 error）：只显示错误文本，不崩-->
     <div v-else-if="phase === 'error'" class="novel-block" data-test="novel-error">
       <div class="novel-block-title">
         <AppIcon name="triangle-alert" :size="13" :stroke-width="2" /> 读取失败
@@ -15,7 +13,6 @@
       <button class="novel-btn" data-test="novel-retry" @click="load()">重试</button>
     </div>
 
-    <!-- 非小说项目：给出「初始化小说项目」引导，不直接写文件（设计 §7.3-4） -->
     <div v-else-if="phase === 'empty'" class="novel-empty" data-test="novel-empty">
       <div class="novel-empty-icon"><AppIcon name="file" :size="22" :stroke-width="1.6" /></div>
       <div class="novel-empty-title">{{ emptyTitle }}</div>
@@ -29,9 +26,7 @@
       >初始化小说项目</button>
     </div>
 
-    <!-- 正常态：头部字数 / 章节列表 / 状态卡 -->
     <template v-else>
-      <!-- 工具区：多书切换（同一工作区内多本小说时才出现）+ 导出全书 -->
       <div class="novel-toolbar">
         <select
           v-if="books.length > 1"
@@ -61,7 +56,6 @@
           @click="exportNovel('txt')"
         >导出 TXT</button>
       </div>
-      <!-- 导出结果：成功/失败都是内联提示，不弹模态、不动快照 -->
       <div v-if="exportHint" class="novel-export-hint" data-test="novel-export-hint">{{ exportHint }}</div>
       <div v-if="exportError" class="novel-export-error" data-test="novel-export-error">{{ exportError }}</div>
 
@@ -79,8 +73,6 @@
             今日 <b class="novel-num">{{ formatWords(todayWords) }}</b>
           </span>
         </div>
-        <!-- 目标只在后端给出 target_words 时才有进度条；当前契约没有该字段，
-             不编造分母，避免出现「永远 0%」的假进度 -->
         <div v-if="targetWords > 0" class="novel-bar" data-test="novel-progress">
           <span class="novel-bar-fill" :style="{ width: progressPercent + '%' }"></span>
         </div>
@@ -108,12 +100,10 @@
             <span v-else class="novel-chapter-tag">待写</span>
           </div>
         </div>
-        <!-- 后端只回章数、不回逐章明细时明确告知，不让用户以为章节列表坏了 -->
         <div v-if="chaptersArePlaceholder" class="novel-note" data-test="novel-chapter-note">
           接口只返回章数与总字数，逐章章名/字数未知，此处按章号列出
         </div>
 
-        <!-- 章节编辑器：点章节列表项展开，读原文 → 编辑 → 覆盖保存（不新建章节） -->
         <div v-if="editorChapter > 0" class="novel-editor-box" data-test="novel-editor-box">
           <div class="novel-editor-head">
             <span class="novel-editor-title">{{ editorName }}</span>
@@ -163,7 +153,6 @@
             >{{ tab.label }}</button>
           </div>
         </div>
-        <!-- 聚合读取失败（含老桥接缺方法）：只提示可读文案，表格位置让给错误行 -->
         <div v-if="workbenchError" class="novel-sec-error" data-test="novel-workbench-error">
           {{ workbenchError }}
         </div>
@@ -174,7 +163,6 @@
         </template>
       </div>
 
-      <!-- 近 7 天字数：口径由后端给出（章节文件 mtime），合计只在展示层累加 -->
       <div class="novel-sec">
         <div class="novel-sec-head">
           <span class="novel-sec-title">近 7 天</span>
@@ -255,8 +243,6 @@ import type {
   NovelWorkbenchVolumeDto,
 } from '../types/pywebview.d';
 
-// 激活态由 RightPanel 传入（页签可见、面板展开且停在本工作台）。
-// 只在「激活 → 拉一次」时取数，不做轮询（设计 §7.3 刷新策略）
 const props = defineProps<{ active: boolean }>();
 
 const store = useAppStore();
@@ -269,7 +255,6 @@ const errorText = ref('');
 // 本次快照是否有逐章明细；false 表示章节列表按章号兜底生成
 const chaptersArePlaceholder = ref(false);
 
-// 桥接访问：缺桥时给出可读错误，不弹后端连接失败模态（页签只显示内联提示）
 function bridgeApi() {
   try {
     return window.pywebview?.api ?? null;
@@ -300,7 +285,6 @@ const progressPercent = computed(() => {
 
 const lastCommitText = computed(() => (lastCommit.value > 0 ? `第 ${lastCommit.value} 章` : '暂无提交'));
 
-// 空态文案：未进入项目目录时引导先选目录，其余引导开书
 const canInit = computed(() => {
   const wd = String(store.workdir || '').trim();
   return !!wd && wd !== 'GLOBAL';
@@ -318,7 +302,6 @@ function chapterNameFromIndex(index: number): string {
   return `第 ${String(index).padStart(3, '0')} 章`;
 }
 
-// 保存成功后覆盖该章字数：状态快照可能只有章数，覆盖表让「刚存完的字数」立刻生效
 const chapterWordsOverride = ref<Record<number, number>>({});
 
 function chapterWordsOf(number: number, fallback: number | null): number | null {
@@ -373,7 +356,6 @@ function formatWords(value: number): string {
 const books = ref<{ path: string; title: string; chapters_written: number }[]>([]);
 const activeWorkdir = ref('');
 
-// 相对工作区的 posix 路径 → 绝对路径（"." 表示工作区自身，直接用工作区路径）
 function joinBookPath(path: string): string {
   const base = String(store.workdir || '').trim().replace(/[\\/]+$/, '');
   const rel = String(path || '').trim().replace(/\\/g, '/').replace(/^\.\//, '');
@@ -383,7 +365,6 @@ function joinBookPath(path: string): string {
 
 const bookSelectValue = computed(() => currentWorkdir());
 
-// 拉一次项目列表：纯增强信息，失败静默（面板保持原状态，不退化成错误态）
 async function loadBooks() {
   const workdir = String(store.workdir || '').trim();
   if (!workdir || workdir === 'GLOBAL') {
@@ -391,7 +372,6 @@ async function loadBooks() {
     return;
   }
   const api = bridgeApi();
-  // 老版本桥接没有该方法时按「只有一本书」处理，不做任何提示
   if (!api || typeof api.list_novel_projects !== 'function') return;
   try {
     const res = await api.list_novel_projects(workdir);
@@ -406,11 +386,9 @@ async function loadBooks() {
         chapters_written: toInt(item.chapters_written),
       }));
   } catch {
-    // 列表失败不影响主面板：保持原有的单书展示
   }
 }
 
-// 切书：先收掉编辑器与本地字数缓存（属于上一本书），再按新目录重拉快照
 function onBookChange(event: Event) {
   const target = event.target as HTMLSelectElement | null;
   const next = String(target?.value || '').trim();
@@ -419,13 +397,11 @@ function onBookChange(event: Event) {
   chapterWordsOverride.value = {};
   exportHint.value = '';
   exportError.value = '';
-  // 上一本书的设定库与审查结论一并作废：切书后由 load() 按新目录重拉
   resetWorkbench();
   activeWorkdir.value = next;
   void load();
 }
 
-// ---- 导出全书（P3-B）：产物由后端写到 {项目}/导出/{书名}.{fmt} ----
 const exporting = ref(false);
 const exportHint = ref('');
 const exportError = ref('');
@@ -462,7 +438,6 @@ async function exportNovel(fmt: 'md' | 'txt') {
   }
 }
 
-// ---- 章节编辑器（P3-A）：点章节 → 读正文 → 编辑 → 覆盖保存，不新建章节 ----
 const editorChapter = ref(0);
 const editorName = ref('');
 const editorText = ref('');
@@ -472,8 +447,6 @@ const saving = ref(false);
 const saveHint = ref('');
 const saveError = ref('');
 
-// 当前生效目录：优先显式选中的那本书（activeWorkdir），为空才回落会话工作区，
-// GLOBAL（自由对话）没有项目目录，统一返回空串
 function currentWorkdir(): string {
   const active = String(activeWorkdir.value || '').trim();
   const wd = active || String(store.workdir || '').trim();
@@ -496,7 +469,6 @@ function closeEditor() {
   saveError.value = '';
 }
 
-// 点章节：已写章节才可进入编辑；编辑中切章直接丢弃未保存内容（不做多章草稿缓存）
 async function openChapter(ch: ChapterRow) {
   if (!ch.written) return;
   const workdir = currentWorkdir();
@@ -513,7 +485,6 @@ async function openChapter(ch: ChapterRow) {
   editorLoading.value = true;
   try {
     const res = await api.get_novel_chapter(workdir, ch.number);
-    // 期间又点了别的章节：只认最后一次点击，丢弃这次结果
     if (editorChapter.value !== ch.number) return;
     if (!res || typeof res !== 'object') {
       saveError.value = '后端返回了空章节内容，无法编辑';
@@ -535,7 +506,6 @@ async function openChapter(ch: ChapterRow) {
   }
 }
 
-// 保存：成功后用返回字数更新该章并重拉整体状态；失败只显示错误，不动本地正文
 async function saveChapter() {
   const workdir = currentWorkdir();
   const number = editorChapter.value;
@@ -562,7 +532,6 @@ async function saveChapter() {
     editorWords.value = words;
     chapterWordsOverride.value = { ...chapterWordsOverride.value, [number]: words };
     saveHint.value = '已保存';
-    // 总字数/今日字数由后端统一口径统计，保存后重拉一次（复用 load，不前端自算）
     void load();
   } catch (err) {
     saveError.value = err instanceof Error ? err.message : String(err);
@@ -611,7 +580,6 @@ const recentDailyRows = computed<NovelWorkbenchDailyDto[]>(
 );
 const recentDailyTotal = computed(() => recentDailyRows.value.reduce((acc, row) => acc + toInt(row.words), 0));
 
-// 三个 tab 的文案直接带数量：数量来自同一次快照，切 tab 不再请求后端
 const settingTabs = computed(() => [
   { key: 'foreshadow' as const, label: `伏笔 ${foreshadowRows.value.length}` },
   { key: 'character' as const, label: `角色 ${characterRows.value.length}` },
@@ -620,7 +588,6 @@ const settingTabs = computed(() => [
 
 const docVisible = computed(() => docTitle.value !== '');
 
-// 拉一次工作台聚合（伏笔 / 角色 / 卷纲 / 近 7 天）：失败只写 workbenchError
 async function loadWorkbench() {
   const workdir = currentWorkdir();
   const seq = workbenchSeq + 1;
@@ -631,7 +598,6 @@ async function loadWorkbench() {
     return;
   }
   const api = bridgeApi();
-  // 老版本桥接没有该方法：只在本分区提示不支持，其余功能照常
   if (!api || typeof api.get_novel_workbench !== 'function') {
     workbench.value = null;
     workbenchError.value = '当前后端版本不支持该功能，请更新后再查看设定库';
@@ -639,7 +605,6 @@ async function loadWorkbench() {
   }
   try {
     const res = await api.get_novel_workbench(workdir);
-    // 期间切了书 / 换了目录：这次结果已作废，不覆盖新书数据
     if (seq !== workbenchSeq) return;
     if (!res || typeof res !== 'object') {
       workbench.value = null;
@@ -684,7 +649,6 @@ async function runAudit() {
       return;
     }
     auditResult.value = res;
-    // ok=false 时结果里也带 error：统一收进 auditError，面板只出一处红字
     auditError.value = res.error || (res.ok === false ? '审查未完成' : '');
   } catch (err) {
     if (seq !== auditSeq) return;
@@ -694,8 +658,6 @@ async function runAudit() {
     if (seq === auditSeq) auditLoading.value = false;
   }
 }
-
-// ---- 审查结论 → 修复入口：只把问题拼成对话指令预填进输入框，不在面板里直接改文件 ----
 
 // 五种检查项（后端 AUDIT_TYPES）各自的修复方向；未知 type 落到通用兜底文案
 const AUDIT_FIX_HINTS: Record<string, string> = {
@@ -719,7 +681,6 @@ function auditFixHint(type: string): string {
   return AUDIT_FIX_HINTS[String(type || '').trim()] || '按审查结论逐条核对原文后修正。';
 }
 
-// 预填与提示都是同步的：短暂上锁只为挡住连点造成的重复预填
 function tryLockAuditFix(): boolean {
   if (auditFixing.value) return false;
   auditFixing.value = true;
@@ -729,7 +690,6 @@ function tryLockAuditFix(): boolean {
   return true;
 }
 
-// 单条修复：原样带上级别/类型/文件/问题全文，只动这一处
 function fixFromAudit(finding: NovelAuditFindingDto) {
   const workdir = currentWorkdir();
   if (!workdir || !tryLockAuditFix()) return;
@@ -753,7 +713,6 @@ function fixFromAudit(finding: NovelAuditFindingDto) {
   store.notifyChat('已把这条问题的修复指令填进输入框，确认后回车发送');
 }
 
-// 全部修复：按 type 分组汇总当前审查结论，逐组给修复方向，一次交给星瑶
 function fixAllFromAudit() {
   const workdir = currentWorkdir();
   const findings = Array.isArray(auditResult.value?.findings) ? auditResult.value.findings : [];
@@ -793,7 +752,6 @@ function fixAllFromAudit() {
   store.notifyChat('已把全部问题的修复指令填进输入框，确认后回车发送');
 }
 
-// 点卷纲：拼相对项目根的 posix 路径读文档；失败也打开浮层，在浮层里显示错误
 async function openVolumeDoc(volume: NovelWorkbenchVolumeDto) {
   const name = String(volume?.name || '').trim();
   if (!name) return;
@@ -813,9 +771,7 @@ async function openVolumeDoc(volume: NovelWorkbenchVolumeDto) {
   }
   docLoading.value = true;
   try {
-    // name 已是文件名 stem（如 卷纲_第001卷），后端在 core 内做白名单与越界校验
     const res = await api.read_novel_doc(workdir, `大纲/${name}.md`);
-    // 期间关了浮层或点了别的卷：丢弃这次结果
     if (docTitle.value !== name) return;
     if (!res || typeof res !== 'object') {
       docError.value = '读取失败：后端没有返回结果';
@@ -841,8 +797,6 @@ function closeDoc() {
   docError.value = '';
 }
 
-// 切书 / 换目录 / 回合结束：设定库与审查结论都属于「上一本书」，一律作废；
-// 序号随之 +1，迟到的在途结果会被丢弃，不会回填到新书下
 function resetWorkbench() {
   workbenchSeq += 1;
   auditSeq += 1;
@@ -856,7 +810,6 @@ function resetWorkbench() {
 
 // 拉一次状态：只读接口，失败按错误态展示，不抛异常
 async function load() {
-  // 目录取「当前生效目录」：多书切换后 activeWorkdir 覆盖会话工作区
   const workdir = currentWorkdir();
   if (!workdir) {
     status.value = null;
@@ -911,7 +864,6 @@ async function load() {
   }
 }
 
-// 初始化引导：只预填输入框，不直接写文件（设计 §7.3-4）
 function initNovel() {
   const workdir = String(store.workdir || '').trim();
   if (!workdir || workdir === 'GLOBAL') return;
@@ -922,13 +874,11 @@ function initNovel() {
   store.notifyChat('已把初始化小说项目的指令填进输入框，确认后回车发送');
 }
 
-// 页签激活时拉一次；工作目录切换后再按需重拉（同一页签不会重复轮询）
 watch(() => props.active, (active) => {
   if (!active) return;
   void loadBooks();
   void load();
 }, { immediate: true });
-// 换工作区：上一本书的选择与本地缓存全部作废，多书列表按新工作区重扫
 watch(() => store.workdir, () => {
   closeEditor();
   chapterWordsOverride.value = {};
@@ -942,12 +892,8 @@ watch(() => store.workdir, () => {
     void load();
   }
 });
-// 对话回合结束（running true→false）时按需重拉一次：对话里初始化出的项目、
-// 写出的新章节、新建的书立刻反映到面板，不必切页签才看到变化。
-// 只在页签可见且真的经历了「跑→停」时刷新，不做轮询；回合开始不打扰。
 watch(() => store.running, (running, prev) => {
   if (!props.active || running || prev !== true) return;
-  // 刚写完一章：设定库（伏笔 / 字数）随之重拉，但审查结论作废、不自动重跑
   resetWorkbench();
   void loadBooks();
   void load();
@@ -955,7 +901,6 @@ watch(() => store.running, (running, prev) => {
 </script>
 
 <style scoped>
-/* 深色主题跟随全局 CSS 变量（--text / --border / --accent…），不引入新 UI 库 */
 .novel-wrap {
   display: flex;
   flex-direction: column;
@@ -968,7 +913,6 @@ watch(() => store.running, (running, prev) => {
   font-size: 12.5px;
 }
 
-/* 工具区：多书下拉 + 导出按钮，紧贴标题上方 */
 .novel-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .novel-toolbar-spacer { flex: 1; }
 .novel-select {
@@ -1011,10 +955,8 @@ watch(() => store.running, (running, prev) => {
 .novel-sec-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .novel-sec-title { font-size: 12px; font-weight: 600; color: var(--text-dim); }
 .novel-sec-meta { font-size: 11.5px; color: var(--text-faint); }
-/* 设定库分区内错误：只占本分区一行，不挡下面的近 7 天与审查 */
 .novel-sec-error { font-size: 11.5px; line-height: 1.5; color: var(--red); word-break: break-word; }
 
-/* 设定库 tab：数量直接写进文案，当前项用 accent 描边高亮 */
 .novel-tabs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
 .novel-tab {
   padding: 2px 8px;
@@ -1058,7 +1000,6 @@ watch(() => store.running, (running, prev) => {
 .novel-chapter-words.dim { color: var(--text-faint); }
 .novel-chapter-tag { color: var(--yellow); font-size: 11.5px; }
 
-/* 章节编辑器：只出现在点击章节后，不占用默认状态的高度 */
 .novel-editor-box {
   display: flex;
   flex-direction: column;
@@ -1164,7 +1105,6 @@ watch(() => store.running, (running, prev) => {
   cursor: pointer;
 }
 .novel-btn:hover { border-color: var(--accent); color: var(--text-bright); }
-/* 工具区按钮：比正文按钮更紧凑，不抢主操作（保存/初始化）的视觉权重 */
 .novel-btn.small { padding: 3px 8px; font-size: 11.5px; align-self: center; }
 .novel-btn.primary { border-color: var(--accent); color: var(--accent); }
 .novel-btn.primary:hover { background: var(--accent-soft); }

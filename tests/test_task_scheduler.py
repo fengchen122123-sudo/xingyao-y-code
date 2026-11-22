@@ -54,8 +54,6 @@ def test_scheduler_marks_failure_and_retry_requeues_item():
     assert scheduler.retry("a") is True
     retried = plan.snapshot()[0]
     assert retried["status"] == "pending"
-    # attempts 只在真实执行开始时自增（Task 3 语义）：retry 仅重置状态，
-    # 下一次 run_ready/start_item 才会计入第 2 次尝试
     assert retried["attempts"] == 1
     assert [item["id"] for item in scheduler.start_ready()] == ["a"]
     assert plan.snapshot()[0]["attempts"] == 2
@@ -179,7 +177,6 @@ def test_command_verification_decodes_windows_console_output(monkeypatch):
 
 
 def test_command_verification_without_authorized_runner_fails_closed(monkeypatch):
-    """缺少授权 runner 时，计划验证不得自行启动 shell。"""
     launches = []
 
     class FakeProcess:
@@ -366,8 +363,6 @@ def test_verification_honors_cancel_event_and_stops_process(monkeypatch):
 
 
 def test_verification_cancel_reaps_output_without_blocking(monkeypatch):
-    """detached 孙进程继承管道句柄时 communicate 可能永久阻塞；
-    取消/超时分支必须带超时回收并强关管道，避免验证线程悬挂。"""
     import subprocess as subprocess_module
 
     closed_streams = []
@@ -434,7 +429,6 @@ def test_blocked_item_revives_when_dependency_reset_pending_via_plan_update():
     assert scheduler.start_ready() == []
     assert plan.snapshot()[1]["status"] == "blocked"
 
-    # 模拟 plan_update 直接把依赖项重置为 pending（不经过 complete）
     assert plan.update("a", status="pending", error="") is True
     scheduler.start_ready()
 
@@ -499,9 +493,6 @@ def test_session_switch_does_not_cancel_new_session_items():
 
 
 def test_verification_runs_in_process_cwd_not_item_file_dir(monkeypatch):
-    """回归：验证命令必须与 execute_command 一样在项目工作目录执行，
-    不得根据计划项 files 把 cwd 偷换成文件所在目录（否则模型按项目根
-    目录写的 `cd subdir && ...` 会永远报"系统找不到指定的路径"）。"""
     captured = {}
 
     class FakeProcess:
@@ -556,7 +547,6 @@ def test_release_uses_claimed_file_snapshot_not_mutated_plan_files():
     scheduler = TaskScheduler(plan)
     assert scheduler.start_item("item") is True
 
-    # 模拟内部调用方绕过模型边界修改计划，调度器仍必须释放真实租约。
     assert plan.update("item", files=["b.py"]) is True
     assert scheduler.cancel("item") is True
 
@@ -613,11 +603,6 @@ def test_promote_takeover_keeps_queue_when_files_are_claimed():
 
 
 def test_promote_refuses_queued_item_without_takeover_flag():
-    """CAS 防御：takeover_queued 但 takeover_required=False 的异常项不得晋升，
-    与 claim_takeover_for_turn / resume_takeover 的接管防御级别保持一致。
-
-    plan 层 _normalize_item 会把 queued 模式强制补上 takeover_required，
-    因此这里用 transition_execution 模拟内部调用方绕过不变量的场景。"""
     plan = PlanManager()
     plan.replace([{"id": "item", "subject": "broken-flag", "status": "pending", "files": ["a.py"]}])
     assert plan.transition_execution(
@@ -639,7 +624,6 @@ def test_promote_refuses_queued_item_without_takeover_flag():
 
 
 def _queued_takeover_item(item_id, *, sequence, files=None):
-    """构造一个崩溃恢复形态的排队接管项（pending + takeover_queued）。"""
     item = {
         "id": item_id,
         "subject": item_id,
@@ -655,8 +639,6 @@ def _queued_takeover_item(item_id, *, sequence, files=None):
 
 
 def test_claim_takeover_skips_queued_item_blocked_by_file_lease():
-    """FIFO 只决定优先级：队首文件租约被占用时必须顺延认领后面的接管项，
-    否则单个占位项会把整条接管队列永久堵死。"""
     plan = PlanManager()
     plan.replace([
         {"id": "holder", "subject": "占用共享文件", "files": ["shared.py"]},
@@ -681,7 +663,6 @@ def test_claim_takeover_skips_queued_item_blocked_by_file_lease():
 
 
 def test_claim_takeover_returns_none_when_every_queued_item_is_file_blocked():
-    """所有排队项都被文件租约占用时保持队列不动，绝不无锁运行。"""
     plan = PlanManager()
     plan.replace([
         {"id": "holder", "subject": "占用共享文件", "files": ["shared.py"]},
@@ -697,7 +678,6 @@ def test_claim_takeover_returns_none_when_every_queued_item_is_file_blocked():
 
 
 def test_promote_next_takeover_skips_queued_item_blocked_by_file_lease():
-    """plan_finish 后的提升同样不得被队首文件冲突卡住整条队列。"""
     plan = PlanManager()
     plan.replace([
         {"id": "holder", "subject": "占用共享文件", "files": ["shared.py"]},
@@ -719,7 +699,6 @@ def test_promote_next_takeover_skips_queued_item_blocked_by_file_lease():
 
 
 def _released_takeover_item():
-    """构造"子代理超时移交后又因回合结束被降级排队"的计划项。"""
     plan = PlanManager()
     plan.replace([{"id": "item", "subject": "delegated work"}])
     scheduler = TaskScheduler(plan)
@@ -736,8 +715,6 @@ def _released_takeover_item():
 
 
 def test_complete_rejected_reports_reason_instead_of_silent_drop():
-    """迟到的完成回写被拒时必须可观测：静默 return False 会让"干完了状态却不动"
-    无从排查。"""
     plan, scheduler = _released_takeover_item()
     events = []
     scheduler.set_event_callback(lambda kind, payload: events.append((kind, payload)))
@@ -755,7 +732,6 @@ def test_complete_rejected_reports_reason_instead_of_silent_drop():
 
 
 def test_fail_rejected_reports_reason_instead_of_silent_drop():
-    """失败回写同样不得静默丢弃，否则子代理的真实失败原因会消失。"""
     plan, scheduler = _released_takeover_item()
     events = []
     scheduler.set_event_callback(lambda kind, payload: events.append((kind, payload)))
@@ -773,7 +749,6 @@ def test_fail_rejected_reports_reason_instead_of_silent_drop():
 
 
 def test_writeback_rejected_event_keeps_plan_items_render_path_clean():
-    """诊断事件不能复用 plan_item_* 前缀：CLI 会把该前缀一律当计划项状态渲染。"""
     plan, scheduler = _released_takeover_item()
     events = []
     scheduler.set_event_callback(lambda kind, payload: events.append((kind, payload)))
@@ -785,13 +760,6 @@ def test_writeback_rejected_event_keeps_plan_items_render_path_clean():
 
 
 def test_resume_takeover_accepts_queued_in_progress_item():
-    """排队等待接管的 in_progress 项必须能恢复为 main_takeover。
-
-    回归场景：子代理超时移交后，项停在 status=in_progress +
-    execution_mode=takeover_queued。旧 resume_takeover 只认
-    failed/blocked/cancelled/pending，导致这类项既不能 resume、也不能 finish、
-    更不能 retry，永久锁死整条依赖链。
-    """
     plan = PlanManager()
     item = _queued_takeover_item("stuck", sequence=1, files=["a.py"])
     item["status"] = "in_progress"
@@ -807,7 +775,6 @@ def test_resume_takeover_accepts_queued_in_progress_item():
 
 
 def test_resume_takeover_still_rejects_delegated_in_progress_item():
-    """在途 delegated 项不得被 resume 抢走：只放行 takeover_queued。"""
     plan = PlanManager()
     plan.replace([{"id": "running", "subject": "执行中", "files": ["b.py"]}])
     scheduler = TaskScheduler(plan)

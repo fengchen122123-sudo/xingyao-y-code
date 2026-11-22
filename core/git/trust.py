@@ -1,15 +1,3 @@
-"""仓库信任策略（规格 §4.5）。
-
-参数数组只能防 Shell 重解释，防不住 Git 自身调用的 Hooks/Filter/fsmonitor/
-外部 Diff/Textconv/Credential Helper/Remote Helper。手动 Git 工作台对每个仓库
-维护独立信任：
-
-- 指纹 = 规范化 Common Git Dir + Worktree + 安全相关配置摘要；
-- 任一安全配置变化 → 已有信任失效，重新询问；
-- "允许本次"只存进程内存；"信任此仓库"持久化 git_trust.json（原子写）；
-- 不保存凭据或 Hook 内容。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -69,7 +57,6 @@ def collect_security_fingerprint(runner: GitRunner, identity: RepositoryIdentity
         i += 2
         lowered = key.lower()
         if any(lowered == p or lowered.startswith(p) for p in _SECURITY_KEY_PREFIXES):
-            # 只收键名与值的哈希材料，不落盘原文
             selected.append(f"{lowered}={value}")
     material = {
         "repo": repository_id(identity),
@@ -102,7 +89,6 @@ def save_trust_store(store: Dict, path: Optional[str] = None) -> None:
 
 
 def check_trust(identity: RepositoryIdentity, fingerprint: str) -> str:
-    """返回 "trusted" | "allowed_once" | "untrusted"。"""
     repo_id = repository_id(identity)
     with _LOCK:
         if (repo_id, fingerprint) in _ONCE_ALLOWED:

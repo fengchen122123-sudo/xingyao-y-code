@@ -22,7 +22,6 @@ describe('appStore update functionality', () => {
     const api = (window as any).pywebview.api;
     api.check_update.mockResolvedValue({ ok: true, has_update: false });
 
-    // 距上次检查不足 1 小时：静默检查应被跳过
     localStorage.setItem('ycode-last-update-check', String(Date.now()));
     await store.checkUpdate(false);
     expect(api.check_update).not.toHaveBeenCalled();
@@ -38,7 +37,6 @@ describe('appStore update functionality', () => {
     const api = (window as any).pywebview.api;
     api.check_update.mockResolvedValue({ ok: true, has_update: false });
 
-    // 上次检查在 2 小时前：应正常发起请求并刷新时间戳
     localStorage.setItem('ycode-last-update-check', String(Date.now() - 2 * 3600 * 1000));
     await store.checkUpdate(false);
     expect(api.check_update).toHaveBeenCalledTimes(1);
@@ -67,7 +65,6 @@ describe('appStore update functionality', () => {
     expect(store.updateState.status).toBe('available');
     expect(store.updateState.showUpdateModal).toBe(false);
 
-    // 手动检查时应打开弹窗
     await store.checkUpdate(true);
     expect(store.updateState.showUpdateModal).toBe(true);
   });
@@ -101,7 +98,6 @@ describe('appStore update functionality', () => {
     await store.startDownloadUpdate();
     expect(store.updateState.status).toBe('downloading');
 
-    // 模拟下载进度事件
     store.handleBridgeEvent({
       type: 'update_download_progress',
       data: { percent: 45, downloaded: 20000000, total: 50000000 },
@@ -109,7 +105,6 @@ describe('appStore update functionality', () => {
     expect(store.updateState.downloadProgress).toBe(45);
     expect(store.updateState.downloadedBytes).toBe(20000000);
 
-    // 模拟下载完成事件
     store.handleBridgeEvent({
       type: 'update_download_complete',
       data: { installer_path: 'C:/temp/setup.exe' },
@@ -122,9 +117,8 @@ describe('appStore update functionality', () => {
     const store = useAppStore();
     store.updateState.installerPath = 'C:/temp/setup.exe';
     store.updateState.latestVersion = '1.2.6';
-    store.running = true; // 模拟当前有任务在跑
+    store.running = true;
 
-    // 触发安装点击
     store.handleInstallClick();
 
     expect(store.confirmModal.show).toBe(true);
@@ -149,7 +143,6 @@ describe('appStore update functionality', () => {
 
     await store.checkUpdate(true);
 
-    // 缓存命中：后端已校验通过本地安装包，前端直接进入"已就绪"态
     expect(store.updateState.status).toBe('downloaded');
     expect(store.updateState.installerPath).toBe(
       'C:/temp/ycode_updates/Y-CODE-Setup-v1.2.6.exe',

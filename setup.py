@@ -24,7 +24,7 @@ setup(
         'bench', 'bench.*',
         'frontend', 'frontend.*',
     ]),
-    py_modules=['main'],  # 根目录的 main.py 作为入口模块
+    py_modules=['main'],
     install_requires=[
         # 下限为已验证兼容版本，上限锁到下一个大版本，避免上游 breaking change 静默破坏安装
         'rich>=13.0.0,<16',

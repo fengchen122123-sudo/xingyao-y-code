@@ -1,4 +1,3 @@
-// gitStore 单元测试（规格 §17.3 前端测试选集：状态分组 / 外部事件刷新 / 确认流程）
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useGitStore } from './gitStore';
@@ -107,7 +106,6 @@ describe('gitStore', () => {
     store.onExternalChange({ workspace: 'E:/proj' });
     await new Promise((r) => setTimeout(r, 0));
     expect(get_status).toHaveBeenCalledTimes(2);
-    // 其他 Worktree 的事件不触发本工作区刷新
     store.onExternalChange({ workspace: 'E:/other' });
     await new Promise((r) => setTimeout(r, 0));
     expect(get_status).toHaveBeenCalledTimes(2);
@@ -119,9 +117,6 @@ describe('gitStore', () => {
   });
 
   it('切会话后在途的旧工作区快照响应被丢弃，不串台分支角标', async () => {
-    // 复现路径：项目会话（大仓库）快照请求在途 → 切到公共对话（workdir 清空
-    // 并 $reset）→ 旧响应迟到落地。无串号防护时旧仓库快照会重新填入 snapshot，
-    // 公共对话持续显示上一个项目的分支（git_get_status 实测秒级，窗口很大）
     let resolveStale!: () => void;
     const staleGate = new Promise<void>((resolve) => { resolveStale = resolve; });
     const get_status = vi.fn()
@@ -158,7 +153,6 @@ describe('gitStore', () => {
     });
     const store = useGitStore();
     const stale = store.ensureLoaded('E:/proj');
-    // 模拟 App.vue 切到 GLOBAL 会话：workdir 置空 + $reset
     store.workdir = '';
     store.$reset();
     resolveStale();

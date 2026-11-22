@@ -1,18 +1,3 @@
-"""飞书卡片结构红线：把所有卡片构造器的产出过一遍，钉死已知平台限制。
-
-背景（真实缺陷）：完成卡的表单里，输入框与提交按钮的 `name` 都叫 `reply`，
-飞书整卡拒收（`230099 / 11310: name(reply) duplicate`），用户侧表现是
-「消息发出去了，但收不到任何回复」——只有带表单的那张卡会踩到，
-`/list`、`/status` 这类无表单卡片一切正常，所以极难凭现象定位。
-
-红线清单（对齐 opencode-mobile 的实测结论）：
-1. 卡片 2.0 没有 `note` 标签；
-2. 按钮必须 `behaviors:[{type:'callback'}]`（表单提交按钮例外，用 form_action_type）；
-3. `input.max_length ≤ 1000`；
-4. **同一个 form 内元素 name 必须唯一**（本文件新增的一条）；
-5. 不用 `collapsible_panel` 之外的老标签（此处只校验前四条 + schema）。
-"""
-
 import json
 
 import pytest
@@ -44,7 +29,6 @@ MAX_INPUT_LENGTH = 1000
 
 
 def _all_cards():
-    """所有卡片构造器的产出（含开/关按钮、有/无表单等分支）。"""
     sessions = [
         {"name": "session_a", "display_name": "重构鉴权", "workdir": "GLOBAL"},
         {"name": "session_b", "display_name": "会话二", "workdir": "D:/p"},
@@ -114,7 +98,6 @@ def _all_cards():
 
 
 def _walk(node):
-    """深度遍历卡片 JSON，产出所有 dict 节点。"""
     if isinstance(node, dict):
         yield node
         for value in node.values():
@@ -129,20 +112,16 @@ def test_card_follows_platform_red_lines(name):
     card = _all_cards()[name]
     nodes = list(_walk(card))
 
-    # 卡片 2.0 骨架
     assert card["schema"] == "2.0"
     assert card["header"]["title"]["tag"] == "plain_text"
 
     for node in nodes:
         tag = node.get("tag")
-        # 红线 1：2.0 没有 note 标签（落款用 markdown）
         assert tag != "note", f"{name}: 卡片 2.0 不支持 note 标签"
 
-        # 红线 3：输入框长度上限
         if tag == "input":
             assert node.get("max_length", 0) <= MAX_INPUT_LENGTH, f"{name}: input 超长会被整卡拒收"
 
-        # 红线 2：按钮要么走 callback 行为，要么是表单提交按钮
         if tag == "button":
             behaviors = node.get("behaviors")
             is_submit = node.get("form_action_type") == "submit"
@@ -153,11 +132,6 @@ def test_card_follows_platform_red_lines(name):
 
 @pytest.mark.parametrize("name", sorted(_all_cards().keys()))
 def test_form_element_names_are_unique(name):
-    """红线 4：同一 form 内元素 name 唯一。
-
-    违反时飞书报 230099 / 11310「name(xxx) duplicate」并**整卡拒收**，
-    用户侧只看到「发消息没回复」。
-    """
     card = _all_cards()[name]
     for node in _walk(card):
         if node.get("tag") != "form":
@@ -168,30 +142,27 @@ def test_form_element_names_are_unique(name):
 
 
 def test_completion_card_reply_form_names_are_distinct():
-    """具体回归：完成卡的输入框与提交按钮不得同名（曾因此整卡被拒）。"""
     card = completion_card("飞书 · ou_x", "结果")
     form = next(n for n in _walk(card) if n.get("tag") == "form")
     input_name = form["elements"][0]["name"]
     submit_name = form["elements"][1]["name"]
     assert input_name != submit_name
-    assert submit_name == "reply"          # 路由名（回调按它分派）
-    assert input_name == "reply_text"      # form_value 的键（回调按它取值）
+    assert submit_name == "reply"
+    assert input_name == "reply_text"
 
 
 def test_card_is_json_serializable():
-    """卡片最终要 json.dumps 后发给飞书，含中文不能炸。"""
     for name, card in _all_cards().items():
         assert json.dumps(card, ensure_ascii=False)
 
 
 def test_with_status_appends_without_mutating_original():
-    """原地回执：追加状态行不得改动原卡片（原件要能反复复用）。"""
     original = completion_card("飞书 · ou_x", "星瑶的回复正文")
     before = json.dumps(original, ensure_ascii=False)
 
     updated = with_status(original, "✅ 已发送")
 
-    assert json.dumps(original, ensure_ascii=False) == before          # 原件未被改动
-    assert "星瑶的回复正文" in json.dumps(updated, ensure_ascii=False)   # 内容保留
+    assert json.dumps(original, ensure_ascii=False) == before
+    assert "星瑶的回复正文" in json.dumps(updated, ensure_ascii=False)
     assert "✅ 已发送" in json.dumps(updated, ensure_ascii=False)
     assert len(updated["body"]["elements"]) == len(original["body"]["elements"]) + 1

@@ -1,10 +1,3 @@
-"""只读查询层（规格 §5.2/§5.9）：porcelain v2 解析、操作状态检测与各只读查询。
-
-状态解析只吃 `git status --porcelain=v2 -z --branch --show-stash` 的原始字节
-（快照路径追加 `--ignored=matching`，单次扫描同时产出 ignored 计数），
-绝不解析本地化的人类可读输出（规格 §5.2/§8）。
-"""
-
 from __future__ import annotations
 
 import os
@@ -26,7 +19,6 @@ from core.git.runner import ExecScope, GitRunner
 _UNBORN_MARK = "(initial)"
 _DETACHED_MARK = "(detached)"
 
-# 未合并 XY → 冲突类型（git status v2 unmerged entries）
 _CONFLICT_KINDS = {
     "DD": "both_deleted",
     "AU": "added_by_us",
@@ -53,7 +45,6 @@ class StatusV2:
     conflicts: Tuple[ConflictEntry, ...]
     ignored_count: int = 0
 
-    # porcelain v2 的"未修改"标记是 "."（区别于 v1 的空格）
     @property
     def staged(self) -> Tuple[FileChange, ...]:
         return tuple(e for e in self.entries if e.index_status not in (".",))
@@ -72,14 +63,6 @@ def _decode(raw: bytes) -> str:
 
 
 def parse_status_v2(raw: bytes) -> StatusV2:
-    """解析 `git status --porcelain=v2 -z --branch --show-stash` 输出。
-
-    快照路径会追加 `--ignored=matching`，此时输出含 `!`（ignored）记录，
-    一并在此计数（单次扫描产出，避免为 ignored 计数再全量扫描一遍工作区）。
-
-    -z 格式：所有记录 NUL 结尾；`2` 重命名条目的 <path> 与 <origPath> 各自
-    NUL 结尾（已用真实仓库字节实验核对）；路径不做任何引号/转义猜测。
-    """
     head_oid: Optional[str] = None
     branch_name: Optional[str] = None
     upstream: Optional[str] = None
@@ -116,7 +99,6 @@ def parse_status_v2(raw: bytes) -> StatusV2:
             elif key == "stash" and len(tokens) > 1:
                 stash_count = _safe_int(tokens[1])
         elif line.startswith("1 "):
-            # 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
             parts = line.split(" ", 8)
             if len(parts) == 9:
                 entries.append(
@@ -128,7 +110,6 @@ def parse_status_v2(raw: bytes) -> StatusV2:
                     )
                 )
         elif line.startswith("2 "):
-            # 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <score> <path>\0<origPath>
             parts = line.split(" ", 9)
             orig_path: Optional[str] = None
             if index < len(segments):
@@ -144,7 +125,6 @@ def parse_status_v2(raw: bytes) -> StatusV2:
                     )
                 )
         elif line.startswith("u "):
-            # u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
             parts = line.split(" ", 10)
             if len(parts) == 11:
                 xy = parts[1]
@@ -157,7 +137,6 @@ def parse_status_v2(raw: bytes) -> StatusV2:
         elif line.startswith("? "):
             untracked.append(line[2:])
         elif line.startswith("! "):
-            # `!`（ignored）记录仅在使用 --ignored 时出现；路径内联在同一段
             ignored_count += 1
     return StatusV2(
         head_oid=head_oid,
@@ -174,14 +153,6 @@ def parse_status_v2(raw: bytes) -> StatusV2:
 
 
 def strip_ignored_records(raw: bytes) -> bytes:
-    """去掉 `!`（ignored）记录，还原成不带 --ignored 扫描的原始字节流。
-
-    快照把 `--ignored=matching` 合并进唯一一次 status 扫描后，worktree_version
-    的 status 字节材料仍必须与旧两段式扫描字节一致——ignored 文件变化
-    （如 node_modules 抖动）不得触发版本变化，否则乐观并发会误报冲突。
-    与 parse_status_v2 同款结构化游走：`2` 记录的 <origPath> 是独立 NUL 段，
-    须随记录一并保留，避免恰好以 "! " 开头的重命名原名被误剥。
-    """
     segments = raw.split(b"\x00")
     kept: List[bytes] = []
     index = 0
@@ -212,10 +183,6 @@ def detect_operation_state(
     identity: RepositoryIdentity,
     has_conflicts: bool,
 ) -> Tuple[OperationKind, OperationPhase]:
-    """读取 Git 目录状态文件识别进行中操作（规格 §14 状态机）。
-
-    外部 Bisect/Am/未知 Sequencer 一律识别为 unsupported_external，不得误判 idle。
-    """
     git_dir = identity.git_dir
     common_dir = identity.common_git_dir
 
@@ -225,7 +192,6 @@ def detect_operation_state(
     if exists(os.path.join(git_dir, "BISECT_LOG")) or exists(os.path.join(common_dir, "BISECT_LOG")):
         return OperationKind.UNSUPPORTED_EXTERNAL, OperationPhase.RUNNING
     if exists(os.path.join(git_dir, "rebase-apply", "applying")):
-        # git am：工作台不管理，显式标记
         return OperationKind.UNSUPPORTED_EXTERNAL, OperationPhase.RUNNING
     if exists(os.path.join(git_dir, "rebase-merge")) or exists(os.path.join(git_dir, "rebase-apply")):
         kind = OperationKind.REBASE

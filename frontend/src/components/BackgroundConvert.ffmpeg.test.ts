@@ -71,8 +71,6 @@ it('已就绪展示版本号，进度事件驱动进度条宽度', async () => {
   expect(ready.exists()).toBe(true);
   expect(ready.text()).toContain('6.1.1');
 
-  // 进度事件只更新 Store；组件从 Store 读出来渲染（不做乐观进度）。
-  // 这里带 installed=false 模拟「重新下载中」：installed 优先级高于进度条
   store.handleBridgeEvent({
     type: 'ffmpeg_component_progress',
     data: {
@@ -131,7 +129,6 @@ it('下载完成事件会在已选视频时自动重探预检信息（无需重�
   expect(api.describe_background_video).toHaveBeenCalledWith('C:\\clip.mp4');
   expect(store.bgConvert.video?.can_convert).toBe(true);
   expect(store.bgConvert.video?.blockers).toEqual([]);
-  // 装好后没有「未检测到 ffmpeg」的旧提示
   expect(wrapper.find('[data-test="ffmpeg-component-error"]').exists()).toBe(false);
 });
 
@@ -175,7 +172,6 @@ it('进页时组件已就绪但旧预检说缺 ffmpeg：自动重探', async () 
   expect(store.bgConvert.video?.can_convert).toBe(true);
 });
 
-// 反面：组件没装时不重探——多跑一次 ffprobe 没有意义，预检结论也不会变。
 it('进页时组件未安装：不重探预检', async () => {
   const pinia = createPinia();
   setActivePinia(pinia);

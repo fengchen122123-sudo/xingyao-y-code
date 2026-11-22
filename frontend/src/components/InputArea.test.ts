@@ -11,8 +11,6 @@ beforeEach(() => {
   localStorage.removeItem(COMPOSER_HEIGHT_KEY);
 });
 
-// jsdom 的 PointerEvent 属性是 getter-only，VTU trigger 直接赋值 clientY 会报错，
-// 统一用原生构造器派发（bubbles 保证 window 上的 pointermove/up 监听能收到）
 function firePointer(el: EventTarget, type: string, clientY: number) {
   el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, clientY, pointerId: 1 }));
 }
@@ -39,7 +37,6 @@ it('uses the current session state for the send/stop button', () => {
 
   const wrapper = mount(InputArea);
 
-  // 发送图标已统一为 AppIcon SVG：断言按钮内渲染了内联 svg 且 title 语义不变
   expect(wrapper.get('#send-btn').find('svg').exists()).toBe(true);
   expect(wrapper.get('#send-btn').attributes('title')).toContain('发送');
   wrapper.unmount();
@@ -101,7 +98,6 @@ it('排队消息显示在输入框上方，提供取消与插队按钮', async (
   expect(items[0].find('[data-test="queue-cancel-btn"]').exists()).toBe(true);
   expect(items[0].find('[data-test="queue-jump-btn"]').exists()).toBe(true);
 
-  // 队列清空后排队条整体消失
   store.messageQueues['session-b'] = [];
   await wrapper.vm.$nextTick();
   expect(wrapper.find('[data-test="queue-item"]').exists()).toBe(false);
@@ -122,7 +118,6 @@ it('运行中输入内容按 Enter 排队发送，不再打断当前任务', asy
 
   expect(sendSpy).toHaveBeenCalledWith('下一条指令', []);
   expect(stopSpy).not.toHaveBeenCalled();
-  // 发送后输入框 DOM 与 composerText 均应清空，发送按钮回到停止态
   expect(editor.element.textContent).toBe('');
   expect(store._getSessionRuntime().composerText).toBe('');
   expect(wrapper.get('#send-btn').classes()).toContain('stop');
@@ -165,7 +160,6 @@ it('打开斜杠补全面板时 ArrowDown 高亮不被 input 事件重置，Ente
 
   await editor.trigger('keydown', { key: 'Enter' });
   expect(sendSpy).not.toHaveBeenCalled();
-  // 选中技能后渲染为胶囊（标签去掉前导 /，保留原始 /beta 在 composerText）
   expect(editor.find('.ce-chip-skill').exists()).toBe(true);
   expect(editor.find('.ce-chip-skill .ce-chip-label').text()).toBe('beta');
   expect(editor.find('.ce-chip-skill .ce-chip-icon polygon').exists()).toBe(true);
@@ -201,7 +195,6 @@ it('斜杠面板技能项渲染星盘图标，选中技能后像对话一样显�
     await editor.trigger('keydown', { key: 'Tab' });
     expect(editor.find('.ce-chip-session').exists()).toBe(true);
 
-    // 在对话胶囊后输入 /g，并把光标放到末尾，验证命令图标与技能星盘 SVG 图标
     const el = editor.element as HTMLElement;
     el.appendChild(document.createTextNode('/g'));
     const range = document.createRange();
@@ -216,7 +209,6 @@ it('斜杠面板技能项渲染星盘图标，选中技能后像对话一样显�
     expect(sgItems[0].find('.sg-icon').text()).toBe('⌘');
     expect(sgItems[1].find('.sg-icon svg polygon').exists()).toBe(true);
 
-    // 选中 /gzh-design：对话胶囊与技能胶囊并排显示
     await editor.trigger('keydown', { key: 'ArrowDown' });
     await editor.trigger('keydown', { key: 'Enter' });
     expect(sendSpy).not.toHaveBeenCalled();
@@ -225,7 +217,6 @@ it('斜杠面板技能项渲染星盘图标，选中技能后像对话一样显�
     expect(editor.find('.ce-chip-skill .ce-chip-label').text()).toBe('gzh-design');
     expect(store._getSessionRuntime().composerText).toBe('@{缓存改造} /gzh-design ');
 
-    // 点选技能胶囊并按 Backspace：整个技能胶囊一次删光，不影响前面的对话胶囊
     const skillChip = el.querySelector('.ce-chip-skill') as HTMLElement;
     skillChip.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
     await editor.trigger('keydown', { key: 'Backspace' });
@@ -256,7 +247,6 @@ it('斜杠面板选中内置命令（如 /goal）后渲染为胶囊，删除时�
   expect(editor.find('.ce-chip-command .ce-chip-label').text()).toBe('goal');
   expect(store._getSessionRuntime().composerText).toBe('/goal ');
 
-  // 退格删掉尾随空格后再退格：整个 /goal 胶囊一次全删
   const el = editor.element as HTMLElement;
   const range = document.createRange();
   range.selectNodeContents(el);
@@ -270,7 +260,6 @@ it('斜杠面板选中内置命令（如 /goal）后渲染为胶囊，删除时�
   expect(editor.find('.ce-chip-command').exists()).toBe(false);
   expect(store._getSessionRuntime().composerText).toBe('');
 
-  // 重新选中并发送：对外仍提交原始 '/goal '
   el.textContent = '/go';
   const r2 = document.createRange();
   r2.selectNodeContents(el);
@@ -352,11 +341,8 @@ it('点击撤销按钮把排队消息文本和附件恢复到输入框并取消�
   await undoBtn.trigger('click');
   await flushPromises();
 
-  // 文本回到输入框
   expect(wrapper.get('.ce-input').element.textContent).toBe('要撤销的消息');
-  // 从队列移除（复用取消排队）
   expect(cancelSpy).toHaveBeenCalledWith('session-b', 'q1');
-  // 附件（图片+文件）一并回到输入框
   expect(wrapper.findAll('.attach-chip')).toHaveLength(2);
   wrapper.unmount();
 });
@@ -371,28 +357,23 @@ it('拖拽顶边手柄抬高输入框，向下拖以默认高度为下限，松�
   await nextTick();
   expect(wrapper.get('#input-area').classes()).toContain('is-resizing');
 
-  // 向上拖 60px → 默认 46px + 60px
   firePointer(window, 'pointermove', 40);
   await nextTick();
   expect(textareaEl()).toBe('106px');
 
-  // 继续向上拖超过窗口 60% 上限（jsdom innerHeight=768 → 上限 461px）
   firePointer(window, 'pointermove', -400);
   await nextTick();
   expect(textareaEl()).toBe('461px');
 
-  // 向下拖过头 → 回到默认高度即触底
   firePointer(window, 'pointermove', 500);
   await nextTick();
   expect(textareaEl()).toBe('46px');
 
-  // 松手：拖回默认高度视为未拉伸，不写入记忆
   firePointer(window, 'pointerup', 500);
   await nextTick();
   expect(wrapper.get('#input-area').classes()).not.toContain('is-resizing');
   expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBeNull();
 
-  // 再拖高并松手 → 写入 localStorage
   firePointer(handleEl, 'pointerdown', 100);
   firePointer(window, 'pointermove', 40);
   await nextTick();
@@ -408,7 +389,6 @@ it('挂载时恢复上次记忆的高度，并按当前窗口重新夹取', asyn
   expect((wrapper.get('.ce-input').element as HTMLElement).style.height).toBe('200px');
   wrapper.unmount();
 
-  // 存储的上限按当前窗口夹取（461px），低于默认高度则视为未拉伸
   localStorage.setItem(COMPOSER_HEIGHT_KEY, '99999');
   wrapper = mount(InputArea);
   await nextTick();
@@ -466,8 +446,6 @@ it('输入组件因设置页卸载后重新挂载仍恢复当前会话草稿', a
   wrapper.unmount();
 });
 
-// —— 上下文用量面板：悬停圆环打开 / 延迟关闭 / 面板内保持 ——
-
 function mountInput() {
   return mount(InputArea, { global: { stubs: { teleport: true } } });
 }
@@ -480,7 +458,6 @@ it('悬停上下文圆环打开用量面板，移出后延迟关闭', async () =
     const wrapper = mountInput();
     const ring = wrapper.get('[data-test="context-ring"]');
 
-    // 原生 title 已移除，改为悬停详情面板
     expect(ring.attributes('title')).toBeUndefined();
 
     await ring.trigger('mouseenter');
@@ -488,7 +465,6 @@ it('悬停上下文圆环打开用量面板，移出后延迟关闭', async () =
     expect(wrapper.get('[data-test="ctx-usage-summary"]').text())
       .toBe('12,345 / 128,000（9.6%）');
 
-    // 移出圆环：延迟期内仍显示（留给鼠标移入面板的过渡时间）
     await ring.trigger('mouseleave');
     expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
 
@@ -546,8 +522,6 @@ it('触摸设备点按上下文圆环切换面板', async () => {
   }
 });
 
-// —— QQ2009 皮肤专属工具栏行：默认主题不渲染，仅真实功能按钮 ——
-
 it('默认主题下不渲染 QQ2009 工具栏行', () => {
   const wrapper = mount(InputArea);
   expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
@@ -557,17 +531,14 @@ it('默认主题下不渲染 QQ2009 工具栏行', () => {
 it('QQ2009 主题下渲染工具栏行，两个附件按钮都调用真实的附件入口', async () => {
   const store = useAppStore();
   store.guiTheme = { id: 'builtin.qq2009' } as any;
-  // 附件入口最终落点是 store.pickFiles（系统文件对话框），断言真实函数被调用
   const pickSpy = vi.spyOn(store, 'pickFiles').mockResolvedValue([]);
 
   const wrapper = mount(InputArea);
   const toolbar = wrapper.get('[data-test="qq09-toolbar"]');
-  // 动作清单：图片 + 文件（星瑶无独立图片菜单，两者共用同一附件入口）
   const buttons = toolbar.findAll('.qq09-tb-btn');
   expect(buttons).toHaveLength(2);
   expect(buttons[0].attributes('title')).toContain('图片');
   expect(buttons[1].attributes('title')).toContain('文件');
-  // 图标为 inline SVG（stroke 风格），非 emoji
   expect(buttons[0].find('svg').exists()).toBe(true);
 
   await buttons[0].trigger('click');

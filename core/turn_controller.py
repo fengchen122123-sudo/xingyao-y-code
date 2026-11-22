@@ -1,5 +1,3 @@
-"""Turn lifecycle state used to cancel and roll back one model turn."""
-
 from __future__ import annotations
 
 import threading

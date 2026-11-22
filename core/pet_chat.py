@@ -1,26 +1,3 @@
-"""星瑶桌宠「无聊时自己说话」的调度与台词生成。
-
-这是什么：一个后台轻量线程，每 30 秒醒来一次，判断用户是否长时间没碰键鼠；是的话
-就让模型用星瑶的语气生成一句短台词，经 `core.pet_manager.push_bubble` 冒到桌宠上。
-
-为什么四类触发条件这样设计：
-- 开关（pet_chat_enabled）：不想要就永远不开口，用户在设置页随时能关，关掉时线程
-  即使还在跑也一次都不会说话；
-- 桌宠在跑 + 系统空闲 ≥ 阈值：`GetLastInputInfo` 看的是「最后一次键鼠输入」，比
-  「星瑶有没有在跑任务」更贴近「人是不是不在电脑前」这个真实语义；人一走开就冒一
-  句，回来就自然停下，这是不打扰工作的唯一可靠信号；
-- 间隔长尾随机：说完一句就抽定下一次的时间点（阈值的 0.4~2.6 倍，众数在 0.7 倍），
-  于是有时五六分钟就冒一句、有时二十多分钟不吭声；固定周期或「固定值 × 小抖动」听感
-  上都是一个钟，只有真随机才像「自己忽然想起来」；
-- 当日上限 40 条：既防模型抽风，也防用户把阈值调成 60 秒时刷屏，顺手兜住成本；
-- 星瑶没有任务在跑：任务执行期后端会推「正在读文件…」这类气泡，两条气泡抢同一个
-  位置只会互相打断，所以有回合在跑时宁可不说话（详见 `_should_speak` 的说明）。
-
-为什么不读文件内容、不读对话记录：桌宠卖的是「陪伴感」而不是「监视感」。把工作区
-内容塞进闲聊提示词，等于给一句无关紧要的台词附上隐私风险；所以提示词只带时间、
-当前目录名、宠物形象名三项公开事实，并明确要求不提问、不解释、不带 emoji。
-"""
-
 from __future__ import annotations
 
 import collections
@@ -40,16 +17,12 @@ logger = logging.getLogger(__name__)
 # 调度节拍：30 秒足够贴合「人离开电脑」这种分钟级事件，又不至于让 daemon 线程
 # 频繁抢 GIL（tick 本身只读配置 + 查空闲，不做网络请求）。
 _TICK_SECONDS = 30
-# 默认空闲阈值 10 分钟：短于这个值，喝口水回来就发现她说了句话，显得吵闹。
 _DEFAULT_IDLE_SECONDS = 600
-# 单日上限：按条数而不是按 token，口径直观，用户能自己估出来。
 _DAILY_LIMIT = 40
 # 台词长度上限（字符）：气泡宽度有限，超过一行半就换行溢出，宁可截断也不要糊成一团。
 _MAX_CHARS = 40
-# 去重样本容量：只保留最近 8 条做「别重复」参考，够压住短期复读，又不占提示词预算。
 _RECENT_KEEP = 8
 
-# 设置页下拉能选到的阈值范围（秒）：太短会打扰，太长等于永远不说。
 _IDLE_MIN_SECONDS = 60
 _IDLE_MAX_SECONDS = 86400
 
@@ -60,20 +33,17 @@ _BUBBLE_HOLD_MS = 3200
 # 否则截断后剩下的全是思考碎片。
 _THINK_RE = re.compile(r"<(?:think|thinking)>.*?</(?:think|thinking)>", re.DOTALL | re.IGNORECASE)
 
-# 包裹式引号：中英混排时模型最常"礼貌地"加一层引号，去掉才像自己嘟囔。
 _QUOTE_PAIRS = (
     ('"', '"'),
     ("'", "'"),
-    ("\u201c", "\u201d"),  # “ ”
-    ("\u2018", "\u2019"),  # ‘ ’
-    ("\u300c", "\u300d"),  # 「 」
-    ("\u300e", "\u300f"),  # 『 』
+    ("\u201c", "\u201d"),
+    ("\u2018", "\u2019"),
+    ("\u300c", "\u300d"),
+    ("\u300e", "\u300f"),
 )
 
-# ---- 运行态（模块级单例：星瑶是单进程应用，闲聊调度只应有一条） ----
 _state_lock = threading.RLock()
 _last_spoken_at: float = 0.0
-# 下一次允许开口的绝对时间戳：说完那一刻由 _roll_next_gap 抽定，0 表示「还没抽过」
 _next_speak_at: float = 0.0
 _today_count: int = 0
 _today_day: str = ""
@@ -82,14 +52,7 @@ _thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 
 
-# --------------------------------------------------------------------- 配置
 def _config_value(key: str, default: Any = None) -> Any:
-    """读单个配置项（先看模块级属性，再回落 config.json 的载荷）。
-
-    写法照 `core/pet_manager._config_value`：函数内 import 是为了避开模块顶层
-    import config 带来的循环导入；config 的 `__getattr__` 对未注册名字会抛
-    AttributeError，一律吞掉——读不到配置只该退化成默认值，不该让整个调度线程崩。
-    """
     try:
         import config
     except Exception:
@@ -107,7 +70,6 @@ def _config_value(key: str, default: Any = None) -> Any:
 
 
 def _setting_enabled() -> bool:
-    """开关默认关闭：用户没明确勾选过，就不该有模型请求偷偷发出去。"""
     try:
         return bool(_config_value("pet_chat_enabled", False))
     except Exception:
@@ -115,7 +77,6 @@ def _setting_enabled() -> bool:
 
 
 def _setting_idle_seconds() -> int:
-    """空闲阈值：读不到或非法值都回落到默认 10 分钟，并钳进合理区间。"""
     try:
         raw = int(_config_value("pet_chat_idle_seconds", _DEFAULT_IDLE_SECONDS))
     except Exception:
@@ -124,30 +85,22 @@ def _setting_idle_seconds() -> int:
 
 
 def _setting_model_id() -> str:
-    """用户指定的模型 id；空串表示「自动」（副模型 → 主模型）。"""
     try:
         return str(_config_value("pet_chat_model_id", "") or "").strip()
     except Exception:
         return ""
 
 
-# ----------------------------------------------------------------- 空闲检测
 class _LASTINPUTINFO(ctypes.Structure):
     """Win32 LASTINPUTINFO：cbSize 必须由调用方填成结构体大小，否则 API 直接失败。"""
 
     _fields_ = [
         ("cbSize", ctypes.c_uint),
-        ("dwTime", ctypes.c_uint),  # 最后一次输入时的 GetTickCount 值（低 32 位）
+        ("dwTime", ctypes.c_uint),
     ]
 
 
 def _system_idle_seconds() -> float:
-    """距最后一次键鼠输入的秒数；非 Windows 或取不到时返回 0.0（等于永远不触发）。
-
-    用 `GetTickCount64` 而不是 `GetTickCount`：后者 32 位、49.7 天回绕，机器长期
-    不关机时算出来的空闲时长会突然变成负数或几十万小时。`dwTime` 只有低 32 位，
-    所以两者相减按 2^32 取模——这既抹平回绕，又不受系统运行天数影响。
-    """
     if not sys.platform.startswith("win"):
         return 0.0
     try:
@@ -166,9 +119,7 @@ def _system_idle_seconds() -> float:
         return 0.0
 
 
-# ------------------------------------------------------------- 外部状态探测
 def _pet_running() -> bool:
-    """桌宠进程是否在跑：没起来时气泡通道不存在，先判掉能省下一次模型调用。"""
     try:
         from core import pet_manager
 
@@ -179,14 +130,6 @@ def _pet_running() -> bool:
 
 
 def _agent_busy() -> bool:
-    """星瑶此刻是否还有任务在跑（近似判定，宁松勿紧）。
-
-    现实约束：回合状态没有进程级权威信号——GUI 的 `_active_turns` 挂在 ApiBridge
-    实例上，核心模块拿不到那个实例。这里退一步用两个已有的、只读的登记表近似：
-    - `core.turn_undo.coordinator` 的活跃回合登记（回合开始 recording 时会登记）；
-    - `core.task_manager.list_active_tasks()`（后台任务是否还在跑）。
-    任何异常都按「没有任务」处理：多说一句气泡只是略吵，永久不说话才是功能坏掉。
-    """
     try:
         from core.turn_undo import coordinator as coordinator_mod
 
@@ -205,14 +148,11 @@ def _agent_busy() -> bool:
     return False
 
 
-# ------------------------------------------------------------------- 模型解析
 def _model_entry(provider: dict, model: dict) -> dict:
-    """把 providers[].models[] 的一项整理成与 `get_secondary_model()` 同形状的请求参数。"""
     from core.model_manager import effective_provider_api_key
 
     return {
         "litellm_model": str(model.get("litellm_model") or ""),
-        # 多 Key provider 只取「当前该用」的那一把，与 get_active_model 口径一致
         "api_key": effective_provider_api_key(provider),
         "base_url": str(provider.get("base_url") or ""),
         "name": str(model.get("name") or model.get("id") or ""),
@@ -221,11 +161,6 @@ def _model_entry(provider: dict, model: dict) -> dict:
 
 
 def _model_by_id(model_id: str) -> Optional[dict]:
-    """按 id 在 providers[].models[] 里找模型；找不到返回 None。
-
-    model_manager 现有的 `get_model_config_by_id` 只返回模型条目本身（不含
-    provider 的 base_url / api_key），发请求还差一半信息，所以在内部补一个遍历。
-    """
     from core import model_manager
 
     wanted = str(model_id or "").strip()
@@ -241,11 +176,6 @@ def _model_by_id(model_id: str) -> Optional[dict]:
 
 
 def _resolve_model() -> Optional[dict]:
-    """按「指定模型 → 副模型 → 当前激活模型」解析出这次要用的模型；解析不到返回 None。
-
-    这个顺序的理由：用户显式指定就用她的选择（哪怕贵也是她的决定）；没指定时借用
-    副模型——闲聊是典型的廉价后台任务，用主模型纯属浪费；连副模型都没配才退回主模型。
-    """
     wanted = _setting_model_id()
     if wanted:
         try:
@@ -290,9 +220,7 @@ def _resolve_model() -> Optional[dict]:
     return None
 
 
-# --------------------------------------------------------------------- 提示词
 def _time_phrase(now: _dt.datetime) -> str:
-    """把小时折成中文时段：模型对「傍晚」的语感比「18:20」准得多。"""
     hour = now.hour
     if hour < 5:
         return "凌晨"
@@ -308,7 +236,6 @@ def _time_phrase(now: _dt.datetime) -> str:
 
 
 def _skin_profile() -> tuple[str, str]:
-    """当前宠物形象名与性格设定；读不到就回落（「星瑶」, 空）。"""
     try:
         from core import pet_skins
 
@@ -364,15 +291,7 @@ def _build_prompt() -> str:
     return "\n".join(lines)
 
 
-# ----------------------------------------------------------------- 生成与清洗
 def _request_completion(model: dict, prompt: str, *, disable_thinking: bool) -> Optional[str]:
-    """发一次非流式补全，返回正文字符串；请求本身失败返回 None。
-
-    为什么要显式关思考：推理型模型（实测 hy3）会把 max_tokens 全花在 reasoning 上，
-    正文直接是空串、finish_reason=length——连 800 token 都不够，因为思考有上千字。
-    关掉后一句台词只要十来个 token 就够了。个别渠道不认 `thinking` 参数会直接报错，
-    由调用方去掉参数重试（那种情况只能靠更大的预算让思考先跑完）。
-    """
     try:
         from core.llm import _dispatch_completion
 
@@ -381,7 +300,6 @@ def _request_completion(model: dict, prompt: str, *, disable_thinking: bool) -> 
             "api_key": model["api_key"],
             "api_base": model["base_url"],
             "messages": [{"role": "user", "content": prompt}],
-            # temperature 由 native 传输层按模型能力自行决定是否透传，这里照常传
             "temperature": 0.9,
             "timeout": 20 if disable_thinking else 40,
             "max_tokens": 120 if disable_thinking else 800,
@@ -398,14 +316,6 @@ def _request_completion(model: dict, prompt: str, *, disable_thinking: bool) -> 
 
 
 def _generate_line() -> Optional[str]:
-    """调模型拿一句台词；拿不到返回 None（本轮跳过，不重试、不打扰用户）。
-
-    走 `core.llm._dispatch_completion`（与记忆压缩同一条轻量非流式入口）：闲聊不该
-    进 Agent 的工具循环，否则一句话要牵出一整套回合状态，成本和风险都不对等。
-
-    两次尝试的顺序有讲究：先关思考（快、便宜、正文稳定），拿不到正文才退回「开着
-    思考 + 大预算」——后者更慢更贵，但能兼容不认 `thinking` 参数的渠道。
-    """
     model = _resolve_model()
     if not model:
         logger.debug("没有可用模型，跳过本轮桌宠闲聊")
@@ -420,7 +330,6 @@ def _generate_line() -> Optional[str]:
 
 
 def _strip_wrapping_quotes(text: str) -> str:
-    """剥掉包裹式引号；一层层剥，避免「“『…』”」这种套娃漏网。"""
     value = text
     while len(value) >= 2:
         for left, right in _QUOTE_PAIRS:
@@ -463,14 +372,12 @@ def _clean_line(text: Any) -> Optional[str]:
     return line
 
 
-# ---------------------------------------------------------------------- 触发
 def _today_stamp() -> str:
     """本地日期字符串：跨天清零按「用户感知的今天」，不能用 UTC。"""
     return time.strftime("%Y-%m-%d")
 
 
 def _refresh_day_locked() -> None:
-    """跨天把当日计数清零（调用方须持 `_state_lock`）。"""
     global _today_count, _today_day
     stamp = _today_stamp()
     if stamp != _today_day:
@@ -479,20 +386,6 @@ def _refresh_day_locked() -> None:
 
 
 def _should_speak(now_idle: float) -> bool:
-    """是否该在此刻开口：五条全满足才算。
-
-    五条分别是：开关开、桌宠在跑、空闲 ≥ 阈值、已到「随机抽定的下一次时间」、
-    当日未达 40 条；另外「星瑶没有任务在跑」一票否决。
-
-    间隔为什么改成「抽一次、用完再抽」：原来的「阈值 × 0.8~1.2」是每个 tick 现算，
-    等于每次重新掷骰子，说与不说取决于当天第几次骰子，既不好复现也不像活物——听感
-    上仍是每十分钟一句的钟。现在说完就把下一次的时间点算好写进 `_next_speak_at`，
-    判断只剩「到点没有」，而每次间隔本身服从长尾随机，节奏自然不齐。
-
-    说明：「无任务在跑」这条目前只有近似信号（见 `_agent_busy`：撤销协调器的活跃
-    回合登记 + 后台任务表），核心模块拿不到 ApiBridge 实例上那份权威的 `_active_turns`，
-    所以未接入完整的回合状态；探测不到时按「没有回合」放行，只按系统空闲判断。
-    """
     if not _setting_enabled():
         return False
     if not _pet_running():
@@ -511,7 +404,6 @@ def _should_speak(now_idle: float) -> bool:
         next_at = _next_speak_at
     if count >= _DAILY_LIMIT:
         return False
-    # 说过话就等到抽定的那一刻；从没说过（last<=0）时到达阈值即可开一次头
     if last > 0 and time.time() < next_at:
         return False
     if _agent_busy():
@@ -519,14 +411,7 @@ def _should_speak(now_idle: float) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------- 说话
 def _roll_next_gap(base_seconds: int) -> float:
-    """抽定「下一次开口」要等多久（秒）。
-
-    用三角分布而不是「固定值 × 小抖动」：抖动只在均值附近来回晃，听感还是一个钟。
-    这里众数压在 0.7×阈值、尾巴拖到 2.6×阈值——多数时候七八分钟就冒一句，偶尔
-    二十多分钟都不吭声；下限留 0.4×阈值，免得刚说完立刻又说，变成碎嘴子。
-    """
     try:
         base = max(float(base_seconds), 1.0)
     except (TypeError, ValueError):
@@ -535,12 +420,6 @@ def _roll_next_gap(base_seconds: int) -> float:
 
 
 def _record_spoken(line: str) -> None:
-    """记账：上次开口时间、当日条数、最近台词，并顺手抽定下一次开口的时间点。
-
-    下次时间点在「说完这一刻」就定死，而不是等下一次 tick 现算：定死之后这一轮间隔
-    就完全确定，`_should_speak` 只比时间戳，行为可解释、也能写单测；现算则等于每个
-    tick 重新掷骰子，节奏不可复现，听感上仍是死板的固定周期。
-    """
     global _last_spoken_at, _today_count, _next_speak_at
     with _state_lock:
         _refresh_day_locked()
@@ -551,10 +430,6 @@ def _record_spoken(line: str) -> None:
 
 
 def _speak(line: str) -> bool:
-    """把一句台词冒到桌宠上；推送成功才记账，避免「没显示也算说过了」。
-
-    停留 3200ms 比状态气泡长一点：这句话没有上下文，一闪而过就白生成一次。
-    """
     try:
         from core import pet_manager
 
@@ -570,10 +445,6 @@ def _speak(line: str) -> bool:
 
 
 def _tick_once() -> Optional[str]:
-    """调度线程的一拍：判断要不要开口，要就生成一句并推送；返回说出口的台词。
-
-    抽成独立函数是为了能在测试/手工验证里「只跑一拍」，不必真的启动线程。
-    """
     if not _should_speak(_system_idle_seconds()):
         return None
     line = _generate_line()
@@ -595,7 +466,6 @@ def _loop() -> None:
             logger.debug("桌宠闲聊调度异常（已忽略，循环继续）", exc_info=True)
 
 
-# ---------------------------------------------------------------------- 接口
 def start() -> None:
     """幂等启动调度线程：重复调用（设置页点两次、应用重启后自动恢复）只保留一条。"""
     global _thread
@@ -621,11 +491,6 @@ def stop() -> None:
 
 
 def status() -> dict:
-    """给设置页/诊断用的当前状态快照。
-
-    `last_spoken_at` 用 epoch 秒（从没说过就是 None）：前端要显示「几分钟前」比显示
-    格式化字符串更省事，也避开了时区口径不一致。
-    """
     with _state_lock:
         _refresh_day_locked()
         thread = _thread
@@ -644,12 +509,6 @@ def update_settings(
     idle_seconds: Optional[Any] = None,
     model_id: Optional[Any] = None,
 ) -> dict:
-    """写设置并即时生效，返回最新 `status()`（附带 `saved` 表示是否写盘成功）。
-
-    立即生效靠的是每次 tick 现读配置，而不是把值缓存在线程里：缓存会和「另一个
-    窗口/另一台设备改了配置」打架，现读永远以磁盘为准。写盘失败也不抛异常——设置
-    页只该提示一句「保存失败」，不该让按钮把界面卡死。
-    """
     updates: dict = {}
     if enabled is not None:
         updates["pet_chat_enabled"] = bool(enabled)

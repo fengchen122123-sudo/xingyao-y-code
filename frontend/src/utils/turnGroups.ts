@@ -3,11 +3,6 @@ import { diffCounts, type LegacyDiff } from './toolTrace';
 
 export { countDiffChanges } from './toolTrace';
 
-// ---------------------------------------------------------------------------
-// 稳定消息 key：对象身份 -> 递增数字。
-// App.vue 消息流与 TurnGroup 折叠体共用，保证分组重排（running -> 折叠形态
-// 切换）时同一条消息的组件实例按身份复用，而不是按数组下标错位重挂载。
-// ---------------------------------------------------------------------------
 const msgKeyMap = new WeakMap<object, number>();
 let msgKeySeq = 0;
 
@@ -20,27 +15,12 @@ export function msgKey(msg: object): number {
   return k;
 }
 
-// ---------------------------------------------------------------------------
-// 按回合分组消息流
-//
-// 一个回合 = 一条用户消息 + 其后到下一条用户消息前的全部回复消息。
-// 回合结束后中间过程（多个 LLM 轮次的星瑶消息、提示、中途错误）折叠成
-// 一块，组尾只保留最后一条 assistant（最终总结）与其后的 error 消息。
-// 回合运行中不折叠，保持逐条实时显示的现状。
-// ---------------------------------------------------------------------------
-
 export interface TurnGroupInfo {
-  /** 触发本轮的用户消息；会话开头孤儿段可为 null */
   userMsg: ChatMessage | null;
-  /** 中间过程消息（已完成的轮次 / 提示 / 中途错误），回合结束后折叠展示 */
   middle: ChatMessage[];
-  /** 组尾：最后一条 assistant（总结轮）+ 其后的 error 消息，始终可见 */
   tail: ChatMessage[];
-  /** 组内任一 assistant 仍 running：实时模式，不折叠 */
   running: boolean;
-  /** 回合终态（running 时不定），用于折叠头文案 */
   state: 'completed' | 'cancelled' | 'error';
-  /** 按回合撤销：权威回合身份（message_turn_links 持久化，旧消息为空串） */
   turnId: string;
 }
 
@@ -58,7 +38,6 @@ export function buildMessageGroups(messages: ChatMessage[]): TurnGroupInfo[] {
       continue;
     }
     if (!current) {
-      // 会话开头没有用户消息的孤儿段（异常数据 / 旧会话残留），同样聚合
       current = { userMsg: null, middle: [], tail: [], running: false, state: 'completed', turnId: '' };
       groups.push(current);
     }
@@ -68,10 +47,8 @@ export function buildMessageGroups(messages: ChatMessage[]): TurnGroupInfo[] {
       current.tail.length = 0;
       current.tail.push(msg);
     } else if (current.tail.length > 0) {
-      // 总结轮之后的 error 消息跟在组尾（用户需要立即看到）
       current.tail.push(msg);
     } else {
-      // 回合中段的 notice / error 收进折叠区
       current.middle.push(msg);
     }
   }
@@ -91,12 +68,10 @@ export function buildMessageGroups(messages: ChatMessage[]): TurnGroupInfo[] {
   return groups;
 }
 
-/** 回合内是否值得显示折叠头：有中间过程消息才有东西可折 */
 export function groupHasProcess(group: TurnGroupInfo): boolean {
   return group.middle.length > 0;
 }
 
-/** 折叠头摘要统计：轮次数与工具调用数（含未绑定的历史 diff） */
 export function groupStats(group: TurnGroupInfo): { rounds: number; toolCount: number } {
   let rounds = 0;
   let toolCount = 0;
@@ -108,22 +83,11 @@ export function groupStats(group: TurnGroupInfo): { rounds: number; toolCount: n
   return { rounds, toolCount };
 }
 
-// ---------------------------------------------------------------------------
-// 回合文件更改摘要（"N 个文件已更改" 折叠面板）
-//
-// 数据来源：本回合所有 assistant 消息里，mutation 工具调用绑定的 diff 与
-// 未绑定的历史 legacy_diffs。新事件优先使用后端基于完整 diff 计算的统计；
-// 旧历史数据才从截断/渲染文本启发式统计。同一文件多次修改去重，行数累加。
-// ---------------------------------------------------------------------------
-
 export interface FileChangeEntry {
-  /** 文件名（basename），如 tools.py */
   name: string;
-  /** 相对/原始路径，如 .\core\tools.py */
   path: string;
   added: number;
   removed: number;
-  /** 该文件本回合全部修改的 unified diff 文本（多次修改拼接），用于展开查看 */
   diffText: string;
 }
 
@@ -133,7 +97,6 @@ function baseName(p: string): string {
   return i >= 0 ? norm.slice(i + 1) : norm;
 }
 
-/** 收集回合内的文件更改（去重 + 行数累加）。无更改返回空数组（面板不显示） */
 export function collectFileChanges(group: TurnGroupInfo): FileChangeEntry[] {
   const byPath = new Map<string, FileChangeEntry>();
   const push = (diff: LegacyDiff) => {

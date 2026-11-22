@@ -1,10 +1,3 @@
-"""星轨自动化 Agent 工具（automation_*）测试。
-
-把 fake AutomationService 注册进 core.automation.service 单例，完全不依赖真实
-GUI / 数据库：工具层只允许经服务句柄访问自动化能力，fake 记录调用并返回与桥侧
-同构的 dict（ok/errors/msg/deleted/run_id/runs）。
-"""
-
 import re
 from datetime import datetime
 
@@ -25,7 +18,6 @@ _TOOL_NAMES = (
 
 
 class FakeAutomationService:
-    """记录调用的 fake 服务：方法签名与 AutomationService 完全一致。"""
 
     def __init__(self):
         self.tasks: dict[str, dict] = {}
@@ -35,7 +27,6 @@ class FakeAutomationService:
         self.save_msg: str | None = None
         self.runs_ok = True
 
-    # -- 断言辅助 --
     def call_names(self) -> list[str]:
         return [call[0] for call in self.calls]
 
@@ -58,7 +49,6 @@ class FakeAutomationService:
             "last_run_at": task.get("last_run_at"),
         }
 
-    # -- 7 个服务方法 --
     def list_tasks(self):
         self.calls.append(("list_tasks",))
         return {"ok": True, "tasks": [self._dto(task) for task in self.tasks.values()]}
@@ -163,10 +153,6 @@ def registry():
     return build_default_registry()
 
 
-# ---------------------------------------------------------------------------
-# 服务未注册（CLI / headless）
-# ---------------------------------------------------------------------------
-
 def test_all_automation_tools_fail_without_gui_service(registry):
     automation_service.unregister()
 
@@ -176,10 +162,6 @@ def test_all_automation_tools_fail_without_gui_service(registry):
         assert result.is_error is True, name
         assert "仅在 GUI 运行期间可用" in result.content, name
 
-
-# ---------------------------------------------------------------------------
-# automation_list
-# ---------------------------------------------------------------------------
 
 def test_list_reports_tasks(fake_service, registry):
     fake_service.tasks["task-1"] = _existing_task()
@@ -220,10 +202,6 @@ def test_list_unknown_task_id_is_error(fake_service, registry):
     assert result.is_error is True
     assert "task-404" in result.content
 
-
-# ---------------------------------------------------------------------------
-# automation_create
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     "trigger_kwargs, expected_type, expected_config",
@@ -357,10 +335,6 @@ def test_create_rejects_unattended_high_permission_modes(fake_service, registry,
     assert fake_service.call_names() == []
 
 
-# ---------------------------------------------------------------------------
-# automation_update
-# ---------------------------------------------------------------------------
-
 def test_update_merges_partial_fields_without_wiping_others(fake_service, registry):
     fake_service.tasks["task-1"] = _existing_task()
 
@@ -370,7 +344,6 @@ def test_update_merges_partial_fields_without_wiping_others(fake_service, regist
     saved = fake_service.last_saved()
     assert saved["id"] == "task-1"
     assert saved["name"] == "改名后的任务"
-    # 未传字段必须原样保留（桥侧 save_task 是整体覆盖）
     assert saved["prompt"] == "总结今天的站会"
     assert saved["trigger_type"] == "daily"
     assert saved["trigger_config"] == {"time": "09:30"}
@@ -443,10 +416,6 @@ def test_update_can_disable_task_via_set_enabled(fake_service, registry):
     assert fake_service.tasks["task-1"]["enabled"] is False
 
 
-# ---------------------------------------------------------------------------
-# automation_delete / automation_run_now
-# ---------------------------------------------------------------------------
-
 def test_delete_removes_task(fake_service, registry):
     fake_service.tasks["task-1"] = _existing_task()
 
@@ -480,10 +449,6 @@ def test_run_now_missing_task_is_error(fake_service, registry):
     assert result.is_error is True
     assert "任务不存在" in result.content
 
-
-# ---------------------------------------------------------------------------
-# 桥侧错误原样透出
-# ---------------------------------------------------------------------------
 
 def test_create_surfaces_bridge_errors(fake_service, registry):
     fake_service.save_errors = ["任务名称不能为空", "提示词不能为空"]
@@ -525,10 +490,6 @@ def test_update_surfaces_bridge_errors(fake_service, registry):
     assert result.is_error is True
     assert "触发器：触发间隔非法" in result.content
 
-
-# ---------------------------------------------------------------------------
-# 注册与 schema 断言
-# ---------------------------------------------------------------------------
 
 def test_registry_registers_automation_tools_with_expected_capabilities(registry):
     names = {schema["function"]["name"] for schema in registry.api_schemas()}
@@ -574,10 +535,6 @@ def test_create_schema_exposes_trigger_parameters(registry):
     assert properties["notify_on_success"]["default"] is False
 
 
-# ---------------------------------------------------------------------------
-# once（一次性触发器）：对话内只收 delay_minutes
-# ---------------------------------------------------------------------------
-
 def test_create_schema_offers_once_with_delay_minutes_only(registry):
     properties = (
         registry.get("automation_create")
@@ -611,7 +568,6 @@ def test_create_once_rejects_run_at_and_feeds_back_current_time(fake_service, re
 
     assert result.is_error is True
     assert "只接受 delay_minutes" in result.content
-    # 把当前时刻回喂给模型，便于下一轮自行换算
     assert re.search(r"现在是 \d{2}:\d{2}", result.content)
     assert "save_task" not in fake_service.call_names()
 
@@ -662,7 +618,6 @@ def test_create_once_converts_delay_minutes_to_run_at(fake_service, registry):
     task = fake_service.last_saved()
     assert task["trigger_type"] == "once"
     config = task["trigger_config"]
-    # 相对延迟不落库，换算成服务端时钟锚定的绝对时刻
     assert set(config) == {"run_at"}
     fire_at = datetime.strptime(config["run_at"], "%Y-%m-%d %H:%M")
     delta_seconds = (fire_at - before).total_seconds()
@@ -670,10 +625,6 @@ def test_create_once_converts_delay_minutes_to_run_at(fake_service, registry):
     assert "一次性" in result.content
     assert config["run_at"] in result.content
 
-
-# ---------------------------------------------------------------------------
-# 有限次执行：max_runs（共执行 N 次后自动完成，手动执行不计入）
-# ---------------------------------------------------------------------------
 
 def test_create_passes_max_runs(fake_service, registry):
     result = registry.execute(
@@ -731,4 +682,3 @@ def test_create_schema_documents_max_runs(registry):
     assert "max_runs" in description
     assert "自动完成" in description
     assert "不计入" in description
-

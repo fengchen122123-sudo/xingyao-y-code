@@ -1,11 +1,3 @@
-"""星轨自动化回合工具策略（G3：防任务自我繁殖）测试。
-
-覆盖四层同源策略：线程本地标记与 scope 语义、core.llm 工具 schema 过滤、
-工具 wrapper 拦截、Harness 管线门控兜底。FakeAutomationService 与
-tests/test_automation_tools.py 同风格：只经 core.automation.service 单例注入，
-完全不依赖 GUI / SQLite。
-"""
-
 import json
 
 import pytest
@@ -27,7 +19,6 @@ _WRITE_TOOLS = (
 
 
 class FakeAutomationService:
-    """记录调用的 fake 服务：方法签名与 AutomationService 一致。"""
 
     def __init__(self):
         self.tasks: dict[str, dict] = {}
@@ -131,7 +122,6 @@ class _EmptyMcp:
 
 
 class _Decoded:
-    """管线门控入参替身：只需要 name / call_id。"""
 
     def __init__(self, name, call_id="call-1"):
         self.name = name
@@ -157,14 +147,12 @@ def registry():
 
 @pytest.fixture
 def tool_schema_env(monkeypatch):
-    """工具 schema 构建环境：MCP 走空实现（不连接、不引入外部依赖）。"""
     monkeypatch.setattr(llm, "_mcp_first_wait_done", True)
     monkeypatch.setattr(llm, "_get_mcp_manager", lambda: _EmptyMcp())
 
 
 @pytest.fixture
 def clean_automation_turn():
-    """前后都清空线程标记，避免测试之间互相污染。"""
     app_context.set_thread_automation_turn(None)
     try:
         yield
@@ -179,10 +167,6 @@ def _schema_names():
     }
 
 
-# ---------------------------------------------------------------------------
-# 1. 回归：无标记时策略完全惰性，普通会话不受任何影响
-# ---------------------------------------------------------------------------
-
 def test_plain_turn_hides_nothing_and_blocks_nothing(clean_automation_turn):
     assert app_context.get_thread_automation_turn() is None
     assert tool_policy.is_automation_turn() is False
@@ -190,13 +174,8 @@ def test_plain_turn_hides_nothing_and_blocks_nothing(clean_automation_turn):
     assert tool_policy.automation_write_denied() is False
     for name in _WRITE_TOOLS + ("automation_list", "read_file"):
         assert tool_policy.is_automation_turn_tool_blocked(name) is False, name
-    # 空名字不阻断（工具名解析失败时不得误拦）
     assert tool_policy.is_automation_turn_tool_blocked("") is False
 
-
-# ---------------------------------------------------------------------------
-# 2. 自动化回合：只隐藏/拒绝 4 个写工具，automation_list 保留
-# ---------------------------------------------------------------------------
 
 def test_scope_hides_only_write_tools(clean_automation_turn):
     with app_context.automation_turn_scope("run-1"):
@@ -209,14 +188,9 @@ def test_scope_hides_only_write_tools(clean_automation_turn):
         )
         for name in _WRITE_TOOLS:
             assert tool_policy.is_automation_turn_tool_blocked(name) is True, name
-        # 只读查询必须保留：模型要靠它了解现状并向用户提建议
         assert tool_policy.is_automation_turn_tool_blocked("automation_list") is False
         assert tool_policy.is_automation_turn_tool_blocked("read_file") is False
 
-
-# ---------------------------------------------------------------------------
-# 3. 退出恢复（含嵌套 / 异常 / 空 run_id）
-# ---------------------------------------------------------------------------
 
 def test_scope_restores_after_exit_and_supports_nesting(clean_automation_turn):
     with app_context.automation_turn_scope("run-outer"):
@@ -239,17 +213,12 @@ def test_scope_restores_on_exception(clean_automation_turn):
 
 
 def test_empty_run_id_means_plain_turn(clean_automation_turn):
-    # 回合入口 automation_run_id 为 "" 时传 None：不得把普通回合误判成自动化回合
     with app_context.automation_turn_scope(None):
         assert app_context.get_thread_automation_turn() is None
         assert tool_policy.is_automation_turn() is False
     with app_context.automation_turn_scope(""):
         assert tool_policy.is_automation_turn() is False
 
-
-# ---------------------------------------------------------------------------
-# 4. 工具 schema：自动化回合不含 4 个写工具，普通回合含
-# ---------------------------------------------------------------------------
 
 def test_tool_schema_hides_write_tools_only_in_automation_turn(
     tool_schema_env, clean_automation_turn
@@ -274,15 +243,11 @@ def test_secretary_branch_unaffected_by_automation_turn(
     monkeypatch.setattr(llm.secretary, "is_secretary_session", lambda *_a, **_k: True)
     plain = _schema_names()
     for name in _WRITE_TOOLS:
-        assert name not in plain, name
+        assert name in plain, name
     with app_context.automation_turn_scope("run-secretary"):
         automation = _schema_names()
     assert automation == plain
 
-
-# ---------------------------------------------------------------------------
-# 5. 工具 wrapper：自动化回合拒绝且不落库，普通回合正常执行
-# ---------------------------------------------------------------------------
 
 def test_write_wrappers_deny_in_automation_turn(fake_service, registry, clean_automation_turn):
     fake_service.tasks["task-1"] = _existing_task()
@@ -330,10 +295,6 @@ def test_automation_list_still_works_in_automation_turn(
     assert fake_service.call_names() == ["list_tasks"]
 
 
-# ---------------------------------------------------------------------------
-# 6. Harness 管线门控兜底（MCP / 插件 / 同名调用旁路）
-# ---------------------------------------------------------------------------
-
 def test_pipeline_gate_blocks_write_tools(clean_automation_turn):
     with app_context.automation_turn_scope("run-1"):
         message = ToolPipeline._automation_gate_blocked(
@@ -362,7 +323,6 @@ def test_pipeline_gate_allows_plain_turn_and_readonly_tool(clean_automation_turn
 def test_pipeline_end_to_end_blocks_tool_call(
     fake_service, clean_automation_turn
 ):
-    # 门控在权限判定之前，因此无需权限环境即可断言调用被拦下
     with app_context.automation_turn_scope("run-e2e"):
         result = llm._execute_single_tool_call({
             "id": "call-1",

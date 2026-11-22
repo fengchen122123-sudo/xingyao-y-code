@@ -9,7 +9,6 @@ from pathlib import Path, PurePosixPath
 from config import YCODE_DIR as CONFIG_YCODE_DIR
 
 
-# 数据目录唯一事实源来自 config：默认 ~/.ycode，YCODE_DATA_DIR 可覆盖。
 YCODE_DIR = Path(CONFIG_YCODE_DIR)
 MEMORY_DIR = YCODE_DIR / "memory"
 SESSIONS_DIR = YCODE_DIR / "sessions"
@@ -33,31 +32,22 @@ _MEMORY_TARGET_RE = re.compile(
     r"^(?:(?:user|feedback|project|reference)/)?[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.md$"
 )
 
-# B1-02：记忆投毒防护——劫持式指令句式的强特征过滤（低误伤）。
-# 与 _MEMORY_INSTRUCTION_RE（索引行的宽泛过滤，宁可错杀）不同：本过滤面向
-# 正文与日记账的真实记忆内容，误伤代价高，因此只拦「忽略之前指令」「执行
-# 以下命令」「覆盖系统提示词」「不要告诉用户」这类劫持句式；对真实记忆
-# 数据（~/.ycode/memory 全量评测）保持零命中。
 _MEMORY_DIRECTIVE_PATTERNS = (
-    # 忽略/无视/忘掉 + 限定词 + 指令类中心词（中文）
     re.compile(
         r"(?:忽略|无视|忘掉|忘记|跳过)(?:掉|了)?"
         r"(?:(?:所有|全部|之前|以前|先前|以上|上述|前面|过往)(?:的|之)?)+"
         r"(?:指令|命令|指示|规则|要求|设定|约束|提示|内容|信息)"
     ),
-    # ignore (all) previous instructions（英文）
     re.compile(
         r"(?i)\bignore\s+(?:all\s+|any\s+|the\s+)?"
         r"(?:previous|prior|above|earlier|preceding)\s+"
         r"(?:instructions?|prompts?|rules?|messages?)"
     ),
-    # 执行/运行/调用 + 指示词（必选）+ 命令类中心词
     re.compile(
         r"(?:执行|运行|调用)\s*[:：]?\s*"
         r"(?:以下|如下|下列|下述|上述|以上|这条|该条|本条|下一条|下面)\s*[:：]?\s*"
         r"(?:命令|指令|脚本|shell|代码|操作)"
     ),
-    # 覆盖/改写/绕过/突破/替换/篡改 + [系统/你的…] + 提示词类
     re.compile(
         r"(?:覆盖|改写|绕过|突破|替换|篡改)"
         r"(?:系统|安全|全部|所有|全局|你的|您的)*"
@@ -73,11 +63,6 @@ _MEMORY_DIRECTIVE_PATTERNS = (
 
 
 def _contains_memory_directive(text) -> bool:
-    """判断文本是否含劫持式指令句式（B1-02 记忆投毒防护）。
-
-    只做强特征匹配，宁可漏判不误伤：真实记忆/日志数据（大量出现「执行/
-    覆盖/命令」等日常词）不得命中；命中者拒绝进入日记账与持久记忆正文。
-    """
     if not text:
         return False
     value = str(text)
@@ -110,11 +95,6 @@ def is_memory_path(path):
 
 
 def is_ycode_data_path(path):
-    """判断路径是否位于 ycode 数据目录（~/.ycode）内。
-
-    用户明确要求整个 ~/.ycode 数据目录豁免沙盒外询问：里面全是 ycode 自身
-    的运行数据（记忆/会话/配置），agent 读写自家数据不应每次确认。
-    """
     return _is_within_dir(path, YCODE_DIR)
 
 # 记忆文件读写锁：防止后台 dream 整理线程与主线程 append_to_daily_log 并发写导致丢行/截断
@@ -138,7 +118,6 @@ def _atomic_write_text(path, content):
 
 
 def _is_safe_memory_filename(fname):
-    """校验 LLM 输出的记忆文件名，拒绝路径穿越（如 ../x、dir/x、绝对路径）。"""
     if not fname or not isinstance(fname, str):
         return False
     if ".." in fname:
@@ -149,9 +128,6 @@ def _is_safe_memory_filename(fname):
 def ensure_memory_dir():
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     (MEMORY_DIR / "logs").mkdir(parents=True, exist_ok=True)
-    # 系统提示词里承诺的四类记忆子目录也一并创建，
-    # 避免主 Agent 按 build_memory_system_section 的指引直接写文件时
-    # 因父目录不存在触发 write_file 的 FileNotFoundError。
     for sub in ("user", "feedback", "project", "reference"):
         (MEMORY_DIR / sub).mkdir(parents=True, exist_ok=True)
 
@@ -162,11 +138,6 @@ def daily_log_path(today=None):
     return path
 
 def append_to_daily_log(entry):
-    """把 <memory> 条目追加到当日日记账；含劫持式指令的条目拒绝写入（B1-02）。
-
-    拒绝时不落原文，仅留一条不含恶意内容的拦截占位记录（便于事后诊断
-    「记忆为何缺失」）；返回 True 表示原文已写入，False 表示被拦截。
-    """
     ensure_memory_dir()
     path = daily_log_path()
     timestamp = datetime.now().strftime("%H:%M")
@@ -197,7 +168,6 @@ def extract_memory_tags(text):
 
 
 def _is_safe_memory_index_entry(content):
-    """Only accept one bounded Markdown link into a memory Markdown file."""
     if not isinstance(content, str):
         return False
     line = content.strip()
@@ -216,33 +186,16 @@ def _is_safe_memory_index_entry(content):
     path = PurePosixPath(target)
     return not path.is_absolute() and ".." not in path.parts
 
-# 进入稳定系统提示词的记忆索引提示语：必须是固定文案，不含任何计数/文件名/描述。
-# 为什么去掉计数（2026-09-22 实测）：旧实现把各类别的文件数拼进这段文本，而该文本
-# 由 build_memory_system_section() 注入稳定系统提示词并位于每轮请求首位、参与
-# system_sha256；于是一旦有记忆写入（如 15:21 写入 3 条），计数变化 → 稳定系统
-# 提示词变化 → 所有活跃会话在各自回合边界前缀全量 miss（实测 16.4 万 token
-# 前缀失效、缓存命中率跌到 2.5%）。因此这里只返回与记忆内容无关的恒定文案，
-# 具体条目改由 Agent 用文件工具按需读取。
 MEMORY_INDEX_HINT = "记忆索引位于 MEMORY.md；使用文件工具按需读取具体条目。"
 
 
 def load_memory_index():
-    """返回注入系统提示词的记忆索引提示语（固定文案，不随记忆写入变化）。
-
-    MEMORY.md 不存在时返回 ""（保持原有语义，用于区分"还没有记忆"）。
-    """
     if not (MEMORY_DIR / "MEMORY.md").exists():
         return ""
     return MEMORY_INDEX_HINT
 
 
 def _read_memory_index_for_dream():
-    """读取 MEMORY.md 中通过安全校验的索引行，仅供 dream 整理 prompt 使用。
-
-    与 load_memory_index() 分离的原因：系统提示词只需要固定文案（缓存稳定性，
-    见上），而梦境整理必须看到已有索引的真实条目才能合并去重，因此这里按行读取
-    并复用 _is_safe_memory_index_entry 过滤（仍不把模型可控的非法行喂给 LLM）。
-    """
     path = MEMORY_DIR / "MEMORY.md"
     if not path.exists():
         return ""
@@ -378,23 +331,17 @@ def run_dream_consolidation_sync(api_model, api_key, api_base=None):
         from core.learning import run_self_evolution_sync
 
         run_self_evolution_sync(api_model, api_key, api_base)
-    except Exception as e:  # 自我演化失败不影响 dream 整理结果
+    except Exception as e:
         logging.debug("梦境整理后的自我演化失败（已忽略）：%s", e)
     return result
 
 
 def _run_dream_consolidation_impl(api_model, api_key, api_base=None):
-    """
-    后台执行 dream 归纳整理：
-    1. 收集Logs文件夹中的所有今日日志与MEMORY.md内容；
-    2. 利用大模型生成整理策略，修改对应的 .md 记忆文件，并更新 MEMORY.md 索引。
-    """
     ensure_memory_dir()
     # 注意：这里不能用 load_memory_index()（它只返回固定提示文案，供系统提示词用），
     # 梦境整理需要看到已有索引的真实条目，才能合并去重、避免重复写入。
     index = _read_memory_index_for_dream()
     
-    # 搜集所有日记账文件内容
     log_content = ""
     logs_dir = MEMORY_DIR / "logs"
     if logs_dir.exists():
@@ -414,7 +361,6 @@ def _run_dream_consolidation_impl(api_model, api_key, api_base=None):
     # 统一经过 core.llm 的懒加载包装，确保补丁、日志和测试替换点一致。
     from core.llm import completion
 
-    # 整理提示里的自称跟随当前会话（秘书会话 → 秘书名）
     try:
         from core.secretary import get_active_agent_name
 
@@ -467,7 +413,6 @@ def _run_dream_consolidation_impl(api_model, api_key, api_base=None):
             
         res = completion(**kwargs)
         reply = res.choices[0].message.content.strip()
-        # 清理多余字符
         reply = re.sub(r"^```json\s*", "", reply)
         reply = re.sub(r"\s*```$", "", reply)
         
@@ -479,8 +424,6 @@ def _run_dream_consolidation_impl(api_model, api_key, api_base=None):
                 fname = act.get("filename")
                 content = act.get("content")
                 if fname and content:
-                    # MEMORY.md 是索引文件：只允许走 update_index 追加索引行，
-                    # 禁止 create_or_update 整体覆写，绕过索引去重合并逻辑
                     if str(fname).strip().lower() == "memory.md":
                         summary_lines.append("⚠️ 拒绝直接覆写索引文件 MEMORY.md（索引请使用 update_index 追加）")
                         continue

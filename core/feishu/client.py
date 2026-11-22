@@ -1,8 +1,3 @@
-"""飞书出站 API 客户端（发消息 / 发卡片 / 原地更新卡片）。
-
-只用标准库（urllib），不引入新依赖。HTTP 实现可注入，便于单测。
-"""
-
 import json
 import logging
 import time
@@ -16,11 +11,9 @@ logger = logging.getLogger("ycode.feishu.client")
 
 TOKEN_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
 MESSAGE_PATH = "/open-apis/im/v1/messages"
-# 令牌提前刷新余量（秒）
 TOKEN_REFRESH_MARGIN = 60
 RETRY_STATUS = (429, 500, 502, 503, 504)
 
-# http(method, url, headers, body_bytes, timeout) -> (status_code, response_text)
 HttpCallable = Callable[[str, str, Dict[str, str], Optional[bytes], float], Tuple[int, str]]
 
 
@@ -82,8 +75,6 @@ class FeishuApiClient:
         self._token = ""
         self._token_expire_at = 0.0
 
-    # ---- 令牌 ----
-
     def tenant_access_token(self, force: bool = False) -> str:
         if not force and self._token and self._clock() < self._token_expire_at:
             return self._token
@@ -99,8 +90,6 @@ class FeishuApiClient:
         self._token = token
         self._token_expire_at = self._clock() + max(60, expire - TOKEN_REFRESH_MARGIN)
         return token
-
-    # ---- 消息 ----
 
     def send_text(self, chat_id: str, text: str, reply_to: Optional[str] = None) -> Dict[str, Any]:
         return self._send(chat_id, "text", {"text": text}, reply_to=reply_to)
@@ -121,8 +110,6 @@ class FeishuApiClient:
             return self._request("POST", f"{MESSAGE_PATH}/{reply_to}/reply", body=body)
         body["receive_id"] = chat_id
         return self._request("POST", MESSAGE_PATH, query={"receive_id_type": "chat_id"}, body=body)
-
-    # ---- 传输 ----
 
     def _request(self, method: str, path: str, *, query: Optional[Dict[str, str]] = None,
                  body: Optional[Dict[str, Any]] = None, with_token: bool = True) -> Dict[str, Any]:

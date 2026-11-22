@@ -1,10 +1,3 @@
-"""relay_server CLI：serve / create-device / list-devices / revoke / rotate。
-
-env：RELAY_BIND（默认 127.0.0.1）、RELAY_PORT（默认 18080）、RELAY_DB_PATH、
-RELAY_JWT_SECRET 或 RELAY_JWT_SECRET_FILE、RELAY_DESKTOP_DIR、RELAY_MOBILE_DIR、
-RELAY_SHIM_PATH。设备令牌明文只在创建/轮换时输出一次。
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -53,7 +46,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
     )
     host = os.environ.get("RELAY_BIND") or "127.0.0.1"
     port = int(os.environ.get("RELAY_PORT") or "18080")
-    # 放大 WS 单帧上限（默认 16 MiB），与桌面端 70 MiB 对齐以承载 ≤50 MB 附件上传。
     uvicorn.run(app, host=host, port=port, ws_max_size=70 * 1024 * 1024)
     return 0
 
@@ -64,7 +56,6 @@ def cmd_create_device(args: argparse.Namespace) -> int:
         device_id, token = RelayRegistry().create_device(conn, args.name)
     finally:
         conn.close()
-    # 明文令牌仅此次输出：库里只存 SHA-256 哈希，丢了只能 rotate。
     print(f"device_id: {device_id}")
     print(f"token: {token}")
     return 0
@@ -111,7 +102,6 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     if token is None:
         print(f"设备不存在：{args.device_id}", file=sys.stderr)
         return 1
-    # 明文令牌仅此次输出；旧令牌即刻失效，旧连接被踢。
     print(f"device_id: {args.device_id}")
     print(f"token: {token}")
     return 0

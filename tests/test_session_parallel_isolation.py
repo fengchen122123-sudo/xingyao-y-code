@@ -1,15 +1,3 @@
-"""多会话并发隔离回归测试。
-
-覆盖三组修复的隔离契约：
-- H1：PlanManager 按会话实例化 + 线程路由，计划互不可见；
-- H2：授权白名单（命令/写/编辑）与会话级沙盒放行按会话分桶，
-      UI 切换全局会话不再收回运行中回合的授权；
-- M 组：项目级目录（subagent_registry / skills 相对路径）跟随线程工作目录。
-
-模拟 gui_bridge 回合线程的完整绑定协议：
-    app_context.set_thread_session + plan.set_current_plan_session + set_workdir
-"""
-
 import threading
 from types import SimpleNamespace
 
@@ -20,12 +8,7 @@ from core import plan as plan_module
 from core.workspace_context import clear_workdir, set_workdir
 
 
-# ---------------------------------------------------------------------------
-# 基础设施：会话路由绑定 / 状态清理
-# ---------------------------------------------------------------------------
-
 class SessionRoute:
-    """模拟 gui_bridge 回合线程入口的会话绑定协议（进入绑定、退出解绑）。"""
 
     def __init__(self, session_id, workdir):
         self.session_id = str(session_id)
@@ -45,11 +28,6 @@ class SessionRoute:
 
 
 def start_session_worker(session_id, workdir, fn, results, key, barrier=None):
-    """启动一个绑定会话路由的线程执行 fn（不阻塞等待）。
-
-    返回 finalize 闭包：调用时 join 线程并把结果写入 results[key]。
-    需要并行的用例先把所有 worker 启动完，再统一 finalize。
-    """
     outcome = {}
 
     def _worker():
@@ -82,14 +60,12 @@ def join_workers(*finalizers):
 
 
 def run_in_session(session_id, workdir, fn, results, key, barrier=None):
-    """单 worker 便捷版：立即启动并等待完成，结果写入 results[key]。"""
     finalize = start_session_worker(session_id, workdir, fn, results, key, barrier)
     finalize()
 
 
 @pytest.fixture(autouse=True)
 def clean_session_state():
-    """测试前后清空所有按会话分桶的全局状态，避免用例间串扰。"""
     import core.llm as llm
     from core import permission_grants, tools as tools_module
 
@@ -111,12 +87,7 @@ def clean_session_state():
     _reset()
 
 
-# ---------------------------------------------------------------------------
-# H1：计划按会话隔离
-# ---------------------------------------------------------------------------
-
 def test_plan_managers_isolated_between_parallel_sessions(tmp_path):
-    """两个不同目录的会话并发写计划，各自只看到自己的计划项。"""
     dir_a, dir_b = tmp_path / "projA", tmp_path / "projB"
     dir_a.mkdir()
     dir_b.mkdir()
@@ -129,7 +100,6 @@ def test_plan_managers_isolated_between_parallel_sessions(tmp_path):
             manager.replace([
                 {"id": f"{marker}-1", "subject": f"任务-{marker}", "status": "pending"},
             ])
-            # 并发窗口内反复读取，验证对端写入不会串进来
             for _ in range(20):
                 snapshot = manager.snapshot()
                 assert len(snapshot) == 1
@@ -146,7 +116,6 @@ def test_plan_managers_isolated_between_parallel_sessions(tmp_path):
     assert results["A"][1] == ["A-1"]
     assert results["B"][1] == ["B-1"]
 
-    # 落盘文件也按会话分开，各自目录下只有自己的计划
     plan_file_a = dir_a / ".ycode_tasks" / "plans" / "sess-A.json"
     plan_file_b = dir_b / ".ycode_tasks" / "plans" / "sess-B.json"
     assert plan_file_a.exists()
@@ -154,10 +123,6 @@ def test_plan_managers_isolated_between_parallel_sessions(tmp_path):
 
 
 def test_plan_isolated_between_sessions_in_same_directory(tmp_path):
-    """同一目录下的两个会话（GUI 多会话打开同一项目）计划互不可见。
-
-    计划存储文件按 session_id 命名（<sid>.json），即使 workdir 相同也天然分离。
-    """
     shared = tmp_path / "shared-proj"
     shared.mkdir()
     barrier = threading.Barrier(2)
@@ -181,14 +146,12 @@ def test_plan_isolated_between_sessions_in_same_directory(tmp_path):
 
     assert results["A"][0] == "ok", results["A"]
     assert results["B"][0] == "ok", results["B"]
-    # 同一存储目录下两个会话各自的持久化文件
     plans_dir = shared / ".ycode_tasks" / "plans"
     assert (plans_dir / "same-dir-A.json").exists()
     assert (plans_dir / "same-dir-B.json").exists()
 
 
 def test_plan_manager_registry_reuses_instance_per_session(tmp_path):
-    """同会话多次路由拿到同一实例；释放后重建能从磁盘恢复计划。"""
     workdir = tmp_path / "proj"
     workdir.mkdir()
     results = {}
@@ -210,21 +173,15 @@ def test_plan_manager_registry_reuses_instance_per_session(tmp_path):
 
     assert results["first"][0] == "ok", results["first"]
     assert results["second"][0] == "ok", results["second"]
-    # 未释放时同会话路由拿到同一实例
     assert results["first"][1] is results["second"][1][0]
     assert results["second"][1][1] == ["p1"]
 
-    # 释放注册表条目后重建：新实例从磁盘完整恢复
     plan_module.release_plan_manager("reuse-sess")
     run_in_session("reuse-sess", workdir, _second, results, "restored")
     assert results["restored"][0] == "ok", results["restored"]
     assert results["restored"][1][1] == ["p1"]
     assert results["restored"][1][0] is not results["first"][1]
 
-
-# ---------------------------------------------------------------------------
-# H2：授权白名单 / 沙盒放行按会话分桶
-# ---------------------------------------------------------------------------
 
 def test_task_grant_survives_visible_session_switch(monkeypatch):
     from core import app_context
@@ -252,7 +209,6 @@ def test_bound_background_task_keeps_its_own_grant(monkeypatch):
         app_context.set_thread_session(None)
 
 def test_command_grants_isolated_between_sessions(tmp_path):
-    """会话 A 授权的命令前缀，会话 B 不继承。"""
     import core.llm as llm
 
     dir_a, dir_b = tmp_path / "projA", tmp_path / "projB"
@@ -271,16 +227,13 @@ def test_command_grants_isolated_between_sessions(tmp_path):
     run_in_session("grant-B", dir_b, _check_other, results, "B")
 
     assert results["A"] == ("ok", True)
-    # 未授权的会话 B 命不中 A 的授权
     assert results["B"] == ("ok", False)
 
-    # 会话 A 重新进入后自己的授权仍然有效
     run_in_session("grant-A", dir_a, _check_other, results, "A2")
     assert results["A2"] == ("ok", True)
 
 
 def test_write_edit_grants_isolated_between_sessions(tmp_path):
-    """文件写入/编辑授权同样按会话分桶。"""
     import core.llm as llm
 
     dir_a, dir_b = tmp_path / "projA", tmp_path / "projB"
@@ -312,7 +265,6 @@ def test_write_edit_grants_isolated_between_sessions(tmp_path):
 
 
 def test_check_session_reset_keeps_task_grants_across_visible_switches(tmp_path):
-    """UI 切换只改变路由，不清理绑定线程或可见任务的授权。"""
     import core.llm as llm
 
     workdir = tmp_path / "proj"
@@ -321,17 +273,13 @@ def test_check_session_reset_keeps_task_grants_across_visible_switches(tmp_path)
 
     def _grant_and_park():
         llm._grant_command_add(("npm", "run"))
-        # 模拟 UI 线程在回合运行中切换全局会话：未绑定线程视角下
-        # 全局会话从 sess-running 变为 sess-other
         app_context._current_session_fallback = "sess-other"
         llm.check_session_reset()
         return llm._grant_command_hit("npm run build")
 
-    # 回合线程绑定 sess-running 时授权不被切换收回
     run_in_session("sess-running", workdir, _grant_and_park, results, "bound")
     assert results["bound"] == ("ok", True)
 
-    # 未绑定线程也按当前任务 ID 分桶，切换后隔离，切回来仍保留。
     app_context.set_current_session("cli-sess-1")
     llm._grant_command_add(("ls",))
     assert llm._grant_command_hit("ls") is True
@@ -343,7 +291,6 @@ def test_check_session_reset_keeps_task_grants_across_visible_switches(tmp_path)
 
 
 def test_sandbox_bypass_isolated_between_sessions(tmp_path):
-    """会话级沙盒放行按会话分桶，A 放行不影响 B。"""
     from core import tools as tools_module
 
     dir_a, dir_b = tmp_path / "projA", tmp_path / "projB"
@@ -364,7 +311,6 @@ def test_sandbox_bypass_isolated_between_sessions(tmp_path):
     assert results["A"] == ("ok", True)
     assert results["B"] == ("ok", False)
 
-    # B 自行关闭后 A 的放行不受影响
     def _disable_b():
         tools_module.set_session_sandbox_bypass(False)
         return tools_module.is_session_sandbox_bypass_enabled()
@@ -375,19 +321,13 @@ def test_sandbox_bypass_isolated_between_sessions(tmp_path):
     assert results["A2"] == ("ok", True)
 
 
-# ---------------------------------------------------------------------------
-# 并发压力：多会话同时操作，零串扰
-# ---------------------------------------------------------------------------
-
 def test_many_sessions_parallel_zero_crosstalk(tmp_path):
-    """8 个会话（两两共享目录）并发写计划 + 授权 + 沙盒放行，结果零串扰。"""
     import core.llm as llm
     from core import tools as tools_module
 
     session_count = 8
     dirs = []
     for i in range(session_count):
-        # 两两共享同一目录：目录隔离之外，session_id 隔离也必须成立
         workdir = tmp_path / f"proj{i // 2}"
         workdir.mkdir(exist_ok=True)
         dirs.append(workdir)
@@ -399,17 +339,13 @@ def test_many_sessions_parallel_zero_crosstalk(tmp_path):
         sid = f"stress-{index}"
 
         def _fn():
-            # 计划写入
             manager = plan_module.get_default_plan_manager()
             manager.replace([
                 {"id": f"item-{index}", "subject": f"任务{index}", "status": "pending"},
             ])
-            # 授权（二元组规则=子命令前缀规则，可匹配带参数的命令）
             llm._grant_command_add((f"tool{index}", "run"))
-            # 沙盒放行（偶数会话开启）
             tools_module.set_session_sandbox_bypass(index % 2 == 0)
             barrier.wait(timeout=30)
-            # 并发窗口后校验，全部只应看到自己的状态
             ids = {item["id"] for item in manager.snapshot()}
             return (
                 ids == {f"item-{index}"},
@@ -438,12 +374,7 @@ def test_many_sessions_parallel_zero_crosstalk(tmp_path):
         assert sandbox_ok, f"会话 {i} 沙盒放行状态串扰"
 
 
-# ---------------------------------------------------------------------------
-# M 组：项目级目录路由跟随线程工作目录
-# ---------------------------------------------------------------------------
-
 def test_subagent_dirs_follow_thread_workdir(tmp_path):
-    """项目级 .ycode/agents 扫描跟随线程工作目录，而非进程 cwd。"""
     from core import subagent_registry
 
     proj_a, proj_b = tmp_path / "projA", tmp_path / "projB"
@@ -473,7 +404,6 @@ def test_subagent_dirs_follow_thread_workdir(tmp_path):
 
 
 def test_skills_relative_paths_follow_thread_workdir(tmp_path):
-    """skills 相对路径（配置项 / 沙盒白名单）按线程工作目录解析。"""
     from core import skills
 
     proj_a, proj_b = tmp_path / "projA", tmp_path / "projB"
@@ -497,7 +427,6 @@ def test_skills_relative_paths_follow_thread_workdir(tmp_path):
 def test_subagent_model_snapshot_uses_parent_session_when_global_was_overwritten(
     monkeypatch,
 ):
-    """会话 B 后启动覆盖全局 tuple 后，会话 A 的子代理仍必须继承 A。"""
     from core import tools as tools_module
 
     app_context.set_active_model_tuple("openai/model-B", "key-B", "url-B")
@@ -528,7 +457,6 @@ def test_subagent_model_snapshot_uses_parent_session_when_global_was_overwritten
 
 
 def test_explicit_session_model_lookup_never_reuses_process_tuple(monkeypatch):
-    """显式会话解析为空时必须失败，不能把最后写入者 B 当成 A。"""
     from core import tools as tools_module
 
     app_context.set_active_model_tuple("openai/model-B", "key-B", "url-B")
@@ -541,7 +469,6 @@ def test_explicit_session_model_lookup_never_reuses_process_tuple(monkeypatch):
 
 
 def test_subagent_manager_run_snapshots_parent_session_model(monkeypatch):
-    """验证实际 run 入口把 parent_session 对应模型冻结到任务。"""
     from core import tools as tools_module
 
     monkeypatch.setattr(
@@ -568,7 +495,6 @@ def test_subagent_manager_run_snapshots_parent_session_model(monkeypatch):
 
 
 def test_custom_inherit_uses_parent_session_model(monkeypatch):
-    """自定义子代理 inherit 的真实模型请求必须使用父会话，而非任务 fallback。"""
     from core import tools as tools_module
 
     monkeypatch.setattr(
@@ -609,7 +535,6 @@ def test_custom_inherit_uses_parent_session_model(monkeypatch):
 
 
 def test_unbound_thread_falls_back_to_default_singletons(tmp_path):
-    """未绑定线程（CLI 主流程 / headless）走进程级默认单例，行为不回归。"""
     import core.llm as llm
     from core import tools as tools_module
 
@@ -617,23 +542,16 @@ def test_unbound_thread_falls_back_to_default_singletons(tmp_path):
     assert default_plan is plan_module._DEFAULT_PLAN_MANAGER
     assert app_context.get_thread_session() is None
 
-    # 未绑定线程授权写入模块级默认集合（单元素规则=精确匹配裸命令）
     llm._grant_command_add(("echo",))
     assert llm._grant_command_hit("echo") is True
     assert ("echo",) in llm.session_allowed_commands
 
-    # 未绑定线程沙盒放行写进程级全局标志
     tools_module.set_session_sandbox_bypass(True)
     assert tools_module.is_session_sandbox_bypass_enabled() is True
     tools_module.set_session_sandbox_bypass(False)
 
 
 def test_takeover_queue_is_isolated_between_session_schedulers(tmp_path):
-    """接管租约按会话调度器隔离：同名计划项/同 turn 查询不得跨会话命中。
-
-    接管状态只允许存放在会话自己的 PlanManager/TaskScheduler 实例内；
-    任何进程级全局 active-id 都会造成跨会话串扰。
-    """
     from core.plan import PlanManager
     from core.task_scheduler import TaskScheduler
 
@@ -668,19 +586,16 @@ def test_takeover_queue_is_isolated_between_session_schedulers(tmp_path):
             "timeout",
         ) is not None
 
-    # 各会话的 active 接管项只归属自己的 turn
     assert scheduler_a.active_takeover("turn-a")["id"] == "item"
     assert scheduler_b.active_takeover("turn-b")["id"] == "item"
     assert scheduler_a.active_takeover("turn-b") is None
     assert scheduler_b.active_takeover("turn-a") is None
 
-    # 会话 A 完成并清空自己的队列后，不得跨会话认领会话 B 的排队项
     assert scheduler_a.complete("item", "done") is True
     assert scheduler_a.promote_next_takeover("turn-a")["id"] == "item-a2"
     assert scheduler_a.complete("item-a2", "done") is True
     assert scheduler_a.promote_next_takeover("turn-a") is None
 
-    # 会话 B 的队列不受会话 A 影响
     assert scheduler_b.complete("item", "done") is True
     promoted_b = scheduler_b.promote_next_takeover("turn-b")
     assert promoted_b is not None

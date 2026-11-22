@@ -45,7 +45,6 @@ class FakeTray:
 
 
 def _wait_for(predicate, timeout=5.0):
-    """exit_application 的 stop+destroy 序列在独立线程执行，测试轮询等待完成。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -107,7 +106,6 @@ def test_finalize_after_native_loop_runs_shutdown_once_without_destroying_again(
 
 
 def _make_confirm(choices):
-    """按调用顺序回放选择；额外记录 allow_background 供断言。"""
     calls = []
     it = iter(choices)
 
@@ -128,7 +126,6 @@ def test_close_without_running_turn_exits_immediately():
     )
     assert lifecycle.start_tray() is True
 
-    # 无回合在跑：即使托盘就绪也真退出（不再隐藏驻留）
     assert lifecycle.on_closing() is True
     assert window.hidden == 0
 
@@ -147,7 +144,7 @@ def test_close_with_running_turn_background_hides_window():
 
     assert lifecycle.on_closing() is False
     assert window.hidden == 1
-    assert calls == [True]  # 托盘可用时应提供后台选项
+    assert calls == [True]
 
 
 def test_close_with_running_turn_exit_runs_full_shutdown_sequence():
@@ -200,8 +197,8 @@ def test_close_with_running_turn_and_broken_tray_never_offers_background():
 
     assert lifecycle.on_closing() is False
     assert window.hidden == 0  # 托盘不可用时绝不隐藏（否则窗口再也唤不回）
-    assert calls == [False]  # 未提供后台选项
-    assert _wait_for(lambda: window.destroyed == 1)  # exit 分支走完整关停序列
+    assert calls == [False]
+    assert _wait_for(lambda: window.destroyed == 1)
 
 
 def test_close_after_exit_started_passes_native_close_through():
@@ -215,12 +212,10 @@ def test_close_after_exit_started_passes_native_close_through():
     assert lifecycle.start_tray() is True
     lifecycle.exit_application()
 
-    # 退出序列进行中再次触发 closing：放行原生关闭，避免拦住销毁
     assert lifecycle.on_closing() is True
 
 
 def test_gui_exit_finalizes_turn_shutdown_before_computer_runtime(monkeypatch):
-    """GUI 退出顺序（Task 16）：回合级 shutdown 先于电脑操控运行时统一关闭。"""
     import gui_main
 
     calls = []

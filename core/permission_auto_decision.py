@@ -1,18 +1,3 @@
-"""自动决策模式（auto_decision）的 JEV 决策适配层。
-
-职责边界：
-- ``core.permission_policy.decide_permission`` 保持纯函数（零网络 IO）；本模块在其
-  返回 ``auto_decision_requires_jev`` 后，按需调用 JEV ``auto_permission`` 场景；
-- ``core.ask_user.ask_user`` 在 ``auto_decision`` 模式下先经本模块调用 JEV
-  ``auto_question`` 场景；
-- 硬性安全边界：
-  1. 灾难性命令（CATASTROPHIC）在纯函数层已硬拒绝，绝不进入 JEV；
-  2. 沙盒外访问（受限态）与凭据文件写入在纯函数层已判定 ``sandbox_boundary_requires_confirmation``，
-     本模块不越过该边界；
-  3. JEV 未启用 / 处于影子模式 / 未配通道或 Key / 超时 / 上游异常 / 选择 ``ask_user``
-     时，一律返回原 ``ASK`` 判定或 ``None``，安全回退到正常人工确认弹窗。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -181,11 +166,6 @@ def decide_ask_user_with_jev(
     *,
     source: str = "主代理",
 ) -> int | None:
-    """在 ``auto_decision`` 模式下调用 JEV 为 ``ask_user`` 择优作答。
-
-    返回选中项的 0 基下标；若 JEV 选择 ``ask_user`` 转交人工、未启用、
-    处于影子模式、超时或发生任意异常，返回 ``None`` 以便回退为弹窗提问。
-    """
     try:
         items = [str(item or "").strip() for item in (choices or ())]
         if not items or len(items) > 3:

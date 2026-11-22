@@ -27,11 +27,6 @@ def test_session_from_turn_id_uses_the_prefix_before_the_last_separator():
 
 
 def _use_real_turn_undo(monkeypatch, tmp_path, session="session"):
-    """回合生命周期重排后 worker 依赖真实 turn_undo 服务与会话行。
-
-    用真实 MemoryManager 配置服务并预建会话行；worker 里的假 Memory 继续
-    承担消息/绑定桩。
-    """
     from core.memory import MemoryManager
     from core.turn_undo import service as tu_service
 
@@ -48,7 +43,6 @@ def _use_real_turn_undo(monkeypatch, tmp_path, session="session"):
 
 
 def test_session_is_created_before_model_binding_and_unchanged_binding_skips_update():
-    """首回合必须先建 session；第二回合同模型不得重复 UPDATE+commit。"""
     calls = []
 
     class Memory:
@@ -79,7 +73,6 @@ def test_session_is_created_before_model_binding_and_unchanged_binding_skips_upd
 
 
 def test_worker_model_snapshot_does_not_overwrite_newer_session_binding():
-    """worker 的旧模型 A 不得覆盖用户并发切换后已经落库的 B。"""
     calls = []
 
     class Memory:
@@ -264,7 +257,6 @@ def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch, tmp_
 
     emitted = consume_bridge_events(monkeypatch, events)
 
-    # error/turn_error 现在附带 session_name，只校验 message 字段
     error_msgs = [data.get("message") for kind, data in emitted if kind == "error"]
     turn_error_msgs = [data.get("message") for kind, data in emitted if kind == "turn_error"]
     assert error_msgs == ["provider disconnected"]
@@ -299,7 +291,6 @@ def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch, tmp_path
 
     bridge._run_turn_worker("hello", "session")
 
-    # error/turn_error 现在附带 session_name
     assert any(kind == "turn_error" and data.get("message") == "provider disconnected" for kind, data in emitted)
     assert any(kind == "error" and data.get("message") == "provider disconnected" for kind, data in emitted)
 
@@ -355,7 +346,6 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
 
     def capture_context(*args, **kwargs):
-        # 多会话并行改造后，workdir 绑定在线程本地上下文而不再是进程 cwd
         from core.workspace_context import get_workdir
         seen["cwd"] = str(get_workdir())
         return []
@@ -365,7 +355,6 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._run_turn_worker("inspect", "project-session")
 
     assert os.path.realpath(seen["cwd"]) == os.path.realpath(project)
-    # 回合结束后线程本地 workdir 必须恢复，不能泄漏到本回合之外
     from core.workspace_context import get_workdir
     assert str(get_workdir()) == os.path.realpath(launch)
 
@@ -521,7 +510,6 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
 
 
 def test_bridge_set_reasoning_choice_returns_model_snapshot(monkeypatch):
-    """设置成功必须返回当前模型的精确选项，而不是通用档位。"""
     bridge = ApiBridge.__new__(ApiBridge)
     monkeypatch.setattr(
         "gui_bridge.set_model_reasoning_choice",
@@ -562,7 +550,6 @@ def test_bridge_set_reasoning_choice_returns_model_snapshot(monkeypatch):
 
 
 def test_bridge_set_reasoning_choice_requires_model_id(monkeypatch):
-    """前端没有给出按钮对应模型时不能猜测全局模型。"""
     bridge = ApiBridge.__new__(ApiBridge)
 
     res = bridge.set_reasoning_choice("", "low")
@@ -572,7 +559,6 @@ def test_bridge_set_reasoning_choice_requires_model_id(monkeypatch):
 
 
 def test_bridge_get_reasoning_snapshot_is_read_only(monkeypatch):
-    """pending 草稿切模型时只读取能力快照，不能改写模型配置。"""
     bridge = ApiBridge.__new__(ApiBridge)
     model = {
         "id": "m1",
@@ -595,7 +581,6 @@ def test_bridge_get_reasoning_snapshot_is_read_only(monkeypatch):
 
 
 def test_bridge_set_reasoning_choice_exposes_fixed_model_as_disabled(monkeypatch):
-    """固定思考模型的桥接快照必须锁定为开启。"""
     bridge = ApiBridge.__new__(ApiBridge)
     monkeypatch.setattr(
         "gui_bridge.set_model_reasoning_choice",
@@ -613,7 +598,6 @@ def test_bridge_set_reasoning_choice_exposes_fixed_model_as_disabled(monkeypatch
 
 
 def test_bridge_forwards_round_started_event(monkeypatch):
-    """round_started 轮次边界事件必须透传给前端（流式分段思考依赖它）"""
     events = make_events([("round_started", {"round": 2})])
 
     emitted = consume_bridge_events(monkeypatch, events)
@@ -622,8 +606,6 @@ def test_bridge_forwards_round_started_event(monkeypatch):
 
 
 def _bare_bridge_with_snapshots(session_name, snapshots):
-    """构造只够驱动 _consume_turn_events 的桥接裸实例（与 consume_bridge_events 同套路），
-    区别是额外注入进行中回合快照，供断言按轮清零行为。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {session_name: threading.Event()}
     bridge._active_turns = {}
@@ -638,7 +620,6 @@ def _bare_bridge_with_snapshots(session_name, snapshots):
 
 
 def _consume_events_with_bridge(bridge, monkeypatch, events, session_name="session"):
-    """在给定裸实例上消费事件，返回 (kind, data) 列表。"""
     monkeypatch.setattr(
         "core.llm.chat_with_model_events",
         lambda *args, **kwargs: iter(events),
@@ -652,10 +633,6 @@ def _consume_events_with_bridge(bridge, monkeypatch, events, session_name="sessi
 
 
 def test_round_started_clears_turn_snapshot_streaming_thinking_and_tool_calls(monkeypatch):
-    """round_started 必须按轮清零快照的流式/思考文本与工具列表。
-
-    快照若只累加不清零，中途接入或切换运行中会话时整回合文本会被灌进最后一个气泡。
-    """
     bridge = _bare_bridge_with_snapshots("session", {
         "session": {
             "session_name": "session",
@@ -676,7 +653,6 @@ def test_round_started_clears_turn_snapshot_streaming_thinking_and_tool_calls(mo
 
 
 def test_round_started_clears_only_target_session_snapshot_and_still_forwards(monkeypatch):
-    """清零只作用于本会话：其他会话快照保持原值，且 round_started 仍照常透传。"""
     bridge = _bare_bridge_with_snapshots("session", {
         "session": {
             "session_name": "session",
@@ -705,15 +681,12 @@ def test_round_started_clears_only_target_session_snapshot_and_still_forwards(mo
 
 
 class _AliveThread:
-    """模拟存活的回合线程（is_alive 恒真）。"""
 
     def is_alive(self):
         return True
 
 
 def test_stop_current_turn_cancels_permission_wait_and_foreground_subagents(monkeypatch):
-    """H6：停止回合必须同步取消权限等待（owner=turn_id）与前台子代理，
-    否则回合线程悬置在 broker 等待或 run_subagent 上，一直持有 _turn_workdir_lock。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._current_session = "session"
     bridge._cancel_events = {"session": threading.Event()}
@@ -742,8 +715,6 @@ def test_stop_current_turn_cancels_permission_wait_and_foreground_subagents(monk
 
 
 def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch, tmp_path):
-    """回合运行期间 _active_turn_ids 记录 session → turn_id，结束后清理；
-    回合结束按 turn_id（不是会话名）清理权限 broker 的残留等待。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"session": threading.Event()}
     bridge._active_turns = {}
@@ -800,16 +771,13 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch, tmp_path):
 
     bridge._run_turn_worker("hello", "session")
 
-    # 新协议：turn_id 是 32 位随机 UUID（不透明、全局唯一，不嵌会话名）
     assert seen_turn_ids and len(seen_turn_ids[0]) == 32
     assert all(c in "0123456789abcdef" for c in seen_turn_ids[0])
     assert "session" not in bridge._active_turn_ids
-    # 清理必须按 turn_id，历史实现传会话名永远不命中
     assert cancelled_owners == seen_turn_ids
 
 
 def test_bg_summary_pending_is_bucketed_per_session(monkeypatch, tmp_path):
-    """M22：pending 按会话分桶，多会话并行时互不覆盖；回合结束只消费自己的桶。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._shutting_down = False
     bridge._bg_summary_pending_sessions = set()
@@ -832,8 +800,6 @@ def test_bg_summary_pending_is_bucketed_per_session(monkeypatch, tmp_path):
 
 
 def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch, tmp_path):
-    """用户点终止后：记录取消标记、清掉挂起的自动汇总、抑制计划续推；
-    _maybe_start_bg_summary_turn 对该会话不再自动发起汇总回合。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._current_session = "session"
     bridge._cancel_events = {"session": threading.Event()}
@@ -847,14 +813,12 @@ def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch
     assert "session" in bridge._user_cancelled_sessions
     assert "session" not in bridge._bg_summary_pending_sessions
 
-    # 计划续推抑制已生效（core.plan 模块级状态，用后清理）
     from core.plan import (
         clear_plan_auto_continue_suppression,
         plan_auto_continue_suppressed,
     )
     assert plan_auto_continue_suppressed("session")
 
-    # 被用户取消的会话不自动发起汇总回合：提前返回，不入 triggered、不起线程
     bridge._shutting_down = False
     bridge._turn_start_lock = threading.Lock()
     bridge._turn_owner_sessions = {}
@@ -876,13 +840,6 @@ def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch
 
 
 def test_stop_current_turn_reports_idle_when_no_active_turn(monkeypatch):
-    """停止请求没命中活跃回合时必须明确回 idle=True。
-
-    回归背景：旧实现 `_cancel_events.get(target)` 为空时静默返回 ok，前端既不
-    收到任何新事件、也拿不到「本来就没在跑」的结论，界面上的残留运行态永远
-    不会被纠正，表现为用户反复点停止毫无反应。命中活跃回合时 idle=False，
-    前端才继续等 turn_cancelled 终态事件。
-    """
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._current_session = "session"
     bridge._cancel_events = {}
@@ -960,7 +917,6 @@ def test_turn_finish_emits_empty_plan_updated_when_plan_all_terminal(tmp_path, m
 
     bridge._run_turn_worker("检查项目", "sess-plan-cleared")
 
-    # 空 plan_updated 在 turn_finish 之前发出（前端先归零面板再解锁输入框）
     kinds = [kind for kind, _data in emitted]
     assert "plan_updated" in kinds
     assert kinds.index("plan_updated") < kinds.index("turn_finish")
@@ -1034,23 +990,13 @@ def test_turn_finish_survives_plan_clear_failure(tmp_path, monkeypatch):
 
     bridge._run_turn_worker("检查项目", "sess-plan-clear-fail")
 
-    # 计划清空落盘失败（磁盘满/权限）不能吞掉 turn_finish：前端输入框靠它解锁
     kinds = [kind for kind, _data in emitted]
     assert "turn_finish" in kinds
     finishes = [data for kind, data in emitted if kind == "turn_finish"]
     assert finishes == [{"session_name": "检查项目"}]
 
 
-# ---------------- Task 13a：电脑操控事件桥（controller listener → _js_queue） ----------------
-
-
 def _make_computer_bridge(js_queue_maxsize=None):
-    """构造仅含电脑操控桥接所需内部状态的裸桥实例。
-
-    _js_dispatcher 指向主线程（恒 alive）：阻止 _ensure_js_dispatcher 在测试内
-    启动真实派发线程抢空队列，drain_js_queue 断言才稳定；事件桥由控制方法
-    惰性建立（生产路径），事件只进 _js_queue、绝不直接 evaluate_js。
-    """
     instance = ApiBridge.__new__(ApiBridge)
     instance._shutting_down = False
     instance._window = None
@@ -1080,12 +1026,11 @@ def fake_controller():
 def bridge(fake_controller, monkeypatch):
     _inject_fake_controller(monkeypatch, fake_controller)
     instance = _make_computer_bridge()
-    instance.get_computer_control_status()  # 控制方法惰性建立事件桥（生产路径）
+    instance.get_computer_control_status()
     return instance
 
 
 class _RecordingWindow:
-    """记录 evaluate_js 调用的窗口 fake：断言事件源线程绝不直接 evaluate_js。"""
 
     def __init__(self):
         self.evaluate_js_calls = []
@@ -1104,7 +1049,6 @@ def test_bridge_forwards_only_small_json_events_to_js_queue(fake_controller, bri
 
 
 def test_bridge_forwards_all_four_computer_event_types(fake_controller, bridge):
-    """controller 四类事件全部经 listener 进 _js_queue，形状原样保留。"""
     fake_controller.emit_state(run_id="run-a", event_seq=1, status="running")
     assert bridge.drain_js_queue()["type"] == "computer_state"
 
@@ -1121,11 +1065,10 @@ def test_bridge_forwards_all_four_computer_event_types(fake_controller, bridge):
     fake_controller.emit_observation(run_id="run-a", event_seq=4)
     payload = bridge.drain_js_queue()
     assert payload["type"] == "computer_observation"
-    assert payload["preview_url"].startswith("/computer-preview/")  # 只带短 URL
+    assert payload["preview_url"].startswith("/computer-preview/")
 
 
 def test_computer_event_listener_never_calls_evaluate_js(fake_controller, monkeypatch):
-    """事件源线程绝不直接 evaluate_js（gui-js-dispatcher 单消费者铁律）。"""
     _inject_fake_controller(monkeypatch, fake_controller)
     instance = _make_computer_bridge()
     window = _RecordingWindow()
@@ -1142,30 +1085,28 @@ def test_computer_event_listener_never_calls_evaluate_js(fake_controller, monkey
 
 
 def test_computer_event_queue_full_drops_new_events_keeps_old(fake_controller, monkeypatch):
-    """队列满按现有策略丢弃新事件：旧事件不被改写，生产者不阻塞。"""
     _inject_fake_controller(monkeypatch, fake_controller)
     instance = _make_computer_bridge(js_queue_maxsize=2)
     instance.get_computer_control_status()
 
     fake_controller.emit_observation(run_id="run-a", event_seq=1)
     fake_controller.emit_observation(run_id="run-a", event_seq=2)
-    fake_controller.emit_observation(run_id="run-a", event_seq=3)  # 队列已满：丢弃
+    fake_controller.emit_observation(run_id="run-a", event_seq=3)
 
     payload = instance.drain_js_queue()
-    assert payload["event_seq"] == 2  # 旧事件原样保留，未被新事件改写
+    assert payload["event_seq"] == 2
     assert payload["run_id"] == "run-a"
     assert instance._js_dropped == 1
 
 
 def test_computer_event_bridge_established_once_idempotent(fake_controller, monkeypatch):
-    """进程内桥接建立一次：重复调用控制方法不重复注册 listener。"""
     _inject_fake_controller(monkeypatch, fake_controller)
     instance = _make_computer_bridge()
     assert fake_controller.listener_count == 0
 
     instance.get_computer_control_status()
     instance.get_computer_control_status()
-    instance.pause_computer_control("run-a")  # 不存在的 run：仍不重复注册
+    instance.pause_computer_control("run-a")
 
     assert fake_controller.listener_count == 1
     fake_controller.emit_observation(run_id="run-a", event_seq=1)
@@ -1173,7 +1114,6 @@ def test_computer_event_bridge_established_once_idempotent(fake_controller, monk
 
 
 def test_bridge_pause_emits_state_event_to_js_queue(fake_controller, bridge):
-    """控制 mutation 触发的 controller 状态事件同样经事件桥进 _js_queue。"""
     fake_controller.start_run(run_id="run-a")
 
     result = bridge.pause_computer_control("run-a")

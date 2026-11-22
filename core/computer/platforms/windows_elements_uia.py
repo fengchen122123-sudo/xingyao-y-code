@@ -1,51 +1,43 @@
-"""RealUIAHost：真实 COM 线程 UIA 元素收集与语义操作（2026-09-06 阶段二）。
-
-复用 windows_surfaces._ComThread（专用 COM 线程 + 有界命令队列）与
-UIAutomationCore CLSID；UIA 元素对象绝不离开 COM 线程，跨线程只传
-脱敏 dict（ref/kind/name/bounds/enabled）。所有失败归一为稳定错误码：
-- collect 失败 → computer_backend_error
-- ref 不存在/已过期 → computer_element_stale
-- 元素不支持 Invoke/Value pattern → computer_element_unsupported
-"""
-
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 from core.computer.models import ComputerControlError
-from core.computer.platforms.windows_elements import MAX_ELEMENTS, MAX_TREE_DEPTH
+from core.computer.platforms.windows_elements import (
+    MAX_ELEMENTS,
+    MAX_TREE_DEPTH,
+    MAX_VISITED_NODES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-# UIA 稳定常量（UIAutomationCore 规范固定）。
 _UIA_CONTROL_TYPE_PROPERTY_ID = 30003
 _UIA_INVOKE_PATTERN_ID = 10000
 _UIA_VALUE_PATTERN_ID = 10002
 _CUIAUTOMATION_CLSID = "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
 
-# 名称/值摘要截断（collect 与 probe 共用同一口径）。
 _MAX_NAME_CHARS = 80
-# probe 返回的匹配摘要字段上限：只做「命中证据」，不承载可操作引用。
 _PROBE_SUMMARY_CHARS = 120
 
-# 只收集的可交互控件类型 ID（UIA ControlType IDs，规范固定）。
 _INTERACTIVE_CONTROL_TYPE_IDS = frozenset(
     {
-        50000,  # Button
-        50002,  # CheckBox
-        50003,  # ComboBox
-        50004,  # Edit
-        50005,  # Hyperlink
-        50007,  # ListItem
-        50008,  # List（微信聊天消息列表等容器，读屏需要）
-        50011,  # MenuItem
-        50013,  # RadioButton
-        50015,  # Slider
-        50019,  # TabItem
-        50024,  # TreeItem
-        50029,  # DataItem
-        50030,  # Document
-        50031,  # SplitButton
+        50000,
+        50002,
+        50003,
+        50004,
+        50005,
+        50007,
+        50008,
+        50011,
+        50013,
+        50015,
+        50019,
+        50024,
+        50029,
+        50030,
+        50031,
     }
 )
 
@@ -57,14 +49,42 @@ class RealUIAHost:
         from core.computer.platforms.windows_surfaces import _ComThread
 
         self._com = _ComThread()
-        # ref → IUIAutomationElement 映射：只在 COM 线程的 job 内读写
+        # ref → IUIAutomationElement 与元信息映射：只在 COM 线程的 job 内读写
         # （UIA 对象绝不离开该线程；COM 线程单消费者，无并发访问）。
         self._elements: dict[str, object] = {}
+        self._element_meta: dict[str, dict] = {}
         self._com.start()
 
-    # ---------------- 对外三个入口（线程安全经 _ComThread marshal） ----------------
+    @staticmethod
+    def _safe_bounds(node) -> list[int]:
+        try:
+            rect = node.CurrentBoundingRectangle
+            return [int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)]
+        except Exception:
+            return [0, 0, 0, 0]
 
-    def collect(self, hwnd: int):
+    @staticmethod
+    def _safe_is_offscreen(node) -> bool:
+        try:
+            return bool(node.CurrentIsOffscreen)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_runtime_id(node) -> tuple[int, ...]:
+        try:
+            rtid = node.GetRuntimeId()
+            return tuple(int(v) for v in rtid) if rtid is not None else ()
+        except Exception:
+            return ()
+
+    def collect(
+        self,
+        hwnd: int,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
         """ElementFromHandle → ControlView BFS 收集。
 
         返回 (listing, ref→None 字典)；真实 ref→IUIAutomationElement 映射只
@@ -87,90 +107,181 @@ class RealUIAHost:
             walker = uia.ControlViewWalker
             listing: list[dict] = []
             elements: dict[str, object] = {}
+            element_meta: dict[str, dict] = {}
             counter = 0
+            visited = 0
             queue = [(root, 0)]
-            while queue and counter < MAX_ELEMENTS:
+            while queue and counter < MAX_ELEMENTS and visited < MAX_VISITED_NODES:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ComputerControlError("computer_cancelled", "UIA 采集已取消")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise ComputerControlError("computer_wait_timeout", "UIA 采集超时")
                 node, depth = queue.pop(0)
+                visited += 1
                 try:
                     child = walker.GetFirstChildElement(node)
                 except Exception:
                     child = None
-                while child is not None:
+                while child is not None and visited < MAX_VISITED_NODES:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ComputerControlError("computer_cancelled", "UIA 采集已取消")
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise ComputerControlError("computer_wait_timeout", "UIA 采集超时")
+                    visited += 1
                     if depth + 1 <= MAX_TREE_DEPTH:
                         queue.append((child, depth + 1))
                     if counter < MAX_ELEMENTS:
                         try:
-                            type_id = child.CurrentControlType
+                            type_id = int(child.CurrentControlType)
                         except Exception:
                             type_id = 0
                         if type_id in _INTERACTIVE_CONTROL_TYPE_IDS:
-                            counter += 1
-                            ref = f"el-{counter}"
-                            try:
-                                name = (child.CurrentName or "")[:_MAX_NAME_CHARS]
-                            except Exception:
-                                name = ""
-                            try:
-                                rect = child.CurrentBoundingRectangle
-                                bounds = [
-                                    int(rect.left), int(rect.top),
-                                    int(rect.right), int(rect.bottom),
-                                ]
-                            except Exception:
-                                bounds = [0, 0, 0, 0]
-                            try:
-                                enabled = bool(child.CurrentIsEnabled)
-                            except Exception:
-                                enabled = True
-                            listing.append({
-                                "ref": ref,
-                                "kind": _control_type_name(uia, type_id),
-                                "name": name,
-                                "bounds": bounds,
-                                "enabled": enabled,
-                            })
-                            elements[ref] = child
+                            bounds = self._safe_bounds(child)
+                            if (
+                                not self._safe_is_offscreen(child)
+                                and bounds[2] > bounds[0]
+                                and bounds[3] > bounds[1]
+                            ):
+                                counter += 1
+                                ref = f"el-{counter}"
+                                try:
+                                    name = (child.CurrentName or "")[:_MAX_NAME_CHARS]
+                                except Exception:
+                                    name = ""
+                                try:
+                                    enabled = bool(child.CurrentIsEnabled)
+                                except Exception:
+                                    enabled = True
+                                listing.append({
+                                    "ref": ref,
+                                    "kind": _control_type_name(uia, type_id),
+                                    "name": name,
+                                    "bounds": bounds,
+                                    "enabled": enabled,
+                                })
+                                elements[ref] = child
+                                element_meta[ref] = {
+                                    "hwnd": int(hwnd),
+                                    "control_type": type_id,
+                                    "bounds": tuple(bounds),
+                                    "runtime_id": self._safe_runtime_id(child),
+                                    "name": name,
+                                }
                     try:
                         child = walker.GetNextSiblingElement(child)
                     except Exception:
                         child = None
-            # 映射替换在 COM 线程内完成：旧 ref 即刻过期（引用在本线程释放）。
             self._elements = elements
+            self._element_meta = element_meta
             return listing, {ref: None for ref in elements}
 
-        return self._com.call(job)
+        timeout_code = (
+            "computer_wait_timeout"
+            if deadline is not None
+            else "computer_surfaces_unavailable"
+        )
+        return self._com.call(
+            job,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            timeout_code=timeout_code,
+        )
 
     def clear(self) -> None:
         """在 COM 线程内清空 ref→元素映射（画面代数变化时释放引用）。"""
         def job(_uia):
             self._elements = {}
+            self._element_meta = {}
 
         self._com.call(job)
 
-    def probe(self, hwnd: int, matcher: dict) -> dict | None:
-        """只读条件探测（wait_for 轮询专用，2026-11-09 Windows-MCP 对齐）。
-
-        硬约束：collect() 会整体替换 ``self._elements``（见本文件 collect 末尾
-        ``self._elements = elements``），模型手里的 el-N 会在等待期间全部失效。
-        因此 probe **绝不调用 collect、绝不写 self._elements、绝不重新编号**：
-
-        - element_exists / element_enabled：从既有 ``self._elements`` 只读取值
-          （CurrentName / CurrentIsEnabled），ref 不存在抛 computer_element_stale
-          （引用已过期，等多久都不会变有效，必须让模型重新 list_elements）；
-        - text_exists：在 COM 线程内用 ControlViewWalker BFS 匹配 CurrentName
-          或 ValuePattern 当前值（大小写不敏感子串），深度上限 MAX_TREE_DEPTH、
-          节点上限 MAX_ELEMENTS，单节点 COM 异常跳过该节点。
-
-        返回脱敏匹配摘要（condition/kind/name/value），**不携带 ref**——摘要与
-        ref 生命周期解耦，命中后模型继续用原有 el-N 操作或在需要新 ref 时
-        list_elements。未命中返回 None。
-        """
+    def probe(
+        self,
+        hwnd: int,
+        matcher: dict,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict | None:
         payload = dict(matcher or {})
-        return self._com.call(lambda uia: self._probe_job(uia, int(hwnd), payload))
+        timeout_code = (
+            "computer_wait_timeout"
+            if deadline is not None
+            else "computer_surfaces_unavailable"
+        )
+        return self._com.call(
+            lambda uia: self._probe_job(
+                uia,
+                int(hwnd),
+                payload,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            ),
+            deadline=deadline,
+            cancel_event=cancel_event,
+            timeout_code=timeout_code,
+        )
 
-    def click(self, ref: str) -> None:
+    def _verify_element_before_action(
+        self, ref: str, *, expected_hwnd: int | None = None
+    ):
+        element = self._require(ref)
+        meta = getattr(self, "_element_meta", {}).get(str(ref), {})
+        if (
+            expected_hwnd is not None
+            and meta.get("hwnd")
+            and int(meta["hwnd"]) != int(expected_hwnd)
+        ):
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 所属窗口已切换，请重新 list_elements"
+            )
+        try:
+            live_type = int(element.CurrentControlType)
+            rect = element.CurrentBoundingRectangle
+            live_bounds = (
+                int(rect.left),
+                int(rect.top),
+                int(rect.right),
+                int(rect.bottom),
+            )
+            live_enabled = bool(element.CurrentIsEnabled)
+        except Exception as error:
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 已失效：{type(error).__name__}"
+            ) from error
+        if meta.get("control_type") is not None and live_type != meta["control_type"]:
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 类型已变化，请重新 list_elements"
+            )
+        recorded_rtid = meta.get("runtime_id") or ()
+        live_rtid = self._safe_runtime_id(element)
+        if recorded_rtid and live_rtid and live_rtid != recorded_rtid:
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 已被替换，请重新 list_elements"
+            )
+        if self._safe_is_offscreen(element):
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 已离开可见区域，请重新 list_elements"
+            )
+        if live_bounds[2] <= live_bounds[0] or live_bounds[3] <= live_bounds[1]:
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 边界已失效，请重新 list_elements"
+            )
+        if meta.get("bounds") and live_bounds != tuple(meta["bounds"]):
+            raise ComputerControlError(
+                "computer_element_stale", f"元素 {ref} 位置已迁移，请重新 list_elements"
+            )
+        if not live_enabled:
+            raise ComputerControlError(
+                "computer_element_unsupported", f"元素 {ref} 当前已禁用，不可操作"
+            )
+        return element
+
+    def click(self, ref: str, *, expected_hwnd: int | None = None) -> None:
         def job(uia):
-            element = self._require(ref)
+            element = self._verify_element_before_action(
+                ref, expected_hwnd=expected_hwnd
+            )
             try:
                 import comtypes.client
 
@@ -193,9 +304,13 @@ class RealUIAHost:
 
         self._com.call(job)
 
-    def set_value(self, ref: str, text: str) -> None:
+    def set_value(
+        self, ref: str, text: str, *, expected_hwnd: int | None = None
+    ) -> None:
         def job(uia):
-            element = self._require(ref)
+            element = self._verify_element_before_action(
+                ref, expected_hwnd=expected_hwnd
+            )
             try:
                 import comtypes.client
 
@@ -224,9 +339,15 @@ class RealUIAHost:
         except Exception:
             _LOGGER.exception("关闭 UIA COM 线程失败")
 
-    # ---------------- 内部 ----------------
-
-    def _probe_job(self, uia, hwnd: int, matcher: dict) -> dict | None:
+    def _probe_job(
+        self,
+        uia,
+        hwnd: int,
+        matcher: dict,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict | None:
         """COM 线程内的 probe 实现（只读；不触碰 self._elements 的赋值）。"""
         condition = str(matcher.get("condition") or "")
         if condition in ("element_exists", "element_enabled"):
@@ -235,7 +356,13 @@ class RealUIAHost:
             raise ComputerControlError(
                 "computer_backend_error", "UI Automation 未初始化"
             )
-        return self._probe_text(uia, hwnd, str(matcher.get("text") or ""))
+        return self._probe_text(
+            uia,
+            hwnd,
+            str(matcher.get("text") or ""),
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     def _probe_element(self, condition: str, element_ref: object) -> dict | None:
         """element_* 条件：从既有映射按 ref 只读取值，不重建映射、不改编号。"""
@@ -254,8 +381,15 @@ class RealUIAHost:
             return None
         return {"condition": condition, "ref": ref, "name": name}
 
-    def _probe_text(self, uia, hwnd: int, needle: str) -> dict | None:
-        """text_exists 条件：ControlViewWalker BFS 匹配名称或 Value 值。"""
+    def _probe_text(
+        self,
+        uia,
+        hwnd: int,
+        needle: str,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict | None:
         if not needle:
             return None
         folded = needle.casefold()
@@ -267,11 +401,14 @@ class RealUIAHost:
         walker = uia.ControlViewWalker
         queue: list[tuple[object, int]] = [(root, 0)]
         visited = 0
-        while queue and visited < MAX_ELEMENTS:
+        while queue and visited < MAX_VISITED_NODES and visited < MAX_ELEMENTS:
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             node, depth = queue.pop(0)
             visited += 1
             if depth > 0:
-                # 根节点自身名称是窗口标题，不算「界面文本」；从其子节点起匹配。
                 name, value = _probe_node_texts(node)
                 if folded in name.casefold() or folded in value.casefold():
                     return {
@@ -296,7 +433,6 @@ class RealUIAHost:
         return None
 
     def _require(self, ref: str):
-        """COM 线程内校验 ref 并取回元素；不存在即过期。"""
         element = self._elements.get(str(ref))
         if element is None:
             raise ComputerControlError(
@@ -330,7 +466,6 @@ def _probe_node_texts(node) -> tuple[str, str]:
 
 
 def _probe_node_kind(uia, node) -> str:
-    """匹配节点的控件类型英文名；读取失败返回空串。"""
     try:
         return _control_type_name(uia, node.CurrentControlType)
     except Exception:
@@ -338,7 +473,6 @@ def _probe_node_kind(uia, node) -> str:
 
 
 def _control_type_name(uia, type_id: int) -> str:
-    """控件类型 ID → 稳定英文名（ButtonControl 等）；未知回空串。"""
     try:
         programmatic = uia.GetProgrammaticName(type_id) or ""
     except Exception:

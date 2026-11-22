@@ -135,7 +135,6 @@
 </template>
 
 <script setup lang="ts">
-// 旧版 Token 统计页（2026-09-22 按 ZCode 风格改版前的样式），保留用于对比，去留待定。
 import { computed, onMounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import type { TokenStatisticsDay } from '../types/pywebview';
@@ -148,7 +147,6 @@ const ranges = [
   { days: 1 as const, label: '今日' },
   { days: 7 as const, label: '近 7 天' },
   { days: 30 as const, label: '近 30 天' },
-  // 0 = 累计全量：后端以最早一条用量记录为起点，覆盖所有历史
   { days: 0 as const, label: '累计' },
 ];
 

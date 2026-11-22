@@ -109,7 +109,6 @@ function onThumbError(a: AttachmentItem) {
   background: var(--bg3);
   color: var(--text);
 }
-/* 拖拽后立即上屏的加载态：chip 底部的不确定进度条 */
 .attach-chip.loading {
   border-color: var(--accent);
   padding-bottom: 9px;

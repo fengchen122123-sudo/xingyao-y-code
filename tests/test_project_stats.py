@@ -16,7 +16,6 @@ def test_counts_py_files_and_lines(tmp_path):
     stats = collect_stats(tmp_path)
 
     assert stats["total_py_files"] == 2
-    # 空行与 # 注释行不计入代码行：2 + 2 = 4
     assert stats["total_code_lines"] == 4
 
 

@@ -35,7 +35,6 @@
           <span v-if="store.updateState.assetName" class="asset-name">({{ store.updateState.assetName }})</span>
         </div>
 
-        <!-- 下载中进度条 -->
         <div v-if="store.updateState.status === 'downloading'" class="download-progress-box">
           <div class="progress-info">
             <span>正在下载新版本安装包...</span>
@@ -49,7 +48,6 @@
           </div>
         </div>
 
-        <!-- 下载完成提示 -->
         <div v-else-if="store.updateState.status === 'downloaded'" class="downloaded-tip">
           <AppIcon name="check-circle" :size="16" class="tip-icon-success" />
           <span>安装包已就绪，安装完成后将自动清理安装包。</span>
@@ -57,25 +55,21 @@
       </div>
 
       <div class="modal-foot">
-        <!-- 未下载状态 -->
         <template v-if="store.updateState.status === 'available' || store.updateState.status === 'idle'">
           <button class="btn" @click="store.closeUpdateModal()">稍后提醒</button>
           <button class="btn primary" @click="store.startDownloadUpdate()">立即下载更新</button>
         </template>
 
-        <!-- 下载中状态 -->
         <template v-else-if="store.updateState.status === 'downloading'">
           <button class="btn danger" @click="store.cancelDownloadUpdate()">取消下载</button>
           <button class="btn primary" @click="store.closeUpdateModal()">后台下载</button>
         </template>
 
-        <!-- 下载完成状态 -->
         <template v-else-if="store.updateState.status === 'downloaded'">
           <button class="btn" @click="store.closeUpdateModal()">稍后安装</button>
           <button class="btn primary install-btn" @click="handleInstall">立即安装并重启</button>
         </template>
 
-        <!-- 安装中状态 -->
         <template v-else-if="store.updateState.status === 'installing'">
           <button class="btn primary" disabled>正在启动安装向导...</button>
         </template>
@@ -271,7 +265,6 @@ function handleInstall() {
   opacity: 0.8;
 }
 
-/* 下载进度条 */
 .download-progress-box {
   background: var(--bg1);
   border: 1px solid var(--border);

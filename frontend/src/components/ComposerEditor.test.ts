@@ -3,9 +3,6 @@ import { defineComponent, ref } from 'vue';
 import { describe, expect, it } from 'vitest';
 import ComposerEditor from './ComposerEditor.vue';
 
-// 富文本输入框：对外是纯文本（@{会话名} / @路径），对内是「文本节点 + 胶囊元素」。
-// 这里覆盖三件要紧的事：胶囊渲染、序列化回文本、以及「退格一次删掉整个引用」。
-
 function mountEditor(modelValue: string, skillIds?: string[], commandIds?: string[]) {
   return mount(ComposerEditor, {
     props: { modelValue, placeholder: '说点什么', skillIds, commandIds },
@@ -13,7 +10,6 @@ function mountEditor(modelValue: string, skillIds?: string[], commandIds?: strin
   });
 }
 
-/** 把光标折叠到编辑内容末尾（jsdom 的选区 API 够用，但必须 attachTo document） */
 function caretToEnd(el: HTMLElement) {
   const range = document.createRange();
   range.selectNodeContents(el);
@@ -42,7 +38,6 @@ describe('ComposerEditor @ 引用胶囊', () => {
   it('胶囊内部仍保留原始 token，序列化后与原文逐字符相等', async () => {
     const wrapper = mountEditor('先 @{对话A} 再 @docs/接口文档.md 结束');
 
-    // 触发一次输入事件即可看到组件回写出去的文本
     await wrapper.get('.ce-input').trigger('input');
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([
       '先 @{对话A} 再 @docs/接口文档.md 结束',
@@ -66,7 +61,6 @@ describe('ComposerEditor @ 引用胶囊', () => {
     const wrapper = mountEditor('@{缓存改造} 后面还有字');
     const root = wrapper.get('.ce-input').element as HTMLElement;
 
-    // 光标放到「后面」两个字之间
     const textNode = Array.from(root.childNodes).find(
       n => n.nodeType === Node.TEXT_NODE && (n.textContent || '').includes('后面'),
     ) as Text;
@@ -78,7 +72,6 @@ describe('ComposerEditor @ 引用胶囊', () => {
     sel?.addRange(range);
 
     await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
-    // 未被组件接管（返回 false），引用完好
     expect(root.querySelector('.ce-chip')).not.toBeNull();
     wrapper.unmount();
   });
@@ -163,7 +156,6 @@ describe('ComposerEditor @ 引用胶囊', () => {
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['nihao']);
     expect(editor.classes()).not.toContain('is-empty');
 
-    // 取消组词后内容为空，占位提示回来
     editor.element.textContent = '';
     await editor.trigger('compositionstart');
     expect(editor.classes()).not.toContain('is-empty');
@@ -183,7 +175,6 @@ describe('ComposerEditor @ 引用胶囊', () => {
 
     await editor.trigger('compositionend');
 
-    // 原生 isComposing=true（即使 compositionstart 未先到）同样拦截
     editor.element.dispatchEvent(
       new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true }),
     );
@@ -216,14 +207,12 @@ describe('ComposerEditor @ 引用胶囊', () => {
     const wrapper = mountEditor('@{对话A} /gzh-design', ['gzh-design']);
     const root = wrapper.get('.ce-input').element as HTMLElement;
 
-    // 1) 光标紧邻技能胶囊末尾按 Backspace：整块删除
     caretToEnd(root);
     await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['@{对话A} ']);
     expect(root.querySelector('.ce-chip-skill')).toBeNull();
     expect(root.querySelector('.ce-chip-session')).not.toBeNull();
 
-    // 2) 点选技能胶囊后按 Delete：整块删除
     await wrapper.setProps({ modelValue: '/gzh-design 排版' });
     const chip = root.querySelector('.ce-chip-skill') as HTMLElement;
     expect(chip).not.toBeNull();
@@ -258,13 +247,11 @@ describe('ComposerEditor @ 引用胶囊', () => {
     await wrapper.get('.ce-input').trigger('input');
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual(['/goal 做一个网站']);
 
-    // 点选命令胶囊并按 Backspace：整块删除
     (cmdChips[0] as HTMLElement).dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
     await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([' 做一个网站']);
     expect(root.querySelector('.ce-chip-command')).toBeNull();
 
-    // 紧邻命令胶囊末尾退格：整块删除
     await wrapper.setProps({ modelValue: '/fix' });
     caretToEnd(root);
     await wrapper.get('.ce-input').trigger('keydown', { key: 'Backspace' });

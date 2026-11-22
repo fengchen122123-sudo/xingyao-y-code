@@ -1,16 +1,3 @@
-"""JEV 决策服务核心：配置 / Key 策略 / 客户端 / 影子 / 审计 / 探针。
-
-设计依据：docs/superpowers/specs/2026-10-15-jev-decision-service-design.md。
-
-安全约束（硬性）：
-- 默认全关：``enabled=false`` 时不产生任何网络请求与副作用；
-- Key 只在内存中解密使用，**不落盘、不进日志、不进审计**（审计只记第几把 key_hint）；
-- 任何运行时异常一律不外抛，调用方永远拿到 None 走原逻辑；
-- 不新增依赖（httpx 已有）。
-
-测试隔离辅助：``_reset_runtime_state()`` 仅清空进程内 Key 状态，供用例调用。
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -28,10 +15,6 @@ import httpx
 
 from core.credentials import unprotect_secret
 
-# ---------------------------------------------------------------------------
-# 默认配置（设计文档第 3 节全表）
-# ---------------------------------------------------------------------------
-
 DEFAULT_CONFIG: dict = {
     "version": 1,
     "enabled": False,
@@ -43,7 +26,6 @@ DEFAULT_CONFIG: dict = {
     "shadow_mode": True,
     "timeout_ms": 800,
     "scenes": {
-        # timeout_ms：业务决策的单次超时（网关读取；真实决策宁可不用也不拖慢主流程）
         "router": {"enabled": False, "shadow": True, "threshold": 0.5, "timeout_ms": 250},
         "secretary": {"enabled": False, "shadow": True, "threshold": 0.6, "timeout_ms": 250},
         "search": {"enabled": False, "shadow": True, "threshold": 0.5, "timeout_ms": 250},
@@ -57,8 +39,6 @@ MIN_TIMEOUT_MS = 100
 MAX_TIMEOUT_MS = 5000
 KEY_COOLDOWN_SECONDS = 60
 
-# 任务执行过程中的自动决策场景：不在 DEFAULT_CONFIG["scenes"] 占界面行，
-# 只要全局 enabled=True 即自动随 shadow_mode 生效（也可在 decision.json 显式覆盖）。
 AUTO_TASK_SCENES = frozenset({
     "loop_guard",
     "subagent_review",
@@ -68,7 +48,6 @@ AUTO_TASK_SCENES = frozenset({
     "auto_question",
 })
 
-# 探针的无害问题（每把 Key 至多 1 次调用，遵守基元律动技能红线：禁止压测）
 _PROBE_STATE = "本请求为无害连通探针，不涉及任何用户数据。"
 _PROBE_INSTRUCTIONS = "1+1 是否等于 2？请给出该命题成立的概率。"
 
@@ -77,16 +56,10 @@ _PROBE_INSTRUCTIONS = "1+1 是否等于 2？请给出该命题成立的概率。
 _AUDIT_MAX_BYTES = 6000
 _AUDIT_LOCK = threading.Lock()
 
-# Key 分隔符：换行（含 \r\n）、英文/中文逗号、分号（中英文）
 _RE_KEY_SEPARATOR = re.compile(r"[\r\n,，;；]+")
 
 
-# ---------------------------------------------------------------------------
-# 路径与基础工具（惰性求值：模块导入零副作用）
-# ---------------------------------------------------------------------------
-
 def _ycode_dir() -> str:
-    """用户数据目录：跟随 config.YCODE_DIR（测试可用 monkeypatch 重定向）。"""
     try:
         import config
 
@@ -129,7 +102,6 @@ def _read_json(path: str) -> dict:
 
 
 def _deep_merge(base, overlay):
-    """深合并：overlay 优先；dict 递归，其余整体替换；返回新对象，不污染入参。"""
     if isinstance(base, dict) and isinstance(overlay, dict):
         merged = dict(base)
         for key, value in overlay.items():
@@ -147,20 +119,11 @@ def _sha16(value) -> str:
 
 
 def _state_digest(state) -> str:
-    """state 摘要：字符串取前 80 字符（超长截断），非字符串取哈希。
-
-    超长时截断而不是整条转哈希：决策记录面板要靠这段摘要告诉用户「这次判的是
-    什么事」，全哈希等于把面板变成一串无意义字符。80 字上限保持不变。
-    """
     if isinstance(state, str):
         text = state.strip()
         return text if len(text) <= 80 else text[:80]
     return _sha16(state)
 
-
-# ---------------------------------------------------------------------------
-# 配置层（~/.ycode/decision.json 独立文件；损坏回落默认值=全关）
-# ---------------------------------------------------------------------------
 
 def load_decision_config() -> dict:
     """读取决策配置并与默认值深合并；缺失/损坏一律回落默认值（全关）。"""
@@ -168,7 +131,6 @@ def load_decision_config() -> dict:
 
 
 def _validate_config(cfg: dict) -> None:
-    """保存前校验；非法值抛 ValueError（桥层负责转 ok=false）。"""
     if not isinstance(cfg.get("enabled"), bool):
         raise ValueError("enabled 必须是布尔值")
     model_id = cfg.get("model_id")
@@ -207,10 +169,6 @@ def save_decision_config(patch: dict) -> dict:
     return merged
 
 
-# ---------------------------------------------------------------------------
-# Key 层（provider 解析 + 多 Key 解密 + 进程内状态，加锁访问）
-# ---------------------------------------------------------------------------
-
 class _KeyState:
     """进程内 Key 运行状态（粘性 index / 403 拒绝 / 429 冷却），绝不落盘。"""
 
@@ -227,7 +185,6 @@ _KEY_STATE = _KeyState()
 
 
 def _reset_runtime_state() -> None:
-    """测试隔离辅助：清空进程内 Key 状态（产品代码不调用）。"""
     with _KEY_STATE.lock:
         _KEY_STATE.signature = ()
         _KEY_STATE.active_index = 0
@@ -237,7 +194,6 @@ def _reset_runtime_state() -> None:
 
 
 def _sync_keys_locked(keys: list) -> None:
-    """Key 列表变化时重置运行状态（调用方须已持有锁）。"""
     signature = tuple(keys)
     if signature != _KEY_STATE.signature:
         _KEY_STATE.signature = signature
@@ -247,11 +203,6 @@ def _sync_keys_locked(keys: list) -> None:
 
 
 def _load_user_config() -> dict:
-    """读取 ~/.ycode/config.json（含 provider 列表）。
-
-    优先走 config._read_json_with_backup（自带 .bak 自愈与 mtime 缓存）；读取路径
-    被重定向导致解密转换不生效时，_load_keys 会显式调用 unprotect_secret 兜底。
-    """
     path = _user_config_path()
     try:
         import config
@@ -265,7 +216,6 @@ def _load_user_config() -> dict:
 
 
 def _resolve_provider(cfg: dict) -> dict | None:
-    """按 provider_ref 定位用户 provider；auto = base_url 含 tokenrhythm 的第一个。"""
     try:
         providers = [
             item
@@ -299,7 +249,6 @@ def _resolve_base_url(cfg: dict, provider) -> str:
 
 
 def _split_key_text(raw) -> list:
-    """把 api_key 文本按分隔符拆为多段（空段/重复段丢弃）。"""
     if not isinstance(raw, str):
         return []
     result: list = []
@@ -311,10 +260,6 @@ def _split_key_text(raw) -> list:
 
 
 def _load_keys(cfg: dict, provider=None) -> list:
-    """解密并返回 provider 的多 Key 列表；任何异常返回空列表。
-
-    Key 只在内存中解密使用：本函数不缓存、不落盘、不写日志、不进审计。
-    """
     try:
         if not isinstance(provider, dict):
             provider = _resolve_provider(cfg)
@@ -394,10 +339,6 @@ def _apply_probe_state(index: int, status: str) -> None:
         _mark_cooldown(index)
 
 
-# ---------------------------------------------------------------------------
-# 客户端层（httpx、非流式；_post / _get 独立函数便于测试 monkeypatch）
-# ---------------------------------------------------------------------------
-
 def _endpoint_url(base_url: str, endpoint_style) -> str:
     suffix = "systemone" if endpoint_style == "systemone" else "decision"
     return base_url.rstrip("/") + "/" + suffix
@@ -423,7 +364,6 @@ def _post(url: str, headers: dict, payload: dict, timeout_seconds: float):
 
 
 def _get(url: str, timeout_seconds: float):
-    """执行一次 GET（上游 /api/models 公开接口）。"""
     with httpx.Client(timeout=timeout_seconds) as client:
         return client.get(url, headers=_headers(None, url))
 
@@ -436,10 +376,6 @@ def _effective_timeout_ms(cfg: dict, override=None) -> int:
         value = DEFAULT_CONFIG["timeout_ms"]
     return max(MIN_TIMEOUT_MS, min(MAX_TIMEOUT_MS, value))
 
-
-# ---------------------------------------------------------------------------
-# 审计层（~/.ycode/decision_audit/YYYYMMDD.jsonl，字段见设计第 5 节）
-# ---------------------------------------------------------------------------
 
 def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
     return {
@@ -458,7 +394,6 @@ def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
         "adopted": False,
         "fallback_reason": None,
         "trace_id": trace_id,
-        # 会话标识：用于按会话判定「这个会话是否真的做过业务决策」；取不到时为空串
         "session_id": "",
     }
 
@@ -511,11 +446,6 @@ def _current_session_id() -> str:
 
 
 def _cap_record(record: dict) -> dict:
-    """把单条记录压到 _AUDIT_MAX_BYTES 以内，尽量保住可读内容。
-
-    降级顺序：先缩 request.state（保留 200 字）→ 再换掉 answers → 最后换掉 extra。
-    优先保住请求摘要，因为「面板回看这次问了什么」最依赖它。
-    """
     try:
         def _size(value) -> int:
             return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
@@ -679,10 +609,6 @@ def mark_adopted(trace_id) -> None:
         pass
 
 
-# ---------------------------------------------------------------------------
-# 主入口：ask_decision
-# ---------------------------------------------------------------------------
-
 def _final_reason(failures: list) -> str:
     if not failures:
         return "upstream_error"
@@ -705,13 +631,6 @@ def ask_decision(
     audit_extra=None,
     session_id=None,
 ):
-    """向 JEV 发一次决策请求。
-
-    - 禁用 / 场景未启用：直接 None（零请求、零副作用）；
-    - 影子：正常发请求并写审计（shadow=true），但返回 None；
-    - 成功且非影子：返回上游响应 dict（附带 trace_id 供 mark_adopted 回填）；
-    - 失败（403/401/429/超时/网络/5xx/无 Key）：None + 审计记 fallback_reason。
-    """
     cfg = load_decision_config()
     if not bool(cfg.get("enabled")):
         return None
@@ -723,7 +642,6 @@ def ask_decision(
             return None
         scene_shadow = bool(scene_cfg.get("shadow", True))
     elif scene_name in AUTO_TASK_SCENES:
-        # 任务执行期决策点：只要全局启用即自动参与，默认遵循全局 shadow_mode
         scene_shadow = False
     else:
         return None
@@ -747,7 +665,6 @@ def ask_decision(
     record["session_id"] = explicit_sid or _current_session_id()
     record["state_digest"] = _state_digest(state)
     record["questions_digest"] = _sha16(questions)
-    # 请求快照：记录真正发给决策模型的三个字段，供面板回看「问的是什么」
     record["request"] = {
         "model": cfg.get("model_id"),
         "state": _audit_state(state),
@@ -791,7 +708,6 @@ def ask_decision(
             try:
                 response = _post(url, _headers(keys[index], url), payload, timeout_seconds)
             except Exception:
-                # 超时/网络异常：直接回落（时延优先，不重试）
                 record["key_hint"] = f"key#{index}"
                 record["latency_ms"] = int((_now() - started) * 1000)
                 record["fallback_reason"] = "upstream_error"
@@ -833,7 +749,6 @@ def ask_decision(
                 failures.append("rate_limited")
                 continue
 
-            # 其余状态码（413/422/5xx 等）：上游故障，不重试
             record["fallback_reason"] = "upstream_error"
             _append_audit(record, audit_enabled)
             return None
@@ -850,16 +765,7 @@ def ask_decision(
         return None
 
 
-# ---------------------------------------------------------------------------
-# 探针（逐 Key 1 题无害 noul；每把 Key 至多 1 次）
-# ---------------------------------------------------------------------------
-
 def probe_decision() -> dict:
-    """逐 Key 各发 1 题无害 noul 探针，返回分类结果。
-
-    状态取值：available（含 latency_ms）/ no_permission / invalid_key /
-    timeout / network_error / rate_limited / error。
-    """
     cfg = load_decision_config()
     model_id = str(cfg.get("model_id") or "")
     results: list = []
@@ -931,8 +837,6 @@ def probe_decision() -> dict:
     except Exception as exc:
         msg = f"探针执行失败：{exc}"
     result = {"ok": not msg, "results": results, "model_id": model_id, "msg": msg}
-    # 探针也是真实调用：写一条 scene="probe" 的审计，让设置页「决策记录」
-    # 面板能立刻证明链路已通（与业务场景记录用 scene 字段区分统计）。
     try:
         record = _new_record(cfg, "probe", False, f"probe-{int(_now() * 1000)}")
         available = next(
@@ -952,17 +856,7 @@ def probe_decision() -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# 上游模型列表（设置页「从上游拉取」下拉）
-# ---------------------------------------------------------------------------
-
 def list_decision_providers() -> dict:
-    """列出「决策模型」可选的调用通道（不含 Key 内容，仅报 Key 数量）。
-
-    数据源与 ask_decision 同一路径（~/.ycode/config.json），保证"界面能选到的
-    通道"和"实际能用的通道"一致；base_url 含 tokenrhythm 的第一个通道额外标记
-    auto_match=True（即 provider_ref="auto" 的解析目标），供前端提示。
-    """
     try:
         providers = [
             item
@@ -1008,7 +902,6 @@ def _price_text(model: dict) -> str:
 
 
 def list_decision_models() -> dict:
-    """GET 上游 {scheme+host}/api/models，过滤 type=="decision" 的模型。"""
     cfg = load_decision_config()
     provider = _resolve_provider(cfg)
     base_url = _resolve_base_url(cfg, provider)
@@ -1063,10 +956,6 @@ def list_decision_models() -> dict:
     return {"ok": True, "models": models, "msg": ""}
 
 
-# ---------------------------------------------------------------------------
-# 设置页快照（配置 + 运行时状态）
-# ---------------------------------------------------------------------------
-
 def _brief_answer(answers) -> str:
     """从审计 answers 里提取一行结论（choice 选项 / noul 概率 / score 等级）。
 
@@ -1119,11 +1008,8 @@ def _audit_brief(record: dict) -> dict:
         "latency_ms": record.get("latency_ms"),
         "fallback_reason": str(record.get("fallback_reason") or ""),
         "model_id": str(record.get("model_id") or ""),
-        # trace_id：面板点开某条记录时用它回查完整请求/响应
         "trace_id": str(record.get("trace_id") or ""),
-        # 决策输入摘要：面板据此展示「这次判的是什么事」
         "state_digest": str(record.get("state_digest") or "")[:160],
-        # 模型给出的结论：choice 选项 / noul 概率 / score 等级
         "answer": _brief_answer(answers),
         "answers_digest": answers_digest,
     }
@@ -1132,22 +1018,6 @@ def _audit_brief(record: dict) -> dict:
 def get_decision_audit_summary(
     limit: int = 20, session_id=None, session_only: bool = False
 ) -> dict:
-    """汇总决策审计：今日计数 + 最近 N 条记录。
-
-    两种口径，由 ``session_only`` 决定（返回值的 ``session_scoped`` 明示实际用了哪种）：
-
-    - ``session_only=True`` 且 ``session_id`` 非空：``today_*`` 与 ``recent`` 也只统计
-      该会话的记录。会话头部「决策」面板用这个口径，否则会把别的会话的
-      「判的是什么事 / 判成什么」展示在当前会话下。
-    - 其余情况：全局口径（扫全部文件、全部会话），设置页面板依赖它，避免数据缺口。
-
-    ``has_business_records`` 有两种口径：
-
-    - 传了非空 ``session_id``（strip 后非空）：只统计「属于该会话」的业务记录，
-      即 scene 既不是 ""/"probe" 且 ``record["session_id"] == session_id``；
-      头部「决策」入口据此判断当前会话是否真的做过业务决策。
-    - 不传或传空：保持全局口径（扫全部文件、全部会话）。
-    """
     try:
         count = max(1, min(int(limit), 200))
     except (TypeError, ValueError):
@@ -1162,12 +1032,9 @@ def get_decision_audit_summary(
         "today_fallback_count": 0,
         # 所属范围的累计决策总数（传了 session_id 即本会话累计总数，否则全局累计）
         "session_total_count": 0,
-        # 全局今日决策总数（不限会话，供面板消除「今日 N 次」的口径歧义）
         "global_today_count": 0,
         "recent": [],
-        # 本次是否按会话过滤 today_*/recent（前端据此决定文案口径）
         "session_scoped": bool(session_only and wanted_session),
-        # 是否出现过真实业务决策（排除探针）：头部「决策」入口据此决定是否展示
         "has_business_records": False,
     }
     if not os.path.isdir(directory):
@@ -1197,11 +1064,6 @@ def get_decision_audit_summary(
         return records
 
     def _in_scope(record) -> bool:
-        """记录是否落在本次统计口径内：session_only 时按会话过滤。
-
-        非 dict（JSON 行解析出数字/字符串）一律排除：既避免下面 .get 抛错，
-        也不让脏行污染计数。
-        """
         if not isinstance(record, dict):
             return False
         if not (session_only and wanted_session):
@@ -1220,8 +1082,6 @@ def get_decision_audit_summary(
             return True
         return str(record.get("session_id") or "") == wanted_session
 
-    # 按文件倒序单遍扫描：同步统计 has_business_records、session_total_count、
-    # global_today_count / today_* 以及最近 N 条（保持时间升序）。
     collected: list = []
     for name in reversed(names):
         records = _iter_records(os.path.join(directory, name))
@@ -1278,7 +1138,6 @@ def get_decision_record_detail(trace_id: str) -> dict:
                 lines = handle.readlines()
         except Exception:
             continue
-        # 新记录在文件末尾，倒序找更快命中
         for line in reversed(lines):
             line = line.strip()
             if not line or wanted not in line:

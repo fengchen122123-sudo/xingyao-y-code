@@ -1,13 +1,3 @@
-"""Task 8：单租约 Controller、状态机、暂停恢复与停止顺序测试。
-
-brief 的 6 个样例逐字保留；另覆盖：非法状态转换（含跳过 completing）、
-owner/cancel/generation 检查、动作串行、错误不发成功、三次无变化停止、
-observe/wait 不计 no-progress、停止事件只发一次、Turn 终态 finally 二选一
-不留 running 租约、provider_safety_required 不可恢复、清理错误记为 failed。
-
-所有 backend 均为 FakeComputerBackend，绝不启动真实浏览器/键鼠。
-"""
-
 import json
 import threading
 import time
@@ -31,11 +21,6 @@ from tests.computer_fakes import (
 
 
 class _ServiceFixture:
-    """ComputerControlService 测试夹具：注入 fake backend factory / 设置源 / abort 记录。
-
-    ``backend`` 返回最近创建的 browser fake（无 browser 时返回任意已创建 fake），
-    供 brief 样例断言 release/close 计数。
-    """
 
     def __init__(self, service, created, settings_state, abort_calls, loader_calls):
         self._service = service
@@ -60,7 +45,6 @@ class _ServiceFixture:
 
 @pytest.fixture
 def settings_state():
-    """可变设置状态：generation 与开关由测试直接改写，模拟开启/关闭/损坏。"""
 
     return {
         "browser": True,
@@ -132,20 +116,13 @@ def owner_b():
 
 @pytest.fixture
 def running_run(service, owner_a, capability):
-    """generic run 已通过第一次 observe 建立 browser 租约，状态 running。"""
 
     run = service.start_run(owner_a, capability, target=None)
     service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
     return run
 
 
-# ---------------- brief Step 1 样例（逐字） ----------------
-
-
 def test_every_event_carries_owner_session_id(service, owner_a, capability):
-    """事件信封必须带 run 归属会话：前端用首个事件建立运行态，「操控」页签按
-    归属会话登记——归属只在快照里时，首帧只能回落当前查看的会话，后台会话
-    发起的操控会串到用户眼前的另一个会话（2026-10-30 反馈）。"""
     events = []
     service.add_listener(events.append)
     run = service.start_run(owner_a, capability, target=None)
@@ -198,22 +175,15 @@ def test_complete_run_releases_lease_but_retains_browser_session(service, runnin
     first = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
     second = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
     assert first.status == second.status == "completed"
-    # R3：retain 前必须释放按下状态（修饰键/鼠标键不带入下一 run）；
-    # backend 本身不 close，作为 retained session 供下一 run 显式复用。
     assert service.backend.release_count == 1
-    assert service.backend.close_count == 0  # stop 才关闭 backend
-    new_run = service.start_run(owner_b, capability, target="browser")  # 租约已释放，可开新 run
+    assert service.backend.close_count == 0
+    new_run = service.start_run(owner_b, capability, target="browser")
     assert new_run.run_id != running_run.run_id
 
 
 def test_complete_run_from_waiting_for_user_releases_lease(
     service, running_run, owner_a, owner_b, capability
 ):
-    """L1：用户接管态（waiting_for_user）的 run 也能按“完成”收尾并释放租约。
-
-    回合以 completed 收尾时必须允许 waiting_for_user → completing；否则 run
-    既不终结也不清理，租约留活，下一回合被 computer_session_busy 永久挡死。
-    """
     service.execute(
         running_run.run_id, owner_a,
         ComputerAction(kind="request_user_takeover", target="browser", reason_code="login_required"),
@@ -227,7 +197,6 @@ def test_complete_run_from_waiting_for_user_releases_lease(
     # 连接，但保留会话还能让下一回合免去重连。
     assert service.backend.close_count == 0
     assert service.backend.release_count == 1
-    # 租约已释放：另一 owner 立即可以开新 run，不抛 computer_session_busy。
     new_run_id = service.start_run(owner_b, capability, target="browser").run_id
     assert new_run_id != running_run.run_id
 
@@ -240,13 +209,31 @@ def test_stop_is_idempotent_and_releases_inputs_once(service, running_run):
     assert service.backend.close_count == 1
 
 
-def test_stop_from_stopping_is_idempotent(service, running_run):
-    """L2：停止在途（stopping）时再次 stop 必须幂等返回，而不是抛非法状态转换。
+def test_stop_closes_backend_admission_before_releasing_inputs(
+    service, running_run, owner_a
+):
+    backend = service.backend
+    calls = []
+    original_release = backend.release_inputs
 
-    现状 stopping → stopping 非法，会把正在进行的清理链打断；且幂等路径
-    不得重复释放/关闭 backend，也不得终结 run。
-    """
+    backend.request_stop = lambda: calls.append("request_stop")
+
+    def record_release():
+        calls.append("release_inputs")
+        original_release()
+
+    backend.release_inputs = record_release
+
+    snapshot = service.stop(running_run.run_id, "user_stop", cancel_owner=False)
+
+    assert snapshot.status == "stopped"
+    assert calls == ["request_stop", "release_inputs"]
+    assert not owner_a.cancel_event.is_set()
+
+
+def test_stop_from_stopping_is_idempotent(service, running_run):
     service._transition(service._run, "stopping")
+    service._run.stop_cleanup_in_progress = True
     snapshot = service.stop(running_run.run_id, "again")
     assert snapshot.status == "stopping"
     assert service.backend.release_count == 0
@@ -254,13 +241,61 @@ def test_stop_from_stopping_is_idempotent(service, running_run):
     assert service.snapshot().run_id == running_run.run_id
 
 
-# ---------------- 状态机与租约 ----------------
+def test_stop_during_backend_start_holds_lease_until_backend_is_closed(
+    owner_a, owner_b, capability
+):
+    start_entered = threading.Event()
+    allow_start_to_finish = threading.Event()
+    backend = FakeComputerBackend(target="desktop")
+    original_start = backend.start
+
+    def blocked_start():
+        original_start()
+        start_entered.set()
+        assert allow_start_to_finish.wait(timeout=2)
+
+    backend.start = blocked_start
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 1,
+        abort_streams=lambda event: None,
+    )
+    start_errors = []
+
+    def start_run():
+        try:
+            service.start_run(owner_a, capability, target="desktop")
+        except ComputerControlError as error:
+            start_errors.append(error)
+
+    starter = threading.Thread(target=start_run)
+    starter.start()
+    try:
+        assert start_entered.wait(timeout=2)
+        run_id = service.snapshot().run_id
+        stopping = service.stop(run_id, "user_stop", cancel_owner=False)
+
+        assert stopping.status == "stopping"
+        assert not owner_a.cancel_event.is_set()
+        with pytest.raises(ComputerControlError) as raised:
+            service.start_run(owner_b, capability, target="desktop")
+        assert raised.value.code == "computer_session_busy"
+        assert backend.close_count == 0
+    finally:
+        allow_start_to_finish.set()
+        starter.join(timeout=3)
+
+    assert not starter.is_alive()
+    assert start_errors and start_errors[0].code == "computer_cancelled"
+    assert backend.release_count == 1
+    assert backend.close_count == 1
+    assert service.snapshot().status == "stopped"
 
 
 def test_transition_table_rejects_skipping_completing(service, running_run):
     run = service._run
     with pytest.raises(ComputerControlError) as raised:
-        service._transition(run, "completed")  # running 直接跳 completed
+        service._transition(run, "completed")
     assert raised.value.code == "computer_invalid_state"
     service._transition(run, "completing")
     service._transition(run, "completed")
@@ -295,9 +330,6 @@ def test_start_run_rejects_cancelled_owner(service, owner_a, capability):
     assert service.snapshot().status == "idle"
 
 
-# ---------------- owner / cancel / generation 检查 ----------------
-
-
 def test_execute_rejects_wrong_owner(service, running_run, owner_b):
     with pytest.raises(ComputerControlError) as raised:
         service.execute(running_run.run_id, owner_b, ComputerAction(kind="observe", target="browser"))
@@ -326,14 +358,13 @@ def test_resume_rejected_after_owner_turn_ended(service, running_run, owner_a):
 
 
 def test_generation_bump_with_target_still_allowed_continues(service, running_run, owner_a, settings_state):
-    # 另一个开关变化导致 generation 递增，但 browser 仍开启：重读设置后继续运行
     settings_state["desktop"] = False
     settings_state["generation"] += 1
     observation = service.execute(
         running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser")
     )
     assert observation.ok
-    assert service.loader_calls  # 确实重读了有效设置
+    assert service.loader_calls
     assert service.snapshot().status == "running"
 
 
@@ -358,9 +389,6 @@ def test_settings_load_failure_treated_as_disabled(service, running_run, owner_a
         )
     assert raised.value.code == "computer_disabled"
     assert service.snapshot().status == "stopped"
-
-
-# ---------------- 动作顺序、串行与无进展 ----------------
 
 
 def test_generic_run_first_action_must_be_observe(service, owner_a, capability):
@@ -396,7 +424,6 @@ def test_actions_are_serialized_through_single_action_lock(service, running_run,
     second = threading.Thread(target=click)
     second.start()
     time.sleep(0.2)
-    # 第一动作未结束前，第二动作不得进入 backend
     assert len(backend.execute_calls) == 1
     gate.set()
     first.join(5)
@@ -430,14 +457,11 @@ def test_observe_failure_propagates_without_stale_screenshot(service, running_ru
 
 
 def test_three_identical_screens_stop_with_no_progress(service, running_run, owner_a):
-    """连续 3 次无进展停止（R6 语义：变化后计数归零，再连续 3 次不变才停止）。"""
     backend = service.backend
     backend._screen_hashes = ["h1", "h1", "h1", "h1"]
-    # 第 1 击相对观察基线有变化（计数 0），第 2/3 击不变（计数 1/2），仍继续。
     for _ in range(3):
         service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
     assert service.snapshot().status == "running"
-    # 第 4 击仍不变：计数达到 3，停止。
     with pytest.raises(ComputerControlError) as raised:
         service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
     assert raised.value.code == "computer_no_progress"
@@ -472,11 +496,6 @@ def test_observe_and_wait_do_not_count_no_progress(service, running_run, owner_a
 
 
 def test_consecutive_wait_for_does_not_count_no_progress(service, owner_a, capability):
-    """连续 wait_for 不触发 computer_no_progress（画面不变是等待的常态）。
-
-    条件等待命中稳定态时画面天然不变（例如标题仍是「保存成功」），若按无进展
-    计数，连续 wait_for 会在第 4 次被误停为 computer_no_progress。
-    """
     run = service.start_run(owner_a, capability, target="desktop")
     service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="desktop"))
     backend = service.backend
@@ -500,9 +519,6 @@ def test_consecutive_wait_for_does_not_count_no_progress(service, owner_a, capab
     assert service.backend.close_count == 0
 
 
-# ---------------- 事件 ----------------
-
-
 def test_events_have_strictly_increasing_seq_and_no_sensitive_payload(service, running_run, owner_a):
     events = []
     service.add_listener(events.append)
@@ -513,7 +529,7 @@ def test_events_have_strictly_increasing_seq_and_no_sensitive_payload(service, r
     assert "computer_observation" in types
     seqs = [event["event_seq"] for event in events]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
-    assert events[0]["action_ordinal"] == 2  # 第一次 observe 是 ordinal 1
+    assert events[0]["action_ordinal"] == 2
     for event in events:
         json.dumps(event)
         assert "png_path" not in event
@@ -545,29 +561,34 @@ def test_stop_final_event_emitted_once(service, running_run):
     assert len(stopped) == 1
 
 
-# ---------------- 停止顺序与清理 ----------------
-
-
 def test_stop_sets_cancel_event_and_aborts_inflight_streams(service, owner_a, capability):
     run = service.start_run(owner_a, capability, target="desktop")
     snapshot = service.stop(run.run_id, "hotkey")
     assert snapshot.status == "stopped"
     assert snapshot.stop_reason == "hotkey"
     assert owner_a.cancel_event.is_set()
-    # 先 set 事件再 abort：abort 收到的必须是同一个已 set 的 cancel_event
     assert service.abort_calls == [owner_a.cancel_event]
 
 
-def test_stop_cleanup_error_marks_failed_not_stopped(service, running_run):
+def test_stop_cleanup_error_holds_lease_until_cleanup_retry(
+    service, running_run, owner_b, capability
+):
+    backend = service.backend
     service.backend.close_error = RuntimeError("close boom")
     snapshot = service.stop(running_run.run_id, "hotkey")
     assert snapshot.status == "failed"
     assert snapshot.error_code
-    # 后续清理步骤仍然执行
-    assert service.backend.release_count == 1
-    assert service.backend.close_count == 1
-    # 失败也释放租约：可以开新 run
-    assert service.snapshot().run_id == running_run.run_id  # 终态快照仍可见
+    assert service._run is not None
+    with pytest.raises(ComputerControlError) as raised:
+        service.start_run(owner_b, capability, target="desktop")
+    assert raised.value.code == "computer_session_busy"
+
+    backend.close_error = None
+    retried = service.stop(running_run.run_id, "retry_cleanup", cancel_owner=False)
+    assert retried.status == "stopped"
+    assert backend.release_count == 2
+    assert backend.close_count == 2
+    assert service._run is None
 
 
 def test_turn_end_finally_complete_or_stop_leaves_no_running_lease(
@@ -576,17 +597,14 @@ def test_turn_end_finally_complete_or_stop_leaves_no_running_lease(
     run = service.start_run(owner_a, capability, target="desktop")
     snapshot = service.complete_run(run.run_id, owner_a)
     assert snapshot.status == "completed"
-    # desktop backend 立即释放输入并关闭
     desktop = service.created["desktop"][-1]
     assert desktop.release_count == 1
     assert desktop.close_count == 1
-    # 租约已释放：其他 owner 可开新 run；新 run 走 stop 终态
     second = service.start_run(owner_b, capability, target="desktop")
     assert second.run_id != run.run_id
     stopped = service.stop(second.run_id, "turn_end")
     assert stopped.status == "stopped"
     assert service.snapshot().status == "stopped"
-    # 再无可执行动作
     with pytest.raises(ComputerControlError):
         service.execute(second.run_id, owner_b, ComputerAction(kind="observe", target="desktop"))
 
@@ -603,17 +621,7 @@ def test_provider_safety_required_blocks_execute_and_resume(service, running_run
     assert stopped.status == "stopped"
 
 
-# ---------------- 审查修复：claim 竞态孤儿 backend 必须 best-effort 关闭 ----------------
-
-
 def test_start_run_closes_backend_when_stopped_during_claim(service, owner_a, capability):
-    """run 在 _claim_backend 期间被停止：刚启动的 backend 不得泄漏。
-
-    场景：start_run 发出 starting 事件后、backend 启动完成前，另一个入口
-    （如全局热键）停止了 run。此时 stop() 看到的 run.backend 仍是 None，
-    关不到这个 backend；start_run 必须自己 best-effort 关闭它，否则遗留
-    真实浏览器进程与被锁 profile。
-    """
     stopped = []
 
     def listener(event):
@@ -634,7 +642,6 @@ def test_start_run_closes_backend_when_stopped_during_claim(service, owner_a, ca
 
 
 def test_start_run_orphan_close_failure_does_not_mask_error(owner_a, capability):
-    """孤儿 backend 关闭自身失败只留痕，不得掩盖 computer_cancelled。"""
     backend = FakeComputerBackend(target="desktop", close_error=RuntimeError("close boom"))
     service = ComputerControlService(
         backend_factory=lambda target, identity: backend,
@@ -660,7 +667,6 @@ def test_start_run_orphan_close_failure_does_not_mask_error(owner_a, capability)
 def test_execute_establishing_closes_backend_when_run_stopped_during_claim(
     owner_a, capability
 ):
-    """generic 首次 observe 建租约期间 run 被停止：刚启动的 backend 不得泄漏。"""
     created = []
     holder = {}
 
@@ -690,14 +696,13 @@ def test_execute_establishing_closes_backend_when_run_stopped_during_claim(
 def test_execute_establishing_closes_backend_when_settings_revoked_during_claim(
     owner_a, capability
 ):
-    """建租约期间设置被关闭（generation 失配且能力撤销）：backend 不泄漏，run 停止。"""
     created = []
     state = {"generation": 1}
 
     def factory(target, identity):
         backend = FakeComputerBackend(target=target)
         created.append(backend)
-        state["generation"] += 1  # claim 期间设置被改写（关闭 browser 开关）
+        state["generation"] += 1
         return backend
 
     def loader():
@@ -727,14 +732,7 @@ def test_execute_establishing_closes_backend_when_settings_revoked_during_claim(
     assert service.snapshot().status == "stopped"
 
 
-# ---------------- R1：取消提交点（取消期间不得发布成功结果） ----------------
-
-
 def test_cancel_during_action_must_not_publish_success(owner_a, capability):
-    """backend.execute 期间 owner 取消：动作不得提交成功，恰好一条 finished(ok=False)。
-
-    审计复现迁移（tests/audits/computer_control_cases.py 同名用例）。
-    """
     backend = FakeComputerBackend(target="browser")
     service = ComputerControlService(
         backend_factory=lambda target, identity: backend,
@@ -755,17 +753,14 @@ def test_cancel_during_action_must_not_publish_success(owner_a, capability):
             event for event in events if event["type"] == "computer_action_finished"
         ]
         assert not any(event.get("ok") is True for event in events)
-        # 已 action_started 的动作恰好产生一条 finished，取消时 ok=False。
         assert len(finished) == 1 and finished[0]["ok"] is False
         assert finished[0]["error_code"] == "computer_cancelled"
-        # 取消后不得发布新观察事件。
         assert not any(event["type"] == "computer_observation" for event in events)
     finally:
         service.stop()
 
 
 def test_cancel_during_observe_must_not_publish_success(service, running_run, owner_a):
-    """backend.observe 期间取消：观察结果不得提交为成功。"""
     backend = service.backend
     original_observe = backend.observe
 
@@ -787,7 +782,6 @@ def test_cancel_during_observe_must_not_publish_success(service, running_run, ow
 
 
 def test_cancel_during_preview_publish_must_not_commit_success(owner_a, capability):
-    """预览发布期间取消：发布发生在提交点之前，取消后不得提交成功。"""
     backend = FakeComputerBackend(target="browser", png_path="virtual-shot.png")
     service = ComputerControlService(
         backend_factory=lambda target, identity: backend,
@@ -818,7 +812,6 @@ def test_cancel_during_preview_publish_must_not_commit_success(owner_a, capabili
 def test_settings_revoked_during_action_does_not_commit_success(
     service, running_run, owner_a, settings_state
 ):
-    """动作执行期间设置关闭（generation 失配且能力撤销）：不提交成功，run 停止。"""
     backend = service.backend
 
     def revoke_during_execute(run_id, action):
@@ -841,7 +834,6 @@ def test_settings_revoked_during_action_does_not_commit_success(
 
 
 def test_pause_during_action_still_commits_current_input(service, running_run, owner_a):
-    """暂停只阻止下一动作：暂停在动作中途到达时，当前输入完成并提交成功。"""
     backend = service.backend
 
     def pause_during_execute(run_id, action):
@@ -860,7 +852,6 @@ def test_pause_during_action_still_commits_current_input(service, running_run, o
         ]
         assert len(finished) == 1 and finished[0]["ok"] is True
         assert service.snapshot().status == "paused"
-        # 暂停后下一动作被拒绝，恢复后必须先 observe。
         with pytest.raises(ComputerControlError, match="暂停"):
             service.execute(
                 running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=20, y=20)
@@ -872,7 +863,6 @@ def test_pause_during_action_still_commits_current_input(service, running_run, o
 def test_native_batch_cancel_before_second_action_executes_nothing_further(
     owner_a,
 ):
-    """native 批次：第一项成功后取消，第二项起零执行且不再发模型续推。"""
     from core.computer.provider_openai import (
         BoundNativeController,
         NativeComputerCall,
@@ -908,13 +898,9 @@ def test_native_batch_cancel_before_second_action_executes_nothing_further(
         with pytest.raises(ComputerControlError) as raised:
             execute_native_computer_call(call, bound)
         assert raised.value.code == "computer_cancelled"
-        # 只有第一项真实执行；第二项在动作前检查即被拒绝，余项零执行。
         assert [entry[1] for entry in backend.execute_calls] == ["click"]
     finally:
         service.stop()
-
-
-# ---------------- 单例 ----------------
 
 
 def test_get_computer_control_service_lazy_singleton(monkeypatch):
@@ -925,11 +911,7 @@ def test_get_computer_control_service_lazy_singleton(monkeypatch):
     assert first is get_computer_control_service()
 
 
-# ---------------- R4：留存 backend 身份匹配 ----------------
-
-
 def test_browser_change_does_not_reuse_previous_channel(owner_a, owner_b):
-    """审计复现迁移（tests/audits 同名用例）：Edge → Chrome 后不得复用留存实例。"""
     state = {"generation": 1, "browser": "edge"}
     created = []
 
@@ -954,7 +936,6 @@ def test_browser_change_does_not_reuse_previous_channel(owner_a, owner_b):
             target="browser",
         )
         assert service._run.backend.browser == "chrome"
-        # 旧 Edge 实例被显式关闭，新实例按新身份创建。
         assert created[0].close_count == 1
         assert created[1] is service._run.backend
         assert second.run_id != first.run_id
@@ -963,7 +944,6 @@ def test_browser_change_does_not_reuse_previous_channel(owner_a, owner_b):
 
 
 def test_same_identity_retained_session_is_reused(service, running_run, owner_a, owner_b, capability):
-    """相同身份：留存实例正常复用（同一 backend 对象），不重复创建。"""
     backend = service.backend
     service.complete_run(running_run.run_id, owner_a)
     second = service.start_run(owner_b, capability, target="browser")
@@ -976,7 +956,6 @@ def test_same_identity_retained_session_is_reused(service, running_run, owner_a,
 
 
 def test_retained_close_failure_fails_claim(service, running_run, owner_a, owner_b):
-    """身份不匹配且旧实例 close 失败：本次启动显式失败，不静默丢弃旧对象。"""
     backend = service.backend
     service.complete_run(running_run.run_id, owner_a)
     backend.close_error = ComputerControlError("computer_cleanup_failed", "注入关闭失败")
@@ -988,14 +967,13 @@ def test_retained_close_failure_fails_claim(service, running_run, owner_a, owner
 
 
 def test_unusable_retained_session_fails_explicitly(service, running_run, owner_a, owner_b, capability):
-    """身份相同但实例不可复用（用户已关闭窗口/不健康）：明确失败，不暗中复活。"""
     backend = service.backend
     service.complete_run(running_run.run_id, owner_a)
     backend.reusable = False
     with pytest.raises(ComputerControlError) as raised:
         service.start_run(owner_b, capability, target="browser")
     assert raised.value.code == "computer_browser_closed"
-    assert backend.close_count == 1  # 旧实例已清理；下一轮可显式新建
+    assert backend.close_count == 1
     assert service.snapshot().status == "failed"
     third_owner = ComputerOwner(
         session_id="session-c", turn_id="turn-c", session_label="会话C",
@@ -1007,7 +985,6 @@ def test_unusable_retained_session_fails_explicitly(service, running_run, owner_
 
 
 def test_factory_receives_frozen_identity_not_current_settings(service, running_run, owner_a, owner_b, settings_state, capability):
-    """配置在 Turn 冻结后改变：工厂消费 run 冻结身份，不重读“当前选中浏览器”。"""
     seen_identities = []
     original_factory = service._backend_factory
 
@@ -1017,17 +994,15 @@ def test_factory_receives_frozen_identity_not_current_settings(service, running_
 
     service._backend_factory = recording_factory
     service.complete_run(running_run.run_id, owner_a)
-    # 留存身份匹配时复用，不调用工厂；改 profile 后身份失配，工厂收到新身份。
     assert seen_identities == []
     with pytest.raises(ComputerControlError):
         service._resolve_backend_identity("browser", replace(GENERIC_CAPABILITY, browser=""))
     second = service.start_run(owner_b, capability, target="browser")
-    assert service.backend is service.created["browser"][0]  # 复用留存，未新建
+    assert service.backend is service.created["browser"][0]
     service.stop()
 
 
 def test_complete_run_does_not_retain_unusable_backend(service, running_run, owner_a):
-    """有未结束工作/不健康的实例不得进入 retained：complete 时按不留存关闭。"""
     backend = service.backend
     backend.reusable = False
     snapshot = service.complete_run(running_run.run_id, owner_a)
@@ -1036,11 +1011,7 @@ def test_complete_run_does_not_retain_unusable_backend(service, running_run, own
     assert service._retained == {}
 
 
-# ---------------- R5：surface 身份变化接线 ----------------
-
-
 def test_surface_changed_sets_require_observe_and_blocks_old_coordinates(service, running_run, owner_a):
-    """backend 报 surface_changed：controller 立即使旧坐标作废，恢复必须先 observe。"""
     backend = service.backend
     backend.execute_error = ComputerControlError(
         "computer_surface_changed", "受控页面已切换"
@@ -1051,14 +1022,12 @@ def test_surface_changed_sets_require_observe_and_blocks_old_coordinates(service
         )
     assert raised.value.code == "computer_surface_changed"
     backend.execute_error = None
-    # 不观察直接再点：被拒绝（旧坐标已作废）。
     with pytest.raises(ComputerControlError) as blocked:
         service.execute(
             running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1)
         )
     assert blocked.value.code == "computer_invalid_action"
     assert [entry[1] for entry in backend.execute_calls] == ["click"]
-    # observe 后恢复可输入。
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
     service.execute(
         running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1)
@@ -1068,7 +1037,6 @@ def test_surface_changed_sets_require_observe_and_blocks_old_coordinates(service
 
 
 def test_observation_event_carries_surface_identity(service, running_run, owner_a):
-    """computer_observation 事件携带本地 surface_id/generation（GUI 区分受控页）。"""
     events = []
     service.add_listener(events.append)
     try:
@@ -1086,7 +1054,6 @@ def test_observation_event_carries_surface_identity(service, running_run, owner_
 
 
 def test_native_batch_surface_change_aborts_remaining_actions(owner_a):
-    """native 批次中途切页：第一项后即中断，余项零执行。"""
     from core.computer.provider_openai import (
         BoundNativeController,
         NativeComputerCall,
@@ -1133,11 +1100,7 @@ def test_native_batch_surface_change_aborts_remaining_actions(owner_a):
         service.stop()
 
 
-# ---------------- R6：无进展计数 ----------------
-
-
 def test_three_valid_mouse_moves_do_not_stop_desktop(owner_a):
-    """审计复现迁移（tests/audits 同名用例）：move 不进入无进展计数。"""
     backend = FakeComputerBackend(target="desktop")
     service = ComputerControlService(
         backend_factory=lambda target, identity: backend,
@@ -1158,10 +1121,8 @@ def test_three_valid_mouse_moves_do_not_stop_desktop(owner_a):
 
 
 def test_changed_frame_resets_no_progress_count_to_zero(service, running_run, owner_a):
-    """审计复现迁移（tests/audits 同名用例）：有进展后计数归零而非从 1 起算。"""
     backend = service.backend
     backend._screen_hashes = ["changed", "changed", "changed"]
-    # 第一击已产生进展，随后只有两击无变化，不得按三次无进展停止。
     for x in (10, 20, 30):
         service.execute(
             running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=x, y=10)
@@ -1171,7 +1132,6 @@ def test_changed_frame_resets_no_progress_count_to_zero(service, running_run, ow
 
 
 def test_two_unchanged_clicks_remain_allowed(service, running_run, owner_a):
-    """对照（审计保留）：仅两次不变点击允许继续。"""
     for x in (10, 20):
         service.execute(
             running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=x, y=10)
@@ -1181,11 +1141,6 @@ def test_two_unchanged_clicks_remain_allowed(service, running_run, owner_a):
 
 
 def test_progress_then_zero_one_two_three_stops(service, running_run, owner_a):
-    """进展后计数序列 0→1→2→3：变化一击 + 三击不变才停止。
-
-    每次动作后 controller 都会取新观察：p1 之后首个 s 仍是变化（计 0），
-    随后三次 s 不变依次计 1/2/3，第 5 击停止。
-    """
     backend = service.backend
     backend._screen_hashes = ["p1", "s", "s", "s", "s"]
     for _ in range(4):
@@ -1198,15 +1153,11 @@ def test_progress_then_zero_one_two_three_stops(service, running_run, owner_a):
 
 
 def test_observe_with_real_change_resets_count_and_baseline(service, running_run, owner_a):
-    """豁免动作（observe）观察到真实变化：计数归零且基线更新，后续重新累计。"""
     backend = service.backend
     backend._screen_hashes = ["a", "a", "b", "b", "b", "b"]
-    # 两击不变（计数 1、2）。
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
-    # observe 看到变化 b：计数归零、基线更新（不留过期基线）。
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
-    # 三击不变才停止（1、2、3）。
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
     assert service.snapshot().status == "running"
@@ -1217,13 +1168,10 @@ def test_observe_with_real_change_resets_count_and_baseline(service, running_run
 
 
 def test_unchanged_observe_does_not_mask_existing_failures(service, running_run, owner_a):
-    """豁免动作且画面不变：保留既有失败次数，不得靠插入 observe 掩盖重复失败。"""
     backend = service.backend
     backend._screen_hashes = ["same"] * 8
-    # 首击相对基线有变化计 0，第 2/3 击不变计 1/2。
     for _ in range(3):
         service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
-    # 插入不变 observe：计数保留（2），下一击不变即达 3 停止。
     service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
     with pytest.raises(ComputerControlError) as raised:
         service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
@@ -1231,11 +1179,7 @@ def test_unchanged_observe_does_not_mask_existing_failures(service, running_run,
     service.stop()
 
 
-# ---------------- R9：动作耗时测量 ----------------
-
-
 def test_action_finished_supplies_measured_duration(service, running_run, owner_a):
-    """审计复现迁移（tests/audits 同名用例）：finished 事件携带真实耗时字段。"""
     events = []
     service.add_listener(events.append)
     try:
@@ -1255,7 +1199,6 @@ def test_action_finished_supplies_measured_duration(service, running_run, owner_
 
 
 def test_action_finished_reports_input_and_wait_segments(service, running_run, owner_a):
-    """输入/显式等待/观察分段真实出现；失败与取消同样携带耗时。"""
     events = []
     service.add_listener(events.append)
     try:
@@ -1274,7 +1217,6 @@ def test_action_finished_reports_input_and_wait_segments(service, running_run, o
         assert "observe_ms" in wait_event
         assert click_event["input_ms"] >= 0 and click_event["observe_ms"] >= 0
         assert "wait_ms" not in click_event
-        # 失败路径同样携带耗时。
         service.backend.observe_error = ComputerControlError(
             "computer_action_failed", "注入观察失败"
         )
@@ -1291,15 +1233,7 @@ def test_action_finished_reports_input_and_wait_segments(service, running_run, o
         service.stop()
 
 
-# ---------------- Task 3：wait_for 计入等待阶段计时 ----------------
-
-
 def test_wait_for_finished_reports_wait_not_input(service, owner_a, capability):
-    """wait_for 是条件等待而非输入：finished 事件 input_ms=0、wait_ms>=0。
-
-    条件等待的轮询耗时属于等待阶段，绝不能混进 input_ms——否则"输入耗时"
-    会把被动等待算成按键/点击耗时。fake backend 直接返回，不真实等待。
-    """
     events = []
     service.add_listener(events.append)
     run = service.start_run(owner_a, capability, target="desktop")
@@ -1332,7 +1266,6 @@ def test_wait_for_finished_reports_wait_not_input(service, owner_a, capability):
 
 
 def test_wait_for_timeout_also_reports_wait_segment(service, owner_a, capability):
-    """超时失败同样按等待阶段计时：input_ms=0、wait_ms>=0。"""
     events = []
     service.add_listener(events.append)
     run = service.start_run(owner_a, capability, target="desktop")
@@ -1365,3 +1298,155 @@ def test_wait_for_timeout_also_reports_wait_segment(service, owner_a, capability
         assert failed[-1]["wait_ms"] >= 0
     finally:
         service.stop()
+
+
+def test_run_generation_and_event_seq_sync_and_current_action_clears_on_finish(
+    service, owner_a, owner_b, capability
+):
+    events = []
+    service.add_listener(events.append)
+    first = service.start_run(owner_a, capability, target="browser")
+    try:
+        assert first.run_generation >= 1
+        assert first.event_seq >= 1
+        service.execute(
+            first.run_id, owner_a, ComputerAction(kind="observe", target="browser")
+        )
+        assert service.snapshot().current_action == ""
+        service.backend.execute_error = ComputerControlError(
+            "computer_action_failed", "注入动作失败"
+        )
+        with pytest.raises(ComputerControlError):
+            service.execute(
+                first.run_id,
+                owner_a,
+                ComputerAction(kind="click", target="browser", x=10, y=10),
+            )
+        assert service.snapshot().current_action == ""
+    finally:
+        service.stop(first.run_id, "done")
+
+    second = service.start_run(owner_b, capability, target="browser")
+    try:
+        assert second.run_generation > first.run_generation
+        second_events = [e for e in events if e.get("run_id") == second.run_id]
+        assert second_events
+        assert all(
+            e.get("run_generation") == second.run_generation for e in second_events
+        )
+    finally:
+        service.stop(second.run_id, "done")
+
+
+def test_stop_unconfirmed_keeps_stopping_status_and_lease_until_retry(
+    service, running_run, owner_b, capability
+):
+    backend = service.backend
+    backend.close_error = ComputerControlError(
+        "computer_stop_unconfirmed", "执行端未确认退出"
+    )
+    snapshot = service.stop(running_run.run_id, "user_stop", cancel_owner=False)
+    assert snapshot.status == "stopping"
+    assert snapshot.error_code == "computer_stop_unconfirmed"
+    assert service._run is not None
+    with pytest.raises(ComputerControlError) as raised:
+        service.start_run(owner_b, capability, target="desktop")
+    assert raised.value.code == "computer_session_busy"
+
+    backend.close_error = None
+    retried = service.stop(running_run.run_id, "retry_cleanup", cancel_owner=False)
+    assert retried.status == "stopped"
+    assert service._run is None
+
+
+def test_stop_still_closes_backend_when_release_inputs_fails(
+    service, running_run
+):
+    backend = service.backend
+    fail_release = {"active": True}
+    orig_release = backend.release_inputs
+
+    def flaky_release():
+        orig_release()
+        if fail_release["active"]:
+            raise ComputerControlError("computer_cleanup_failed", "释放输入失败")
+
+    backend.release_inputs = flaky_release
+    snapshot = service.stop(running_run.run_id, "hotkey")
+    assert snapshot.status == "failed"
+    assert snapshot.error_code == "computer_cleanup_failed"
+    assert backend.release_count == 1
+    assert backend.close_count == 1
+    fail_release["active"] = False
+    retried = service.stop(running_run.run_id, "retry_cleanup", cancel_owner=False)
+    assert retried.status == "stopped"
+    assert backend.release_count == 2
+    assert backend.close_count == 2
+
+
+@pytest.mark.parametrize(
+    ("target", "browser", "expected_mode"),
+    [
+        ("desktop", "", ""),
+        ("browser", "edge", "external"),
+        ("browser", "embedded", "embedded"),
+    ],
+)
+def test_snapshot_and_events_expose_frozen_browser_mode_under_lock(
+    target, browser, expected_mode
+):
+    import threading
+    from core.computer.controller import ComputerControlService
+    from core.computer.models import ComputerCapability, ComputerOwner
+    from tests.computer_fakes import FakeComputerBackend
+
+    events = []
+    backend = FakeComputerBackend(target=target)
+    cap = ComputerCapability(
+        enabled=True,
+        protocol="generic",
+        targets=(target,),
+        browser=browser,
+        settings_generation=1,
+    )
+    service = ComputerControlService(
+        backend_factory=lambda _t, _i: backend,
+        generation_provider=lambda: 1,
+        embedded_endpoint_provider=(
+            (lambda _sid: "http://127.0.0.1:9555") if browser == "embedded" else None
+        ),
+        abort_streams=lambda _ev: None,
+    )
+    service.add_listener(events.append)
+    owner = ComputerOwner(
+        session_id="sess-mode",
+        turn_id="turn-1",
+        session_label="sess-mode",
+        cancel_event=threading.Event(),
+    )
+
+    snap = service.start_run(owner, cap, target=target)
+    try:
+        assert snap.target == target
+        assert snap.browser == browser
+        assert snap.browser_mode == expected_mode
+        assert snap.to_public_dict()["browser_mode"] == expected_mode
+
+        service.execute(
+            snap.run_id,
+            owner,
+            ComputerAction(kind="observe", target=target),
+        )
+        state_events = [e for e in events if e.get("type") == "computer_state"]
+        obs_events = [e for e in events if e.get("type") == "computer_observation"]
+        assert state_events
+        assert obs_events
+        for ev in state_events:
+            assert ev["target"] == target
+            assert ev["browser"] == browser
+            assert ev["browser_mode"] == expected_mode
+        assert obs_events[-1]["target"] == target
+        assert obs_events[-1]["browser"] == browser
+        assert obs_events[-1]["browser_mode"] == expected_mode
+    finally:
+        service.stop(snap.run_id, "done")

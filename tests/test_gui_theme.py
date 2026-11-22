@@ -25,7 +25,6 @@ def _use_tmp_config(tmp_path, monkeypatch):
 
 
 def _bare_bridge():
-    """不经 __init__ 构造裸实例，避免启动期的重初始化副作用。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._hwnd = 0
     bridge._titlebar_dark = True
@@ -258,7 +257,6 @@ def test_invalid_startup_theme_keeps_config_bytes(tmp_path, monkeypatch):
 
 
 def test_startup_fragment_marks_only_active_theme_error(monkeypatch):
-    # fragment 是否带 os=win10 取决于系统版本，固定 Win11 保证跨 OS 可重复
     monkeypatch.setattr(
         gui_main.sys,
         "getwindowsversion",
@@ -276,7 +274,6 @@ def test_startup_fragment_marks_only_active_theme_error(monkeypatch):
 
 
 def test_startup_fragment_marks_win10_for_frontend_border(monkeypatch):
-    """Win10 无 DWMWA_BORDER_COLOR 可隐藏外框，前端据 os=win10 补 1px CSS 边框。"""
     monkeypatch.setattr(
         gui_main.sys,
         "getwindowsversion",
@@ -398,7 +395,7 @@ def test_win10_unsupported_custom_colors_still_activates_theme(tmp_path, monkeyp
     bridge._native_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
     bridge._native_titlebar_color_capability = "supported"
     fake_dwm = Mock()
-    unsupported = ctypes.c_int32(0x80070057).value  # E_INVALIDARG on pre-Win11 color attrs
+    unsupported = ctypes.c_int32(0x80070057).value
 
     def set_attribute(_hwnd, attr, _value, _size):
         return 0 if attr in (20, 19) else unsupported
@@ -530,7 +527,6 @@ def test_active_theme_rename_updates_authoritative_id(tmp_path):
 
 
 def test_rename_theme_with_unchanged_id_only_updates_name(tmp_path):
-    """重命名对话框默认沿用当前主题 ID：只改名称时不能报“主题已存在”。"""
     config_file = tmp_path / "config.json"
     config_file.write_text("{}", encoding="utf-8")
     repo = ThemeRepository(tmp_path / "themes", config_file)
@@ -654,7 +650,6 @@ def test_set_gui_theme_persists_light(tmp_path, monkeypatch):
     assert res["ok"] is True
     assert model_manager.load_config().get("gui_theme_light") is True
     assert model_manager.load_config().get("gui_theme_id") == "builtin.light"
-    # 标题栏同步为浅色（dark=False）
     assert bridge._titlebar_dark is False
 
 
@@ -669,6 +664,5 @@ def test_set_gui_theme_persists_dark(tmp_path, monkeypatch):
 
 
 def test_theme_light_defaults_to_false_in_config(tmp_path, monkeypatch):
-    """老配置没有 gui_theme_light 键时按深色处理。"""
     _use_tmp_config(tmp_path, monkeypatch)
     assert bool(model_manager.load_config().get("gui_theme_light", False)) is False

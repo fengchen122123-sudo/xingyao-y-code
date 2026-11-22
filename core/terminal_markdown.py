@@ -1,5 +1,3 @@
-"""Theme-aware Rich Markdown renderer for CLI answers and history replay."""
-
 from __future__ import annotations
 
 from io import StringIO
@@ -25,7 +23,6 @@ from core.themes import get_theme
 
 
 class _LeftHeading(Heading):
-    """Left-aligned Markdown headings with subtle theme accent hierarchy."""
 
     LEVEL_ALIGN: ClassVar[dict[str, JustifyMethod]] = {
         "h1": "left",
@@ -54,7 +51,6 @@ class _LeftHeading(Heading):
 
 
 class _ThemedCodeBlock(CodeBlock):
-    """Code block with top/bottom rules and language tag (no side borders to copy)."""
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
@@ -82,7 +78,6 @@ class _ThemedCodeBlock(CodeBlock):
 
 
 class _ThemedTable(TableElement):
-    """Markdown table rendered with rounded box borders matching active theme."""
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
@@ -115,12 +110,10 @@ class _ThemedMarkdown(_RichMarkdown):
     }
 
 
-# Keep module-level `Markdown` symbol patchable by unit tests.
 Markdown = _ThemedMarkdown
 
 
 def _build_markdown_theme(theme_name: str | None = None) -> tuple[Theme, str]:
-    """根据当前主题构建克制单主色 Rich Markdown 主题并返回代码语法主题名。"""
     t = get_theme(theme_name)
     theme = Theme({
         "markdown.paragraph": t["text"],

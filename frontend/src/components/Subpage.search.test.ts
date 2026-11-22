@@ -37,19 +37,19 @@ describe('Subpage - 关键词搜索', () => {
     const wrapper = mountSubpage('skills');
     expect(cardNames(wrapper)).toHaveLength(3);
 
-    await typeSearch(wrapper, '网文'); // 名称命中
+    await typeSearch(wrapper, '网文');
     expect(cardNames(wrapper).join('|')).toContain('网文写作');
 
-    await typeSearch(wrapper, 'COVER'); // 介绍命中且大小写不敏感
+    await typeSearch(wrapper, 'COVER');
     expect(cardNames(wrapper).join('|')).toContain('封面图生成');
 
-    await typeSearch(wrapper, '文章 视频'); // 两个词须同时命中
+    await typeSearch(wrapper, '文章 视频');
     const hit = cardNames(wrapper).join('|');
     expect(hit).toContain('讲解视频');
     expect(hit).not.toContain('网文写作');
     expect(hit).not.toContain('封面图生成');
 
-    await typeSearch(wrapper, ''); // 清空恢复全量
+    await typeSearch(wrapper, '');
     expect(cardNames(wrapper)).toHaveLength(3);
   });
 
@@ -80,7 +80,7 @@ describe('Subpage - 关键词搜索', () => {
     await typeSearch(wrapper, '生图');
     expect(cardNames(wrapper).join('|')).toContain('tokenrhythm-image');
 
-    await typeSearch(wrapper, 'workbuddy_status'); // 工具名命中
+    await typeSearch(wrapper, 'workbuddy_status');
     expect(cardNames(wrapper).join('|')).toContain('workbuddy_connect');
   });
 

@@ -65,8 +65,6 @@ def test_step_metrics_event_dispatch(monkeypatch):
     monkeypatch.setattr(
         bridge, "emit_event", lambda kind, payload: emitted.append((kind, payload))
     )
-    # Simulate step_metrics coming from core.llm callback
-    # We call the event handler logic
     payload = {
         "duration_s": 3.12,
         "output_duration_s": 2.80,
@@ -74,7 +72,6 @@ def test_step_metrics_event_dispatch(monkeypatch):
         "completion_tokens": 140,
         "token_speed": 50.0,
     }
-    # In gui_bridge, handler calls self.emit_event("step_metrics", {**payload, "session_name": "会话A"})
     bridge.emit_event("step_metrics", {**payload, "session_name": "会话A"})
 
     assert emitted == [(
@@ -99,7 +96,6 @@ def test_step_metrics_handles_mock_stream_gracefully(monkeypatch):
         return SimpleNamespace(type=event_type, **kwargs)
 
     def fake_responses(**kwargs):
-        # 模拟 500 tokens 瞬时在内存返回（如 MockResponsesAPIStreamingIterator 模式）
         response = SimpleNamespace(
             usage=SimpleNamespace(input_tokens=50, output_tokens=500, total_tokens=550)
         )

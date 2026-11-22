@@ -1,5 +1,3 @@
-"""turn_undo FileMutationRecorder 测试：记录契约、验证、节点拒绝与回合封闭。"""
-
 import hashlib
 import os
 import stat
@@ -63,12 +61,7 @@ def _prepare(env, path, content, tool="write_file", call="call-1", after_kind=No
     )
 
 
-# ---------------------------------------------------------------------------
-# 无检查点上下文 / 封闭检查点
-# ---------------------------------------------------------------------------
-
 def test_prepare_without_context_fails_closed(env):
-    """线程无检查点上下文（回合外调用）：no_active_checkpoint，由工具层降级。"""
     with pytest.raises(TurnUndoError) as exc:
         _prepare(env, env["ws"] / "a.txt", b"x")
     assert exc.value.code == UndoErrorCode.NO_ACTIVE_CHECKPOINT
@@ -76,11 +69,6 @@ def test_prepare_without_context_fails_closed(env):
 
 
 def test_late_write_with_bound_thread_refused_before_disk(env):
-    """H2 核心：子代理线程仍绑定已封闭检查点时，写入在触盘前拒绝。
-
-    模拟协作式取消场景——父回合已 finish_turn，子代理线程 TLS 仍持有
-    旧上下文对象；write 触盘前必须失败，文件不变。
-    """
     import threading as _threading
 
     target = env["ws"] / "late-bound.txt"
@@ -91,7 +79,6 @@ def test_late_write_with_bound_thread_refused_before_disk(env):
     result = {}
 
     def _stuck_subagent():
-        # 模拟前台子代理线程：绑定父回合后仍卡在执行中
         assert recorder.bind_thread(cp.checkpoint_id, owner=False)
         bound.set()
         assert parent_closed.wait(timeout=10)
@@ -112,7 +99,7 @@ def test_late_write_with_bound_thread_refused_before_disk(env):
     t = _threading.Thread(target=_stuck_subagent, daemon=True)
     t.start()
     assert bound.wait(timeout=10)
-    recorder.close_turn(ctx)  # 父回合封闭（不触碰 target）
+    recorder.close_turn(ctx)
     parent_closed.set()
     t.join(timeout=10)
 
@@ -121,10 +108,8 @@ def test_late_write_with_bound_thread_refused_before_disk(env):
 
 
 def test_late_write_after_close_rejected_before_disk(env):
-    """上下文被注销后（正常收尾路径）：no_active_checkpoint，工具层降级为
-    不可撤销写入；而 TLS仍绑定的迟到线程走 CHECKPOINT_CLOSED 拒绝（见上）。"""
     cp, ctx = _begin_turn(env)
-    recorder.close_turn(ctx)  # no_changes
+    recorder.close_turn(ctx)
     with pytest.raises(TurnUndoError) as exc:
         _prepare(env, env["ws"] / "late.txt", b"x")
     assert exc.value.code == UndoErrorCode.NO_ACTIVE_CHECKPOINT
@@ -146,15 +131,10 @@ def test_bind_thread_unknown_checkpoint(env):
     assert recorder.bind_thread("ckpt-none", owner=False) is False
 
 
-# ---------------------------------------------------------------------------
-# prepare/verify 契约
-# ---------------------------------------------------------------------------
-
 def test_prepare_persists_blobs_and_row_before_write(env):
     target = env["ws"] / "new.txt"
     cp, ctx = _begin_turn(env)
     handle = _prepare(env, target, b"hello undo")
-    # blob 已持久化
     after_sha = hashlib.sha256(b"hello undo").hexdigest()
     assert env["storage"].blob_store.exists(after_sha)
     row = env["storage"].get_file(handle.file_id)
@@ -163,9 +143,7 @@ def test_prepare_persists_blobs_and_row_before_write(env):
     assert row.before_kind == NodeKind.MISSING.value
     assert row.after_sha256 == after_sha
     assert row.verified_at_ms is None
-    # 目标文件在 prepare 阶段还没被写
     assert not target.exists()
-    # 写入 + verify
     target.write_bytes(b"hello undo")
     actual = recorder.verify_after_mutation(handle)
     assert actual.sha256 == after_sha
@@ -213,19 +191,15 @@ def test_verify_mismatch_skips_file_and_keeps_turn_recording(env):
     cp, ctx = _begin_turn(env)
     try:
         handle = _prepare(env, target, b"planned")
-        # 验证前被外部改变
         target.write_bytes(b"external!")
         with pytest.raises(TurnUndoError) as exc:
             recorder.verify_after_mutation(handle)
         assert exc.value.code == UndoErrorCode.FILE_CONFLICT
-        # 单个文件验证失败只让该文件退出撤销范围，不再封死整个回合
         row = env["storage"].get_file(handle.file_id)
         assert row.undo_result == "skipped"
         cp_row = env["storage"].get_checkpoint(cp.checkpoint_id)
         assert cp_row.status_enum is TurnUndoStatus.RECORDING
-        # 目标文件未被记录器触碰（仍是外部内容）
         assert target.read_bytes() == b"external!"
-        # 同回合后续写入其他文件不受影响
         other = env["ws"] / "later.txt"
         h2 = _prepare(env, other, b"later", call="call-later")
         other.write_bytes(b"later")
@@ -277,15 +251,10 @@ def test_prepare_with_snapshot_failure_blocks_mutation(env):
             _prepare(env, target, b"new content")
     finally:
         env["storage"].blob_store.put_bytes = original
-    # 快照失败：文件内容不变
     assert target.read_bytes() == b"keep me"
     assert env["storage"].list_files(cp.checkpoint_id) == []
     recorder.release_context(cp.checkpoint_id)
 
-
-# ---------------------------------------------------------------------------
-# 严格节点边界
-# ---------------------------------------------------------------------------
 
 def test_symlink_target_rejected(env):
     real = env["ws"] / "real.txt"
@@ -354,10 +323,6 @@ def test_prepare_rejects_directory_after_kind(env):
     recorder.release_context(cp.checkpoint_id)
 
 
-# ---------------------------------------------------------------------------
-# 回合封闭
-# ---------------------------------------------------------------------------
-
 def test_close_turn_ready_with_net_stats(env):
     target = env["ws"] / "stats.txt"
     target.write_bytes(b"line1\nline2\n")
@@ -401,7 +366,7 @@ def test_close_turn_binary_diff(env):
 def test_unverified_record_makes_turn_unavailable(env):
     target = env["ws"] / "unver.txt"
     cp, ctx = _begin_turn(env)
-    _prepare(env, target, b"data")  # prepare 后未写入也未 verify
+    _prepare(env, target, b"data")
     status = recorder.close_turn(ctx)
     assert status is TurnUndoStatus.UNAVAILABLE
     cp_row = env["storage"].get_checkpoint(cp.checkpoint_id)
@@ -416,7 +381,6 @@ def test_mid_turn_external_change_skips_file_but_keeps_recording(env):
         h1 = _prepare(env, target, b"v1", call="call-1")
         target.write_bytes(b"v1")
         recorder.verify_after_mutation(h1)
-        # 外部修改后再 prepare 同一文件：该文件退出撤销范围，写入继续
         target.write_bytes(b"external")
         h2 = _prepare(env, target, b"v2", call="call-2")
         assert h2.file_id == h1.file_id
@@ -427,7 +391,6 @@ def test_mid_turn_external_change_skips_file_but_keeps_recording(env):
         assert row.undo_error_code == UndoErrorCode.FILE_CONFLICT
         assert env["storage"].get_checkpoint(cp.checkpoint_id).status_enum \
             is TurnUndoStatus.RECORDING
-        # 同回合写其他文件仍正常
         other = env["ws"] / "other.txt"
         h3 = _prepare(env, other, b"ok", call="call-3")
         other.write_bytes(b"ok")
@@ -445,31 +408,22 @@ def test_close_turn_all_files_skipped_is_no_changes(env):
         target.write_bytes(b"external")
         with pytest.raises(TurnUndoError):
             recorder.verify_after_mutation(handle)
-        # 全部文件退出撤销范围 → 等价于本回合没有可撤销修改
         assert recorder.close_turn(ctx) is TurnUndoStatus.NO_CHANGES
     finally:
         recorder.release_context(cp.checkpoint_id)
 
 
-# ---------------------------------------------------------------------------
-# 通用命令副作用标记
-# ---------------------------------------------------------------------------
-
 def test_mark_uncovered_command_effects(env):
     cp, ctx = _begin_turn(env)
     recorder.mark_uncovered_command_effects("execute_command")
     assert env["storage"].get_checkpoint(cp.checkpoint_id).has_uncovered_command_effects == 1
-    recorder.mark_uncovered_command_effects("write_file")  # 非命令不重复标记
+    recorder.mark_uncovered_command_effects("write_file")
     recorder.close_turn(ctx)
 
 
 def test_mark_uncovered_without_context_noop(env):
-    recorder.mark_uncovered_command_effects("execute_command")  # 不应抛异常
+    recorder.mark_uncovered_command_effects("execute_command")
 
-
-# ---------------------------------------------------------------------------
-# 符号链接拒绝逻辑（纯逻辑层，不依赖 Windows 符号链接特权）
-# ---------------------------------------------------------------------------
 
 def test_reject_unsupported_rejects_symlink_node_kind():
     from core.turn_undo.models import NodeState
@@ -496,13 +450,10 @@ def test_reject_unsupported_rejects_directory_and_special():
 def test_reject_unsupported_allows_missing_and_regular_and_multi_hardlink():
     from core.turn_undo.models import NodeState
 
-    # missing 与普通文件放行
     recorder._reject_unsupported(NodeState(kind=NodeKind.MISSING, exists=False), "/ws/a")
     recorder._reject_unsupported(
         NodeState(kind=NodeKind.REGULAR_FILE, exists=True, link_count=1), "/ws/a",
     )
-    # 多硬链接拒绝（真实 os.link路径已由 test_hardlink_rejected 覆盖，
-    # 此处验证 nlink>1 判定本身）
     with pytest.raises(TurnUndoError) as exc:
         recorder._reject_unsupported(
             NodeState(kind=NodeKind.REGULAR_FILE, exists=True, link_count=3),
@@ -512,7 +463,6 @@ def test_reject_unsupported_allows_missing_and_regular_and_multi_hardlink():
 
 
 def test_prepare_rejects_via_capture_poisoned_symlink(env, monkeypatch):
-    """prepare_mutation 对"捕获结果为符号链接"的路径拒绝写入（无真实 symlink 环境）。"""
     target = env["ws"] / "poison.txt"
 
     original = recorder.capture_node_state
@@ -543,15 +493,7 @@ def test_prepare_rejects_via_capture_poisoned_symlink(env, monkeypatch):
         recorder.release_context(cp.checkpoint_id)
 
 
-# ---------------------------------------------------------------------------
-# 工作区写入互斥与封闭原因可读性
-# ---------------------------------------------------------------------------
-
-
-
-
 def test_checkpoint_closed_message_includes_reason(env):
-    """封闭错误必须带出触发原因，避免只看到"检查点已封闭"无从排查。"""
     cp, ctx = _begin_turn(env, turn="turn-closed")
     try:
         env["storage"].transition_checkpoint(

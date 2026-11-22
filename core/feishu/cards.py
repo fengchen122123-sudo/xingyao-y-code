@@ -1,13 +1,3 @@
-"""飞书卡片 2.0 构件库（对齐 opencode-mobile `src/feishu/cards.ts`）。
-
-注释里这几条是实测踩出来的红线，别改：
-1. 2.0 不支持 1.0 的 `note` 标签（报 230099）——落款一律用 markdown；
-2. 按钮回调必须 `behaviors:[{type:'callback',value}]`，旧写法在长连接下收不到回调；
-3. 回调结果卡必须包成 `{card:{type:'raw',data}}` 随响应帧返回，裸卡片会被飞书回滚；
-4. `input` 的 `max_length` 上限 1000，超了整卡被拒（230099 / 11310）；
-5. `collapsible_panel` 老租户不支持会被整卡拒——只在正文真放不下时用。
-"""
-
 import json
 from typing import Any, Dict, List, Optional
 
@@ -22,8 +12,6 @@ TEMPLATE_BLUE = "blue"
 
 CardElement = Dict[str, Any]
 
-
-# ---------------------------------------------------------------- 基础构件
 
 def card2(title: str, template: str, elements: List[CardElement]) -> Dict[str, Any]:
     return {
@@ -78,7 +66,7 @@ def input_field(name: str, placeholder: str, max_length: int = MAX_INPUT_LENGTH)
     return {
         "tag": "input",
         "name": name,
-        "max_length": min(int(max_length or MAX_INPUT_LENGTH), MAX_INPUT_LENGTH),  # 红线 4
+        "max_length": min(int(max_length or MAX_INPUT_LENGTH), MAX_INPUT_LENGTH),
         "placeholder": {"tag": "plain_text", "content": placeholder},
     }
 
@@ -129,12 +117,6 @@ def card_response(card: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def with_status(card: Dict[str, Any], text: str) -> Dict[str, Any]:
-    """在卡片副本末尾追加一行状态（原地回执用，保留原内容）。
-
-    飞书会用回调返回的卡片**原地替换**被点的那张卡：直接返回一张小回执卡会把
-    原内容（比如星瑶的回复）冲掉。这里基于**原始卡片的副本**追加状态行——
-    原内容保留，且每次都从原始卡片重建，反复提交不会累积多行状态。
-    """
     import copy
 
     new_card = copy.deepcopy(card or {})
@@ -150,14 +132,7 @@ def build_result_card(title: str, lines: List[str]) -> Dict[str, Any]:
     return card2(title, TEMPLATE_RED if negative else TEMPLATE_GREEN, [md(line) for line in lines if line])
 
 
-# ---------------------------------------------------------------- 业务卡片
-
 def context_markdown(session_label: str, workdir: str = "") -> str:
-    """卡片上的「会话 / 工作目录」两行。
-
-    工作目录一律给出行：`GLOBAL`（自由对话）没有真实目录，显示成
-    「自由对话（未绑定目录）」而不是留空——留空会让人以为"没取到"。
-    """
     lines = [f"**会话**　{session_label}"]
     lines.append(f"**工作目录**　{workdir or '自由对话（未绑定目录）'}")
     return "\n".join(lines)
@@ -189,9 +164,6 @@ def failure_card(session_label: str, message: str) -> Dict[str, Any]:
     return card2("⚠️ 星瑶执行出错", TEMPLATE_RED, body)
 
 
-# ---------------------------------------------------------------- 审批 / 提问
-
-# 动作名归一成中文（对齐 opencode-mobile「动作名被归一成中文，不是原始英文标识」）
 ACTION_LABELS = {
     "run_command": "执行命令",
     "execute_command": "执行命令",
@@ -297,8 +269,6 @@ def question_card(*, question: str, options: List[str], session_label: str,
         elements.append(note(hint))
     return card2("❓ 星瑶提问", TEMPLATE_BLUE, elements)
 
-
-# ---------------------------------------------------------------- 解析
 
 def extract_text(message: Dict[str, Any]) -> Optional[str]:
     """从飞书消息体取纯文本（非文本消息返回 None）。"""

@@ -1,14 +1,3 @@
-"""任务执行过程中的 JEV 自动决策钩子（不干预模型路由）。
-
-设计原则：
-- 只在任务执行关键控制点介入：循环止损（loop_guard）、子代理验收
-  （subagent_review）、计划失败恢复（plan_recovery）、后台记忆筛选（memory_filter）；
-- 只要用户在设置中开启决策模型（``enabled=True``）即自动参与；未开启时零请求、
-  零文本构造开销；全局 ``shadow_mode=True`` 时仅发请求写审计但不影响业务流程；
-- 隐私脱敏：所有进入 ``state`` 的业务文本先经 ``redact_sensitive`` 并严格截断；
-- 失败全静默兜底：任何异常一律返回 None / 原对象，绝不阻断或拖慢任务主流程。
-"""
-
 from __future__ import annotations
 
 import logging
@@ -93,7 +82,6 @@ def _collapse(text, limit: int) -> str:
 
 
 def _task_decision_armed(scene: str) -> bool:
-    """轻量前置闸门：全局未启用或该场景被显式禁用时返回 False（零文本构造）。"""
     try:
         from core import decision_service
 

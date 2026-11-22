@@ -10,7 +10,6 @@
       @mouseenter="emit('hover-enter')"
       @mouseleave="emit('hover-leave')"
     >
-      <!-- 标题行：左中文标题、右等宽摘要（完整千分位，百分比 1 位小数） -->
       <div class="cxp-header">
         <span class="cxp-title">上下文容量</span>
         <span class="cxp-summary" data-test="ctx-usage-summary">{{ summaryText }}</span>
@@ -28,7 +27,6 @@
         </div>
       </div>
 
-      <!-- 来源占比列表：按 chars 降序，仅显示 chars>0；Σchars<=0 时整段隐藏 -->
       <div v-if="rows.length" class="cxp-rows" data-test="ctx-usage-breakdown">
         <div v-for="row in rows" :key="row.source" class="cxp-row" data-test="ctx-usage-row">
           <span class="cxp-swatch" :style="{ background: row.color }"></span>
@@ -37,7 +35,6 @@
         </div>
       </div>
 
-      <!-- 缓存命中率：cache_available=false 或无值时隐藏 -->
       <template v-if="showCacheRow">
         <div class="cxp-sep"></div>
         <div class="cxp-cache" data-test="ctx-usage-cache">
@@ -86,7 +83,6 @@ function segmentColor(index: number): string {
   return `color-mix(in srgb, var(--accent) ${pct}%, var(--bg2))`;
 }
 
-// 防御性过滤：store 已归一化，面板对任意来源数据仍保持健壮（非法项静默丢弃）
 const breakdown = computed(() =>
   (store.tokenUsage.context_breakdown || [])
     .filter(item => !!item && SOURCE_LABELS[item.source] !== undefined && Number(item.chars) > 0)
@@ -95,7 +91,6 @@ const breakdown = computed(() =>
 
 const breakdownTotal = computed(() => breakdown.value.reduce((sum, item) => sum + item.chars, 0));
 
-// 每行：色块 + 中文名 + 1 位小数百分比；色块与进度条分段同色
 const breakdownRows = computed(() => {
   const total = breakdownTotal.value;
   if (total <= 0) return [];
@@ -123,7 +118,6 @@ const barSegments = computed(() => breakdownRows.value.map(row => ({
   color: row.color,
 })));
 
-// 摘要：used / window（pct 1 位小数）；window<=0 时按 0% 处理，不产生 NaN
 const summaryText = computed(() => {
   const used = store.tokenUsage.used || 0;
   const win = store.tokenUsage.window || 0;
@@ -146,9 +140,6 @@ const showCacheRow = computed(() => {
 
 const cachePctText = computed(() => `${Number(store.tokenUsage.cache_session_pct).toFixed(1)}%`);
 
-// 保活命中率已下线（与车道身份行同批）：store/后端字段保留，界面不再展示。
-
-// —— 定位：向上弹出（输入框在底部）、水平对齐锚点并在视口内夹取 ——
 const PANEL_WIDTH = 320;
 const PANEL_GAP = 8;
 const VIEWPORT_PADDING = 12;
@@ -177,7 +168,6 @@ watch(() => props.visible, (visible) => {
   if (visible) positionPanel();
 }, { immediate: true });
 
-// 打开期间视口尺寸变化（窗口缩放/软键盘）重新夹取位置
 function onViewportResize() {
   if (props.visible) positionPanel();
 }
@@ -224,7 +214,6 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize));
   white-space: nowrap;
 }
 
-/* 进度条：高 8px 圆角，fill 表示已用/窗口，内部分段按来源占比着色 */
 .cxp-bar {
   margin-top: 10px;
   height: 8px;

@@ -1,5 +1,3 @@
-"""Windows 接入层；执行依赖仅在相应方法调用时导入。"""
-
 import os
 import shutil
 
@@ -27,7 +25,6 @@ class WindowsPlatformAdapter:
         executable = shutil.which(executable_name)
         if executable:
             return executable
-        # 同一浏览器依次检查原有安装位置，不跨浏览器或跨平台替换。
         for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
             root = os.environ.get(env_name)
             if root:

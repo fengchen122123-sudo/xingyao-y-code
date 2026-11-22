@@ -1,5 +1,3 @@
-"""第三批高吞吐执行、代码理解升级与编排减负的回归测试。"""
-
 from __future__ import annotations
 
 import json
@@ -13,7 +11,6 @@ from core.tools import SubagentManager, list_directory, search_code
 
 
 def test_list_directory_markers_and_tree_depth(tmp_path, monkeypatch):
-    """list_directory 支持目录 '/' 标注与 depth>1 树状展开并忽略噪音目录。"""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "sub.py").write_text("x = 1\n", encoding="utf-8")
@@ -33,13 +30,11 @@ def test_list_directory_markers_and_tree_depth(tmp_path, monkeypatch):
 
 
 def test_search_code_modes_glob_case_and_python_fallback(tmp_path, monkeypatch):
-    """search_code 支持 output_mode(content/files/count)、glob 与区分大小写。"""
     monkeypatch.chdir(tmp_path)
     tool_cache.clear_all()
     (tmp_path / "a.py").write_text("TargetFunc()\ntargetfunc()\nTargetFunc()\n", encoding="utf-8")
     (tmp_path / "b.md").write_text("TargetFunc in docs\n", encoding="utf-8")
 
-    # 强制走 Python 回退分支覆盖两者等价性
     monkeypatch.setattr("core.tools._get_rg_executable", lambda: None)
 
     files_out = search_code("TargetFunc", dir_path=str(tmp_path), glob="*.py", output_mode="files")
@@ -58,7 +53,6 @@ def test_search_code_modes_glob_case_and_python_fallback(tmp_path, monkeypatch):
 
 
 def test_lsp_get_outline_and_find_references(tmp_path, monkeypatch):
-    """get_outline 提取类/方法签名行号，find_references 按整词查找全仓引用。"""
     monkeypatch.chdir(tmp_path)
     tool_cache.clear_all()
 
@@ -86,7 +80,6 @@ def test_lsp_get_outline_and_find_references(tmp_path, monkeypatch):
     assert "def start(self, port)" in outline
     assert "async def run_helper(x)" in outline
 
-    # 关闭 rg 验证内置回退也可准确整词匹配
     monkeypatch.setattr(lsp, "_get_rg_executable", lambda: "nonexistent-rg-bin")
     refs = lsp.find_references("run_helper", dir_path=str(tmp_path))
     assert "service.py:5" in refs
@@ -96,7 +89,6 @@ def test_lsp_get_outline_and_find_references(tmp_path, monkeypatch):
 
 
 def test_subagent_implement_and_review_inherit_primary_model(monkeypatch):
-    """implement/review/general 子代理默认不降级 secondary；explore/test 可用 secondary。"""
     import core.tools as tools_mod
 
     recorded_calls = []
@@ -127,7 +119,6 @@ def test_subagent_implement_and_review_inherit_primary_model(monkeypatch):
 
 
 def test_completed_test_subagent_satisfies_verification_claim_guard(mocker):
-    """写文件后委派 subagent_type='test' 完成验证，收尾声称测试通过不应再误报警。"""
     from core.llm import chat_with_model_events
 
     def _chunk(content="", tool_calls=None):
@@ -181,7 +172,6 @@ def test_completed_test_subagent_satisfies_verification_claim_guard(mocker):
 
 
 def test_finish_reason_length_runs_safe_readonly_calls_only(mocker):
-    """finish_reason=='length' 时只安全执行完整只读调用，写调用与尾截断调用仍拦截。"""
     import core.llm as llm_mod
 
     def _chunk(content="", tool_calls=None, finish_reason=None):
@@ -251,7 +241,6 @@ def test_finish_reason_length_runs_safe_readonly_calls_only(mocker):
 
 
 def test_pooled_daemon_call_restores_tls_and_thread_name():
-    """线程池复用期间不泄漏线程本地 session，且保持 'ycode-tool-call' 线程名契约。"""
     import threading
 
     app_context.set_thread_session("sess-A")
@@ -274,7 +263,6 @@ def test_pooled_daemon_call_restores_tls_and_thread_name():
 
 
 def test_http2_enabled_helper(monkeypatch):
-    """_http2_enabled 在安装 h2 时开启，且尊重 YCODE_HTTP2=0 开关。"""
     monkeypatch.delenv("YCODE_HTTP2", raising=False)
     assert _http2_enabled() is True
     monkeypatch.setenv("YCODE_HTTP2", "0")

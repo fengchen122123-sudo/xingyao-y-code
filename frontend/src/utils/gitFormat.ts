@@ -14,9 +14,6 @@ export function splitGitPath(rawPath: string): { name: string; dir: string } {
   };
 }
 
-/**
- * 格式化 Git 提交时间（Unix 秒）为易读的相对时间或日期。
- */
 export function formatRelativeCommitTime(
   unixSeconds: number,
   nowSeconds: number = Math.floor(Date.now() / 1000),
@@ -34,9 +31,6 @@ export function formatRelativeCommitTime(
   return `${y}-${m}-${day}`;
 }
 
-/**
- * 统计 Diff 中的新增与删除行数，用于在弹窗头展示概览角标。
- */
 export function countDiffStats(diff: GitDiffDto | null): { added: number; deleted: number } {
   if (!diff || diff.is_binary || !Array.isArray(diff.hunks)) {
     return { added: 0, deleted: 0 };

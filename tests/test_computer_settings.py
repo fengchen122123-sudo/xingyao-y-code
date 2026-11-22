@@ -1,5 +1,3 @@
-"""电脑操控设置（core/computer/settings.py）的严格行为测试。"""
-
 import json
 import os
 import sys
@@ -23,9 +21,6 @@ from core.computer.settings import (
     set_computer_control_enabled,
 )
 from tests.computer_fakes import use_temp_config
-
-
-# ---------------- brief 样例（逐字） ----------------
 
 
 def test_missing_computer_settings_are_safe_defaults(tmp_path, monkeypatch):
@@ -62,9 +57,6 @@ def test_disable_persists_and_increments_generation_before_stop(tmp_path, monkey
     assert get_settings_generation() == before + 1
 
 
-# ---------------- 补充：默认值与损坏配置 ----------------
-
-
 def test_invalid_config_error_code_is_stable(tmp_path, monkeypatch):
     use_temp_config(tmp_path, monkeypatch, {"browser_control_enabled": 1})
     with pytest.raises(ComputerControlError) as exc_info:
@@ -99,7 +91,6 @@ def test_snapshot_exposes_static_fields_without_runtime_state(tmp_path, monkeypa
     use_temp_config(tmp_path, monkeypatch, {})
     snapshot = load_computer_settings()
     assert isinstance(snapshot.browser_options, tuple)
-    # embedded = GUI 内置 WebView2（CDP 直连），与外部浏览器并列可选项
     assert {option.browser for option in snapshot.browser_options} == {
         "edge",
         "chrome",
@@ -115,9 +106,6 @@ def test_non_win32_platform_is_not_supported(tmp_path, monkeypatch):
     use_temp_config(tmp_path, monkeypatch, {})
     snapshot = load_computer_settings(platform="linux")
     assert snapshot.platform_supported is False
-
-
-# ---------------- 补充：setter 语义 ----------------
 
 
 def test_setter_rejects_non_bool_value(tmp_path, monkeypatch):
@@ -181,9 +169,6 @@ def test_browser_change_persists_and_bumps_generation(tmp_path, monkeypatch):
     assert get_settings_generation() == before + 1
 
 
-# ---------------- 补充：profile 路径隔离与逃逸防护 ----------------
-
-
 def test_profile_dirs_are_isolated_per_browser(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "YCODE_DIR", str(tmp_path))
     edge_dir = get_browser_profile_dir("edge")
@@ -210,9 +195,6 @@ def test_snapshot_profile_path_uses_ycode_dir_string_safely(tmp_path, monkeypatc
     snapshot = load_computer_settings()
     expected = (Path(str(tmp_path)) / "browser-profiles" / "chrome").resolve()
     assert snapshot.profile_display_path == str(expected)
-
-
-# ---------------- 补充：浏览器探测不 fallback ----------------
 
 
 def _patch_no_explicit_installs(monkeypatch):
@@ -274,9 +256,6 @@ def test_browser_option_to_dict_shape(monkeypatch):
     assert option["available"] is False
 
 
-# ---------------- embedded（内置浏览器）与项目视口 ----------------
-
-
 def test_embedded_browser_option_detected_without_executable(tmp_path, monkeypatch):
     use_temp_config(tmp_path, monkeypatch, {})
     options = {option.browser: option for option in list_browser_options(platform="win32")}
@@ -286,9 +265,6 @@ def test_embedded_browser_option_detected_without_executable(tmp_path, monkeypat
 
 
 def test_get_browser_profile_dir_embedded_matches_panel_profile(tmp_path, monkeypatch):
-    """embedded 的 profile 目录 = 面板 WebView2 控件（自动化也接管它）的
-    UserDataFolder：面板控件从创建起就带 CDP 端口，两套共用一个 profile，
-    不再有 0x8007139F 所迫的分离。"""
     use_temp_config(tmp_path, monkeypatch, {})
     from core.embedded_browser import profile_dir
 
@@ -296,7 +272,6 @@ def test_get_browser_profile_dir_embedded_matches_panel_profile(tmp_path, monkey
 
 
 def test_process_default_browser_only_affects_missing_key(tmp_path, monkeypatch):
-    """GUI 注入的进程默认值只影响「配置缺省」；显式配置与 CLI 回落不变。"""
     import core.computer.settings as settings_module
 
     use_temp_config(tmp_path, monkeypatch, {})
@@ -323,13 +298,10 @@ def test_project_viewport_roundtrip_clamp_and_defaults(tmp_path):
 
     workdir = tmp_path / "proj"
     workdir.mkdir()
-    # 未设置回落默认
     assert get_project_browser_viewport(str(workdir)) == (1440, 900)
-    # None（GLOBAL 自由会话）同样回落默认
     assert get_project_browser_viewport(None) == (1440, 900)
     assert set_project_browser_viewport(str(workdir), 375, 667) == (375, 667)
     assert get_project_browser_viewport(str(workdir)) == (375, 667)
-    # 越界值夹取到合法域
     assert set_project_browser_viewport(str(workdir), 50, 9000) == (120, 8192)
 
 

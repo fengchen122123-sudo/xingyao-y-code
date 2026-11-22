@@ -17,13 +17,8 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
-// 代码块模式：renderMarkdown 提取与 findCodeBlockRanges 共用同一 pattern，
-// 保证切分器与渲染器对「代码块范围」的判定完全一致。
-// 围栏后的换行允许 \r：Windows 剪贴板/工具输出常带 CRLF，只匹配 \n 会导致
-// 整块围栏（含 mermaid 图）识别不到，被当作纯文本显示。
 const CODE_BLOCK_PATTERN = '```(\\w*)\\r?\\n([\\s\\S]*?)```';
 
-/** 返回所有已闭合代码块的 [start, end) 字符范围。 */
 export function findCodeBlockRanges(source: string): Array<[number, number]> {
   if (!source) return [];
   const ranges: Array<[number, number]> = [];
@@ -46,23 +41,14 @@ export function sanitizeHref(href: string): string {
   return '#';
 }
 
-// 本地文件路径链接：href 用 # 阻止默认跳转，真实路径放 data-file-link 属性，
-// 由 MessageBubble 的点击委托捕获后走内嵌预览。
 function fileLinkHtml(path: string): string {
   return `<a href="#" data-file-link="${escapeHtml(path)}" data-file-local="1">${escapeHtml(path)}</a>`;
 }
 
-// ---------------------------------------------------------------------------
-// 媒体语法（图片/视频）：与 core/media_refs.py 保持同构，前后端 ordinal 对齐
-// 图片 ![caption](path)；视频 [video: caption](path) / [视频：caption](path)。
-// 组 1/2 = 图片 caption/path；组 3/4 = 视频 caption/path。
-// ---------------------------------------------------------------------------
 const MEDIA_SYNTAX_RE = /!\[([^\]]*)\]\(([^)\s]+)\)|\[(?:video|视频)[ \t]*[:：][ \t]*([^\]]*)\]\(([^)\s]+)\)/gi;
 
 const REMOTE_LINK_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 
-// 本地媒体路径判定：与后端 media_refs._is_local_media_path 同规则。
-// 远程 URL 不是媒体项、不占 ordinal（渲染为普通链接，防 SSRF）。
 function isLocalMediaPath(path: string): boolean {
   const s = (path || '').trim();
   if (!s || /[\s<>"'`]/.test(s)) return false;
@@ -77,7 +63,6 @@ export const COPY_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
 export const CHECK_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
-// "另存为"按钮的下载图标（同上，v-html 内联）
 export const SAVE_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>';
 
@@ -104,9 +89,6 @@ function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): strin
       + `</span>`;
   }
   const alt = caption || item.caption || item.source_name || '图片';
-  // 悬停浮现操作区：src 放 data 属性，点击经 MessageBubble 事件委托处理。
-  // 两个按钮共用 .md-img-actions 容器（各自绝对定位会互相重叠）；
-  // data-save-name 是另存为的默认文件名建议（后端会清理并补真实扩展名）。
   return `<span class="md-media-wrap">`
     + `<img class="md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-media-ordinal="${ordinal}" loading="lazy">`
     + `<span class="md-img-actions">`
@@ -116,9 +98,6 @@ function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): strin
     + `</span>`;
 }
 
-// mermaid 块的渲染缓存 key：源码的 FNV-1a 哈希 + 长度。只用于缓存去重，
-// 不是安全边界（源码在展示前仍会转义）。流式期间同一段源码的 key 保持
-// 稳定，v-html 整体重建 DOM 后可凭 key 直接命中已渲染的 SVG。
 export function mermaidCacheKey(code: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < code.length; i++) {
@@ -140,17 +119,12 @@ export function renderMarkdownDetailed(
   if (!md) return { html: '', mediaCount: 0 };
   let text = md;
 
-  // 占位符用 Unicode 私有区字符包裹：早期版本用 ___CODE_BLOCK_0___ 这种
-  // 下划线格式，会被后面的粗体正则 __(.*?)__ 改写成 <strong>…</strong>，
-  // 导致还原 replace 找不到占位符，正文里直接漏出 _INLINE_CODE_0_ 残片。
   const PH = '\uE000';
 
-  // 1. 保护代码块 ```code```（块内容单独转义后直接生成安全 HTML 片段）
   const codeBlocks: string[] = [];
   const fileLinks: string[] = [];
   const links: string[] = [];
   text = text.replace(new RegExp(CODE_BLOCK_PATTERN, 'g'), (_, lang, rawCode) => {
-    // CRLF 归一化：行尾残留的 \r 会被当成源码内容送进 mermaid 解析器
     const code = String(rawCode ?? '').replace(/\r\n?/g, '\n');
     const idx = codeBlocks.length;
     // mermaid 块：renderMarkdown 保持纯同步——这里只产出带缓存 key 的占位
@@ -210,7 +184,6 @@ export function renderMarkdownDetailed(
     return `${PH}MD${idx}${PH}`;
   });
 
-  // 3. 显式链接 [label](url)：本地文件路径 → 可点击预览；否则走 http/https/mailto 白名单
   text = text.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, label, url) => {
     const idx = links.length;
     if (isLocalFileLink(url)) {
@@ -222,10 +195,6 @@ export function renderMarkdownDetailed(
     return `${PH}L${idx}${PH}`;
   });
 
-  // 4. 裸路径识别：此时代码块/行内代码/显式链接均已占位，只在剩余纯文本上匹配，
-  //    命中后用 isLocalFileLink 二次过滤（正则尾段会匹配到 1.2 / foo.bar 等，靠白名单排除）
-  // 排除字符含中文标点：中文语境下模型常在路径后紧跟「，。；」等，
-  // 不排除会被贪婪匹配吞进路径，导致拼出的磁盘路径不存在
   const LOCAL_PATH_RE = /(?:file:\/\/[^\s<>\"'`()，。；：、！？（）【】《》“”‘…—·]+|[A-Za-z]:[\\/][^\s<>\"'`()，。；：、！？（）【】《》“”‘…—·]+|\.{1,2}[\\/][^\s<>\"'`()，。；：、！？（）【】《》“”‘…—·]+|[^\s<>\"'`()，。；：、！？（）【】《》“”‘…—·]+[\\/][^\s<>\"'`()，。；：、！？（）【】《》“”‘…—·]*\.[A-Za-z0-9]+|[A-Za-z0-9_\-]+\.[A-Za-z0-9]+)/g;
   text = text.replace(LOCAL_PATH_RE, (m) => {
     if (!isLocalFileLink(m)) return m;
@@ -234,25 +203,18 @@ export function renderMarkdownDetailed(
     return `${PH}FL${idx}${PH}`;
   });
 
-  // 5. 关键修复：转义剩余的全部文本，再叠加标记。
-  //    此步之后，文本中原有的 <, >, &, ", ' 均已变为安全实体，
-  //    后续所有正则只会在“已转义”的文本上叠加真正的标签。
   text = escapeHtml(text);
 
-  // 6. 标题（# / ## / ###，井号不会被转义，故可在转义后继续匹配）
   text = text.replace(/^### (.*)$/gim, '<h4>$1</h4>');
   text = text.replace(/^## (.*)$/gim, '<h3>$1</h3>');
   text = text.replace(/^# (.*)$/gim, '<h2>$1</h2>');
 
-  // 6.5 分割线 --- 或 ***
   text = text.replace(/^(?:---|\*\*\*)$/gim, '<hr>');
 
-  // 6. 粗体、斜体
   text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
   text = text.replace(/__(.*?)__/g, '<strong>$1</strong>');
   text = text.replace(/\*(.*?)\*/g, '<em>$1</em>');
 
-  // 7. 逐行处理表格 / 列表 / 引用块 / 段落
   const lines = text.split('\n');
   type Mode = 'ul' | 'ol' | 'bq' | null;
   let mode: Mode = null;
@@ -265,7 +227,6 @@ export function renderMarkdownDetailed(
     mode = null;
   };
 
-  // GFM 表格：行以 | 开始结束；第二行是分隔行 |---|---|（允许 :---: 对齐标记）
   const isTableRow = (l: string) => {
     const t = l.trim();
     return t.length > 1 && t.startsWith('|') && t.endsWith('|');
@@ -282,11 +243,10 @@ export function renderMarkdownDetailed(
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // 表格块：表头行 + 分隔行 + 若干数据行
     if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
       closeMode();
       const headerCells = splitRow(line);
-      i++; // 跳过分隔行
+      i++;
       const bodyRows: string[][] = [];
       while (i + 1 < lines.length && isTableRow(lines[i + 1])) {
         i++;
@@ -323,7 +283,6 @@ export function renderMarkdownDetailed(
       closeMode();
       const trimmed = line.trim();
       if (trimmed === '') {
-        // 空行忽略
       } else if (!trimmed.startsWith('<h') && !trimmed.startsWith(`${PH}CB`)) {
         resultLines.push(`<p>${line}</p>`);
       } else {

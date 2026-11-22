@@ -1,23 +1,3 @@
-"""角色库（ycode.db ``characters`` / ``character_refs`` / ``character_generation_records``）。
-
-P2「角色库与角色带入」的数据层：角色档案（外貌锚点句 + 画风约束 + 可选 seed）、
-参考图（front/side/outfit/style 四类，内容寻址 digest + 项目相对路径，主参考
-每角色仅一张）、生成台账（每次带角色生成的 prompt/参数/参考图快照/费用/产物
-路径，保证旧镜头可复现统计）。
-
-设计要点：
-- 沿用 core/workflows/runs.py 的 DAO 模式：持有 MemoryManager，复用其连接与
-  可重入锁；进程级句柄经 ``init_character_storage(manager)`` 注入
-  （gui_bridge 启动时），未注入（CLI/headless/测试）时 ``get_character_storage()``
-  返回 None，桥层 best-effort 降级为「角色库不可用」提示，绝不起死库。
-- 新增表不算 schema_version 变更：CREATE TABLE IF NOT EXISTS 幂等建表，与
-  harness/工作流等既有新增表同一口径；不触碰既有表的 schema_version。
-- 主参考唯一性在 DB 层兜底：SQLite 部分唯一索引（WHERE is_primary = 1）保证
-  每角色最多一行主参考；替换主参考由 add_ref 在同一事务里先清旧行再插新行。
-- character_ref_snapshot 只存 digest 列表：角色档案后续增删参考图不影响旧
-  镜头的复现口径（内容寻址仓库按 digest 永远能取回当时的字节）。
-"""
-
 from __future__ import annotations
 
 import json
@@ -29,10 +9,8 @@ from typing import Any, Optional
 
 logger = logging.getLogger("ycode.character")
 
-#: 参考类型白名单：正面 / 侧面 / 服装 / 风格。桥层入口与 UI 下拉共用这一份。
 CHARACTER_REF_TYPES = ("front", "side", "outfit", "style")
 
-#: 参考类型的中文文案（UI 提示与桥层错误信息用；顺序与 CHARACTER_REF_TYPES 一致）
 REF_TYPE_LABELS = {
     "front": "正面",
     "side": "侧面",
@@ -40,10 +18,8 @@ REF_TYPE_LABELS = {
     "style": "风格",
 }
 
-#: 生成类型白名单：定妆图（image）/ 镜头视频（video）
 GENERATION_KINDS = ("image", "video")
 
-#: OSS 直传 URL 的保守时效：平台签名约 60 分钟，留 10 分钟余量
 OSS_URL_MAX_AGE_SECONDS = 50 * 60
 
 _TABLE_DDL = (
@@ -142,11 +118,6 @@ def ref_type_label(ref_type: str) -> str:
 
 
 def oss_url_still_fresh(url: str | None, saved_at_ms: Any = None) -> bool:
-    """OSS 直传 URL 是否仍在保守时效内（约 60 分钟签名，留 10 分钟余量）。
-
-    saved_at_ms 缺失/非法一律按过期处理：宁可回落 ¥0.2 重绘，也不把一张
-    过期签名图喂给视频接口（400 白跑一趟还不退钱的话就是纯损失）。
-    """
     url = str(url or "").strip()
     if not url.lower().startswith("https://"):
         return False
@@ -155,22 +126,11 @@ def oss_url_still_fresh(url: str | None, saved_at_ms: Any = None) -> bool:
     except (TypeError, ValueError):
         return False
     if age < 0:
-        # 时钟回拨容忍：saved_at 比当前时间还新就当刚保存
         return True
     return age <= OSS_URL_MAX_AGE_SECONDS
 
 
 def compose_character_prompt(shot: str, character: dict) -> str:
-    """镜头描述 + 角色固定外貌句 + 画风约束的拼装（纯函数）。
-
-    拼装口径（图像/视频两阶段共用；真跑脚本与桥层必须用同一份，避免两处口径漂移）：
-    1. 用户写的镜头描述原样置顶——模型对开头句的服从度最高；
-    2. 【角色】块放 name + prompt_fragment（外貌锚点句），缺失时回落 description；
-    3. 【画风】块放 style_tags（逗号分隔即可读），为空则整个块不拼。
-
-    注意 prompt_fragment 里用户自己写的是「同一角色必须保持的固定特征」，不是
-    逐镜头描述；生成记录里 prompt 与 final_prompt 都落库，两者差值即注入量。
-    """
     shot = str(shot or "").strip()
     name = str((character or {}).get("name") or "").strip()
     fragment = str((character or {}).get("prompt_fragment") or "").strip()
@@ -214,8 +174,6 @@ class CharacterStorage:
             for ddl in _TABLE_DDL:
                 cursor.execute(ddl)
             self.conn.commit()
-
-    # -- 角色 --
 
     def create_character(
         self,
@@ -270,7 +228,7 @@ class CharacterStorage:
         description: Optional[str] = None,
         prompt_fragment: Optional[str] = None,
         style_tags: Optional[str] = None,
-        seed=...,  # sentinel：None 是合法值（清除），不传才是不改
+        seed=...,
     ) -> Optional[dict]:
         """局部更新；None 表示不改该字段（seed 用 ... 哨兵区分「不改」与「清除」）。"""
         cid = int(character_id or 0)
@@ -334,8 +292,6 @@ class CharacterStorage:
                 owner["refs"].append(ref)
         return characters
 
-    # -- 参考图 --
-
     def add_ref(
         self,
         character_id: int,
@@ -349,11 +305,6 @@ class CharacterStorage:
         source_node_id: str = "",
         is_primary: bool = False,
     ) -> dict:
-        """落一条参考；is_primary=True 时同一事务里先清掉旧主参考再插（部分唯一索引兜底）。
-
-        返回 {"ref": {...}, "replaced_primary": bool}——replaced_primary 给桥层
-        做「主参考图已替换」提示用。
-        """
         cid = int(character_id or 0)
         ref_type = str(ref_type or "").strip()
         digest = str(media_digest or "").strip()
@@ -428,8 +379,6 @@ class CharacterStorage:
         """项目相对路径 → 绝对路径（只在读取侧拼，库里的 rel_path 永远随项目走）。"""
         return os.path.join(str(workdir or ""), str((ref or {}).get("rel_path") or ""))
 
-    # -- 生成台账 --
-
     def record_generation(self, record: dict) -> int:
         """落一条生成记录（成功/失败都落，cost_cny 可为 NULL）。返回记录 id。"""
         kind = str(record.get("kind") or "").strip()
@@ -481,8 +430,6 @@ class CharacterStorage:
                 ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
-    # -- 行映射 --
-
     @staticmethod
     def _row_to_character(row) -> Optional[dict]:
         if not row:
@@ -519,8 +466,6 @@ class CharacterStorage:
                 values[target] = {} if key == "params_json" else []
         return values
 
-
-# -- 进程级句柄（gui_bridge 启动时注入；未注入时桥层降级提示）--
 
 _storage: Optional[CharacterStorage] = None
 

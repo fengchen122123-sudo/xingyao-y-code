@@ -1,8 +1,3 @@
-"""LAN 与云中转共用的事件序号缓冲。
-
-缓冲里只有事件 JSON。用户正文、工具参数和凭据仍然只活在会话库里。
-"""
-
 from __future__ import annotations
 
 import json

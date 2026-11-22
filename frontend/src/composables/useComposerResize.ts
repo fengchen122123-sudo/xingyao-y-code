@@ -1,27 +1,19 @@
 import { getCurrentInstance, onMounted, ref, type Ref } from 'vue';
 
-// 持久化键：与 appStore 的 'ycode-*' 前缀约定一致
 export const COMPOSER_HEIGHT_KEY = 'ycode-composer-height';
 
 // textarea 默认 rows=2、字号 14、行高 1.65 ≈ 46px；
 // jsdom / 隐藏状态下 offsetHeight 量不到，用该常量兜底
 export const DEFAULT_MIN_TEXTAREA_HEIGHT = 46;
-// 拉高后仍要给对话区留出空间：输入框最高约占据口高度的 60%
 export const MAX_VIEWPORT_RATIO = 0.6;
-// 小窗口下 60% 可能太矮，保证至少能再拉开约 3 行
 export const MIN_EXPAND_DELTA = 70;
 
-/** 限制在 [min, max] 区间内 */
 export function clampComposerHeight(height: number, min: number, max: number): number {
   const lo = Math.min(min, max);
   const hi = Math.max(min, max);
   return Math.min(Math.max(Math.round(height), lo), hi);
 }
 
-/**
- * 由拖拽起止点算出目标高度：向上拖（clientY 变小）抬高输入框，
- * 向下拖压回默认高度即为下限，不再更矮。
- */
 export function dragTargetHeight(
   startClientY: number,
   currentClientY: number,
@@ -32,15 +24,10 @@ export function dragTargetHeight(
   return clampComposerHeight(startHeight - (currentClientY - startClientY), min, max);
 }
 
-/** 拉伸上限：窗口高度的 60%，且至少比默认高 MIN_EXPAND_DELTA */
 export function composerMaxHeight(min: number, viewportHeight = window.innerHeight): number {
   return Math.max(min + MIN_EXPAND_DELTA, Math.round(viewportHeight * MAX_VIEWPORT_RATIO));
 }
 
-/**
- * 恢复上次记忆的高度：小于默认视为未拉伸（默认即最低），超出当前窗口
- * 允许上限则夹回；无效存储一律按未拉伸处理。
- */
 export function computeRestoredHeight(
   stored: string | null,
   min: number,
@@ -53,29 +40,15 @@ export function computeRestoredHeight(
 }
 
 export interface ComposerResizeApi {
-  /** textarea 显式高度（px）；null 表示未拉伸、走默认 rows=2 高度 */
   textareaHeight: Ref<number | null>;
-  /** 拖拽进行中（手柄据此高亮，并给根节点加 user-select 保护） */
   isResizing: Ref<boolean>;
-  /** 绑定到手柄的 pointerdown */
   onHandlePointerdown: (e: PointerEvent) => void;
-  /** 绑定到手柄的 dblclick：恢复默认高度并清除记忆 */
   resetHeight: () => void;
 }
 
-/**
- * 输入框高度拖拽调节：
- * - 最小高度 = textarea 当前默认渲染高度（即"现在的设置"，不可压得更矮）
- * - 最大高度 = 窗口高度的 60%（小窗口保底默认+70px）
- * - 松手后写入 localStorage，下次进入自动恢复（按当时窗口重新夹取）
- */
-// getTextarea 只用到 offsetHeight，富文本编辑器同样满足，故按 HTMLElement 收
 export function useComposerResize(getTextarea: () => HTMLElement | null): ComposerResizeApi {
   const textareaHeight = ref<number | null>(null);
   const isResizing = ref(false);
-  // 下限（默认未拉伸高度）只在首次测量成功时锁定一次。拉伸后 textarea 的
-  // offsetHeight 就是当前拉伸值，若每次按下都重新测量，下限会跟着抬高，
-  // 表现为"拉上去之后就再也拖不下来了"。
   let measuredMin: number | null = null;
 
   function minLimit(): number {
@@ -110,18 +83,16 @@ export function useComposerResize(getTextarea: () => HTMLElement | null): Compos
     const minH = minLimit();
     const maxH = composerMaxHeight(minH);
     const startY = e.clientY;
-    // 起始高度取真实渲染值：无论此前是默认态还是已拉伸态都可继续拖
     const startHeight = el.offsetHeight > 0 ? el.offsetHeight : minH;
     const handle = e.currentTarget as HTMLElement;
-    // pointer capture 让指针移出手柄/窗口后仍持续收到 move（jsdom 无此实现）
-    try { handle.setPointerCapture?.(e.pointerId); } catch { /* 忽略 */ }
+    try { handle.setPointerCapture?.(e.pointerId); } catch { }
     isResizing.value = true;
 
     const onMove = (ev: PointerEvent) => {
       textareaHeight.value = dragTargetHeight(startY, ev.clientY, startHeight, minH, maxH);
     };
     const onUp = (ev: PointerEvent) => {
-      try { handle.releasePointerCapture?.(ev.pointerId); } catch { /* 忽略 */ }
+      try { handle.releasePointerCapture?.(ev.pointerId); } catch { }
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onUp);
@@ -131,7 +102,6 @@ export function useComposerResize(getTextarea: () => HTMLElement | null): Compos
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
-    // 阻止手柄上的拖拽演变为文本选择
     e.preventDefault();
   }
 

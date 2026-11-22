@@ -1,5 +1,3 @@
-"""porcelain v2 解析与操作状态检测测试（规格 §5.2/§14/§17.1）。"""
-
 from pathlib import Path
 
 from core.git.query import (
@@ -15,8 +13,6 @@ from core.git.runner import GitRunner
 from tests.git_fixtures import make_commit, make_repo, run_git
 
 
-# ---------------------------------------------------------------- 合成字节表驱动
-
 def test_parse_branch_headers_and_untracked():
     raw = (
         b"# branch.oid abc123\x00"
@@ -25,7 +21,7 @@ def test_parse_branch_headers_and_untracked():
         b"# branch.ab +2 -1\x00"
         b"# stash 3\x00"
         b"? u1.txt\x00"
-        b"? \xe4\xb8\xad\xe6\x96\x87 \xe6\x96\x87\xe4\xbb\xb6.txt\x00"  # "中文 文件.txt"
+        b"? \xe4\xb8\xad\xe6\x96\x87 \xe6\x96\x87\xe4\xbb\xb6.txt\x00"
     )
     status = parse_status_v2(raw)
     assert status.head_oid == "abc123"
@@ -61,7 +57,6 @@ def test_parse_changed_entries_with_special_paths():
 
 
 def test_parse_rename_entry_path_then_orig_path():
-    # 字节格式经真实仓库实验核对：score 后 path\0origPath\0
     raw = (
         b"# branch.oid a\x00# branch.head main\x00"
         b"2 R. N... 100644 100644 100644 h1 h2 R60 "
@@ -102,8 +97,6 @@ def test_staged_unstaged_grouping():
     assert [e.path for e in status.unstaged] == ["both.txt", "only-wt.txt"]
 
 
-# ---------------------------------------------------------------- 真实仓库
-
 def test_fetch_status_real_repo_roundtrip(tmp_path):
     repo = make_repo(tmp_path, commits=1)
     (repo / "中文 目录").mkdir()
@@ -135,7 +128,6 @@ def test_ahead_behind_real_repo(tmp_path):
     run_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD~0")
     make_commit(repo, "extra")
     run_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD~1")
-    # upstream 需要 remote.origin 配置 + 跟踪分支，git 才输出 branch.upstream/ab
     run_git(repo, "config", "remote.origin.url", "https://example.com/probe.git")
     run_git(repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
     run_git(repo, "branch", "-u", "origin/main", "main")
@@ -144,8 +136,6 @@ def test_ahead_behind_real_repo(tmp_path):
     assert status.upstream == "origin/main"
     assert status.ahead == 1 and status.behind == 0
 
-
-# ---------------------------------------------------------------- 操作状态检测
 
 def test_detect_operation_merge_and_rebase(tmp_path):
     repo = make_repo(tmp_path, commits=1)
@@ -156,7 +146,6 @@ def test_detect_operation_merge_and_rebase(tmp_path):
         OperationPhase.NONE,
     )
 
-    # MERGE_HEAD 模拟 merge 进行中
     (Path(identity.git_dir) / "MERGE_HEAD").write_text("abc\n", encoding="utf-8")
     assert detect_operation_state(runner, identity, False) == (
         OperationKind.MERGE,
@@ -168,7 +157,6 @@ def test_detect_operation_merge_and_rebase(tmp_path):
     )
     (Path(identity.git_dir) / "MERGE_HEAD").unlink()
 
-    # rebase-merge 目录 → rebase；有冲突 = paused_for_conflict，无 = paused_for_edit
     rebase_dir = Path(identity.git_dir) / "rebase-merge"
     rebase_dir.mkdir()
     (rebase_dir / "interactive").write_text("", encoding="utf-8")
@@ -195,7 +183,6 @@ def test_detect_bisect_marked_unsupported(tmp_path):
 
 
 def test_parse_ignored_records_counted():
-    # --ignored=matching 合并进单次扫描后，`!` 记录在解析时计数，其余条目不受影响
     raw = (
         b"# branch.oid a\x00# branch.head main\x00"
         b"1 .M N... 100644 100644 100644 h1 h2 tracked.txt\x00"
@@ -215,7 +202,6 @@ def test_parse_ignored_without_flag_is_zero():
 
 
 def test_strip_ignored_records_byte_fidelity():
-    # 剥离 `!` 记录后须与不带 --ignored 的扫描字节完全一致（worktree_version 材料不变）
     plain = (
         b"# branch.oid a\x00# branch.head main\x00"
         b"1 .M N... 100644 100644 100644 h1 h2 tracked.txt\x00"
@@ -232,7 +218,6 @@ def test_strip_ignored_records_byte_fidelity():
 
 
 def test_strip_ignored_records_keeps_rename_orig_path():
-    # `2` 记录的 <origPath> 是独立 NUL 段，恰好以 "! " 开头也不能被误剥
     raw = (
         b"2 R. N... 100644 100644 100644 h1 h2 R60 new.txt\x00! tricky-orig.txt\x00"
         b"! real-ignored.log\x00"

@@ -1,24 +1,3 @@
-"""回合级学习（学习节流 + 经验抽取 + 落盘）与深度自我演化。
-
-与 ``core.identity_store`` 的关系：本模块只做「编排」——决定何时学习、从
-对话里抽取出结构化学习结果、再交给 identity_store 落盘；所有数据读写、
-字段裁剪、劫持指令过滤都由 identity_store 负责，本模块不重复实现。
-
-设计约束（与 memory_kairos / identity_store 保持一致的安全口径）：
-
-- 数据目录一律按「调用时刻」从 ``config.YCODE_DIR`` 现取，测试用
-  monkeypatch 切换数据目录时必须立刻生效，绝不读写真实 ``~/.ycode``。
-- 模型输出属于不可信数据：抽取结果先经 ``core.memory_kairos.
-  _contains_memory_directive`` 过滤，命中劫持句式的内容整条丢弃；单条
-  文本有 200 字硬上限。
-- 大模型调用方式与 ``core.memory_kairos.run_dream_consolidation_sync``
-  完全一致（``from core.llm import completion`` + model/api_key/messages/
-  timeout/api_base），保证补丁点、测试替换点与真实请求路径统一。
-- 全链路 best-effort：任何异常只记 ``logging.debug`` 并回落默认值，绝不
-  向调用方（GUI/CLI 回合）抛异常——学习失败不能阻断对话。
-- 不引入任何第三方依赖，不联网。
-"""
-
 from __future__ import annotations
 
 import json
@@ -36,46 +15,32 @@ logger = logging.getLogger("ycode.learning")
 # ---------------------------------------------------------------------------
 #: 两次「全局学习」之间的最小间隔（秒）
 GLOBAL_INTERVAL_SECONDS = 600
-#: 同一会话两次「会话学习」之间的最小间隔（秒）
 SESSION_INTERVAL_SECONDS = 1800
-#: 触发一次学习所需的最少新增用户消息数
 MIN_NEW_USER_MESSAGES = 6
-#: 送进模型的对话文本上限（只保留最近的部分）
 MAX_CONTEXT_CHARS = 6000
-#: 单条学习内容（事实/经验/笔记）的字数上限
 MAX_ITEM_CHARS = 200
-#: 单次抽取最多接受的用户事实条数
 MAX_USER_FACTS = 3
-#: 单次抽取最多接受的经验条数
 MAX_LESSONS = 3
-#: 单次抽取最多接受的自我笔记条数
 MAX_SELF_NOTES = 2
 #: 自我演化时 traits 单次最多改动条数（防止人格一夜重写）
 MAX_TRAIT_CHANGES = 2
-#: 自传叙事文本上限
 MAX_NARRATIVE_CHARS = 4000
-#: 模型请求超时（与 Dream 整理一致）
 LLM_TIMEOUT_SECONDS = 60
 
 DEFAULT_STATE = {"last_global_at": 0, "sessions": {}}
 
-#: slug 白名单：只保留小写字母、数字与连字符
 _SLUG_CLEAN_RE = re.compile(r"[^a-z0-9-]+")
 _SLUG_DASH_RE = re.compile(r"-{2,}")
 
 _io_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# 路径与节流状态
-# ---------------------------------------------------------------------------
 def _data_root() -> Path:
-    """按调用时刻读取数据根目录（测试会 monkeypatch config.YCODE_DIR）。"""
-    import config  # 局部导入：确保拿到的是 monkeypatch 之后的最新值
+    import config
 
     try:
         raw = getattr(config, "YCODE_DIR", "") or ""
-    except Exception:  # config 导入异常也不该阻断调用方
+    except Exception:
         raw = ""
     try:
         return Path(str(raw)).expanduser()
@@ -84,11 +49,6 @@ def _data_root() -> Path:
 
 
 def _data_path(*parts) -> Path:
-    """经 identity_store 的统一路径校验解析数据文件路径。
-
-    此前这里自己拼 ``_data_root() / ...``，绕过了 identity_store 的越界校验，
-    同一层模块出现了两套路径口径。identity_store 不可用时回退裸拼接，保证可用。
-    """
     try:
         from core import identity_store as store
 
@@ -101,17 +61,14 @@ def _data_path(*parts) -> Path:
 
 
 def _state_path() -> Path:
-    """节流状态文件路径：<YCODE_DIR>/self/learning_state.json。"""
     return _data_path("self", "learning_state.json")
 
 
 def _narrative_path() -> Path:
-    """自传叙事文件路径：<YCODE_DIR>/self/narrative.md。"""
     return _data_path("self", "narrative.md")
 
 
 def _read_state() -> dict:
-    """读节流状态；文件缺失/坏 JSON/结构异常一律回落默认状态。"""
     default = {"last_global_at": 0, "sessions": {}}
     try:
         raw = _state_path().read_text(encoding="utf-8")
@@ -178,11 +135,6 @@ def _now() -> float:
 
 
 def _should_learn_state(state: dict, session: str, new_user_messages: int) -> bool:
-    """基于已读状态判断是否允许学习（纯函数，供原子占位复用）。
-
-    三个条件必须同时满足：全局间隔 >= 600 秒、同会话间隔 >= 1800 秒、
-    新增用户消息数 >= 6。任何异常都按「不允许学习」处理。
-    """
     try:
         now = _now()
         last_global = float(state.get("last_global_at") or 0)
@@ -211,11 +163,6 @@ def should_learn(session: str, new_user_messages: int) -> bool:
 
 
 def _claim_learning(session: str, new_user_messages: int) -> dict | None:
-    """原子地「检查节流 + 占位」，成功返回占位前状态（供失败回滚）。
-
-    占位即先把 last_global_at / last_at 置为当前时间，让并发线程立刻被拦下；
-    真正的学习没发生（无凭据 / 抽取失败）时用 _release_learning 回滚。
-    """
     try:
         with _io_lock:
             state = _read_state()
@@ -248,7 +195,6 @@ def _claim_learning(session: str, new_user_messages: int) -> dict | None:
 
 
 def _release_learning(session: str, previous: dict | None) -> None:
-    """回滚 _claim_learning 的占位：学习没有真正发生时调用。"""
     if not isinstance(previous, dict):
         return
     try:
@@ -278,7 +224,6 @@ def _release_learning(session: str, previous: dict | None) -> None:
 
 
 def _mark_learned(session: str, user_message_count: int) -> bool:
-    """记录一次成功学习：更新全局时间、会话时间与已消化的消息计数。"""
     try:
         with _io_lock:
             state = _read_state()
@@ -303,21 +248,13 @@ def _mark_learned(session: str, user_message_count: int) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# 文本与 JSON 工具
-# ---------------------------------------------------------------------------
 def _clip(value, limit: int = MAX_ITEM_CHARS) -> str:
-    """裁剪成单行文本并截断到上限；空值返回空串。"""
     text = "" if value is None else str(value)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit]
 
 
 def _clip_block(value, limit: int = MAX_NARRATIVE_CHARS) -> str:
-    """保留段落结构的多行裁剪：只收敛行尾空白与连续空行。
-
-    自传叙事靠分段读；``_clip`` 会把所有空白压成一个空格，段落结构直接没了。
-    """
     text = "" if value is None else str(value)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     collapsed: list[str] = []
@@ -329,7 +266,6 @@ def _clip_block(value, limit: int = MAX_NARRATIVE_CHARS) -> str:
 
 
 def _has_directive(value) -> bool:
-    """递归检查字符串是否命中劫持式指令句式。"""
     try:
         from core.memory_kairos import _contains_memory_directive
     except Exception:
@@ -344,7 +280,6 @@ def _has_directive(value) -> bool:
 
 
 def _sanitize_slug(raw) -> str:
-    """slug 白名单清洗：只保留小写字母数字与连字符，空则返回 ""。"""
     text = "" if raw is None else str(raw).strip().lower()
     if not text:
         return ""
@@ -354,7 +289,6 @@ def _sanitize_slug(raw) -> str:
 
 
 def _extract_json_object(text: str) -> str | None:
-    """从模型输出里取出第一个配平的 ``{...}`` 块。"""
     if not text:
         return None
     start = text.find("{")
@@ -385,7 +319,6 @@ def _extract_json_object(text: str) -> str | None:
 
 
 def _parse_json_payload(reply) -> dict | None:
-    """解析模型输出为 dict：剥代码块包裹 → 取第一个 {...} → json.loads。"""
     if not reply:
         return None
     text = str(reply).strip()
@@ -407,11 +340,6 @@ def _parse_json_payload(reply) -> dict | None:
 
 
 def _flatten_history(history) -> str:
-    """把历史压成纯文本：只保留 user/assistant 的文本块，按时间顺序拼接。
-
-    system、tool、工具结果块一律丢弃（工具输出是数据不是对话，且极易
-    撑爆上下文）。拼接后只保留最近的 ``MAX_CONTEXT_CHARS`` 个字符。
-    """
     chunks = []
     try:
         items = history or []
@@ -433,7 +361,6 @@ def _flatten_history(history) -> str:
                     if isinstance(block, str):
                         parts.append(block)
                     elif isinstance(block, dict):
-                        # 只取文本块：工具调用/工具结果块不含可学习的对话内容
                         if str(block.get("type") or "") not in ("text", ""):
                             continue
                         piece = block.get("text")
@@ -458,7 +385,6 @@ def _flatten_history(history) -> str:
 
 
 def _agent_name() -> str:
-    """当前助手自称（取不到时用默认值）。"""
     try:
         from core.secretary import get_active_agent_name
 
@@ -468,7 +394,6 @@ def _agent_name() -> str:
 
 
 def _call_llm(prompt: str, model: str, api_key: str, api_base=None):
-    """调用大模型（与 core/memory_kairos.py 的 Dream 调用完全一致）。"""
     from core.llm import completion
 
     kwargs = {
@@ -483,9 +408,6 @@ def _call_llm(prompt: str, model: str, api_key: str, api_base=None):
     return response.choices[0].message.content
 
 
-# ---------------------------------------------------------------------------
-# 抽取
-# ---------------------------------------------------------------------------
 _TURN_PROMPT = """你是「{agent}」的成长记录员。请阅读下面这段最近的对话，抽取三类信息。
 
 1. user_facts：关于用户的稳定事实。kind 只能是三种之一：
@@ -507,11 +429,6 @@ _TURN_PROMPT = """你是「{agent}」的成长记录员。请阅读下面这段�
 
 
 def extract_turn_lessons(session, history, model_cfg) -> dict | None:
-    """从一轮对话历史里抽取学习结果。
-
-    返回 ``{"user_facts": [...], "lessons": [...], "self_notes": [...]}``；
-    无 api_key、模型调用失败、JSON 不可解析时返回 None（本函数不做任何写入）。
-    """
     try:
         if not model_cfg:
             return None
@@ -542,7 +459,6 @@ def extract_turn_lessons(session, history, model_cfg) -> dict | None:
 
 
 def _normalize_result(data: dict) -> dict:
-    """裁剪抽取结果：条数上限 + 单条 200 字上限 + 劫持指令过滤。"""
     result = {"user_facts": [], "lessons": [], "self_notes": []}
 
     facts = data.get("user_facts")
@@ -591,11 +507,7 @@ def _normalize_result(data: dict) -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# 落盘
-# ---------------------------------------------------------------------------
 def _merge_unique(old_items, new_items) -> list[str]:
-    """追加去重合并（保序）。"""
     merged = []
     seen = set()
     for item in list(old_items or []) + list(new_items or []):
@@ -608,10 +520,6 @@ def _merge_unique(old_items, new_items) -> list[str]:
 
 
 def apply_learning(result: dict, uid: str | None = None) -> dict:
-    """把抽取结果写入 identity_store，返回本次实际写入条数统计。
-
-    返回 ``{"user_facts": n, "lessons": n, "self_notes": n}``。
-    """
     counts = {"user_facts": 0, "lessons": 0, "self_notes": 0}
     if not isinstance(result, dict):
         return counts
@@ -621,7 +529,6 @@ def apply_learning(result: dict, uid: str | None = None) -> dict:
         logger.debug("导入 identity_store 失败：%s", exc)
         return counts
 
-    # ---- 用户事实 ----
     try:
         facts = result.get("user_facts")
         facts = facts if isinstance(facts, (list, tuple)) else []
@@ -662,7 +569,6 @@ def apply_learning(result: dict, uid: str | None = None) -> dict:
     except Exception as exc:
         logger.debug("写入用户事实失败：%s", exc)
 
-    # ---- 经验教训 ----
     try:
         lessons = result.get("lessons")
         lessons = lessons if isinstance(lessons, (list, tuple)) else []
@@ -681,7 +587,6 @@ def apply_learning(result: dict, uid: str | None = None) -> dict:
     except Exception as exc:
         logger.debug("写入经验教训失败：%s", exc)
 
-    # ---- 自我笔记 ----
     try:
         notes = result.get("self_notes")
         notes = notes if isinstance(notes, (list, tuple)) else []
@@ -709,11 +614,7 @@ def apply_learning(result: dict, uid: str | None = None) -> dict:
     return counts
 
 
-# ---------------------------------------------------------------------------
-# 回合入口
-# ---------------------------------------------------------------------------
 def _count_user_messages(history) -> int:
-    """统计历史中的用户消息条数。"""
     try:
         items = history or []
     except Exception:
@@ -732,7 +633,6 @@ def _count_user_messages(history) -> int:
 
 
 def _resolve_model_cfg(session, model_cfg=None):
-    """拿 (model, api_key, api_base)；取不到返回 None。"""
     if model_cfg:
         try:
             api_model, api_key, api_base = model_cfg
@@ -759,10 +659,6 @@ def _resolve_model_cfg(session, model_cfg=None):
 
 
 def _growth_settings() -> dict:
-    """读成长设置；读失败按「已开启」处理（与 identity_store 的默认值一致）。
-
-    局部导入避免 learning ↔ identity_store 的导入期耦合。
-    """
     try:
         from core import identity_store as store
 
@@ -831,19 +727,14 @@ def run_turn_learning(session, manager, model_cfg=None) -> bool:
         with session_scope:
             resolved = _resolve_model_cfg(session, model_cfg)
             if not resolved:
-                # 无可用凭据：回滚占位，下一轮还能再试
                 _release_learning(session, claim)
                 return False
 
             extracted = extract_turn_lessons(session, history, resolved)
             if not extracted:
-                # 抽取失败（网络/坏 JSON/无凭据）：回滚占位，下一轮可重试
                 _release_learning(session, claim)
                 return False
 
-            # JEV memory_filter：闲时后台过滤一次性噪音记忆，不拖慢前台任务。
-            # 同时在线程上下文与显式参数两层锚定归属会话，防止后台线程在未绑定
-            # thread_session 时落回 UI 当前查看的会话。
             try:
                 from core.task_decision_hooks import filter_extracted_learning
 
@@ -866,9 +757,6 @@ def run_turn_learning(session, manager, model_cfg=None) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# 深度自我演化
-# ---------------------------------------------------------------------------
 _EVOLUTION_PROMPT = """你是「{agent}」的自我模型演化器。请基于已有的自我模型、用户档案、既往经验与自传叙事，给出更新后的自我模型。
 
 只输出严格 JSON，不要任何解释文字，格式如下：
@@ -891,7 +779,6 @@ _EVOLUTION_PROMPT = """你是「{agent}」的自我模型演化器。请基于�
 
 
 def _read_narrative() -> str:
-    """读自传叙事；读不到当空串。"""
     try:
         return _narrative_path().read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -913,13 +800,7 @@ def _write_narrative(text: str) -> bool:
 
 
 def run_self_evolution_sync(api_model, api_key, api_base=None) -> str:
-    """深度自我演化：重新审视自我模型并写回，返回简短中文摘要。
-
-    设置页「启用自我演化」关闭、或无 api_key 时返回 ``"skipped"``；
-    任何异常都不抛出。
-    """
     try:
-        # 与 run_turn_learning 同一条原则：开关关闭后不再调用模型、不再改写自我模型。
         if not _growth_settings().get("enabled", True):
             return "skipped"
         if not api_key or not str(api_key).strip():
@@ -960,7 +841,6 @@ def run_self_evolution_sync(api_model, api_key, api_base=None) -> str:
         if data is None:
             return "自我演化失败：模型输出无法解析为 JSON"
 
-        # ---- traits：合并旧值，单次最多改动 2 条 ----
         old_traits = [str(item) for item in (model.get("traits") or [])]
         raw_traits = data.get("traits")
         raw_traits = raw_traits if isinstance(raw_traits, (list, tuple)) else []
@@ -1004,7 +884,6 @@ def run_self_evolution_sync(api_model, api_key, api_base=None) -> str:
 
         saved = store.save_self_model(patch)
 
-        # ---- 自传叙事 ----
         narrative_text = _clip_block(data.get("narrative"), MAX_NARRATIVE_CHARS)
         narrative_written = False
         if narrative_text and not _has_directive(narrative_text):

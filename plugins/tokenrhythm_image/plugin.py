@@ -1,17 +1,3 @@
-"""tokenrhythm_image：基元律动（TokenRhythm）生图插件入口。
-
-提供两个工具：
-- tokenrhythm_generate_image：文生图（qwen-image-2.0 / wan2.7-image）
-- tokenrhythm_edit_image：图生图（垫图改图，1 张原图 + 文字指令）
-
-密钥安全约定（重要）：本插件不内置、不混淆、不缓存任何 API 密钥明文。
-Key 只在运行时从用户配置读取：遍历 ~/.ycode/config.json 的 providers 列表，
-找 base_url 含 tokenrhythm.studio 的条目，其 api_key 字段为 DPAPI 加密密文
-（"dpapi:" 前缀），经 core.credentials.unprotect_secret 解密后仅存于内存、
-只用于本次请求头 Authorization: Bearer，绝不写回任何文件或日志。
-未配置时工具直接返回配置指引错误，不发起任何请求。
-"""
-
 from __future__ import annotations
 
 import json
@@ -38,7 +24,6 @@ VALID_SIZES = (
 )
 VALID_MODELS = ("qwen-image-2.0", "wan2.7-image")
 
-# 图生图（垫图）限制：最多 1 张、不超过 10MB、jpg/jpeg/png
 _EDIT_MAX_BYTES = 10 * 1024 * 1024
 _EDIT_ALLOWED_EXTS = (".jpg", ".jpeg", ".png")
 
@@ -50,11 +35,6 @@ _NOT_CONFIGURED_MSG = (
 
 
 def _resolve_api_key() -> str:
-    """运行时从用户配置读取基元律动 Key 并解密；失败一律返回空串。
-
-    注意：import config 必须放在函数内部（避免循环导入）。providers 中
-    tokenrhythm 条目的 api_key 是 DPAPI 密文，解密结果不落任何明文文件。
-    """
     try:
         import config  # 函数内导入，避免循环导入
 
@@ -78,7 +58,6 @@ def _resolve_api_key() -> str:
 
 
 def _detect_ext(head: bytes) -> str:
-    """按文件头判断真实图片格式（返回 .jpg / .png，其它归为 .img）。"""
     if head.startswith(b"\xff\xd8\xff"):
         return ".jpg"
     if head.startswith(b"\x89PNG"):
@@ -87,31 +66,18 @@ def _detect_ext(head: bytes) -> str:
 
 
 def _response_format_for(model: str) -> str:
-    """wan2.7-image 让服务端直接回 base64；其余模型沿用 url。"""
     return "b64_json" if model == "wan2.7-image" else "url"
 
 
 def _resolve_save_dir(save_dir: str | None) -> str:
-    """解析图片保存目录：未传 → AI 生成内容目录；显式传值 → 原样尊重。
+    from core.ai_output_paths import resolve_ai_output_save_dir
 
-    未传（None）时统一落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp），
-    不再跟进程 cwd 走；显式传值（含 "."）保持旧行为，不做隐式改道。
-    """
-    if save_dir is None:
-        from core.ai_output_paths import resolve_ai_output_dir
-
-        return str(resolve_ai_output_dir())
-    return os.path.abspath(save_dir or ".")
+    return resolve_ai_output_save_dir(save_dir)
 
 
 def _save_image_bytes(
     payload: bytes, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
 ) -> str:
-    """把图片字节写入本地，扩展名按文件头判断。
-
-    按回合撤销：落盘前先持久化计划 after 快照（插件声明的受控文件修改
-    同样接入 FileMutationRecorder，规格 9.5）。
-    """
     save_dir = _resolve_save_dir(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(
@@ -138,7 +104,6 @@ def _save_image_bytes(
             )
         except TurnUndoError as error:
             if error.code != "no_active_checkpoint":
-                # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
                 raise
             handle = None
         with open(path, "wb") as f:
@@ -149,7 +114,6 @@ def _save_image_bytes(
 
 
 def _download_image(url: str, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
-    """下载 URL 内容后落盘：先写 .part，读完即删，再按文件头确定扩展名。"""
     save_dir = _resolve_save_dir(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     tmp = os.path.join(save_dir, ".tokenrhythm_%s.part" % uuid.uuid4().hex)
@@ -169,7 +133,6 @@ def _download_image(url: str, save_dir: str | None, prefix: str, tool_name: str 
 def _save_b64_image(
     b64: str, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
 ) -> str:
-    """服务端直接回 base64 时解码落盘（wan2.7-image 走这条路径）。"""
     import base64
 
     text = str(b64 or "").strip()
@@ -184,13 +147,6 @@ def _save_b64_image(
 def _save_image_from_result(
     result: dict, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
 ) -> tuple:
-    """从接口响应取图并落盘：优先 data[0].b64_json，其次 data[0].url。
-
-    返回 (本地路径, 错误信息, oss_url)，路径/错误必有一为空。第三个值把响应
-    里的原始 OSS 直链透传给调用方（ToolResult.metadata），桥层拿它做视频生成
-    的直传垫图（省 ¥0.2 重绘）；b64 形态没有 URL，返回空串。URL 只有约
-    60 分钟时效，用户侧始终以本地文件为准。
-    """
     items = result.get("data") or []
     item = items[0] if items else {}
     if not isinstance(item, dict):
@@ -213,7 +169,6 @@ def _save_image_from_result(
     ), ""
 
 def _error_from_http(exc: urllib.error.HTTPError) -> ToolResult:
-    """把 HTTPError 转成带排查提示的错误结果（detail 截前 500 字符）。"""
     try:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
     except Exception:
@@ -235,11 +190,6 @@ def generate_image(
     n: int = 1,
     save_dir: str | None = None,
 ) -> ToolResult:
-    """文生图：POST /v1/images/generations，落盘 data[0].b64_json 或 data[0].url。
-
-    wan2.7-image 请求服务端直接回 base64（response_format=b64_json），
-    其余模型沿用 url；两种形态都能落盘，服务端不按 b64 回时自动兜底下载。
-    """
     prompt = (prompt or "").strip()
     if not prompt:
         return ToolResult("缺少 prompt 参数：请提供图片描述文字。", is_error=True)
@@ -304,7 +254,6 @@ def generate_image(
         "请务必在回复中直接用 Markdown 图片语法展示该图片（无需用户要求，用户可见）："
         "![生成的图片](%s)" % path,
     ]
-    # metadata 只给桥层用（对话路径模型看不到）：OSS 直链供视频生成直传垫图
     return ToolResult(
         "\n".join(lines), changed_files=[path],
         metadata={"oss_url": oss_url, "cost_cny": cost_cny},
@@ -340,7 +289,6 @@ def edit_image(
     if not api_key:
         return ToolResult(_NOT_CONFIGURED_MSG, is_error=True)
 
-    # 手工构造 multipart/form-data body（boundary 写法）
     boundary = "----YCodeBoundary%s" % uuid.uuid4().hex
     lines = []
     for field_name, value in (
@@ -359,7 +307,6 @@ def edit_image(
         lines.append(size)
     response_format = _response_format_for(model)
     if response_format == "b64_json":
-        # wan2.7-image：让服务端直接回 base64，省掉一次 URL 下载
         lines.append("--%s" % boundary)
         lines.append('Content-Disposition: form-data; name="response_format"')
         lines.append("")
@@ -416,26 +363,18 @@ def edit_image(
         "请务必在回复中直接用 Markdown 图片语法展示该图片（无需用户要求，用户可见）："
         "![生成的图片](%s)" % path,
     ]
-    # 与生图同口径：OSS 直链（约 60 分钟时效）走 metadata 给桥层，垫图改图
-    # 固定 ¥0.2/次
     return ToolResult(
         "\n".join(lines), changed_files=[path],
         metadata={"oss_url": oss_url, "cost_cny": 0.2},
     )
 
 
-# ---------------------------------------------------------------------------
-# 工具注册
-# ---------------------------------------------------------------------------
-
 _PERMISSION_KWARGS = dict(
     read_only=False,
-    mutates_files=True,          # 会下载图片写入本地文件
-    requires_permission=True,    # 写操作走用户审批
-    cancellable=True,            # 生图耗时长，允许用户中断
+    mutates_files=True,
+    requires_permission=True,
+    cancellable=True,
     parallel_safe=False,
-    # 规格 03 §3.2 取值表：tokenrhythm_* 生图类工具归 network（发起外部
-    # 网络请求）；两个工具共享本 kwargs，此处统一补全声明（A 阶段评审修复）。
     side_effect_scope="network",
 )
 
