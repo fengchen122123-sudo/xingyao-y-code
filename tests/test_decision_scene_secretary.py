@@ -99,12 +99,11 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable_secretary_scene(*, shadow=False):
+def _enable_secretary_scene():
     return svc.save_decision_config(
         {
             "enabled": True,
-            "shadow_mode": shadow,
-            "scenes": {"secretary": {"enabled": True, "shadow": shadow}},
+            "scenes": {"secretary": {"enabled": True}},
         }
     )
 
@@ -197,7 +196,7 @@ def test_scene_disabled_but_global_enabled_matches_pre_integration(
     data_dir, service, monkeypatch
 ):
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     post_calls = _mock_no_network(monkeypatch)
 
     out = tools_mod.dispatch_task(prompt="整理本周会议纪要")
@@ -400,7 +399,7 @@ def test_state_workdir_falls_back_to_global(data_dir, service, monkeypatch):
 
 def test_live_mode_end_to_end_uses_decided_target(data_dir, service, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable_secretary_scene(shadow=False)
+    _enable_secretary_scene()
     post_calls = _mock_post(
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "会话乙"}}})
     )
@@ -413,14 +412,14 @@ def test_live_mode_end_to_end_uses_decided_target(data_dir, service, monkeypatch
     assert payload["decision_note"] == "已按决策模型建议派发到 会话乙"
     record = _audit_records(data_dir)[-1]
     assert record["scene"] == "secretary"
-    assert record["shadow"] is False
+    assert "shadow" not in record
     assert record["adopted"] is True
     assert record["trace_id"]
 
 
 def test_live_mode_illegal_answer_from_upstream_falls_back(data_dir, service, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable_secretary_scene(shadow=False)
+    _enable_secretary_scene()
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "根本不存在的会话"}}}),
@@ -431,21 +430,3 @@ def test_live_mode_illegal_answer_from_upstream_falls_back(data_dir, service, mo
     assert [c["target"] for c in service.dispatch_calls] == [""]
     assert out == _expected_output()
     assert _audit_records(data_dir)[-1]["adopted"] is False
-
-
-def test_shadow_mode_observes_but_keeps_target(data_dir, service, monkeypatch):
-    _write_user_config(data_dir, [PROVIDER])
-    _enable_secretary_scene(shadow=True)
-    post_calls = _mock_post(
-        monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "会话乙"}}})
-    )
-
-    out = tools_mod.dispatch_task(prompt="接着修登录报错")
-
-    assert len(post_calls) == 1, "影子模式仍应发一次请求（只观测不采纳）"
-    assert [c["target"] for c in service.dispatch_calls] == [""]
-    assert out == _expected_output()
-    record = _audit_records(data_dir)[-1]
-    assert record["scene"] == "secretary"
-    assert record["shadow"] is True
-    assert record["adopted"] is False

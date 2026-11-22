@@ -1015,6 +1015,15 @@ class _EscalationProbeBridge:
     def toggle_mcp_server(self, *args, **kwargs):
         return self._probe("toggle_mcp_server", {"ok": True})
 
+    def toggle_plugin(self, *args, **kwargs):
+        return self._probe("toggle_plugin", {"ok": True})
+
+    def delete_plugin(self, *args, **kwargs):
+        return self._probe("delete_plugin", {"ok": True})
+
+    def restore_plugin(self, *args, **kwargs):
+        return self._probe("restore_plugin", {"ok": True})
+
 
 @pytest.mark.parametrize("method,args", [
     ("save_automation_task", [{"name": "t", "prompt": "p", "permission_mode": "full"}]),
@@ -1033,6 +1042,19 @@ def test_lan_forbids_toggle_mcp_server():
     bridge = _EscalationProbeBridge()
     srv = LanServer(bridge=bridge)
     response = srv.dispatch_rpc("toggle_mcp_server", ["evil", True])
+    assert response["error"]["code"] == "method_not_allowed"
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("method,args", [
+    ("toggle_plugin", ["office", True]),
+    ("delete_plugin", ["office"]),
+    ("restore_plugin", ["office"]),
+])
+def test_lan_forbids_plugin_mutation_methods(method, args):
+    bridge = _EscalationProbeBridge()
+    srv = LanServer(bridge=bridge)
+    response = srv.dispatch_rpc(method, args)
     assert response["error"]["code"] == "method_not_allowed"
     assert bridge.calls == []
 

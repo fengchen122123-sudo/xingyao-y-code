@@ -17,7 +17,7 @@ def plugin_settings(payload: dict) -> dict
 星瑶设置页打开"插件"标签时，会对**已加载**的插件调用它（`payload = {"action": "render"}`），把你的返回值（"界面快照"）用星瑶统一风格渲染出来；用户在页面上的每次点击，都会以 `{"action": ..., "params": {...}}` 的形式再次回调这个函数。
 
 - 插件没实现该函数 → 设置页显示"该插件暂不可配置"，其他功能不受影响。
-- 插件没**加载**（未信任 / 未启用 / 加载失败）→ 星瑶**绝不执行**插件代码，只显示状态引导（"信任并启用" / "启用该插件"）。
+- 插件没**加载**（未启用 / 加载失败）→ 星瑶**绝不执行**插件代码，只显示状态引导（"启用该插件"）。
 - 插件安装 → 条目出现；插件目录删除 → 条目消失。**零注册、零持久化注册表**。
 
 ---
@@ -149,13 +149,13 @@ def plugin_settings(payload):
 
 1. 把上面的目录放进 `~/.ycode/plugins/hello_settings/`；
 2. 重启星瑶（或打开设置页点右上角刷新）→ 左侧"插件"标签里出现 `hello_settings`；
-3. 首次使用需**信任**：点条目 → 界面显示"信任并启用" → 确认后即可看到你的设置页。
+3. 首次放入目录即加载（本版本已移除插件信任确认，无需再点"信任并启用"）→ 即可看到你的设置页。
 
 不想开星瑶、只想在命令行里快速验证钩子（用环境变量 `YCODE_DATA_DIR` 把数据目录指到隔离位置，避免动到真实插件）：
 
 ```powershell
 $env:YCODE_DATA_DIR = "$env:TEMP\ycode-demo"     # 该目录下放 plugins\hello_settings\
-venv\Scripts\python.exe -c "import core.plugin_loader as pl, core.tool_registry as tr, json; print(pl.trust_plugin('hello_settings')); pl.load_and_register(tr.build_default_registry()); print(json.dumps(pl.call_plugin_hook('hello_settings', 'plugin_settings', {'action': 'render'}), ensure_ascii=False))"
+venv\Scripts\python.exe -c "import core.plugin_loader as pl, core.tool_registry as tr, json; pl.load_and_register(tr.build_default_registry()); print(json.dumps(pl.call_plugin_hook('hello_settings', 'plugin_settings', {'action': 'render'}), ensure_ascii=False))"
 ```
 
 `call_plugin_hook` 的返回固定是 `{"ok": True, "data": <你的钩子返回值>}` 或 `{"ok": False, "message": ..., "needs": ...}`。
@@ -340,8 +340,8 @@ venv\Scripts\python.exe -c "import core.plugin_loader as pl, core.tool_registry 
 
 ## 5. 安全边界与工程约定
 
-1. **未信任 / 未启用不可执行**：只有"已加载（= 已信任 + 已启用）"的插件才会被调用。未加载时星瑶返回 `needs: "trust" | "enable"`，设置页改成引导按钮（"信任并启用" / "启用该插件"）——**这是硬边界，插件写什么都绕不过**。
-2. **首次使用需信任**：用户目录插件默认不可信。信任按**内容指纹**记录（`plugin_trust.json`）；你改了插件代码，用户需重新确认一次。
+1. **未启用不可执行**：只有"已加载（= 已启用）"的插件才会被调用。未加载时星瑶返回 `needs: "enable"`，设置页改成引导按钮（"启用该插件"）——**这是硬边界，插件写什么都绕不过**。
+2. **信任校验已移除**：本版本不再比对内容指纹、不弹确认，用户目录插件放入即加载。代价是任何写进插件目录的代码都会以星瑶进程权限执行，分发插件时应自己提示用户核对来源。
 3. **凭证自管**：令牌、私钥等只落插件自己的目录（插件目录内，或用环境变量 `YCODE_DATA_DIR` 定位的数据目录），**绝不写日志、绝不打进 `message`**——`message` 会直接显示给用户。
 4. **`cleanup()` 回收**：插件被禁用或目录被删除时星瑶会调用它。你自己创建的持久化数据、后台线程、临时文件都在这里收掉；`cleanup` 抛异常会被吞掉并记日志（不会阻塞用户操作），但残留数据会留下来。
 5. **`danger` 按钮前端会确认**，但这只是 UI 兜底；真正的删除/注销动作请在自己的钩子里做参数校验（例如参与文件路径的 uid 要按白名单 `[A-Za-z0-9_-]` 过滤，防路径穿越）。
@@ -351,7 +351,7 @@ venv\Scripts\python.exe -c "import core.plugin_loader as pl, core.tool_registry 
 
 ---
 
-## 6. 安装、信任与删除
+## 6. 安装与删除
 
 | 事项 | 说明 |
 | --- | --- |
@@ -359,8 +359,8 @@ venv\Scripts\python.exe -c "import core.plugin_loader as pl, core.tool_registry 
 | 数据目录 | 默认 `~/.ycode`；可用环境变量 `YCODE_DATA_DIR` 覆盖（调试、隔离测试时用） |
 | 扫描顺序 | 用户目录优先于内置目录（仓库 `plugins/`）；同名时用户目录的胜出，内置的记为 `overridden` |
 | 生效方式 | 打开设置页 / 点刷新即增量扫盘，**安装即出现，不需要重启、不需要注册** |
-| 首次信任 | 插件未信任 → 条目显示"未信任" + "信任并启用" 按钮（确认弹窗后写入指纹） |
-| 修改代码 | 指纹变化 → 回到"未信任"状态，需重新确认；已加载的旧代码会继续跑到刷新/重启 |
+| 首次加载 | 本版本已移除信任确认，放入目录/刷新即加载 |
+| 修改代码 | 刷新（设置页刷新或 `/plugins reload`）即生效；兄弟模块受 `sys.modules` 缓存影响，需重启 |
 | 删除 | 删掉整个插件目录 → 设置页刷新后条目消失；**已加载**的插件会被完整卸载（注销它注册的工具 + 调用 `cleanup()` + 清掉模块引用），无需重启 |
 | 禁用 | 改用"启用/禁用"开关或把 `plugin.json` 的 `enabled` 设为 `false`；禁用时会走 `cleanup()` 回收 |
 
@@ -371,5 +371,5 @@ venv\Scripts\python.exe -c "import core.plugin_loader as pl, core.tool_registry 
 - **设置页显示"该插件暂不可配置"**：插件没实现 `plugin_settings`，或钩子抛异常/返回非 dict。看星瑶日志里 `插件 <名> 的 plugin_settings ...` 的报错。
 - **点了按钮没反应**：星瑶在按钮回调期间会禁用按钮，且 `params` 必须是自己声明的动作名；确认前端请求真的到了你的钩子（可临时 `message` 回显）。
 - **表单值没变**：`value` 只是初始值，每次渲染都会重置为它返回的值；请在 `render` 时读盘回填当前状态。
-- **改了代码界面没变**：指纹变化后插件处于未信任状态（设置页会提示）；重新信任并启用即可。
+- **改了代码界面没变**：点设置页刷新或 `/plugins reload` 重新加载；用 `import_sibling` 引入的兄弟模块有 `sys.modules` 缓存，需重启才更新。
 - **轮询一直转**：检查轮询动作是否返回 `done: true`；上限 200 次约 10 分钟后自动停止。

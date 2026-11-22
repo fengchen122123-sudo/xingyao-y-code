@@ -54,12 +54,11 @@ def test_get_decision_scenes_default_all_off(data_dir):
     assert [row["scene"] for row in result["scenes"]] == list(SCENES)
     for row in result["scenes"]:
         assert row["mode"] == "off"
-        assert row["requested_mode"] == "off"
         assert row["enabled"] is False
         assert row["label"] == LABELS[row["scene"]]
         assert isinstance(row["description"], str) and row["description"]
         assert row["timeout_ms"] == 250
-    assert result["shadow_mode"] is True
+    assert "shadow_mode" not in result
     assert result["enabled"] is False
 
 
@@ -82,103 +81,78 @@ def test_get_decision_scenes_broken_config_falls_back_to_off(data_dir):
 
 
 @pytest.mark.parametrize(
-    "mode, expect_enabled, expect_shadow",
+    "mode, expect_enabled",
     [
-        ("shadow", True, True),
-        ("live", True, False),
-        ("off", False, True),
+        ("live", True),
+        ("off", False),
     ],
 )
-def test_set_decision_scene_writes_boolean_pair(data_dir, mode, expect_enabled, expect_shadow):
+def test_set_decision_scene_writes_enabled_flag(data_dir, mode, expect_enabled):
     bridge = _make_bridge()
-    svc.save_decision_config({"scenes": {"router": {"enabled": False, "shadow": True}}})
+    svc.save_decision_config({"scenes": {"router": {"enabled": False}}})
 
     result = bridge.set_decision_scene("router", mode)
 
     assert result["ok"] is True
-    assert result["requested_mode"] == mode
+    assert result["mode"] == mode
     scene = svc.load_decision_config()["scenes"]["router"]
     assert scene["enabled"] is expect_enabled
-    assert scene["shadow"] is expect_shadow
+    assert "shadow" not in scene
 
 
-def test_set_decision_scene_live_when_global_shadow_off_is_live(data_dir):
+def test_set_decision_scene_live_returns_live_snapshot(data_dir):
     bridge = _make_bridge()
-    svc.save_decision_config({"shadow_mode": False})
 
     result = bridge.set_decision_scene("safety", "live")
 
     assert result["ok"] is True
     scene = svc.load_decision_config()["scenes"]["safety"]
     assert scene["enabled"] is True
-    assert scene["shadow"] is False
-    assert result["effective_mode"] == "live"
-    assert result["global_shadow"] is False
+    assert result["mode"] == "live"
     assert len(result["scenes"]) == 4
     assert result["scene"]["mode"] == "live"
 
 
 def test_set_decision_scene_returns_fresh_snapshot(data_dir):
     bridge = _make_bridge()
-    svc.save_decision_config({"shadow_mode": False})
-    bridge.set_decision_scene("search", "shadow")
+    bridge.set_decision_scene("search", "live")
 
     result = bridge.set_decision_scene("secretary", "live")
 
     rows = {row["scene"]: row for row in result["scenes"]}
     assert rows["secretary"]["mode"] == "live"
-    assert rows["search"]["mode"] == "shadow"
+    assert rows["search"]["mode"] == "live"
     assert rows["router"]["mode"] == "off"
     assert result["settings"]["scenes"]["secretary"]["enabled"] is True
 
 
-def test_set_decision_scene_off_keeps_scene_shadow(data_dir):
-    bridge = _make_bridge()
-    svc.save_decision_config(
-        {"shadow_mode": False, "scenes": {"router": {"enabled": True, "shadow": False}}}
-    )
+def test_set_decision_scene_rejects_removed_shadow_mode(data_dir):
+    result = _make_bridge().set_decision_scene("router", "shadow")
 
-    result = bridge.set_decision_scene("router", "off")
-
-    assert result["ok"] is True
-    scene = svc.load_decision_config()["scenes"]["router"]
-    assert scene["enabled"] is False
-    assert scene["shadow"] is False
-    assert result["effective_mode"] == "off"
+    assert result["ok"] is False
+    assert "模式" in result["msg"]
+    assert not (data_dir / "decision.json").exists()
 
 
-def test_set_decision_scene_live_with_global_shadow_reports_shadow(data_dir):
-    bridge = _make_bridge()
-    cfg = svc.load_decision_config()
-    assert cfg["shadow_mode"] is True
-
-    result = bridge.set_decision_scene("router", "live")
-
-    assert result["ok"] is True
-    assert result["requested_mode"] == "live"
-    scene = svc.load_decision_config()["scenes"]["router"]
-    assert scene["enabled"] is True
-    assert scene["shadow"] is False
-    assert result["effective_mode"] == "shadow"
-    assert result["global_shadow"] is True
-    assert result["scene"]["mode"] == "shadow"
-    assert result["scene"]["requested_mode"] == "live"
-    assert "影子" in result["msg"]
-    assert isinstance(result["hint"], str) and "影子" in result["hint"]
-
-
-def test_get_decision_scenes_exposes_requested_vs_effective(data_dir):
-    svc.save_decision_config(
-        {"shadow_mode": True, "scenes": {"router": {"enabled": True, "shadow": False}}}
+def test_get_decision_scenes_ignores_legacy_shadow_fields(data_dir):
+    (data_dir / "decision.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "shadow_mode": True,
+                "scenes": {"router": {"enabled": True, "shadow": True}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
     rows = _rows_by_scene(_make_bridge())
 
-    assert rows["router"]["mode"] == "shadow"
-    assert rows["router"]["requested_mode"] == "live"
+    assert rows["router"]["mode"] == "live"
     assert rows["router"]["enabled"] is True
-    assert rows["router"]["shadow"] is False
-    assert rows["router"]["global_shadow"] is True
+    assert "shadow" not in rows["router"]
+    assert "global_shadow" not in rows["router"]
 
 
 def test_set_decision_scene_rejects_unknown_scene(data_dir):
@@ -192,7 +166,7 @@ def test_set_decision_scene_rejects_unknown_scene(data_dir):
 
 
 def test_set_decision_scene_rejects_empty_scene(data_dir):
-    result = _make_bridge().set_decision_scene("", "shadow")
+    result = _make_bridge().set_decision_scene("", "live")
 
     assert result["ok"] is False
     assert result["msg"]
@@ -223,7 +197,7 @@ def test_set_decision_scene_accepts_uppercase_mode(data_dir):
 def test_set_decision_scene_clamps_threshold(data_dir, raw, expected):
     bridge = _make_bridge()
 
-    result = bridge.set_decision_scene("safety", "shadow", raw)
+    result = bridge.set_decision_scene("safety", "live", raw)
 
     assert result["ok"] is True
     assert svc.load_decision_config()["scenes"]["safety"]["threshold"] == pytest.approx(expected)
@@ -231,7 +205,7 @@ def test_set_decision_scene_clamps_threshold(data_dir, raw, expected):
 
 
 def test_set_decision_scene_rejects_non_numeric_threshold(data_dir):
-    result = _make_bridge().set_decision_scene("router", "shadow", "很高")
+    result = _make_bridge().set_decision_scene("router", "live", "很高")
 
     assert result["ok"] is False
     assert "阈值" in result["msg"]
@@ -269,7 +243,7 @@ def test_set_decision_scene_swallows_generic_exception(data_dir, monkeypatch):
     monkeypatch.setattr(svc, "load_decision_config", boom)
     monkeypatch.setattr(svc, "save_decision_config", lambda patch: {})
 
-    result = _make_bridge().set_decision_scene("search", "shadow")
+    result = _make_bridge().set_decision_scene("search", "live")
 
     assert result["ok"] is False
     assert result["scenes"] == []
@@ -282,7 +256,7 @@ def test_set_decision_scene_value_error_returns_message(data_dir, monkeypatch):
 
     monkeypatch.setattr(svc, "save_decision_config", reject)
 
-    result = _make_bridge().set_decision_scene("router", "shadow")
+    result = _make_bridge().set_decision_scene("router", "live")
 
     assert result["ok"] is False
     assert "scenes" in result["msg"]
@@ -320,7 +294,6 @@ def test_existing_bridge_methods_untouched(data_dir):
 SUMMARY_KEYS = {
     "ok",
     "today_count",
-    "today_shadow_count",
     "today_adopted_count",
     "today_fallback_count",
     "recent",
@@ -333,7 +306,6 @@ def _fake_summary(has_business_records=True, session_scoped=False):
     return {
         "ok": True,
         "today_count": 2,
-        "today_shadow_count": 1,
         "today_adopted_count": 1,
         "today_fallback_count": 0,
         "recent": [],
@@ -410,7 +382,7 @@ def test_get_decision_audit_summary_session_scope_end_to_end(data_dir):
     audit.mkdir()
     (audit / f"{svc._today()}.jsonl").write_text(
         json.dumps(
-            {"ts": "2026-10-18T10:00:00", "scene": "router", "shadow": False,
+            {"ts": "2026-10-18T10:00:00", "scene": "router",
              "session_id": "别的会话"},
             ensure_ascii=False,
         ),

@@ -10,7 +10,6 @@ function mockApi(overrides: Record<string, unknown> = {}) {
     get_decision_audit_summary: vi.fn(async () => ({
       ok: true,
       today_count: 0,
-      today_shadow_count: 0,
       today_adopted_count: 0,
       today_fallback_count: 0,
       recent: [],
@@ -49,11 +48,10 @@ describe('DecisionRecordPopup', () => {
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 0,
-        today_shadow_count: 0,
         today_adopted_count: 0,
         today_fallback_count: 0,
         recent: [
-          { ts: '2026-10-19T23:50:00', scene: 'router', shadow: false, adopted: true, latency_ms: 300, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '昨天那次判断', answer: 'main' },
+          { ts: '2026-10-19T23:50:00', scene: 'router', adopted: true, latency_ms: 300, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '昨天那次判断', answer: 'main' },
         ],
       })),
     });
@@ -68,17 +66,16 @@ describe('DecisionRecordPopup', () => {
     expect(wrapper.find('[data-test="decision-pop-stats"]').text()).toContain('今日0');
   });
 
-  it('有记录：渲染统计行与最近记录列表（含影子标记与延迟）', async () => {
+  it('有记录：渲染统计行与最近记录列表（含采纳标记与延迟）', async () => {
     const api = mockApi({
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 2,
-        today_shadow_count: 1,
-        today_adopted_count: 1,
+        today_adopted_count: 2,
         today_fallback_count: 0,
         recent: [
-          { ts: '2026-10-16T10:00:00', scene: 'probe', shadow: false, adopted: true, latency_ms: 326, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '' },
-          { ts: '2026-10-16T10:01:00', scene: 'router', shadow: true, adopted: false, latency_ms: 210, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '帮我把登录模块重构成 async/await', answer: 'main' },
+          { ts: '2026-10-16T10:00:00', scene: 'probe', adopted: true, latency_ms: 326, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '' },
+          { ts: '2026-10-16T10:01:00', scene: 'router', adopted: true, latency_ms: 210, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '帮我把登录模块重构成 async/await', answer: 'main' },
         ],
       })),
       get_decision_settings: vi.fn(async () => ({
@@ -97,13 +94,13 @@ describe('DecisionRecordPopup', () => {
     expect(wrapper.find('[data-test="decision-pop-status"]').text()).toContain('已启用');
     const statsText = wrapper.find('[data-test="decision-pop-stats"]').text();
     expect(statsText).toContain('今日2');
-    expect(statsText).toContain('影子1');
-    expect(statsText).toContain('采纳1');
+    expect(statsText).not.toContain('影子');
+    expect(statsText).toContain('采纳2');
     expect(statsText).toContain('回退0');
     const list = wrapper.find('[data-test="decision-pop-list"]').text();
     expect(list).toContain('探针（连通性）');
     expect(list).toContain('路由（选模型）');
-    expect(list).toContain('影子');
+    expect(list).not.toContain('影子');
     expect(list).toContain('326ms');
     // 业务记录必须带上「判定的事由」与「模型结论」
     expect(list).toContain('帮我把登录模块重构成 async/await');
@@ -118,14 +115,13 @@ describe('DecisionRecordPopup', () => {
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 4,
-        today_shadow_count: 2,
-        today_adopted_count: 1,
+        today_adopted_count: 3,
         today_fallback_count: 1,
         recent: [
-          { ts: '2026-10-20T21:25:29', scene: 'subagent_review', shadow: true, adopted: false, latency_ms: 625, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: longDigest, answer: 'accepted', trace_id: 't1' },
-          { ts: '2026-10-20T21:49:07', scene: 'loop_guard', shadow: false, adopted: true, latency_ms: 765, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '步数：4/200', answer: 'pivot', trace_id: 't2' },
-          { ts: '2026-10-20T21:55:00', scene: 'plan_recovery', shadow: false, adopted: false, latency_ms: 510, fallback_reason: 'timeout', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '计划项 P2 重试判断', answer: '', trace_id: 't3' },
-          { ts: '2026-10-20T21:58:00', scene: 'memory_filter', shadow: true, adopted: false, latency_ms: 480, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '待沉淀记忆候选项', answer: 'keep_facts_only', trace_id: 't4' },
+          { ts: '2026-10-20T21:25:29', scene: 'subagent_review', adopted: true, latency_ms: 625, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: longDigest, answer: 'accepted', trace_id: 't1' },
+          { ts: '2026-10-20T21:49:07', scene: 'loop_guard', adopted: true, latency_ms: 765, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '步数：4/200', answer: 'pivot', trace_id: 't2' },
+          { ts: '2026-10-20T21:55:00', scene: 'plan_recovery', adopted: false, latency_ms: 510, fallback_reason: 'timeout', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '计划项 P2 重试判断', answer: '', trace_id: 't3' },
+          { ts: '2026-10-20T21:58:00', scene: 'memory_filter', adopted: true, latency_ms: 480, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '待沉淀记忆候选项', answer: 'keep_facts_only', trace_id: 't4' },
         ],
       })),
     });
@@ -189,12 +185,11 @@ describe('DecisionRecordPopup', () => {
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 1,
-        today_shadow_count: 0,
         today_adopted_count: 1,
         today_fallback_count: 0,
         recent: [
           {
-            ts: '2026-10-20T10:50:25', scene: 'router', shadow: false, adopted: true,
+            ts: '2026-10-20T10:50:25', scene: 'router', adopted: true,
             latency_ms: 804, fallback_reason: '', model_id: 'NeoHorse-Jev-4B',
             answers_digest: '', state_digest: '1+1 等于几？', answer: 'secondary',
             trace_id: 'abc123',
@@ -247,12 +242,11 @@ describe('DecisionRecordPopup', () => {
       get_decision_audit_summary: vi.fn(async () => ({
         ok: true,
         today_count: 2,
-        today_shadow_count: 0,
         today_adopted_count: 2,
         today_fallback_count: 0,
         recent: [
-          { ts: '2026-10-20T10:00:00', scene: 'router', shadow: false, adopted: true, latency_ms: 300, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '第一条', answer: 'main', trace_id: 'trace-A' },
-          { ts: '2026-10-20T10:01:00', scene: 'router', shadow: false, adopted: true, latency_ms: 320, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '第二条', answer: 'secondary', trace_id: 'trace-B' },
+          { ts: '2026-10-20T10:00:00', scene: 'router', adopted: true, latency_ms: 300, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '第一条', answer: 'main', trace_id: 'trace-A' },
+          { ts: '2026-10-20T10:01:00', scene: 'router', adopted: true, latency_ms: 320, fallback_reason: '', model_id: 'NeoHorse-Jev-4B', answers_digest: '', state_digest: '第二条', answer: 'secondary', trace_id: 'trace-B' },
         ],
       })),
       get_decision_record_detail: vi.fn((traceId: string) => {
@@ -334,7 +328,6 @@ describe('DecisionRecordPopup', () => {
       get_decision_audit_summary: vi.fn(async (limit?: number) => ({
         ok: true,
         today_count: 12,
-        today_shadow_count: 0,
         today_adopted_count: 12,
         today_fallback_count: 0,
         session_total_count: 15,
@@ -342,7 +335,6 @@ describe('DecisionRecordPopup', () => {
         recent: Array.from({ length: limit === 10 ? 10 : 15 }, (_, idx) => ({
           ts: `2026-11-20T16:00:${String(idx).padStart(2, '0')}`,
           scene: 'auto_permission',
-          shadow: false,
           adopted: true,
           latency_ms: 500,
           fallback_reason: '',

@@ -44,10 +44,6 @@
           <span class="k">本会话今日</span>
           <span class="v">{{ summary!.today_count }}</span>
         </div>
-        <div class="stat-cell" :class="{ amber: summary!.today_shadow_count > 0 }">
-          <span class="k">影子</span>
-          <span class="v">{{ summary!.today_shadow_count }}</span>
-        </div>
         <div class="stat-cell" :class="{ green: summary!.today_adopted_count > 0 }">
           <span class="k">采纳</span>
           <span class="v">{{ summary!.today_adopted_count }}</span>
@@ -68,14 +64,13 @@
           v-for="(item, index) in summary.recent"
           :key="item.trace_id || index"
           class="record-card"
-          :class="{ shadow: item.shadow, open: expandedIndex === index }"
+          :class="{ open: expandedIndex === index }"
           data-test="decision-pop-item"
           @click="toggle(index, item)"
         >
           <div class="rec-head" data-test="decision-pop-meta">
             <div class="rec-badges">
               <span class="scene-name" :title="item.scene">{{ sceneLabel(item.scene) }}</span>
-              <span class="tag" :class="item.shadow ? 'tag-shadow' : 'tag-live'">{{ item.shadow ? '影子' : '正式' }}</span>
               <span v-if="item.fallback_reason" class="tag tag-fallback" :title="item.fallback_reason">回退：{{ item.fallback_reason }}</span>
               <span v-else-if="item.adopted" class="tag tag-adopted">已采纳</span>
             </div>
@@ -557,7 +552,7 @@ watch(
 
 .stats-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
 }
 .stat-cell {
@@ -663,14 +658,6 @@ watch(
   padding: 1px 6px;
   border-radius: 5px;
   line-height: 1.45;
-}
-.tag-shadow {
-  background: var(--xy-amber-soft, color-mix(in srgb, var(--orange) 13%, transparent));
-  color: var(--xy-amber, var(--orange));
-}
-.tag-live {
-  background: var(--xy-accent-soft, var(--accent-soft));
-  color: var(--xy-accent, var(--accent));
 }
 .tag-adopted {
   background: var(--xy-green-soft, color-mix(in srgb, var(--green) 13%, transparent));

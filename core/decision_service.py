@@ -23,16 +23,24 @@ DEFAULT_CONFIG: dict = {
     "model_id": "NeoHorse-Jev-4B",
     "endpoint_style": "decision",
     "key_mode": "auto",
-    "shadow_mode": True,
     "timeout_ms": 800,
     "scenes": {
-        "router": {"enabled": False, "shadow": True, "threshold": 0.5, "timeout_ms": 250},
-        "secretary": {"enabled": False, "shadow": True, "threshold": 0.6, "timeout_ms": 250},
-        "search": {"enabled": False, "shadow": True, "threshold": 0.5, "timeout_ms": 250},
-        "safety": {"enabled": False, "shadow": True, "threshold": 0.9, "timeout_ms": 250},
+        "router": {"enabled": False, "threshold": 0.5, "timeout_ms": 250},
+        "secretary": {"enabled": False, "threshold": 0.6, "timeout_ms": 250},
+        "search": {"enabled": False, "threshold": 0.5, "timeout_ms": 250},
+        "safety": {"enabled": False, "threshold": 0.9, "timeout_ms": 250},
     },
     "audit_enabled": True,
 }
+
+DECISION_SCENE_META = (
+    ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
+    ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
+    ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
+    ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
+)
+DECISION_SCENE_MODES = ("off", "live")
+DECISION_SCENE_MODE_TEXT = {"off": "关闭", "live": "开启"}
 
 MAX_QUESTIONS = 16
 MIN_TIMEOUT_MS = 100
@@ -125,9 +133,22 @@ def _state_digest(state) -> str:
     return _sha16(state)
 
 
+def _strip_legacy_shadow_fields(cfg: dict) -> dict:
+    """清理历史影子模式配置字段，确保旧版 decision.json 与旧入参平滑过渡。"""
+    cfg.pop("shadow_mode", None)
+    scenes = cfg.get("scenes")
+    if isinstance(scenes, dict):
+        for scene_cfg in scenes.values():
+            if isinstance(scene_cfg, dict):
+                scene_cfg.pop("shadow", None)
+    return cfg
+
+
 def load_decision_config() -> dict:
     """读取决策配置并与默认值深合并；缺失/损坏一律回落默认值（全关）。"""
-    return _deep_merge(deepcopy(DEFAULT_CONFIG), _read_json(_decision_config_path()))
+    return _strip_legacy_shadow_fields(
+        _deep_merge(deepcopy(DEFAULT_CONFIG), _read_json(_decision_config_path()))
+    )
 
 
 def _validate_config(cfg: dict) -> None:
@@ -161,12 +182,62 @@ def save_decision_config(patch: dict) -> dict:
     """校验并原子写盘；返回保存后的完整配置。非法值抛 ValueError 且不落盘。"""
     if not isinstance(patch, dict):
         raise ValueError("配置 patch 必须是字典")
-    merged = _deep_merge(load_decision_config(), patch)
+    merged = _strip_legacy_shadow_fields(_deep_merge(load_decision_config(), patch))
     _validate_config(merged)
     import config
 
     config._atomic_write_json(_decision_config_path(), merged)
     return merged
+
+
+def build_decision_scene_rows(cfg: dict) -> list[dict]:
+    """构造四个业务场景的二态快照（off 关闭 / live 开启）。"""
+    scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
+    rows: list[dict] = []
+    for scene, label, description in DECISION_SCENE_META:
+        raw_scene = scenes.get(scene)
+        scene_cfg = raw_scene if isinstance(raw_scene, dict) else {}
+        enabled = bool(scene_cfg.get("enabled", False))
+        mode = "live" if enabled else "off"
+        raw_threshold = scene_cfg.get("threshold", 0.5)
+        if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
+            threshold = 0.5
+        else:
+            threshold = max(0.0, min(1.0, float(raw_threshold)))
+        raw_timeout = scene_cfg.get("timeout_ms", 250)
+        if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
+            timeout_ms = 250
+        else:
+            timeout_ms = int(raw_timeout)
+        rows.append(
+            {
+                "scene": scene,
+                "label": label,
+                "description": description,
+                "mode": mode,
+                "mode_text": DECISION_SCENE_MODE_TEXT[mode],
+                "enabled": enabled,
+                "threshold": threshold,
+                "timeout_ms": timeout_ms,
+            }
+        )
+    return rows
+
+
+def build_scene_change_feedback(cfg: dict, row: dict, mode_name: str) -> tuple[str, str]:
+    """根据当前总开关与场景新状态返回人类可读提示语 (msg, hint)。"""
+    label = str(row.get("label") or row.get("scene") or "")
+    effective_mode = str(row.get("mode") or "off")
+    if not bool(cfg.get("enabled")):
+        msg = f"{label}场景已保存为{DECISION_SCENE_MODE_TEXT[mode_name]}"
+        hint = "决策模型总开关未启用：场景设置要等总开关打开后才生效"
+    elif effective_mode == "live":
+        msg = f"{label}场景已开启（决策结果会真实影响任务行为）"
+        hint = "开启后：失败、超时或低置信都会自动回退原逻辑，不会阻断任务"
+    else:
+        msg = f"{label}场景已关闭（零请求、零记录，走原逻辑）"
+        hint = "关闭后该场景不再询问决策模型，行为与未接入时一致"
+    return msg, hint
 
 
 class _KeyState:
@@ -377,11 +448,10 @@ def _effective_timeout_ms(cfg: dict, override=None) -> int:
     return max(MIN_TIMEOUT_MS, min(MAX_TIMEOUT_MS, value))
 
 
-def _new_record(cfg: dict, scene: str, shadow: bool, trace_id: str) -> dict:
+def _new_record(cfg: dict, scene: str, trace_id: str) -> dict:
     return {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "scene": scene,
-        "shadow": bool(shadow),
         "model_id": cfg.get("model_id"),
         "key_hint": None,
         "state_digest": None,
@@ -640,10 +710,7 @@ def ask_decision(
     if isinstance(scene_cfg, dict):
         if not bool(scene_cfg.get("enabled")):
             return None
-        scene_shadow = bool(scene_cfg.get("shadow", True))
-    elif scene_name in AUTO_TASK_SCENES:
-        scene_shadow = False
-    else:
+    elif scene_name not in AUTO_TASK_SCENES:
         return None
     if not isinstance(questions, dict) or not questions:
         raise ValueError("questions 必须是非空字典")
@@ -654,11 +721,10 @@ def ask_decision(
     if image_b64 is not None and len(questions) > 1:
         raise ValueError("带图请求一次只允许 1 题")
 
-    shadow = bool(cfg.get("shadow_mode")) or scene_shadow
     audit_enabled = bool(cfg.get("audit_enabled", True))
     trace_id = uuid.uuid4().hex[:12]
     timeout_seconds = _effective_timeout_ms(cfg, timeout_ms) / 1000.0
-    record = _new_record(cfg, scene_name, shadow, trace_id)
+    record = _new_record(cfg, scene_name, trace_id)
     # 会话归属在构造后立即填充，保证下面所有 _append_audit 分支都带上该字段。
     # 调用方显式给出 session_id（如后台学习线程）时优先采纳，否则读取线程/当前会话。
     explicit_sid = str(session_id or "").strip() if session_id is not None else ""
@@ -671,8 +737,8 @@ def ask_decision(
         "questions": questions,
     }
     if isinstance(audit_extra, dict) and audit_extra:
-        # 调用方附加上下文（如启发式基线档 baseline_tier）：供影子模式后续
-        # 一致性对比分析；体积由 _cap_record 统一兜底
+        # 调用方附加上下文（如启发式基线档 baseline_tier）：供后续一致性对比分析；
+        # 体积由 _cap_record 统一兜底
         record["extra"] = dict(list(audit_extra.items())[:8])
 
     try:
@@ -730,8 +796,6 @@ def ask_decision(
                 _remember_success(index)
                 record["answers"] = body.get("answers", body)
                 _append_audit(record, audit_enabled)
-                if shadow:
-                    return None
                 result = dict(body)
                 result["trace_id"] = trace_id
                 return result
@@ -838,7 +902,7 @@ def probe_decision() -> dict:
         msg = f"探针执行失败：{exc}"
     result = {"ok": not msg, "results": results, "model_id": model_id, "msg": msg}
     try:
-        record = _new_record(cfg, "probe", False, f"probe-{int(_now() * 1000)}")
+        record = _new_record(cfg, "probe", f"probe-{int(_now() * 1000)}")
         available = next(
             (item for item in results if item["status"] == "available"), None
         )
@@ -1003,7 +1067,6 @@ def _audit_brief(record: dict) -> dict:
         "ts": str(record.get("ts") or ""),
         "scene": str(record.get("scene") or ""),
         "session_id": str(record.get("session_id") or ""),
-        "shadow": bool(record.get("shadow")),
         "adopted": bool(record.get("adopted")),
         "latency_ms": record.get("latency_ms"),
         "fallback_reason": str(record.get("fallback_reason") or ""),
@@ -1027,7 +1090,6 @@ def get_decision_audit_summary(
     summary = {
         "ok": True,
         "today_count": 0,
-        "today_shadow_count": 0,
         "today_adopted_count": 0,
         "today_fallback_count": 0,
         # 所属范围的累计决策总数（传了 session_id 即本会话累计总数，否则全局累计）
@@ -1098,8 +1160,6 @@ def get_decision_audit_summary(
                 summary["global_today_count"] += 1
                 if _in_scope(record):
                     summary["today_count"] += 1
-                    if record.get("shadow"):
-                        summary["today_shadow_count"] += 1
                     if record.get("adopted"):
                         summary["today_adopted_count"] += 1
                     if record.get("fallback_reason"):
@@ -1108,7 +1168,8 @@ def get_decision_audit_summary(
                 file_briefs.append(_audit_brief(record))
         if file_briefs:
             collected = file_briefs + collected
-    summary["recent"] = collected[-count:]
+    # 最新一条排在最前，面板和设置页无需下滑即可直接看到最近一次决策
+    summary["recent"] = list(reversed(collected[-count:]))
     return summary
 
 

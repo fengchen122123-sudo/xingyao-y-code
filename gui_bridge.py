@@ -5884,62 +5884,17 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
         ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
     )
-    _DECISION_SCENE_MODES = ("off", "shadow", "live")
-    # 三态 → 中文文案（前端直接用这份，避免两边各写一套）
-    _DECISION_SCENE_MODE_TEXT = {"off": "关闭", "shadow": "影子", "live": "正式"}
-
-    @staticmethod
-    def _decision_scene_mode(cfg: dict, scene_cfg: dict) -> str:
-        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
-            return "off"
-        if bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True)):
-            return "shadow"
-        return "live"
-
-    @staticmethod
-    def _decision_scene_requested_mode(scene_cfg: dict) -> str:
-        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
-            return "off"
-        return "shadow" if bool(scene_cfg.get("shadow", True)) else "live"
+    _DECISION_SCENE_MODES = ("off", "live")
+    # 二态 → 中文文案（前端直接用这份，避免两边各写一套）
+    _DECISION_SCENE_MODE_TEXT = {"off": "关闭", "live": "开启"}
 
     def _decision_scene_rows(self, cfg: dict) -> list:
-        scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
-        global_shadow = bool(cfg.get("shadow_mode"))
-        rows: list = []
-        for scene, label, description in self._DECISION_SCENE_META:
-            raw_scene = scenes.get(scene)
-            scene_cfg = raw_scene if isinstance(raw_scene, dict) else {}
-            mode = self._decision_scene_mode(cfg, scene_cfg)
-            requested = self._decision_scene_requested_mode(scene_cfg)
-            raw_threshold = scene_cfg.get("threshold", 0.5)
-            if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
-                threshold = 0.5
-            else:
-                threshold = max(0.0, min(1.0, float(raw_threshold)))
-            raw_timeout = scene_cfg.get("timeout_ms", 250)
-            if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
-                timeout_ms = 250
-            else:
-                timeout_ms = int(raw_timeout)
-            rows.append(
-                {
-                    "scene": scene,
-                    "label": label,
-                    "description": description,
-                    "mode": mode,
-                    "mode_text": self._DECISION_SCENE_MODE_TEXT[mode],
-                    "requested_mode": requested,
-                    "enabled": bool(scene_cfg.get("enabled", False)),
-                    "shadow": bool(scene_cfg.get("shadow", True)),
-                    "threshold": threshold,
-                    "timeout_ms": timeout_ms,
-                    "global_shadow": global_shadow,
-                }
-            )
-        return rows
+        from core import decision_service
+
+        return decision_service.build_decision_scene_rows(cfg)
 
     def get_decision_scenes(self) -> Dict[str, Any]:
-        """返回四个业务场景的三态快照（设置页「业务场景」区块用）。"""
+        """返回四个业务场景的二态快照（设置页「业务场景」区块用）。"""
         from core import decision_service
 
         try:
@@ -5948,13 +5903,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             return {
                 "ok": True,
                 "scenes": rows,
-                "shadow_mode": bool(cfg.get("shadow_mode")),
                 "enabled": bool(cfg.get("enabled")),
                 "msg": "",
             }
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("get_decision_scenes 失败")
-            return {"ok": False, "msg": str(e), "scenes": [], "shadow_mode": True, "enabled": False}
+            return {"ok": False, "msg": str(e), "scenes": [], "enabled": False}
 
     def set_decision_scene(self, scene: str, mode: str, threshold=None) -> Dict[str, Any]:
         from core import decision_service
@@ -5971,15 +5925,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         if mode_name not in self._DECISION_SCENE_MODES:
             return {
                 "ok": False,
-                "msg": f"未知模式「{mode_name or '(空)'}」；合法值为 off / shadow / live",
+                "msg": f"未知模式「{mode_name or '(空)'}」；合法值为 off / live",
                 "scenes": [],
             }
 
         scene_patch: Dict[str, Any] = {"enabled": mode_name != "off"}
-        if mode_name == "shadow":
-            scene_patch["shadow"] = True
-        elif mode_name == "live":
-            scene_patch["shadow"] = False
         if threshold is not None:
             if isinstance(threshold, bool):
                 return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
@@ -5998,33 +5948,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             rows = self._decision_scene_rows(cfg)
             row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
             effective_mode = str(row.get("mode") or "off")
-            label = str(row.get("label") or scene_name)
             mode_text = self._DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭")
-            if mode_name == "live" and effective_mode != "live":
-                msg = f"{label}场景已标记为正式，但全局影子模式仍开启，当前实际按影子运行"
-                hint = "全局影子模式已开启：到上方关闭「影子模式」后，本场景才会正式生效"
-            elif not bool(cfg.get("enabled")):
-                msg = f"{label}场景已保存为{self._DECISION_SCENE_MODE_TEXT[mode_name]}"
-                hint = "决策模型总开关未启用：场景设置要等总开关打开后才生效"
-            elif effective_mode == "live":
-                msg = f"{label}场景已切换为正式（决策结果会真实影响任务行为）"
-                hint = "正式模式：失败、超时或低置信都会自动回退原逻辑，不会阻断任务"
-            elif effective_mode == "shadow":
-                msg = f"{label}场景已切换为影子（真发请求、真写审计，结果丢弃）"
-                hint = "影子模式用于观察决策质量；确认无误后再切正式"
-            else:
-                msg = f"{label}场景已关闭（零请求、零记录，走原逻辑）"
-                hint = "关闭后该场景不再询问决策模型，行为与未接入时一致"
+            msg, hint = decision_service.build_scene_change_feedback(cfg, row, mode_name)
             return {
                 "ok": True,
                 "msg": msg,
                 "hint": hint,
                 "scene": row,
                 "scenes": rows,
-                "requested_mode": mode_name,
-                "effective_mode": effective_mode,
+                "mode": effective_mode,
                 "mode_text": mode_text,
-                "global_shadow": bool(cfg.get("shadow_mode")),
                 "settings": cfg,
             }
         except ValueError as error:

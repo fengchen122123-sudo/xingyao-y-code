@@ -180,12 +180,6 @@ def plugin_manage(action, name="", setting="", value=None):
             ok, message = toggle_plugin(plugin_name, action == "enable")
             plugins = [_plugin_view(i) for i in (get_plugin_infos() or [])]
             if not ok:
-                message = str(message or "")
-                if "未通过信任确认" in message or "未获信任" in message:
-                    # 明确告知模型：信任必须由用户在交互终端完成，工具无权代办
-                    return _err(
-                        f"{message}。插件信任需由用户在交互终端确认，工具无法代替信任。"
-                    )
                 return _err(message or f"{action} 插件 {plugin_name} 失败")
             return _ok(action=action, applied=True, plugin=plugin_name,
                        message=str(message or ""), plugins=plugins)
@@ -240,8 +234,7 @@ def plugin_manage(action, name="", setting="", value=None):
             )
 
         return _err(
-            f"未知 action: {action}（仅支持 list/enable/disable/settings_get/settings_action；"
-            "插件信任不在工具能力范围内）"
+            f"未知 action: {action}（仅支持 list/enable/disable/settings_get/settings_action）"
         )
     except Exception as exc:
         return _err(f"插件管理失败：{exc}")
@@ -366,8 +359,7 @@ def build_specs():
         "type": "string",
         "enum": ["list", "enable", "disable", "settings_get", "settings_action"],
         "description": (
-            "list=列出插件及加载状态（先增量刷新扫描）；enable/disable=启用或停用插件"
-            "（未信任的插件无法通过工具启用，需用户在交互终端确认信任）；"
+            "list=列出插件及加载状态（先增量刷新扫描）；enable/disable=启用或停用插件；"
             "settings_get=读取插件设置页快照；settings_action=执行插件设置页上的一个动作"
         ),
     }
@@ -414,10 +406,9 @@ def build_specs():
             name="plugin_manage",
             description=(
                 "管理本机插件。action=list 列出插件、加载状态与是否提供设置页；"
-                "enable/disable 启用或停用插件（未信任的插件会被拒绝，信任需用户本人在交互终端确认，"
-                "本工具无信任能力）；settings_get 读取插件设置页快照（调用插件 plugin_settings 钩子）；"
-                "settings_action 用 setting 指定插件设置页动作名、value 传参数（对象）执行该动作。"
-                "设置相关动作仅对已信任且已启用的插件有效"
+                "enable/disable 启用或停用插件；settings_get 读取插件设置页快照"
+                "（调用插件 plugin_settings 钩子）；settings_action 用 setting 指定插件设置页动作名、"
+                "value 传参数（对象）执行该动作。设置相关动作仅对已加载（已启用）的插件有效"
             ),
             properties={
                 "action": plugin_action,

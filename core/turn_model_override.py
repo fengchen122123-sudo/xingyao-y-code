@@ -54,15 +54,11 @@ def router_scene_live() -> bool:
         cfg = decision_service.load_decision_config()
         if not isinstance(cfg, dict) or not bool(cfg.get("enabled")):
             return False
-        if bool(cfg.get("shadow_mode")):
-            return False
         scenes = cfg.get("scenes")
         if not isinstance(scenes, dict):
             return False
         scene_cfg = scenes.get(SCENE)
-        if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
-            return False
-        return not bool(scene_cfg.get("shadow", True))
+        return isinstance(scene_cfg, dict) and bool(scene_cfg.get("enabled"))
     except Exception:
         # 配置读不出来就当没开：宁可不用决策，也不能影响回合
         return False

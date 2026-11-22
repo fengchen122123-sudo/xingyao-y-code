@@ -73,11 +73,8 @@ def _patch_prompt_handler(monkeypatch, handler):
     monkeypatch.setattr(llm_module, "_wait_permission_option", handler, raising=False)
 
 
-def _enable_jev(*, shadow_mode=False, scenes=None):
-    patch = {
-        "enabled": True,
-        "shadow_mode": shadow_mode,
-    }
+def _enable_jev(*, scenes=None):
+    patch = {"enabled": True}
     if scenes is not None:
         patch["scenes"] = scenes
     return svc.save_decision_config(patch)
@@ -182,7 +179,7 @@ def _cmd_spec():
 def test_auto_decision_permission_allows_when_jev_returns_allow(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False, scenes={"safety": {"enabled": True, "shadow": False}})
+    _enable_jev(scenes={"safety": {"enabled": True}})
     app_context.set_permission_mode("auto_decision")
 
     calls = _mock_post(
@@ -220,7 +217,7 @@ def test_auto_decision_permission_allows_when_jev_returns_allow(isolated_env, mo
 def test_auto_decision_permission_denies_and_pipeline_reports_jev_message(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("auto_decision")
 
     _mock_post(
@@ -259,7 +256,7 @@ def test_auto_decision_permission_denies_and_pipeline_reports_jev_message(isolat
 def test_auto_decision_permission_escalates_on_ask_user_or_fallback(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("auto_decision")
 
     _mock_post(
@@ -279,30 +276,20 @@ def test_auto_decision_permission_escalates_on_ask_user_or_fallback(isolated_env
     assert res1.allowed is True
     assert prompts == ["execute_command"]
 
-    _enable_jev(shadow_mode=True)
+    _mock_post(monkeypatch, lambda _idx, _req: httpx.Response(500, json={"error": "boom"}))
     res2 = terminal.authorize_tool_call(
         "execute_command",
-        {"command": "git push origin dev"},
+        {"command": "npm run build"},
         tool_spec=_cmd_spec(),
     )
     assert res2.allowed is True
     assert len(prompts) == 2
 
-    _enable_jev(shadow_mode=False)
-    _mock_post(monkeypatch, lambda _idx, _req: httpx.Response(500, json={"error": "boom"}))
-    res3 = terminal.authorize_tool_call(
-        "execute_command",
-        {"command": "npm run build"},
-        tool_spec=_cmd_spec(),
-    )
-    assert res3.allowed is True
-    assert len(prompts) == 3
-
 
 def test_auto_decision_never_delegates_catastrophic_or_sandbox_or_credential(isolated_env, monkeypatch):
     ycode_dir, workdir = isolated_env
     _write_user_config(ycode_dir, allow_outside_workspace=False)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("auto_decision")
 
     calls = _forbid_network(monkeypatch)
@@ -355,7 +342,7 @@ def test_auto_decision_never_delegates_catastrophic_or_sandbox_or_credential(iso
 def test_ask_user_auto_decision_picks_option_without_broker(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("auto_decision")
 
     monkeypatch.setattr(permission_broker, "has_prompt_handlers", lambda: False)
@@ -386,7 +373,7 @@ def test_ask_user_auto_decision_picks_option_without_broker(isolated_env, monkey
 def test_ask_user_auto_decision_escalates_or_falls_back_to_broker(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("auto_decision")
 
     _mock_post(
@@ -421,7 +408,7 @@ def test_ask_user_auto_decision_escalates_or_falls_back_to_broker(isolated_env, 
 def test_ask_user_respects_cancel_before_calling_jev(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("auto_decision")
     _forbid_network(monkeypatch)
 
@@ -434,7 +421,7 @@ def test_ask_user_respects_cancel_before_calling_jev(isolated_env, monkeypatch):
 def test_ask_user_non_auto_decision_mode_makes_no_jev_call(isolated_env, monkeypatch):
     ycode_dir, _ = isolated_env
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=False)
+    _enable_jev()
     app_context.set_permission_mode("full")
     _forbid_network(monkeypatch)
     monkeypatch.setattr(permission_broker, "has_prompt_handlers", lambda: False)
@@ -463,13 +450,10 @@ def test_gui_bridge_set_permission_mode_auto_decision_readiness_warning(isolated
     assert bridge._effective_permission_mode("s1") == "confirm"
 
     _write_user_config(ycode_dir)
-    _enable_jev(shadow_mode=True)
-    res_shadow = bridge.set_permission_mode("auto_decision", "s1")
-    assert res_shadow["ok"] is True
-    assert res_shadow["permission_mode"] == "auto_decision"
-    assert "影子模式" in res_shadow["decision_warning"]
-
-    _enable_jev(shadow_mode=False)
+    (ycode_dir / "decision.json").write_text(
+        json.dumps({"enabled": True, "shadow_mode": True}),
+        encoding="utf-8",
+    )
     res_ready = bridge.set_permission_mode("auto_decision", "s1")
     assert res_ready == {"ok": True, "permission_mode": "auto_decision", "bound": True}
     assert bridge._effective_permission_mode("s1") == "auto_decision"

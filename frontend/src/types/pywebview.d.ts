@@ -162,9 +162,8 @@ export interface DecisionSettingsSnapshot {
   model_id: string;
   endpoint_style: 'decision' | 'systemone';
   key_mode: string;
-  shadow_mode: boolean;
   timeout_ms: number;
-  scenes: Record<string, { enabled: boolean; shadow: boolean; threshold: number }>;
+  scenes: Record<string, { enabled: boolean; threshold: number }>;
   audit_enabled: boolean;
 }
 
@@ -206,7 +205,6 @@ export interface DecisionProviderOption {
 export interface DecisionAuditRecentItem {
   ts: string;
   scene: string;
-  shadow: boolean;
   adopted: boolean;
   latency_ms: number | null;
   fallback_reason: string;
@@ -223,7 +221,6 @@ export interface DecisionRecordDetail {
   record?: {
     ts?: string;
     scene?: string;
-    shadow?: boolean;
     adopted?: boolean;
     model_id?: string;
     latency_ms?: number | null;
@@ -242,7 +239,7 @@ export interface DecisionRecordDetail {
   msg?: string;
 }
 
-export type DecisionSceneMode = 'off' | 'shadow' | 'live';
+export type DecisionSceneMode = 'off' | 'live';
 
 export interface DecisionSceneRow {
   scene: string;
@@ -250,18 +247,14 @@ export interface DecisionSceneRow {
   description: string;
   mode: DecisionSceneMode;
   mode_text: string;
-  requested_mode: DecisionSceneMode;
   enabled: boolean;
-  shadow: boolean;
   threshold: number;
   timeout_ms: number;
-  global_shadow: boolean;
 }
 
 export interface DecisionAuditSummary {
   ok: boolean;
   today_count: number;
-  today_shadow_count: number;
   today_adopted_count: number;
   today_fallback_count: number;
   session_total_count?: number;
@@ -1771,17 +1764,15 @@ export interface PyWebViewAPI {
   // 保存决策配置 patch（深合并 + 校验，非法值拒绝并回中文原因；settings 为保存后快照）
   set_decision_settings(patch: Partial<DecisionSettingsSnapshot>): Promise<{ ok: boolean; msg?: string; settings?: DecisionSettingsSnapshot }>;
   probe_decision(): Promise<{ ok: boolean; results: DecisionProbeKeyResult[]; model_id: string; msg?: string }>;
-  get_decision_scenes(): Promise<{ ok: boolean; scenes?: DecisionSceneRow[]; shadow_mode?: boolean; enabled?: boolean; msg?: string }>;
+  get_decision_scenes(): Promise<{ ok: boolean; scenes?: DecisionSceneRow[]; enabled?: boolean; msg?: string }>;
   set_decision_scene(scene: string, mode: DecisionSceneMode, threshold?: number): Promise<{
     ok: boolean;
     msg?: string;
     hint?: string;
     scene?: DecisionSceneRow;
     scenes?: DecisionSceneRow[];
-    requested_mode?: DecisionSceneMode;
-    effective_mode?: DecisionSceneMode;
+    mode?: DecisionSceneMode;
     mode_text?: string;
-    global_shadow?: boolean;
   }>;
   list_decision_models(): Promise<{ ok: boolean; models: DecisionModelOption[]; msg?: string }>;
   list_decision_providers(): Promise<{ ok: boolean; providers?: DecisionProviderOption[]; msg?: string }>;

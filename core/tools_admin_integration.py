@@ -453,63 +453,21 @@ _DECISION_SCENE_META = (
     ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
 )
 _DECISION_SCENES = tuple(item[0] for item in _DECISION_SCENE_META)
-_DECISION_SCENE_MODES = ("off", "shadow", "live")
-_DECISION_SCENE_MODE_TEXT = {"off": "关闭", "shadow": "影子", "live": "正式"}
-
-
-def _decision_scene_mode(cfg: dict, scene_cfg: dict) -> str:
-    if not isinstance(scene_cfg, dict) or not bool(scene_cfg.get("enabled")):
-        return "off"
-    if bool(cfg.get("shadow_mode")) or bool(scene_cfg.get("shadow", True)):
-        return "shadow"
-    return "live"
+_DECISION_SCENE_MODES = ("off", "live")
+_DECISION_SCENE_MODE_TEXT = {"off": "关闭", "live": "开启"}
 
 
 def _decision_scene_rows(cfg: dict) -> list[dict[str, Any]]:
-    scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
-    global_shadow = bool(cfg.get("shadow_mode"))
-    rows: list[dict[str, Any]] = []
-    for scene, label, description in _DECISION_SCENE_META:
-        raw_scene = scenes.get(scene)
-        scene_cfg = raw_scene if isinstance(raw_scene, dict) else {}
-        mode = _decision_scene_mode(cfg, scene_cfg)
-        if not bool(scene_cfg.get("enabled")):
-            requested = "off"
-        else:
-            requested = "shadow" if bool(scene_cfg.get("shadow", True)) else "live"
-        raw_threshold = scene_cfg.get("threshold", 0.5)
-        if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, (int, float)):
-            threshold = 0.5
-        else:
-            threshold = max(0.0, min(1.0, float(raw_threshold)))
-        raw_timeout = scene_cfg.get("timeout_ms", 250)
-        if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
-            timeout_ms = 250
-        else:
-            timeout_ms = int(raw_timeout)
-        rows.append(
-            {
-                "scene": scene,
-                "label": label,
-                "description": description,
-                "mode": mode,
-                "mode_text": _DECISION_SCENE_MODE_TEXT[mode],
-                "requested_mode": requested,
-                "enabled": bool(scene_cfg.get("enabled", False)),
-                "shadow": bool(scene_cfg.get("shadow", True)),
-                "threshold": threshold,
-                "timeout_ms": timeout_ms,
-                "global_shadow": global_shadow,
-            }
-        )
-    return rows
+    from core import decision_service
+
+    return decision_service.build_decision_scene_rows(cfg)
 
 
 def _decision_scene_rows_safe() -> list[dict[str, Any]]:
     from core import decision_service
 
     try:
-        return _decision_scene_rows(decision_service.load_decision_config())
+        return decision_service.build_decision_scene_rows(decision_service.load_decision_config())
     except Exception:
         return []
 
@@ -586,7 +544,6 @@ def decision_manage(
         return _ok(
             action="scenes",
             scenes=_decision_scene_rows(cfg),
-            shadow_mode=bool(cfg.get("shadow_mode")),
             enabled=bool(cfg.get("enabled")),
             settings=_sanitize(cfg),
         )
@@ -624,15 +581,11 @@ def decision_manage(
         )
     if mode_name not in _DECISION_SCENE_MODES:
         return _fail(
-            f"未知模式「{mode_name or '(空)'}」；合法值为 off / shadow / live",
+            f"未知模式「{mode_name or '(空)'}」；合法值为 off / live",
             scenes=_decision_scene_rows_safe(),
         )
 
     scene_patch: dict[str, Any] = {"enabled": mode_name != "off"}
-    if mode_name == "shadow":
-        scene_patch["shadow"] = True
-    elif mode_name == "live":
-        scene_patch["shadow"] = False
 
     if threshold is not None:
         if isinstance(threshold, bool):
@@ -656,32 +609,15 @@ def decision_manage(
     rows = _decision_scene_rows(cfg)
     row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
     effective_mode = str(row.get("mode") or "off")
-    label = str(row.get("label") or scene_name)
-    if mode_name == "live" and effective_mode != "live":
-        msg = f"{label}场景已标记为正式，但全局影子模式仍开启，当前实际按影子运行"
-        hint = "到决策设置里关闭「影子模式」后，本场景才会正式生效"
-    elif not bool(cfg.get("enabled")):
-        msg = f"{label}场景已保存为{_DECISION_SCENE_MODE_TEXT[mode_name]}"
-        hint = "决策模型总开关未启用：场景设置要等总开关打开后才生效"
-    elif effective_mode == "live":
-        msg = f"{label}场景已切换为正式（决策结果会真实影响任务行为）"
-        hint = "正式模式：失败、超时或低置信都会自动回退原逻辑，不会阻断任务"
-    elif effective_mode == "shadow":
-        msg = f"{label}场景已切换为影子（真发请求、真写审计，结果丢弃）"
-        hint = "影子模式用于观察决策质量；确认无误后再切正式"
-    else:
-        msg = f"{label}场景已关闭（零请求、零记录，走原逻辑）"
-        hint = "关闭后该场景不再询问决策模型，行为与未接入时一致"
+    msg, hint = decision_service.build_scene_change_feedback(cfg, row, mode_name)
     return _ok(
         action="set_scene",
         msg=msg,
         hint=hint,
         scene=row,
         scenes=rows,
-        requested_mode=mode_name,
-        effective_mode=effective_mode,
+        mode=effective_mode,
         mode_text=_DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭"),
-        global_shadow=bool(cfg.get("shadow_mode")),
         settings=_sanitize(cfg),
     )
 
@@ -750,8 +686,8 @@ def build_specs() -> list[ToolSpec]:
             name="decision_manage",
             description=(
                 "管理 JEV 决策模型：get 读配置与运行状态（密钥脱敏）、set 保存开关与全局参数、"
-                "probe 逐 Key 真实探测可用性、scenes 查看四个业务场景三态、"
-                "set_scene 设置单个场景（off 关闭 / shadow 影子 / live 正式，可同时改阈值）。"
+                "probe 逐 Key 真实探测可用性、scenes 查看四个业务场景开关、"
+                "set_scene 设置单个场景（off 关闭 / live 开启，可同时改阈值）。"
             ),
             input_schema=_schema(
                 {
@@ -766,7 +702,7 @@ def build_specs() -> list[ToolSpec]:
                     "payload": {
                         "type": "object",
                         "description": (
-                            "set 时的配置 patch，如 {enabled, shadow_mode, model_id, "
+                            "set 时的配置 patch，如 {enabled, model_id, "
                             "timeout_ms, base_url, endpoint_style, key_mode}"
                         ),
                     },
@@ -778,7 +714,7 @@ def build_specs() -> list[ToolSpec]:
                     "mode": {
                         "type": "string",
                         "enum": list(_DECISION_SCENE_MODES),
-                        "description": "set_scene 的三态：off 关闭 / shadow 影子 / live 正式",
+                        "description": "set_scene 的开关：off 关闭 / live 开启",
                     },
                     "threshold": {
                         "type": "number",

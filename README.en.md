@@ -1,5 +1,5 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
 [![Version 1.4.0](https://img.shields.io/badge/Version-1.4.0-green.svg)](core/version.py)
 
 # Xingyao (Y-code)
@@ -32,7 +32,7 @@ English | [中文](README.md)
 
 - **Multi-model management**: `/models` opens a full-screen model selector supporting OpenAI / Anthropic / DeepSeek / StepFun and other protocols, unified through a self-built HTTPX engine (`core/llm_native_transport.py`). Preset providers only carry provider info; models are picked from a live "fetch available models" list — endpoint auto-assembly, alternate spelling on 404, multi-key retry, and context window / max output / vision extracted from each vendor's fields (with a local spec table as fallback).
 - **Secondary model support**: Configure a secondary model to handle vision recognition, memory compression, and subagent calls, splitting work between primary and secondary.
-- **91 built-in tools** (the iMOM locator plugin adds 5 dedicated tools, 96 in total): File read/write with atomic batch edits, cross-file code search plus symbol outlines and references, command execution and background tasks, web fetching and free news search, image and video generation, weather, plan orchestration, subagent dispatch, session / model / skill / plugin / hook management, office document read/write, the novel writing toolchain, and computer control plus Windows system tools.
+- **94 default-registered tools** (`computer_action` is added when computer control is enabled, plus 5 dedicated tools from the iMOM locator plugin): File read/write with atomic batch edits, cross-file code search plus symbol outlines and references, command execution and background tasks, web fetching and free news search, image and video generation, weather, plan orchestration, subagent dispatch and secretary cross-project search, session / model / skill / plugin / hook management, office document read/write, the novel writing toolchain, and computer control plus Windows system tools.
 - **Free web search**: 360 Search first, Bing RSS as fallback; no third-party package dependency (timeouts slow it down but never disable it).
 - **Tool result caching**: Identical searches and reads from read-only tools hit an in-process cache, saving tokens and time.
 
@@ -51,11 +51,11 @@ English | [中文](README.md)
 - **Subagent system**: 5 built-in types (explore / implement / test / review / general) plus custom subagents, with dependency-aware parallel scheduling and nesting up to 3 levels deep.
 - **Plan execution mode**: For multi-step tasks (more than 3 subtasks after decomposition), a `plan_write` plan is created first and subtasks are dispatched along the dependency graph, with pause / resume / retry / cancel support.
 - **Background task management**: Long-running commands execute in the background. `/tasks` shows status, `/tasks tail` streams logs, `/tasks kill` terminates.
-- **Permission system**: Four modes (confirm before changes / accept_edits for automatic edits / plan mode / full access), with a sandbox controlling working-directory access boundaries.
+- **Permission system**: Five modes (confirm before changes / accept_edits for automatic edits / auto_decision for JEV-assisted approval / plan mode / full access), with a sandbox controlling working-directory access boundaries.
 - **Scheduled automation tasks**: Bind a prompt to interval / daily / weekly / startup / one-off triggers; the task starts a full agent turn in the chosen session on schedule. Choose a fresh session each run or reuse a fixed one, missed runs catch up by default, and unattended permission is limited to confirm / accept-edits.
 - **Workflow orchestration**: A `.dwf.ts` script declares phases with subagents, commands, and reports; saving it also generates a skill of the same name, and it runs via `/workflow` or `workflow_run` with live step events.
 - **Secretary dispatch ledger**: Every dispatch is recorded (queued / running / done / failed / cancelled / dependency unmet), the result summary is written back to the originating session, and a batch can hold up to 8 tasks with intra-batch dependencies.
-- **Task decision hooks**: Four control points (loop stop-loss, subagent acceptance, etc.) can call the JEV decision model in shadow or live mode, with configurable thresholds and fail-open fallback.
+- **Task decision hooks**: Control points (loop stop-loss, subagent acceptance, etc.) can call the JEV decision model with per-scene toggles, configurable thresholds, and fail-open fallback.
 
 ### Memory and context
 
@@ -320,7 +320,7 @@ Type these in the CLI input box (Tab completion supported). The desktop GUI only
 
 | Command | Description |
 |------|------|
-| `/permission <confirm\|accept_edits\|plan\|full>` | Switch permission level |
+| `/permission <confirm\|accept_edits\|auto_decision\|plan\|full>` | Switch permission level |
 | `/sandbox <on\|off>` | Toggle the sandbox (on = allow access outside the working directory) |
 | `/turns <10-1000>` | Set the maximum model turns per task (default 100) |
 | `/clear` | Clear the screen |
@@ -365,7 +365,7 @@ The desktop app does not provide commands for actions that already have GUI butt
 `/agent` and `/workflow` currently hand off to the model via prompt rather than calling tools directly: the command itself neither starts a subagent nor executes a workflow — it only writes the type, name, and arguments into the current turn's prompt so the model can invoke the corresponding tool.
 
 ## 🛠️ Built-in Tools
-Y-code ships 91 built-in tools (excluding the 5 dedicated tools from the iMOM project-locator plugin stack), grouped by purpose:
+Y-code registers 94 tools by default (`computer_action` is added when computer control is enabled, excluding the 5 dedicated tools from the iMOM project-locator plugin stack), grouped by purpose:
 
 ### Files and code (read-only)
 
@@ -430,7 +430,8 @@ Y-code ships 91 built-in tools (excluding the 5 dedicated tools from the iMOM pr
 | `manage_task` | Inspect / wait on / kill background tasks and background subagents |
 | `dispatch_task` / `dispatch_batch` | Secretary dispatch (single / batch, with intra-batch dependencies) |
 | `list_dispatches` / `get_dispatch_result` | Review the dispatch ledger and results |
-| `secretary_probe` | Read-only probe: dump in-process core module signatures |
+| `list_projects` / `list_sessions` / `read_session` | Secretary cross-project session listing and paginated history reading |
+| `manage_memory` | Secretary personal long-term memory management (`~/.ycode/memory/` only) |
 | `open_session` | Open (switch to) a session |
 | `create_project` | Create a project in a directory (including AGENTS.md scaffolding) |
 
@@ -528,12 +529,13 @@ For multi-step tasks (more than 3 subtasks after decomposition), create an execu
 
 ## 🔒 Permissions and Security
 
-### Four permission modes
+### Five permission modes
 
 | Mode | Description |
 |------|------|
 | `confirm` (default) | Queries pass automatically; any modification, deletion, or execution change is asked first |
 | `accept_edits` | Queries plus ordinary edits and builds pass automatically; deletions, dependency installs, process termination, Git commit/push, and other sensitive operations are still asked |
+| `auto_decision` | Permission requests and clarifying questions are evaluated automatically by the decision model (JEV); falls back to user confirmation when unconfigured or high-risk |
 | `plan` | Only reads, read-only queries, plan metadata, and user clarifications are allowed; modifications and deletions are rejected outright with no authorization bypass |
 | `full` | All non-catastrophic operations inside the sandbox pass automatically; access outside the sandbox depends on the sandbox toggle |
 
@@ -666,7 +668,7 @@ plugins/<plugin_name>/          # Built-in plugins (shipped with the repo)
 | iMOM locator | `~/.ycode/plugins/imom_locator/` (user level) | Multi-project code localization for iMOM/MES: dynamic publish discovery, system identification, page index building, and millisecond-level lookup |
 
 > User-level plugins live in `~/.ycode/plugins/<plugin_name>/`; a plugin with the same name overrides the built-in/repository version.
-> The trash button in the plugin page physically deletes user-level plugins (unloading registered tools and clearing trust records first); built-in plugins are refused, and the phone remote API is blocked from this action too.
+> The trash button on the plugins page physically deletes user-level plugins, or soft-removes built-in plugins (recorded in the removed list without deleting bundled files; restorable from the "Removed" view or via `/plugins restore`). The phone remote API blocks deletion, toggling, and restoration.
 
 ## 📁 Project Structure
 
@@ -723,7 +725,7 @@ xingyao-y-code/
 │   ├── mcp_selector.py      # MCP full-screen configurator
 │   ├── skills.py            # SKILL.md scanning, injection, and deletion
 │   ├── skill_selector.py    # Skill selector
-│   ├── plugin_loader.py     # Plugin loader (trust fingerprints / deletion)
+│   ├── plugin_loader.py     # Plugin loader (hot-load / soft-remove & restore / deletion)
 │   ├── lsp.py               # LSP-lite symbol lookup
 │   ├── worktree.py          # Git worktree
 │   ├── session_selector.py  # Full-screen session selector
@@ -839,7 +841,7 @@ Config file location: `~/.ycode/config.json`. A fresh install starts with a clea
 | `memory_compression` | Memory compression parameters (`insert_mode` insert-mode compression, `idle_maintenance_seconds` idle-maintenance trigger seconds (0 disables), `precompress_ratio` pre-compression watermark) |
 | `providers` | List of model providers |
 | `theme` | Terminal color theme (9 available) |
-| `permission_mode` | Permission mode (confirm / accept_edits / plan / full) |
+| `permission_mode` | Permission mode (confirm / accept_edits / auto_decision / plan / full) |
 | `allow_outside_workspace` | Sandbox toggle |
 | `command_shell` | Default command interpreter (auto / pwsh / powershell / cmd; the GUI "System settings" page restricts choices to what is installed) |
 | `skill_search_paths` | Skill search paths (project level) |

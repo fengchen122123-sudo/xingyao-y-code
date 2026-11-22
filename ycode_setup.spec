@@ -27,6 +27,7 @@ datas = [
     ('system_prompt.md', '.'),
     # GUI 专用提示词：与通用版并列随包，GUI 严格使用自己的，不回退混用
     ('system_prompt_gui.md', '.'),
+    ('system_prompt_secretary_gui.md', '.'),
     # GUI 向导资源：侧栏 logo（构建期预缩放到 168x168 的 PNG，运行期用
     # tk.PhotoImage 直接读，因此不再需要随包 Pillow）+ 窗口图标
     ('assets/ycode-logo-168.png', 'assets'),

@@ -8,9 +8,6 @@ import pytest
 from core import plugin_loader
 from core.tool_registry import ToolRegistry
 
-_REAL_CONFIRM = plugin_loader._confirm_plugin_trust
-
-
 def _make_plugin(plugin_dir, name, body, enabled=True, entry="plugin.py"):
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / "plugin.json").write_text(
@@ -86,12 +83,6 @@ def plugin_env(tmp_path, monkeypatch):
     builtin_dir.mkdir()
     monkeypatch.setattr(plugin_loader, "plugin_dirs", lambda: [user_dir, builtin_dir])
     return user_dir, builtin_dir
-
-
-@pytest.fixture(autouse=True)
-def _trust_env(tmp_path, monkeypatch):
-    monkeypatch.setattr(plugin_loader, "_trust_file", lambda: tmp_path / "plugin_trust.json")
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: True)
 
 
 def test_load_plugin_registers_tool(plugin_env):
@@ -387,168 +378,80 @@ def test_refresh_plugins_records_disabled_new_plugin(plugin_env):
     assert registry.execute("demo_tool").is_error
 
 
-def test_user_plugin_skipped_when_not_confirmed(plugin_env, monkeypatch, caplog):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+def test_builtin_plugin_loads(plugin_env):
+    _, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "demo", "demo", _GOOD_PLUGIN)
 
     registry = ToolRegistry()
-    with caplog.at_level("WARNING", logger="ycode.plugins"):
-        loaded = plugin_loader.load_and_register(registry)
+    assert plugin_loader.load_and_register(registry) == ["demo"]
+    assert registry.execute("demo_tool", x="bi").content == "hello bi"
 
-    assert loaded == []
-    assert registry.execute("demo_tool").is_error
-    infos = plugin_loader.get_plugin_infos()
-    assert infos[0]["status"] == "untrusted"
-    assert any("未获信任" in r.message for r in caplog.records)
-
-
-def test_user_plugin_loads_after_confirmation_persisted(plugin_env, monkeypatch, tmp_path):
+def test_user_plugin_loads_without_trust_confirmation(plugin_env):
     user_dir, _ = plugin_env
     _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
 
     registry = ToolRegistry()
     assert plugin_loader.load_and_register(registry) == ["demo"]
-    trust = json.loads((tmp_path / "plugin_trust.json").read_text(encoding="utf-8"))
-    assert len(trust) == 1
-
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
-    registry2 = ToolRegistry()
-    assert plugin_loader.load_and_register(registry2) == ["demo"]
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "loaded"
+    assert registry.execute("demo_tool", x="hi").content == "hello hi"
 
 
-def test_fingerprint_change_requires_reconfirmation(plugin_env, monkeypatch):
+def test_disabled_plugin_is_not_loaded(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == []
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
+
+
+def test_toggle_enable_loads_plugin_directly(plugin_env, monkeypatch):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+
+    ok, _ = plugin_loader.toggle_plugin("off", True)
+
+    assert ok is True
+    assert registry.execute("demo_tool", x="go").content == "hello go"
+
+
+def test_set_trust_prompt_is_a_noop(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    plugin_loader.set_trust_prompt(lambda *_a: False)
+    try:
+        assert plugin_loader.load_and_register(ToolRegistry()) == ["demo"]
+    finally:
+        plugin_loader.set_trust_prompt(None)
+
+
+def test_trust_plugin_is_a_compat_noop(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    ok, msg = plugin_loader.trust_plugin("demo")
+    assert ok is True
+    assert "无需确认" in msg
+
+    ok2, _ = plugin_loader.trust_plugin("")
+    assert ok2 is False
+
+
+def test_plugin_code_change_reloads_without_confirmation(plugin_env):
     user_dir, _ = plugin_env
     plugin_dir = user_dir / "demo"
     _make_plugin(plugin_dir, "demo", _GOOD_PLUGIN)
     assert plugin_loader.load_and_register(ToolRegistry()) == ["demo"]
 
     (plugin_dir / "plugin.py").write_text(_GOOD_PLUGIN + "\nX = 1\n", encoding="utf-8")
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
-
-    registry = ToolRegistry()
-    assert plugin_loader.load_and_register(registry) == []
-    assert plugin_loader.get_plugin_infos()[0]["status"] == "untrusted"
-
-
-def test_builtin_plugin_auto_trusted(plugin_env, monkeypatch):
-    _, builtin_dir = plugin_env
-    _make_plugin(builtin_dir / "demo", "demo", _GOOD_PLUGIN)
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
 
     registry = ToolRegistry()
     assert plugin_loader.load_and_register(registry) == ["demo"]
-
-
-def test_trust_prompt_callback_allows_loading(plugin_env, monkeypatch):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
-    monkeypatch.setattr(plugin_loader, "_trust_prompt", lambda path, name, fp: True)
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _REAL_CONFIRM)
-
-    registry = ToolRegistry()
-    assert plugin_loader.load_and_register(registry) == ["demo"]
-
-
-def test_disabled_plugin_does_not_trigger_trust_prompt(plugin_env, monkeypatch):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
-
-    def _boom(*a, **k):
-        raise AssertionError("禁用插件不应触发信任确认")
-
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _boom)
-
-    registry = ToolRegistry()
-    assert plugin_loader.load_and_register(registry) == []
-    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
-
-
-def test_toggle_enable_untrusted_plugin_refused(plugin_env, monkeypatch, tmp_path):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
-    registry = ToolRegistry()
-    plugin_loader.load_and_register(registry)
-    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
-
-    ok, msg = plugin_loader.toggle_plugin("off", True)
-
-    assert ok is False
-    assert "信任" in msg
-    assert registry.execute("demo_tool").is_error
-
-
-def test_trust_plugin_untrusted_then_loads_without_confirm(plugin_env, monkeypatch):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
-
-    registry = ToolRegistry()
-    assert plugin_loader.load_and_register(registry) == []
-    assert plugin_loader.get_plugin_infos()[0]["status"] == "untrusted"
-
-    ok, msg = plugin_loader.trust_plugin("demo")
-    assert ok is True
-    assert msg
-
-    registry2 = ToolRegistry()
-    assert plugin_loader.load_and_register(registry2) == ["demo"]
     assert plugin_loader.get_plugin_infos()[0]["status"] == "loaded"
-    assert plugin_loader.get_plugin_infos()[0]["tools"] == ["demo_tool"]
-    assert registry2.execute("demo_tool", x="hi").content == "hello hi"
-
-
-def test_trust_plugin_unknown_name_rejected(plugin_env):
-    ok, msg = plugin_loader.trust_plugin("no_such_plugin")
-    assert ok is False
-    assert "未找到" in msg
-
-
-def test_trust_plugin_builtin_ok_idempotent(plugin_env):
-    _, builtin_dir = plugin_env
-    _make_plugin(builtin_dir / "bi", "bi", _GOOD_PLUGIN)
-
-    ok, _ = plugin_loader.trust_plugin("bi")
-    assert ok is True
-    ok2, _ = plugin_loader.trust_plugin("bi")
-    assert ok2 is True
-
-
-def test_trust_plugin_disabled_only_persists_trust(plugin_env, monkeypatch):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
-    registry = ToolRegistry()
-    plugin_loader.load_and_register(registry)
-    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
-
-    ok, _ = plugin_loader.trust_plugin("off")
-    assert ok is True
-
-    meta = json.loads((user_dir / "off" / "plugin.json").read_text(encoding="utf-8"))
-    assert meta["enabled"] is False
-    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
-    assert registry.execute("demo_tool").is_error
-
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
-    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
-    ok2, msg2 = plugin_loader.toggle_plugin("off", True)
-    assert ok2 is True
-    assert registry.execute("demo_tool", x="go").content == "hello go"
-
-
-def test_trust_plugin_persists_fingerprint_entry(plugin_env, tmp_path):
-    user_dir, _ = plugin_env
-    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
-
-    ok, _ = plugin_loader.trust_plugin("demo")
-    assert ok is True
-
-    trust = json.loads((tmp_path / "plugin_trust.json").read_text(encoding="utf-8"))
-    assert trust == {
-        str((user_dir / "demo").resolve()):
-            plugin_loader._plugin_fingerprint(user_dir / "demo")
-    }
 
 
 def test_core_managed_markers_include_tokenrhythm_account_provider():
@@ -601,38 +504,6 @@ def test_prune_orphan_providers_keeps_account_provider(monkeypatch):
     assert removed == ["被禁用的插件厂商"]
     assert [p["id"] for p in written["data"]["providers"]] == ["tr1", "p_plugin", "p_user"]
     assert written["data"]["active_model_id"] is None
-
-
-def test_confirm_plugin_trust_never_prompts_from_worker_thread(monkeypatch):
-    prompts = []
-
-    class _Tty:
-        def isatty(self):
-            return True
-
-    def _fake_input(prompt=""):
-        prompts.append(prompt)
-        raise AssertionError("后台线程不应调用 input()")
-
-    monkeypatch.setattr(plugin_loader, "_trust_prompt", None)
-    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _REAL_CONFIRM)
-    monkeypatch.setattr("sys.stdin", _Tty())
-    monkeypatch.setattr("sys.stdout", _Tty())
-    monkeypatch.setattr("builtins.input", _fake_input)
-
-    result = []
-
-    def _run():
-        result.append(
-            plugin_loader._confirm_plugin_trust(Path("demo"), "demo", "fp")
-        )
-
-    worker = threading.Thread(target=_run)
-    worker.start()
-    worker.join(5)
-
-    assert result == [False]
-    assert prompts == []
 
 
 def test_refresh_plugins_serializes_concurrent_loads(plugin_env, monkeypatch):

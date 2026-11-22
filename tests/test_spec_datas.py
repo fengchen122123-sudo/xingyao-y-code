@@ -16,6 +16,7 @@ REQUIRED_TWO_TUPLE_DATAS = [
     ('config.example.json', '.'),
     ('system_prompt.md', '.'),
     ('system_prompt_gui.md', '.'),
+    ('system_prompt_secretary_gui.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
     ('vendor/mermaid/mermaid-11.17.2.min.js', 'vendor/mermaid'),
     ('frontend/dist', 'frontend/dist'),
@@ -340,3 +341,11 @@ class TestBloatPruning:
             text = (root / rel).read_text(encoding='utf-8')
             assert 'ycode-logo-168.png' in text
             assert 'ycode.png' not in text
+
+    def test_ycode_spec_bundles_secretary_prompt_and_win32gui(self):
+        root = Path(__file__).resolve().parent.parent
+        spec_text = (root / 'ycode.spec').read_text(encoding='utf-8')
+        assert "('system_prompt_secretary_gui.md', '.')" in spec_text
+        assert "'win32gui'" in spec_text
+        setup_spec_text = (root / 'ycode_setup.spec').read_text(encoding='utf-8')
+        assert "('system_prompt_secretary_gui.md', '.')" in setup_spec_text

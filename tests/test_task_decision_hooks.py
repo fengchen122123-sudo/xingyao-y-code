@@ -106,7 +106,7 @@ def test_disabled_by_default_zero_requests(data_dir, monkeypatch):
 
 def test_global_enabled_auto_activates_task_scenes_without_enabling_router(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     assert router_scene_live() is False
 
     answers = iter(["pivot", "accepted", "split_smaller", "keep_facts_only"])
@@ -141,12 +141,15 @@ def test_global_enabled_auto_activates_task_scenes_without_enabling_router(data_
     assert [r["scene"] for r in records] == [
         "loop_guard", "subagent_review", "plan_recovery", "memory_filter"
     ]
-    assert all(r["shadow"] is False and r["adopted"] is True for r in records)
+    assert all(r["adopted"] is True for r in records)
 
 
-def test_global_shadow_mode_records_audit_without_affecting_behavior(data_dir, monkeypatch):
+def test_legacy_shadow_mode_is_ignored_and_hook_applies(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": True})
+    (data_dir / "decision.json").write_text(
+        json.dumps({"enabled": True, "shadow_mode": True}),
+        encoding="utf-8",
+    )
     calls = _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "skip_all"}}}),
@@ -157,20 +160,22 @@ def test_global_shadow_mode_records_audit_without_affecting_behavior(data_dir, m
         "lessons": [],
         "self_notes": [],
     }
-    assert hooks.filter_extracted_learning(raw) == raw
+    assert hooks.filter_extracted_learning(raw) == {
+        "user_facts": [],
+        "lessons": [],
+        "self_notes": [],
+    }
     assert len(calls) == 1
     records = _audit_records(data_dir)
     assert len(records) == 1
     assert records[0]["scene"] == "memory_filter"
-    assert records[0]["shadow"] is True
-    assert records[0]["adopted"] is False
+    assert records[0]["adopted"] is True
 
 
 def test_explicit_scene_opt_out_stops_requests(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({
         "enabled": True,
-        "shadow_mode": False,
         "scenes": {"loop_guard": {"enabled": False}},
     })
     calls = _mock_no_network(monkeypatch)
@@ -184,7 +189,7 @@ def test_explicit_scene_opt_out_stops_requests(data_dir, monkeypatch):
 
 def test_state_redacts_sensitive_tokens(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     calls = _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "pivot"}}}),
@@ -215,7 +220,7 @@ def test_loop_guard_injects_pivot_guidance_in_chat_turn(data_dir, monkeypatch):
     from core import llm as llm_mod
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "pivot"}}}),
@@ -267,7 +272,7 @@ def test_subagent_review_marks_fake_completion_as_failed(data_dir, monkeypatch):
     from core.tools import SubagentManager, SubagentTask
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "failed"}}}),
@@ -292,7 +297,7 @@ def test_subagent_review_appends_warning_on_incomplete(data_dir, monkeypatch):
     from core.tools import SubagentManager, SubagentTask
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "incomplete"}}}),
@@ -318,7 +323,7 @@ def test_plan_recovery_intercepts_blind_retry_on_split_smaller(data_dir, monkeyp
     from core.task_scheduler import TaskScheduler
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "split_smaller"}}}),
@@ -350,7 +355,7 @@ def test_plan_recovery_allows_retry_same(data_dir, monkeypatch):
     from core.task_scheduler import TaskScheduler
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "retry_same"}}}),
@@ -377,7 +382,7 @@ def test_memory_filter_blocks_noisy_writes_in_run_turn_learning(data_dir, monkey
     from core import learning as learning_mod
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "skip_all"}}}),
@@ -413,7 +418,7 @@ def test_memory_filter_records_target_session_even_when_ui_views_other(data_dir,
     from core import learning as learning_mod
 
     _write_user_config(data_dir, [PROVIDER])
-    svc.save_decision_config({"enabled": True, "shadow_mode": False})
+    svc.save_decision_config({"enabled": True})
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "keep_all"}}}),

@@ -440,7 +440,7 @@ class LanServer:
         "shutdown",
         "save_automation_task", "set_automation_task_enabled", "run_automation_task_now",
         "toggle_mcp_server",
-        "trust_plugin", "toggle_plugin", "run_plugin_settings_action",
+        "trust_plugin", "toggle_plugin", "restore_plugin", "run_plugin_settings_action",
         "add_permission_rule",
         "remove_mcp_server", "open_external_url", "get_remote_bind_qr",
         "delete_skill", "delete_plugin",

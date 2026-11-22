@@ -199,8 +199,8 @@ def step0b_build_playwright_component(project_dir):
 
         manifest = {
             "playwright_version": version,
-            "python_version": "3.14",
-            "abi": "cp314",
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "abi": f"cp{sys.version_info.major}{sys.version_info.minor}",
             "platform": "win-amd64",
             "built_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }

@@ -794,18 +794,10 @@ def main():
         from core.mcp_client import mcp_manager
     except Exception:
         mcp_manager = None
-    # GUI 进程没有可交互的终端（stdin 可能连着隐藏控制台）：插件信任确认必须
-    # 走显式入口（插件页「信任并启用」），绝不能落到 _confirm_plugin_trust 的
-    # 控制台 input()——提示打印在用户看不见的地方，等待输入会把触发刷新的
-    # 回合线程永久挂住（2026-11-04 实测：plugin_manage 卡死 5.5 小时，且停止
-    # 按钮无法中断阻塞的 input）。回调恒返回 False 仅表示"不在 GUI 里自动确认"，
-    # 不影响插件页的显式信任。
-    try:
-        from core.plugin_loader import set_trust_prompt
-
-        set_trust_prompt(lambda _path, _name, _fingerprint: False)
-    except Exception:
-        logger.debug("注册 GUI 插件信任回调失败（不影响启动）", exc_info=True)
+    # 插件信任校验已由 core/plugin_loader 移除，这里不再注册确认回调：GUI 进程
+    # 没有可交互终端，一旦有路径落到控制台 input()，提示用户看不见、等待输入会把
+    # 触发刷新的回合线程永久挂住（2026-11-04 实测：plugin_manage 卡死 5.5 小时，
+    # 停止按钮也无法中断）。
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
     try:

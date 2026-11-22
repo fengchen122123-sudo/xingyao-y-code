@@ -263,7 +263,6 @@ def test_plugin_registering_reserved_name_is_recorded_as_failed(tmp_path, monkey
 
     registry = ToolRegistry()
     monkeypatch.setattr(plugin_loader, "plugin_dirs", lambda: [plugin_root])
-    monkeypatch.setattr(plugin_loader, "_check_plugin_trusted", lambda *_args: True)
     saved_infos = list(plugin_loader._PLUGIN_INFOS)
     try:
         plugin_loader.load_and_register(registry)

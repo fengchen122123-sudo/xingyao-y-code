@@ -235,14 +235,8 @@ def get_auto_decision_readiness_warning() -> str:
         if not isinstance(cfg, dict) or not bool(cfg.get("enabled")):
             return (
                 "已切换到「自动决策」模式，但决策模型（JEV）尚未启用。"
-                "请前往「设置 → 记忆与决策 → 决策模型（JEV）」开启并关闭影子模式；"
+                "请前往「设置 → 记忆与决策 → 决策模型（JEV）」开启；"
                 "未启用前遇到权限和提问仍将回退给你确认。"
-            )
-        if bool(cfg.get("shadow_mode")):
-            return (
-                "已切换到「自动决策」模式，但决策模型（JEV）当前处于「影子模式（只记录不生效）」。"
-                "请在「设置 → 记忆与决策 → 决策模型（JEV）」中关闭影子模式；"
-                "否则遇到权限和提问仍将回退给你确认。"
             )
         provider = decision_service._resolve_provider(cfg)
         base_url = decision_service._resolve_base_url(cfg, provider)

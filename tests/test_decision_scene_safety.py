@@ -75,12 +75,11 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable_safety(*, shadow=False, global_shadow=None, **scene_extra):
-    scene_cfg = {"enabled": True, "shadow": shadow}
+def _enable_safety(**scene_extra):
+    scene_cfg = {"enabled": True}
     scene_cfg.update(scene_extra)
     return svc.save_decision_config({
         "enabled": True,
-        "shadow_mode": shadow if global_shadow is None else global_shadow,
         "scenes": {"safety": scene_cfg},
     })
 
@@ -368,7 +367,7 @@ def test_live_low_probability_downgrades_via_gateway(data_dir, monkeypatch):
 
 def test_live_high_probability_keeps_allow_via_gateway(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable_safety(shadow=False)
+    _enable_safety()
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 0.95}}}))
 
     facts = _allow_facts()
@@ -377,28 +376,9 @@ def test_live_high_probability_keeps_allow_via_gateway(data_dir, monkeypatch):
     assert gate.apply_decision_to_permission(facts, baseline, command="git push") == baseline
 
 
-def test_shadow_mode_keeps_original(data_dir, monkeypatch):
-    _write_user_config(data_dir, [PROVIDER])
-    _enable_safety(shadow=True)
-    calls = _mock_post(
-        monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 0.1}}})
-    )
-
-    facts = _allow_facts()
-    baseline = decide_permission(facts)
-
-    result = gate.apply_decision_to_permission(facts, baseline, command="git push")
-
-    assert len(calls) == 1
-    assert result == baseline
-    records = _audit_records(data_dir)
-    assert records and records[-1]["shadow"] is True
-    assert records[-1]["adopted"] is False
-
-
 def test_upstream_timeout_keeps_original(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable_safety(shadow=False)
+    _enable_safety()
     _mock_post(
         monkeypatch,
         lambda i, call: (_ for _ in ()).throw(httpx.TimeoutException("timeout")),

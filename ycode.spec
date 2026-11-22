@@ -121,6 +121,8 @@ common_datas = [
     ('system_prompt.md', '.'),
     # GUI 专用提示词：与通用版并列随包，GUI 严格使用自己的，不回退混用
     ('system_prompt_gui.md', '.'),
+    # GUI 秘书会话专用提示词：由 core/agent_service.py::_load_secretary_system_prompt 按路径读取
+    ('system_prompt_secretary_gui.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
     # Mermaid 渲染器（CLI 流程图导出用：core.diagram_export 生成的本地 HTML
     # 以 file:// 引用此文件，浏览器端离线渲染；缺失时页面降级只显示源码）
@@ -185,6 +187,9 @@ common_hiddenimports = (
     'core.hunyuan_image',
     # 同上：core.novel_service 只被内置插件 plugins/novel_workspace 动态 import。
     'core.novel_service',
+    # 内置插件 plugins/windows_tools 在 windows_notify 中惰性 import win32gui；
+    # plugins/ 以 datas 形式拷贝而不经过静态分析，且主程序无直接引用，必须显式收集。
+    'win32gui',
     # comtypes 在运行时从系统 UIAutomationCore.dll 生成 comtypes.gen.* 绑定，
     # PyInstaller 静态扫描不可达（仅 Windows 桌面语义定位路径使用）。
     'comtypes',

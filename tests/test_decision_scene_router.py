@@ -100,12 +100,11 @@ def _write_user_config(data_dir):
     )
 
 
-def _enable_router(*, shadow=False):
+def _enable_router():
     return svc.save_decision_config(
         {
             "enabled": True,
-            "shadow_mode": shadow,
-            "scenes": {"router": {"enabled": True, "shadow": shadow, "timeout_ms": 250}},
+            "scenes": {"router": {"enabled": True, "timeout_ms": 250}},
         }
     )
 
@@ -369,29 +368,26 @@ def test_router_scene_live_false_when_off(data_dir, monkeypatch):
     assert tmo.router_scene_live() is False
 
 
-def test_router_scene_live_false_when_scene_shadow(data_dir):
+def test_router_scene_live_ignores_legacy_shadow_fields(data_dir):
     _write_user_config(data_dir)
-    _enable_router(shadow=True)
-
-    assert tmo.router_scene_live() is False
-
-
-def test_router_scene_live_false_when_global_shadow(data_dir):
-    _write_user_config(data_dir)
-    svc.save_decision_config(
-        {
-            "enabled": True,
-            "shadow_mode": True,
-            "scenes": {"router": {"enabled": True, "shadow": False}},
-        }
+    (data_dir / "decision.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "shadow_mode": True,
+                "scenes": {"router": {"enabled": True, "shadow": True}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
-    assert tmo.router_scene_live() is False
+    assert tmo.router_scene_live() is True
 
 
 def test_router_scene_live_true_when_live(data_dir):
     _write_user_config(data_dir)
-    _enable_router(shadow=False)
+    _enable_router()
 
     assert tmo.router_scene_live() is True
 
@@ -405,7 +401,7 @@ def test_router_scene_live_zero_network_when_off(data_dir, monkeypatch):
 
 def test_live_mode_end_to_end_picks_secondary(data_dir, monkeypatch):
     _write_user_config(data_dir)
-    _enable_router(shadow=False)
+    _enable_router()
     _mock_secondary(monkeypatch, SECONDARY_MODEL)
     post_calls = _mock_post(
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "secondary"}}})
@@ -420,14 +416,14 @@ def test_live_mode_end_to_end_picks_secondary(data_dir, monkeypatch):
     assert records, "live 决策必须留审计"
     record = records[-1]
     assert record["scene"] == "router"
-    assert record["shadow"] is False
+    assert "shadow" not in record
     assert record["adopted"] is True
     assert record["trace_id"]
 
 
 def test_live_mode_end_to_end_main_keeps_main_model(data_dir, monkeypatch):
     _write_user_config(data_dir)
-    _enable_router(shadow=False)
+    _enable_router()
     _mock_secondary(monkeypatch, SECONDARY_MODEL)
     post_calls = _mock_post(
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "main"}}})
@@ -438,21 +434,6 @@ def test_live_mode_end_to_end_main_keeps_main_model(data_dir, monkeypatch):
     record = _audit_records(data_dir)[-1]
     assert record["scene"] == "router"
     assert record["adopted"] is True, "网关采纳了合法答案 main（结论是「不用副模型」）"
-
-
-def test_shadow_mode_keeps_main_model(data_dir, monkeypatch):
-    _write_user_config(data_dir)
-    _enable_router(shadow=True)
-    _mock_secondary(monkeypatch, SECONDARY_MODEL)
-    post_calls = _mock_post(
-        monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "secondary"}}})
-    )
-
-    assert tmo.resolve_turn_model(MAIN_MODEL, user_text=USER_TEXT) is None
-    assert len(post_calls) == 1
-    record = _audit_records(data_dir)[-1]
-    assert record["shadow"] is True
-    assert record["adopted"] is False
 
 
 def test_jev_disabled_zero_request_and_no_override(data_dir, monkeypatch):
@@ -467,7 +448,7 @@ def test_jev_disabled_zero_request_and_no_override(data_dir, monkeypatch):
 
 def test_image_turn_never_falls_back_to_text_only_secondary(data_dir, monkeypatch):
     _write_user_config(data_dir)
-    _enable_router(shadow=False)
+    _enable_router()
     _mock_secondary(monkeypatch, SECONDARY_MODEL)
     post_calls = _mock_no_network(monkeypatch)
 
@@ -481,7 +462,7 @@ def test_image_turn_allowed_when_secondary_can_see(data_dir, monkeypatch):
     from core import llm_dialects
 
     _write_user_config(data_dir)
-    _enable_router(shadow=False)
+    _enable_router()
     _mock_secondary(monkeypatch, {**SECONDARY_MODEL, "supports_vision": True})
     calls = _mock_decide(monkeypatch, "secondary")
     monkeypatch.setattr(llm_dialects, "_supports_vision_llm_first", lambda name: True)

@@ -95,12 +95,6 @@
         </label>
       </div>
 
-      <label class="switch-row">
-        <input data-test="decision-shadow" v-model="shadowModeDraft" type="checkbox" :disabled="controlsDisabled" />
-        <span class="switch-label">影子模式（只记录不生效）</span>
-        <span class="switch-hint">仅记录审计日志，不应用决策结果</span>
-      </label>
-
       <label class="field-label" for="decision-timeout">超时（毫秒）</label>
       <div class="timeout-row">
         <input id="decision-timeout" data-test="decision-timeout" v-model.number="timeoutDraft" class="text-field timeout-input" type="number" :min="100" :max="5000" step="50" :disabled="controlsDisabled" />
@@ -128,7 +122,7 @@
                   type="radio"
                   :name="`decision-scene-mode-${row.scene}`"
                   :value="option.value"
-                  v-model="row.requested_mode"
+                  v-model="row.mode"
                   :disabled="controlsDisabled || sceneSaving === row.scene"
                   @change="changeSceneMode(row, option.value)"
                 />
@@ -151,24 +145,17 @@
             </label>
           </div>
           <p
-            v-if="row.requested_mode === 'live'"
+            v-if="row.mode === 'live'"
             class="decision-note warn"
             :data-test="`decision-scene-${row.scene}-live-warning`"
           >
-            正式模式：结果会真实影响任务行为（失败或超时自动回退）。
-          </p>
-          <p
-            v-if="sceneShadowBlocked(row)"
-            class="decision-note warn"
-            :data-test="`decision-scene-${row.scene}-effective-hint`"
-          >
-            全局影子模式已开启，当前仅记录不生效。
+            开启后结果会真实影响任务行为（失败或超时自动回退）。
           </p>
         </div>
         <p v-if="!sceneRows.length" class="decision-note">场景列表未就绪（后端未响应或接口不可用）</p>
       </div>
       <p v-if="scenesMsg" class="decision-note" :class="{ warn: scenesFailed }" data-test="decision-scenes-msg">{{ scenesMsg }}</p>
-      <p class="decision-note">场景切换实时保存（关闭：不请求；影子：仅审计；正式：实际生效）。</p>
+      <p class="decision-note">场景切换实时保存（关闭：不请求；开启：实际生效）。</p>
 
       <div class="field-label">决策记录</div>
       <div class="audit-row">
@@ -198,7 +185,7 @@
         <button data-test="decision-audit-open" class="secondary-button" type="button" :disabled="loading || saving" @click="openAuditDir">打开审计目录</button>
       </div>
       <ul v-if="auditRecent.length" class="audit-list" data-test="decision-audit-list">
-        <li v-for="(item, index) in auditRecent" :key="index" :class="{ shadow: item.shadow }">
+        <li v-for="(item, index) in auditRecent" :key="index">
           {{ auditLine(item) }}
         </li>
       </ul>
@@ -245,11 +232,10 @@ const PROBE_LABELS: Record<string, string> = {
   error: '失败',
 };
 
-// 业务场景三态（顺序：关闭 → 影子 → 正式，风险由低到高；文案与后端 mode_text 一致）
+// 业务场景二态（关闭 / 开启；文案与后端 mode_text 一致）
 const SCENE_MODE_OPTIONS: { value: DecisionSceneMode; label: string }[] = [
   { value: 'off', label: '关闭' },
-  { value: 'shadow', label: '影子' },
-  { value: 'live', label: '正式' },
+  { value: 'live', label: '开启' },
 ];
 
 const loading = ref(false);
@@ -265,7 +251,6 @@ const modelIdDraft = ref('');
 const endpointStyleDraft = ref<'decision' | 'systemone'>('decision');
 const keyModeDraft = ref<'auto' | 'index'>('auto');
 const keyIndexDraft = ref(1);
-const shadowModeDraft = ref(true);
 const timeoutDraft = ref(800);
 const providerRef = ref('auto');
 const baseUrlDraft = ref('');
@@ -326,17 +311,17 @@ const auditSummaryText = computed(() => {
       ? '本会话暂无决策记录'
       : '今日暂无决策记录（跑一次探针即可产生记录）';
   }
-  const base = `${prefix} ${summary.today_count} 次决策 · 影子 ${summary.today_shadow_count} · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
+  const base = `${prefix} ${summary.today_count} 次决策 · 采纳 ${summary.today_adopted_count} · 回退 ${summary.today_fallback_count}`;
   if (auditScope.value === 'session' && typeof summary.session_total_count === 'number') {
     return `本会话累计 ${summary.session_total_count} 次 · ${base}`;
   }
   return base;
 });
 
-/** 单条审计记录的展示行：时间 · 场景 · 模式 · 延迟 · 会话（全局口径） · 回退原因 */
+/** 单条审计记录的展示行：时间 · 场景 · 延迟 · 会话（全局口径） · 回退原因 */
 function auditLine(item: DecisionAuditRecentItem): string {
   const time = item.ts.length >= 19 ? item.ts.slice(11, 19) : item.ts;
-  const parts = [time, item.scene || '未知场景', item.shadow ? '影子' : '正式'];
+  const parts = [time, item.scene || '未知场景'];
   if (typeof item.latency_ms === 'number') parts.push(`${item.latency_ms}ms`);
   if (auditScope.value === 'all' && item.session_id) parts.push(`会话：${item.session_id}`);
   if (item.fallback_reason) parts.push(`回退：${item.fallback_reason}`);
@@ -395,7 +380,6 @@ function applySettings(settings: Partial<DecisionSettingsSnapshot>) {
     keyModeDraft.value = 'auto';
     keyIndexDraft.value = 1;
   }
-  shadowModeDraft.value = settings.shadow_mode !== false;
   timeoutDraft.value = Number(settings.timeout_ms ?? 800) || 800;
   providerRef.value = String(settings.provider_ref ?? 'auto');
   baseUrlDraft.value = String(settings.base_url ?? '');
@@ -458,7 +442,6 @@ async function saveSettings() {
       provider_ref: providerRef.value.trim() || 'auto',
       base_url: baseUrlDraft.value.trim(),
       key_mode: keyModeDraft.value === 'auto' ? 'auto' : `index:${index}`,
-      shadow_mode: shadowModeDraft.value,
       timeout_ms: timeout,
     });
     if (res?.ok) {
@@ -539,32 +522,22 @@ function pickModel(event: Event) {
 
 /** 业务场景条目归一：容忍后端字段缺失/扩展，避免渲染崩溃 */
 function normalizeScene(raw: Partial<DecisionSceneRow>): DecisionSceneRow {
-  const mode = raw.mode === 'live' || raw.mode === 'shadow' || raw.mode === 'off' ? raw.mode : 'off';
-  const requested = raw.requested_mode === 'live' || raw.requested_mode === 'shadow' || raw.requested_mode === 'off'
-    ? raw.requested_mode
-    : mode;
+  const mode: DecisionSceneMode = raw.mode === 'live' ? 'live' : 'off';
   const threshold = Number(raw.threshold ?? 0.5);
   return {
     scene: String(raw.scene ?? ''),
     label: String(raw.label ?? raw.scene ?? ''),
     description: String(raw.description ?? ''),
     mode,
-    mode_text: String(raw.mode_text ?? (mode === 'live' ? '正式' : mode === 'shadow' ? '影子' : '关闭')),
-    requested_mode: requested,
-    enabled: raw.enabled === true,
-    shadow: raw.shadow !== false,
+    mode_text: String(raw.mode_text ?? (mode === 'live' ? '开启' : '关闭')),
+    enabled: raw.enabled === true || mode === 'live',
     threshold: Number.isFinite(threshold) ? threshold : 0.5,
     timeout_ms: Number(raw.timeout_ms ?? 250) || 250,
-    global_shadow: raw.global_shadow === true,
   };
 }
 
 function applyScenes(rows: Partial<DecisionSceneRow>[] | undefined) {
   sceneRows.value = Array.isArray(rows) ? rows.map(normalizeScene).filter((row) => row.scene) : [];
-}
-
-function sceneShadowBlocked(row: DecisionSceneRow): boolean {
-  return row.requested_mode === 'live' && row.mode !== 'live';
 }
 
 /** 拉取四场景快照；接口缺失/异常一律返回 null（绝不抛错） */
@@ -612,7 +585,7 @@ async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
     if (res?.ok) {
       if (res.scenes) applyScenes(res.scenes);
       scenesMsg.value = res.hint ? `${res.msg || '已保存'}；${res.hint}` : String(res.msg || '已保存');
-      scenesFailed.value = mode === 'live' && res.effective_mode !== undefined && res.effective_mode !== 'live';
+      scenesFailed.value = false;
     } else {
       scenesFailed.value = true;
       scenesMsg.value = String(res?.msg || '保存场景设置失败');
@@ -648,7 +621,7 @@ async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
       scenesMsg.value = '后端接口未就绪，无法保存场景设置';
       return;
     }
-    const res = await api.set_decision_scene(row.scene, row.requested_mode, threshold);
+    const res = await api.set_decision_scene(row.scene, row.mode, threshold);
     if (res?.ok) {
       if (res.scenes) applyScenes(res.scenes);
       scenesMsg.value = `${row.label}场景阈值已保存为 ${threshold}`;
@@ -685,7 +658,6 @@ async function loadAuditSummary() {
       auditSummary.value = {
         ok: true,
         today_count: 0,
-        today_shadow_count: 0,
         today_adopted_count: 0,
         today_fallback_count: 0,
         recent: [],
@@ -701,7 +673,6 @@ async function loadAuditSummary() {
       auditSummary.value = {
         ok: true,
         today_count: Number(res.today_count ?? 0),
-        today_shadow_count: Number(res.today_shadow_count ?? 0),
         today_adopted_count: Number(res.today_adopted_count ?? 0),
         today_fallback_count: Number(res.today_fallback_count ?? 0),
         ...(typeof res.session_total_count === 'number'
@@ -812,7 +783,6 @@ onMounted(() => {
 .scene-name { font-weight: 600; font-size: 13px; }
 .scene-mode-badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg3); }
 .scene-mode-badge.live { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
-.scene-mode-badge.shadow { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
 .scene-desc { color: var(--text-faint); font-size: 12px; flex: 1; min-width: 200px; }
 .scene-controls { display: flex; align-items: center; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
 .scene-modes { gap: 16px; }
@@ -826,7 +796,6 @@ onMounted(() => {
 .audit-hint { color: var(--text-faint); font-size: 12px; }
 .audit-summary-text { color: var(--text-dim); font-size: 12px; }
 .audit-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 4px; font-size: 12px; color: var(--text-dim); }
-.audit-list li.shadow { opacity: .75; }
 .decision-actions { display: flex; gap: 10px; margin-top: 16px; }
 .primary-button, .secondary-button { min-height: 38px; padding: 0 18px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; cursor: pointer; font-size: 13px; }
 .primary-button { background: var(--text); color: var(--bg0); }

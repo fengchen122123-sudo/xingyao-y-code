@@ -1,6 +1,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
 [![Version 1.4.0](https://img.shields.io/badge/Version-1.4.0-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
@@ -33,7 +33,7 @@
 
 - **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / 阶跃等多种协议，由自研 HTTPX 引擎（`core/llm_native_transport.py`）统一调用；预置厂商目录只带厂商信息，模型交由「拉取可用模型」按需选择——端点自动拼接、404 换拼法重试、多 Key 逐个尝试，上下文窗口 / 最大输出 / 多模态能力按各厂商字段提取，未提供时按本地规格表回填
 - **副模型机制**：可配置副模型承担视觉识别、记忆压缩、子代理调用等任务，主副分工
-- **91 个内置工具**（iMOM 定位插件另附 5 个专用工具，合计 96 个）：文件读写与批量原子编辑、跨文件代码搜索与符号大纲 / 引用、命令执行与后台任务、网页抓取与免费新闻搜索、图片与视频生成、天气查询、计划编排、子代理派发、会话 / 模型 / 技能 / 插件 / Hook 管理、办公文档读写、小说创作工具链、电脑操控与 Windows 系统工具
+- **94 个默认注册工具**（启用电脑操控后另附 `computer_action`，iMOM 定位插件另附 5 个专用工具）：文件读写与批量原子编辑、跨文件代码搜索与符号大纲 / 引用、命令执行与后台任务、网页抓取与免费新闻搜索、图片与视频生成、天气查询、计划编排、子代理派发与秘书跨项目检索、会话 / 模型 / 技能 / 插件 / Hook 管理、办公文档读写、小说创作工具链、电脑操控与 Windows 系统工具
 - **免费网页搜索**：360 搜索优先、必应 RSS 兜底，不再依赖第三方包（超时也只降速不失效）
 - **工具结果缓存**：只读工具的相同搜索 / 读取走进程内缓存，节省 token 与时间
 
@@ -52,11 +52,11 @@
 - **子代理系统**：5 种内置类型（explore / implement / test / review / general）+ 自定义子代理，支持依赖感知并行调度与嵌套（最深 3 层）
 - **计划执行模式**：多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
 - **后台任务管理**：长周期命令后台执行，`/tasks` 查看状态、`/tasks tail` 看日志、`/tasks kill` 终结
-- **权限系统**：四种模式（confirm 变更前确认 / accept_edits 自动编辑 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
+- **权限系统**：五种模式（confirm 变更前确认 / accept_edits 自动编辑 / auto_decision 自动决策 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
 - **星轨自动化任务**：把一段提示词绑定到定时 / 周期 / 启动 / 延时一次性触发器，到点自动向指定会话发起完整回合；可选用「每次新建会话」或「沿用固定会话」，错过触发默认补跑；无人值守权限只支持确认与自动编辑两档
 - **工作流编排**：`.dwf.ts` 脚本按阶段声明子代理、命令与汇报，保存后自动生成同名技能，`/workflow` 或 `workflow_run` 执行；每步事件实时可见
 - **秘书派活台账**：每次派活落一条记录（排队 / 执行中 / 完成 / 失败 / 取消 / 依赖未满足），回合结束回写结果摘要并通知发起会话，最多一批 8 条、可声明批次内依赖
-- **任务决策钩子**：循环止损、子代理验收等四个控制点可接入 JEV 决策模型，支持影子 / 正式两种运行模式，阈值与失败回落可配
+- **任务决策钩子**：循环止损、子代理验收等控制点可接入 JEV 决策模型，支持按场景开关、阈值与失败回落配置
 
 ### 记忆与上下文
 
@@ -329,7 +329,7 @@ venv\Scripts\python build_release.py --setup-only
 
 | 命令 | 说明 |
 |------|------|
-| `/permission <confirm\|accept_edits\|plan\|full>` | 切换权限级别 |
+| `/permission <confirm\|accept_edits\|auto_decision\|plan\|full>` | 切换权限级别 |
 | `/sandbox <on\|off>` | 沙盒开关（on=允许访问工作目录外文件） |
 | `/turns <10-1000>` | 设置单任务最大模型轮次（默认 100） |
 | `/clear` | 清屏 |
@@ -377,7 +377,7 @@ venv\Scripts\python build_release.py --setup-only
 
 ## 🛠️ 内置工具
 
-Y-code 内置 91 个工具（不含 iMOM 项目定位插件栈的 5 个专用工具），按用途分为九组：
+Y-code 默认注册 94 个工具（开启电脑操控后另附 `computer_action`，不含 iMOM 项目定位插件栈的 5 个专用工具），按用途分为九组：
 
 ### 文件与代码（只读）
 
@@ -442,7 +442,8 @@ Y-code 内置 91 个工具（不含 iMOM 项目定位插件栈的 5 个专用工
 | `manage_task` | 查看 / 等待 / 终止后台任务与后台子代理 |
 | `dispatch_task` / `dispatch_batch` | 秘书派活（单条 / 批量，支持批次内依赖） |
 | `list_dispatches` / `get_dispatch_result` | 查看派活台账与结果 |
-| `secretary_probe` | 只读探针：导出进程内 core 模块签名快照 |
+| `list_projects` / `list_sessions` / `read_session` | 秘书跨项目浏览历史会话与分页回读对话 |
+| `manage_memory` | 秘书跨项目个人长期记忆读写（仅限 `~/.ycode/memory/`） |
 | `open_session` | 打开（切换）指定会话 |
 | `create_project` | 在指定目录创建项目（含 AGENTS.md 等脚手架） |
 
@@ -468,7 +469,7 @@ Y-code 内置 91 个工具（不含 iMOM 项目定位插件栈的 5 个专用工
 | `diagram_manage` | Mermaid 图表导出本地 HTML、列出与打开 |
 | `theme_manage` | 界面主题查看、切换、复制、导入导出 |
 | `persona_manage` | 人设（智能体名称、正文、称呼）读写 |
-| `decision_manage` | JEV 决策模型配置、探针与四个业务场景三态 |
+| `decision_manage` | JEV 决策模型配置、探针与四个业务场景开关 |
 | `feishu_manage` | 飞书通道配置、凭据校验与连接状态 |
 | `lan_manage` | 局域网手机远程服务状态、启停 |
 | `mcp_add_server` / `mcp_remove_server` / `mcp_set_enabled` / `mcp_list_servers` | MCP server 增删、启停与列表（API Key 掩码） |
@@ -542,12 +543,13 @@ Y-code 内置 91 个工具（不含 iMOM 项目定位插件栈的 5 个专用工
 
 ## 🔒 权限与安全
 
-### 四种权限模式
+### 五种权限模式
 
 | 模式 | 说明 |
 |------|------|
 | `confirm`（默认） | 查询自动放行；任何修改、删除或执行类变更都先询问 |
 | `accept_edits` | 查询与普通编辑、构建自动放行；删除、依赖安装、进程终止、Git 提交/推送及其他敏感操作仍询问 |
+| `auto_decision` | 需要确认的操作与澄清提问交由决策模型（JEV）自动裁决；未启用或需本人拍板时自动回退人工确认 |
 | `plan` | 只允许读取、只读查询、计划元数据与用户澄清；直接拒绝修改和删除，不弹授权绕过 |
 | `full` | 沙盒内所有非灾难性操作自动放行；沙盒外是否询问由沙盒开关决定 |
 
@@ -683,7 +685,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 | iMOM 定位器 | `~/.ycode/plugins/imom_locator/`（用户级） | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
 
 > 用户级插件放在 `~/.ycode/plugins/<插件名>/`，同名插件会覆盖内置/仓库版本。
-> 插件页行尾垃圾桶可物理删除用户级插件（先卸载已注册工具并清信任指纹），内置插件拒绝删除；手机远程接口已同步封禁该动作。
+> 插件页行尾垃圾桶可物理删除用户级插件，或软移除内置插件（记入移除名单、不删随包文件，可在「已移除」列表或 `/plugins restore` 恢复）；手机远程接口已同步封禁增删与恢复动作。
 
 ## 📁 项目结构
 
@@ -740,7 +742,7 @@ xingyao-y-code/
 │   ├── mcp_selector.py      # MCP 全屏配置器
 │   ├── skills.py            # SKILL.md 扫描、注入与删除
 │   ├── skill_selector.py    # 技能选择器
-│   ├── plugin_loader.py     # 插件加载器（信任指纹 / 删除）
+│   ├── plugin_loader.py     # 插件加载器（热加载 / 移除恢复 / 删除）
 │   ├── lsp.py               # LSP-lite 符号查找
 │   ├── worktree.py          # Git worktree
 │   ├── session_selector.py  # 全屏会话选择器
@@ -864,7 +866,7 @@ xingyao-y-code/
 | `memory_compression` | 记忆压缩参数（`insert_mode` 插入式压缩、`idle_maintenance_seconds` 空闲维护触发秒数（0 关闭）、`precompress_ratio` 预压缩水位） |
 | `providers` | 模型供应商列表 |
 | `theme` | 终端配色主题（9 种） |
-| `permission_mode` | 权限模式（confirm / accept_edits / plan / full） |
+| `permission_mode` | 权限模式（confirm / accept_edits / auto_decision / plan / full） |
 | `allow_outside_workspace` | 沙盒开关 |
 | `command_shell` | 默认命令解释器（auto / pwsh / powershell / cmd；GUI「系统设置」会按实际安装情况限制选择） |
 | `skill_search_paths` | 技能搜索路径（项目级） |

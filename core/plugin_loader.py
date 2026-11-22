@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import logging
@@ -48,7 +47,7 @@ def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = No
             if str(info.get("name") or "") == name:
                 status = str(info.get("status") or "")
                 break
-        needs = "trust" if status == "untrusted" else "enable"
+        needs = "enable"
         if status == "disabled":
             message = f"插件 {name} 未启用，启用后即可配置"
         else:
@@ -67,60 +66,6 @@ def call_plugin_hook(plugin_name: str, hook_name: str, payload: dict | None = No
     return {"ok": True, "data": result}
 
 
-def _trust_file() -> Path:
-    try:
-        import config
-        return Path(config.YCODE_DIR) / "plugin_trust.json"
-    except Exception:
-        return Path.home() / ".ycode" / "plugin_trust.json"
-
-
-def _load_trust_store() -> dict:
-    try:
-        with open(_trust_file(), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
-    except Exception:
-        pass
-    return {}
-
-
-def _save_trust_store(store: dict) -> None:
-    try:
-        path = _trust_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(store, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-    except Exception as exc:
-        _logger.warning("插件信任记录写入失败: %s", exc)
-
-
-def _plugin_fingerprint(plugin_dir: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(plugin_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(plugin_dir).as_posix()
-        if "__pycache__" in rel.split("/") or rel.endswith(".pyc"):
-            continue
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        if rel == "plugin.json":
-            try:
-                meta = json.loads(path.read_bytes().decode("utf-8"))
-                if isinstance(meta, dict):
-                    meta.pop("enabled", None)
-                canon = json.dumps(meta, ensure_ascii=False, sort_keys=True)
-                digest.update(canon.encode("utf-8"))
-                continue
-            except Exception:
-                pass  # 非 JSON 内容回退为原始字节哈希
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
-
-
 def _is_builtin_plugin(plugin_dir: Path) -> bool:
     try:
         resolved = plugin_dir.resolve()
@@ -135,72 +80,9 @@ def _is_builtin_plugin(plugin_dir: Path) -> bool:
     return False
 
 
-_trust_prompt = None
-
-
 def set_trust_prompt(callback) -> None:
-    """注册插件信任确认回调（供入口层接入 CLI/GUI 弹窗）；传 None 恢复默认。"""
-    global _trust_prompt
-    _trust_prompt = callback
-
-
-def _confirm_plugin_trust(plugin_dir: Path, name: str, fingerprint: str) -> bool:
-    callback = _trust_prompt
-    if callback is not None:
-        try:
-            return bool(callback(str(plugin_dir), name, fingerprint))
-        except Exception:
-            return False
-    # 非主线程绝不落到 input()：插件刷新常由工具调用 / 前端 RPC 的 worker 线程
-    # 触发，控制台提示用户看不见，input() 会永久阻塞该线程——回合因此卡死，
-    # 停止按钮也打不断（2026-11-04 实测：plugin_manage 调用卡了 5.5 小时，
-    # 同时 15 个刷新线程一起阻塞在 stdin 上）。GUI / 后台场景请在插件页
-    # 手动「信任并启用」，或由入口层注册 set_trust_prompt 回调。
-    if threading.current_thread() is not threading.main_thread():
-        _logger.warning(
-            "插件 %s (%s) 需要信任确认，但当前在后台线程，已跳过控制台确认"
-            "（请在插件页手动信任，或用 set_trust_prompt 注册回调）",
-            name, plugin_dir,
-        )
-        return False
-    if sys.stdin is not None and sys.stdout is not None \
-            and sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            print(f"\n[插件安全确认] 插件 {name} 首次加载或内容已变化: {plugin_dir}")
-            print("  插件代码将以 星瑶Code 进程的全部权限执行，请确认来源可信。")
-            answer = input("  信任并加载该插件？[y/N] ").strip().lower()
-            return answer in ("y", "yes")
-        except (EOFError, OSError, KeyboardInterrupt):
-            return False
-    return False
-
-
-def _check_plugin_trusted(plugin_dir: Path, name: str) -> bool:
-    try:
-        fingerprint = _plugin_fingerprint(plugin_dir)
-    except OSError as exc:
-        _logger.warning("插件 %s 指纹计算失败，已跳过: %s", name, exc)
-        return False
-    key = str(plugin_dir.resolve())
-    store = _load_trust_store()
-    if _is_builtin_plugin(plugin_dir):
-        if store.get(key) != fingerprint:
-            store[key] = fingerprint
-            _save_trust_store(store)
-        return True
-    if store.get(key) == fingerprint:
-        return True
-    if _confirm_plugin_trust(plugin_dir, name, fingerprint):
-        store[key] = fingerprint
-        _save_trust_store(store)
-        _logger.info("插件 %s 已确认信任并记录指纹", name)
-        return True
-    _logger.warning(
-        "插件 %s (%s) 未获信任，已跳过加载。"
-        "在交互终端启动 ycode 时会弹出信任确认；或在确认来源可信后重试。",
-        name, plugin_dir,
-    )
-    return False
+    """兼容桩：信任校验已移除，入口层可继续调用但不会产生任何确认流程。"""
+    return None
 
 
 def _user_plugin_dir() -> Path:
@@ -382,10 +264,6 @@ def delete_plugin(name: str) -> tuple[bool, str]:
             info for info in _PLUGIN_INFOS
             if str(info.get("name") or "") != name or info.get("status") == "overridden"
         ]
-        store = _load_trust_store()
-        if str(resolved) in store:
-            store.pop(str(resolved), None)
-            _save_trust_store(store)
         return True, f"已删除插件 {name}"
 
 
@@ -459,9 +337,6 @@ def restore_plugin(name: str) -> tuple[bool, str]:
                 break
         if target is None:
             return False, f"未找到内置插件 {name} 的目录"
-        if not _check_plugin_trusted(target, name):
-            return False, f"插件 {name} 未通过信任确认，已拒绝加载"
-
         registry = _live_registry()
         info = next(
             (
@@ -534,11 +409,6 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     if registry is not None:
         try:
             if enabled:
-                if not _check_plugin_trusted(target, name):
-                    return False, (
-                        f"插件 {name} 未通过信任确认，已拒绝热加载"
-                        "（在交互终端重启 ycode 时会弹出信任确认）"
-                    )
                 # 先卸下同名旧工具，避免重复开关时 duplicate 报错
                 for info in _PLUGIN_INFOS:
                     if info.get("name") == name:
@@ -582,35 +452,10 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
 
 
 def trust_plugin(name: str) -> tuple[bool, str]:
-    target: Path | None = None
-    for info in _PLUGIN_INFOS:
-        if info.get("name") == name:
-            target = Path(info["path"])
-            break
-    # 兜底：内存记录里没找到就扫一遍目录（与 toggle_plugin 同款）
-    if target is None:
-        for base in plugin_dirs():
-            child = base / name
-            if (child / "plugin.json").is_file():
-                target = child
-                break
-    if target is None or not (target / "plugin.json").is_file():
-        return False, f"未找到插件 {name}"
-
-    try:
-        fingerprint = _plugin_fingerprint(target)
-    except OSError as exc:
-        return False, f"计算插件 {name} 指纹失败: {exc}"
-
-    try:
-        store = _load_trust_store()
-        store[str(target.resolve())] = fingerprint
-        _save_trust_store(store)
-    except Exception as exc:
-        return False, f"写入插件信任记录失败: {exc}"
-
-    _logger.info("插件 %s 已被显式信任并记录指纹: %s", name, target)
-    return True, f"已信任插件 {name}，下次启动自动加载"
+    """兼容桩：信任校验已移除。保留入口是为了让 GUI 插件页 / CLI / RPC 调用不报错。"""
+    if not isinstance(name, str) or not name.strip():
+        return False, "插件名无效"
+    return True, "插件信任校验已关闭，无需确认"
 
 
 def plugin_dirs() -> list[Path]:
@@ -753,11 +598,6 @@ def _refresh_plugins_locked(registry=None) -> None:
                 taken_names.add(plugin_name)
                 _PLUGIN_INFOS.append(info)
                 continue
-            if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):
-                info["status"] = "untrusted"
-                taken_names.add(plugin_name)
-                _PLUGIN_INFOS.append(info)
-                continue
             before_tools = {s.name for s in registry.all()}
             try:
                 name = _load_one(child, registry)
@@ -827,11 +667,6 @@ def load_and_register(registry) -> list[str]:
                 info["status"] = "removed"
                 _PLUGIN_INFOS.append(info)
                 continue
-            if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):
-                info["status"] = "untrusted"
-                seen.add(plugin_name)
-                _PLUGIN_INFOS.append(info)
-                continue
             # 已加载跳过：同一进程内重复调用 load_and_register（多入口/测试场景）时，
             # 插件模块与工具仍在运行注册表中；若再次 exec + register 会触发
             # "duplicate tool" 并把插件误标为加载失败，且 loaded 置空会让孤儿
@@ -872,7 +707,7 @@ def load_and_register(registry) -> list[str]:
             _PLUGIN_INFOS.append(info)
 
     # 兜底清理孤儿 provider：只处理带 managed_by 标记、且其插件本次未加载的项。
-    # 禁用/失败/未受信任的插件都不算已加载。整段隔离：清理异常绝不影响星瑶启动。
+    # 禁用/失败/未加载的插件都不算已加载。整段隔离：清理异常绝不影响星瑶启动。
     try:
         _prune_orphan_providers(set(loaded))
     except Exception as exc:

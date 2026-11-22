@@ -27,11 +27,10 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable(data_dir, scene="router", shadow=False, **extra):
+def _enable(data_dir, scene="router", **extra):
     patch = {
         "enabled": True,
-        "shadow_mode": shadow,
-        "scenes": {scene: {"enabled": True, "shadow": shadow}},
+        "scenes": {scene: {"enabled": True}},
     }
     patch.update(extra)
     return svc.save_decision_config(patch)
@@ -101,13 +100,13 @@ def test_default_config_full_table(data_dir):
     assert cfg["model_id"] == "NeoHorse-Jev-4B"
     assert cfg["endpoint_style"] == "decision"
     assert cfg["key_mode"] == "auto"
-    assert cfg["shadow_mode"] is True
+    assert "shadow_mode" not in cfg
     assert cfg["timeout_ms"] == 800
     assert cfg["audit_enabled"] is True
     assert set(cfg["scenes"]) == {"router", "secretary", "search", "safety"}
     for scene in cfg["scenes"].values():
         assert scene["enabled"] is False
-        assert scene["shadow"] is True
+        assert "shadow" not in scene
         assert isinstance(scene["threshold"], float)
 
 
@@ -362,33 +361,23 @@ def test_key_mode_fixed_index_uses_only_that_key(data_dir, monkeypatch):
     assert calls[0]["headers"]["Authorization"] == "Bearer sk_key_two"
 
 
-def test_shadow_sends_request_writes_audit_and_returns_none(data_dir, monkeypatch):
+def test_legacy_shadow_fields_are_stripped_and_answers_returned(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable(data_dir, shadow=True)
-    calls = _mock_post(
-        monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 1.0}}})
+    (data_dir / "decision.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "shadow_mode": True,
+                "scenes": {"router": {"enabled": True, "shadow": True}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
-    assert len(calls) == 1
-    record = _last_audit(data_dir)
-    assert record["shadow"] is True
-    assert record["answers"] == {"q": {"noul": 1.0}}
-    assert record["fallback_reason"] is None
+    cfg = svc.load_decision_config()
+    assert "shadow_mode" not in cfg
+    assert "shadow" not in cfg["scenes"]["router"]
 
-
-def test_global_shadow_mode_overrides_scene_shadow_false(data_dir, monkeypatch):
-    _write_user_config(data_dir, [PROVIDER])
-    _enable(data_dir, shadow=False)
-    svc.save_decision_config({"shadow_mode": True})
-    calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
-    assert len(calls) == 1
-    assert _last_audit(data_dir)["shadow"] is True
-
-
-def test_non_shadow_returns_answers(data_dir, monkeypatch):
-    _write_user_config(data_dir, [PROVIDER])
-    _enable(data_dir, shadow=False)
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 0.9}}}))
     result = svc.ask_decision("s", NOUL_Q, scene="router")
     assert result is not None
@@ -398,7 +387,6 @@ def test_non_shadow_returns_answers(data_dir, monkeypatch):
 AUDIT_FIELDS = [
     "ts",
     "scene",
-    "shadow",
     "model_id",
     "key_hint",
     "state_digest",
@@ -413,7 +401,7 @@ AUDIT_FIELDS = [
 
 def test_audit_record_fields_and_no_key_leak(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable(data_dir, shadow=True)
+    _enable(data_dir)
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 1.0}}}))
     svc.ask_decision("很长的上下文" * 30, NOUL_Q, scene="router")
     record = _last_audit(data_dir)
@@ -810,11 +798,11 @@ def test_audit_summary_counts_and_recent(data_dir):
     result = svc.get_decision_audit_summary(limit=10)
     assert result["ok"] is True
     assert result["today_count"] == 3
-    assert result["today_shadow_count"] == 1
+    assert "today_shadow_count" not in result
     assert result["today_adopted_count"] == 1
     assert result["today_fallback_count"] == 1
-    assert [item["scene"] for item in result["recent"]] == ["probe", "router", "router"]
-    assert result["recent"][-1]["fallback_reason"] == "upstream_error"
+    assert [item["scene"] for item in result["recent"]] == ["router", "router", "probe"]
+    assert result["recent"][0]["fallback_reason"] == "upstream_error"
 
 
 def test_audit_summary_ignores_probe_only(data_dir):
@@ -915,7 +903,6 @@ def test_audit_summary_session_only_filters_recent_and_today(data_dir):
     scoped = svc.get_decision_audit_summary(limit=10, session_id="本会话", session_only=True)
     assert scoped["session_scoped"] is True
     assert scoped["today_count"] == 2
-    assert scoped["today_shadow_count"] == 1
     assert [item["scene"] for item in scoped["recent"]] == ["router", "router"]
 
     glob = svc.get_decision_audit_summary(limit=10)
@@ -1000,8 +987,7 @@ def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "shadow_mode": True,
-        "scenes": {"router": {"enabled": True, "shadow": True, "threshold": 0.5}},
+        "scenes": {"router": {"enabled": True, "threshold": 0.5}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"tier": "c1"}}))
 
@@ -1011,10 +997,9 @@ def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
         scene="router",
         audit_extra={"baseline_tier": "c0", "message_chars": 8},
     )
-    assert result is None
+    assert result is not None
     record = _last_audit(data_dir)
     assert record["extra"] == {"baseline_tier": "c0", "message_chars": 8}
-    assert record["shadow"] is True
     assert record["answers"] == {"tier": "c1"}
 
 
@@ -1031,8 +1016,7 @@ def test_ask_decision_records_session_id(data_dir, monkeypatch):
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "shadow_mode": True,
-        "scenes": {"router": {"enabled": True, "shadow": True}},
+        "scenes": {"router": {"enabled": True}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
 
@@ -1054,8 +1038,7 @@ def test_ask_decision_session_id_survives_app_context_failure(data_dir, monkeypa
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "shadow_mode": True,
-        "scenes": {"router": {"enabled": True, "shadow": True}},
+        "scenes": {"router": {"enabled": True}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
     from core import app_context
@@ -1083,8 +1066,7 @@ def test_ask_decision_explicit_session_id_overrides_context(data_dir, monkeypatc
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "shadow_mode": True,
-        "scenes": {"router": {"enabled": True, "shadow": True}},
+        "scenes": {"router": {"enabled": True}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
     _stub_session(monkeypatch, "线程会话", "进程会话")
@@ -1121,8 +1103,31 @@ def test_rename_session_audit_migrates_records_across_files(data_dir):
     new_summary = svc.get_decision_audit_summary(10, "新会话名", session_only=True)
     other_summary = svc.get_decision_audit_summary(10, "其他会话", session_only=True)
     assert old_summary["recent"] == []
-    assert [r["trace_id"] for r in new_summary["recent"]] == ["t1", "t3"]
+    assert [r["trace_id"] for r in new_summary["recent"]] == ["t3", "t1"]
     assert [r["trace_id"] for r in other_summary["recent"]] == ["t2"]
+
+
+def test_audit_summary_recent_is_newest_first_across_days(data_dir):
+    audit = data_dir / "decision_audit"
+    audit.mkdir()
+    (audit / "20261121.jsonl").write_text(
+        "\n".join([
+            json.dumps({"ts": "2026-11-21T10:00:00", "scene": "router", "trace_id": "d1-1"}),
+            json.dumps({"ts": "2026-11-21T10:01:00", "scene": "router", "trace_id": "d1-2"}),
+            json.dumps({"ts": "2026-11-21T10:02:00", "scene": "router", "trace_id": "d1-3"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (audit / "20261122.jsonl").write_text(
+        "\n".join([
+            json.dumps({"ts": "2026-11-22T09:00:00", "scene": "auto_permission", "trace_id": "d2-1"}),
+            json.dumps({"ts": "2026-11-22T09:01:00", "scene": "auto_permission", "trace_id": "d2-2"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    summary = svc.get_decision_audit_summary(limit=4)
+    assert [item["trace_id"] for item in summary["recent"]] == ["d2-2", "d2-1", "d1-3", "d1-2"]
 
 
 def test_audit_summary_reports_session_total_and_global_today_counts(data_dir):

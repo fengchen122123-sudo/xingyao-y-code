@@ -206,7 +206,7 @@ KAIROS 系统是星瑶的跨会话长期记忆核，保证大模型能够进行�
 - **`skill_manage`**：`list` / `enable` / `disable` / `refresh` / `restore`（替代 `/skills` 的勾选启停、重新扫描与「恢复随包内置版本」）。
 - **`plugin_manage`**：`list` / `enable` / `disable` / `settings_get` / `settings_action`（替代插件页启停与插件设置页的读取/动作执行）。
 - **`hook_manage`**：`list` / `save` / `delete` / `set_disabled`（替代 Hooks 页的增删改与停用开关，支持用户级与项目级）。
-- 边界：这三个工具**不提供** trust/grant/deny/revoke；未信任的插件无法通过工具启用，hook 由模型写入后也仍需用户在交互终端自行信任才会执行，信任状态只在 `list` 结果中原样透出。
+- 边界：这三个工具**不提供** trust/grant/deny/revoke；hook 由模型写入后仍需用户在交互终端自行信任才会执行，信任状态只在 `list` 结果中原样透出（插件信任校验已移除，`plugin_manage` 可直接启停已安装的插件）。
 
 ### 4. 运维与诊断（`core/tools_admin_ops.py`）
 
@@ -226,7 +226,7 @@ KAIROS 系统是星瑶的跨会话长期记忆核，保证大模型能够进行�
 
 - **`feishu_manage`**：`get` / `set` / `test` / `status`（飞书集成配置、连通性测试与运行状态）。
 - **`lan_manage`**：`status` / `start` / `stop`（局域网手机远程服务的启停与状态）。
-- **`decision_manage`**：`get` / `set` / `probe` / `scenes` / `set_scene`（决策模型配置与探针；场景为 `router` / `secretary` / `search` / `safety`，三态 `off` / `shadow` / `live`）。
+- **`decision_manage`**：`get` / `set` / `probe` / `scenes` / `set_scene`（决策模型配置与探针；场景为 `router` / `secretary` / `search` / `safety`，二态 `off` / `live`）。
 
 ### 7. 交互面板与屏幕（`core/tools_admin_interaction.py`）
 
@@ -241,7 +241,7 @@ KAIROS 系统是星瑶的跨会话长期记忆核，保证大模型能够进行�
 工具化不等于「全部功能都能对话完成」，以下仍是刻意保留的边界：
 
 - **权限档位、沙箱开关、命令白名单**：属用户侧授权模型，`system_settings` 显式拒绝，只能由用户在界面/CLI 修改。
-- **Hook 与插件的信任授予**：信任是对本机命令执行的授权，必须由人确认，三个管理工具只做配置与启停。
+- **Hook 的信任授予**：信任是对本机外部命令执行的授权，必须由人确认，管理工具只做配置与启停。
 - **免责声明确认**：合规交互，不应由 Agent 代劳。
 - **窗口最小化/最大化/关闭、侧栏分组排序、消息导航**：纯界面交互，无工具化价值。
 - **尚未补齐**：会话消息排队（`/queue`）、附件拖拽上传仍无对应工具；主题实时预览仍需 GUI。

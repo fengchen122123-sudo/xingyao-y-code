@@ -43,7 +43,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 - 加载器：`core/plugin_loader.py`，由 `core/tool_registry.py:build_default_registry()` 末尾自动调用。
 
-- 插件扫描结果（含禁用/失败/被覆盖/未信任）由 `plugin_loader.get_plugin_infos()` 提供，CLI 内用 `/plugins` 命令查看。
+- 插件扫描结果（含禁用/失败/被覆盖/已移除）由 `plugin_loader.get_plugin_infos()` 提供，CLI 内用 `/plugins` 命令查看。
 
 - 单插件异常只记录日志并跳过，绝不影响 ycode 启动。
 
@@ -51,10 +51,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 - 插件工具通过 `ToolSpec` 元数据自动获得权限拦截、schema 参数过滤与结果截断。
 
-- 信任机制：加载前按插件目录内容指纹判定。内置 `plugins/` 记录指纹并自动信任；
-  用户级 `~/.ycode/plugins/` 首次见到或指纹变化必须确认（交互终端 input 确认，
-  入口层可用 `set_trust_prompt` 注册回调；headless 默认跳过并 warning）。
-  已确认指纹持久化到 `~/.ycode/plugin_trust.json`（YCODE_DATA_DIR 优先）。
+- 信任机制：已移除内容指纹与交互信任确认（`set_trust_prompt` / `trust_plugin` 保留为兼容空操作桩），用户级 `~/.ycode/plugins/` 放入或刷新即加载；仍保留内置插件移除名单 `~/.ycode/plugin_removed.json`（YCODE_DATA_DIR 优先）。
 
 ## 🔌 MCP 安全基线
 

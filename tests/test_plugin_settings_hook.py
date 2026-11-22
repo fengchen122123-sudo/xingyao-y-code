@@ -28,10 +28,10 @@ def _isolate(monkeypatch, infos=None, modules=None):
     return fake_infos, fake_modules, _FakeRegistry()
 
 
-def test_call_plugin_hook_requires_trust(monkeypatch):
-    _isolate(monkeypatch, infos=[{"name": "demo", "status": "untrusted"}])
+def test_call_plugin_hook_not_loaded_needs_enable(monkeypatch):
+    _isolate(monkeypatch, infos=[{"name": "demo", "status": "failed"}])
     result = plugin_loader.call_plugin_hook("demo", "plugin_settings", {"action": "render"})
-    assert result["ok"] is False and result["needs"] == "trust"
+    assert result["ok"] is False and result["needs"] == "enable"
 
 
 def test_call_plugin_hook_disabled_needs_enable(monkeypatch):

@@ -70,13 +70,12 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable_scene(scene="search", *, shadow=False, **scene_extra):
-    scene_cfg = {"enabled": True, "shadow": shadow}
+def _enable_scene(scene="search", **scene_extra):
+    scene_cfg = {"enabled": True}
     scene_cfg.update(scene_extra)
     return svc.save_decision_config(
         {
             "enabled": True,
-            "shadow_mode": shadow,
             "scenes": {scene: scene_cfg},
         }
     )
@@ -257,27 +256,9 @@ def test_jev_disabled_no_results_message_unchanged(data_dir, monkeypatch):
     assert "不存在的选题" in result
 
 
-def test_scene_shadow_keeps_caller_value_but_sends_request(data_dir, monkeypatch):
-    _write_user_config(data_dir, [PROVIDER])
-    _enable_scene("search", shadow=True)
-    post_calls = _mock_post(
-        monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "8"}}})
-    )
-    requests = _install_fake_ddgs(monkeypatch)
-
-    tools_mod.search_news("影子模式查询", num_results=5)
-
-    assert len(post_calls) == 1, "影子模式仍应发一次请求（只观测不采纳）"
-    assert [r["max_results"] for r in requests] == [5]
-    record = _audit_records(data_dir)[-1]
-    assert record["scene"] == "search"
-    assert record["shadow"] is True
-    assert record["adopted"] is False
-
-
 def test_live_mode_end_to_end_uses_decided_value(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable_scene("search", shadow=False)
+    _enable_scene("search")
     post_calls = _mock_post(
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "8"}}})
     )
@@ -290,6 +271,6 @@ def test_live_mode_end_to_end_uses_decided_value(data_dir, monkeypatch):
     assert not result.startswith("🚨")
     record = _audit_records(data_dir)[-1]
     assert record["scene"] == "search"
-    assert record["shadow"] is False
+    assert "shadow" not in record
     assert record["adopted"] is True
     assert record["trace_id"]

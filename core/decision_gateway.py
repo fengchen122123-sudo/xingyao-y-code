@@ -230,7 +230,6 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
                 return None
 
         if is_task_scene:
-            shadow = bool(cfg.get("shadow_mode")) or bool(effective_scene_cfg.get("shadow", False))
             raw_global_timeout = cfg.get("timeout_ms")
             if (
                 not isinstance(raw_global_timeout, bool)
@@ -244,7 +243,6 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
                 effective_scene_cfg, timeout_ms, default_timeout_ms=fallback_timeout
             )
         else:
-            shadow = bool(cfg.get("shadow_mode")) or bool(effective_scene_cfg.get("shadow", True))
             effective_timeout = _resolve_timeout_ms(effective_scene_cfg, timeout_ms)
         ask_kwargs = {
             "scene": scene,
@@ -256,8 +254,6 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         if session_id is not None:
             ask_kwargs["session_id"] = session_id
         result = decision_service.ask_decision(**ask_kwargs)
-        if shadow:
-            return None
         if not isinstance(result, dict):
             return None
 
