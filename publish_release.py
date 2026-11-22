@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -160,8 +161,21 @@ def read_main_sha256(notes_path):
     return m.group(1).lower() if m else ""
 
 
-def build_release_body(version, sha256, part_files):
-    """组装发布说明：更新条目 + SHA256 校验行（格式勿动，updater 依赖）+ 手动合并命令。"""
+def sha256_file(path, chunk_size=4 * 1024 * 1024):
+    """分块计算文件 SHA256（组件包可能很大，不整体读入内存）。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_release_body(version, sha256, part_files, parts_dir=""):
+    """组装发布说明：更新条目 + SHA256 校验行（格式勿动，updater 依赖）+ 手动合并命令
+    + 组件包校验行（parts_dir 下存在对应 .zip 时追加）。"""
     section = changelog_section(version) or "（见 assets/CHANGELOG.md）"
     lines = ["## 更新内容", "", section, "", f"SHA256: {sha256}", ""]
 
@@ -189,6 +203,25 @@ def build_release_body(version, sha256, part_files):
             lines.append(f"cmd /c \"copy /b {joined} {base}\"")
             lines.append(f"```")
             lines.append("")
+
+    # 组件包校验行：客户端 core/components.py::_parse_component_digest 按「资产名
+    # + 两个空格 + SHA256=<64 位小写 hex>」整行解析，格式必须和
+    # build_release.py::COMPONENT_DIGEST_LINE 保持一致，勿改分隔符/大小写。
+    component_lines = []
+    for name in part_files:
+        if not name.lower().endswith(".zip"):
+            continue
+        path = os.path.join(parts_dir, name) if parts_dir else ""
+        if not path or not os.path.isfile(path):
+            continue
+        component_lines.append(f"{name}  SHA256={sha256_file(path)}")
+    if component_lines:
+        lines.append("### 组件包校验")
+        lines.append("")
+        lines.append("客户端下载组件时按资产名匹配 SHA256 校验完整性，格式勿改动。")
+        lines.append("")
+        lines.extend(component_lines)
+        lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -488,7 +521,7 @@ def main():
         print("❌ RELEASE_NOTES.txt 里没有 SHA256 行（自动更新完整性校验依赖它，不能缺）")
         sys.exit(1)
 
-    body = build_release_body(version, sha256, part_files)
+    body = build_release_body(version, sha256, part_files, parts_dir)
 
     print(f"\n📦 即将发布: {tag} -> {GITEE_REPO} (目标分支 {RELEASE_TARGET_BRANCH})")
     for f in part_files:
