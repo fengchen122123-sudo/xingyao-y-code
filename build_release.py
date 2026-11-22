@@ -893,7 +893,13 @@ def step4c_make_release_parts(project_dir, version, cli_only):
         component_entries.append(
             (prefix, title, os.path.basename(archive), component_digest)
         )
-        print(f"✔ 组件包 {os.path.basename(archive)}  SHA256: {component_digest}")
+        # 同步复制进 release_parts：publish_release.py 只上传该目录下的文件，
+        # 只写 SHA256 不复制会让 Release 缺组件包 → 客户端点「下载组件」直接报
+        # 「未找到组件下载源」。cli_only 是本地快速验证产物，不做完整发布。
+        if not cli_only:
+            shutil.copy2(archive, os.path.join(out_dir, os.path.basename(archive)))
+        copied = "" if cli_only else "（已复制到 release_parts）"
+        print(f"✔ 组件包 {os.path.basename(archive)}  SHA256: {component_digest}{copied}")
 
     main_entry = next((e for e in entries if "主安装包" in e[0]), entries[0])
     lines = []
@@ -903,13 +909,14 @@ def step4c_make_release_parts(project_dir, version, cli_only):
     lines.append("1. Gitee 仓库 -> 发布 -> 新建发布，Tag 填 v" + version)
     lines.append("2. 描述粘贴下方『发布说明模板』（SHA256 校验行格式勿改动，")
     lines.append("   自动更新依赖它做安装包完整性校验）")
-    lines.append("3. 附件上传本目录 (dist/release_parts/) 下的全部分卷文件")
+    lines.append("3. 附件上传本目录 (dist/release_parts/) 下的全部文件")
+    lines.append("   （安装包分卷 + 组件包，组件包已由构建脚本复制到本目录）")
     # 组件包必须与主安装包同 Release 发布：core/components.py 只在该 Release 的
     # 资产里按「名字含 spec.asset_hint 且以 .zip 结尾」查找下载源（见
     # _resolve_component_source_impl），漏传时用户在设置页点「下载组件」会直接报
     # "未找到组件下载源"。逐个组件单独列一行，漏传哪项一眼可见。
     for prefix, title, size_mb in RELEASE_COMPONENTS:
-        lines.append(f"   + dist/{prefix}-*.zip（{title}，约 {size_mb}MB；"
+        lines.append(f"   + {prefix}-*.zip（{title}，约 {size_mb}MB；"
                      "漏传则用户点下载会报「未找到组件下载源」）")
     lines.append("   （上述附件必须分别出现在下方对应的『…组件包 SHA256』行里："
                  "客户端靠它校验组件包完整性，格式勿改动）")
