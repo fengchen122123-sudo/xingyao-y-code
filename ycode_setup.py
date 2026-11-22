@@ -20,6 +20,7 @@ from installer_common import (
     get_common_desktop_dir,
     get_desktop_dir,
     is_user_an_admin,
+    refresh_icon_cache,
 )
 
 
@@ -81,11 +82,13 @@ def normalize_browsed_install_dir(chosen):
     return os.path.join(chosen, "Y-code")
 
 
+def _ps_single_quote(value):
+    """转义 PowerShell 单引号字符串字面量。"""
+    return str(value).replace("'", "''")
+
+
 def create_shortcut(shortcut_path, target_path, working_dir, startupinfo):
     """用 PowerShell 的 WScript.Shell COM 对象动态生成 .lnk 快捷方式。"""
-    def _ps_single_quote(value):
-        return str(value).replace("'", "''")
-
     ps_cmd = (
         f"$WshShell = New-Object -ComObject WScript.Shell; "
         f"$Shortcut = $WshShell.CreateShortcut('{_ps_single_quote(shortcut_path)}'); "
@@ -258,22 +261,44 @@ def _cleanup_log(msg):
 
 
 def schedule_installer_self_cleanup(installer_path: str, startupinfo=None) -> bool:
+    """安装成功后安排延时静默删除安装包自身（PowerShell + CREATE_NO_WINDOW）。"""
     try:
         if not installer_path or not os.path.isfile(installer_path):
             return False
         if not _SELF_INSTALLER_NAME_RE.match(os.path.basename(installer_path)):
             _cleanup_log(f"安装包文件名不在自清理白名单内，跳过清理: {installer_path}")
             return False
-        if '"' in installer_path:
+        if any(ch in installer_path for ch in ('"', "\r", "\n")):
             _cleanup_log(f"安装包路径含非法字符，跳过自清理: {installer_path}")
             return False
 
-        cmd = f'cmd /c ping -n 3 127.0.0.1 >nul & del /f /q "{installer_path}"'
-        creationflags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-                         | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        # 改用 powershell.exe + shell=False + 单用 CREATE_NO_WINDOW（不与 DETACHED_PROCESS
+        # 混用，也避免 shell=True + cmd /c 嵌套在 Windows Terminal 下弹窗或打印 ping）。
+        ps_script = (
+            "$ErrorActionPreference = 'SilentlyContinue'; "
+            f"$target = '{_ps_single_quote(installer_path)}'; "
+            "for ($i = 0; $i -lt 20 -and (Test-Path -LiteralPath $target); $i++) { "
+            "Start-Sleep -Milliseconds 300; "
+            "Remove-Item -LiteralPath $target -Force "
+            "}"
+        )
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle", "Hidden",
+            "-Command", ps_script,
+        ]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         subprocess.Popen(
-            cmd, shell=True, creationflags=creationflags,
-            close_fds=True, startupinfo=startupinfo,
+            cmd,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            close_fds=True,
+            startupinfo=startupinfo,
         )
         _cleanup_log(f"安装成功，已安排向导退出后清理安装包: {installer_path}")
         return True
@@ -1200,11 +1225,13 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
                         log(f"⚠️ 清理旧版桌面快捷方式失败（不影响安装）: {e}")
                 shortcut_path = os.path.join(desktop_dir, DESKTOP_SHORTCUT_NAME)
                 create_shortcut(shortcut_path, gui_exe_path, install_dir, startupinfo)
+                refresh_icon_cache((gui_exe_path, shortcut_path))
                 desktop_shortcut = True
                 log(f"✔ 桌面快捷方式创建成功: {shortcut_path}")
             except Exception as e:
                 log(f"⚠️ 创建桌面快捷方式失败: {e}")
         else:
+            refresh_icon_cache((gui_exe_path,))
             log("ℹ 按您的选择，未创建桌面快捷方式。")
         progress(93.0)
 

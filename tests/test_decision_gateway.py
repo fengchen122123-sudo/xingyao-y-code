@@ -28,7 +28,7 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable(scene="router", **scene_extra):
+def _enable(scene="secretary", **scene_extra):
     scene_cfg = {"enabled": True}
     scene_cfg.update(scene_extra)
     patch = {
@@ -100,7 +100,7 @@ def test_global_disabled_returns_none_without_http(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     calls = _mock_no_network(monkeypatch)
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
     assert calls == []
     assert _audit_records(data_dir) == []
 
@@ -115,12 +115,16 @@ def test_scene_disabled_returns_none_without_http(data_dir, monkeypatch):
     assert _audit_records(data_dir) == []
 
 
-def test_unknown_scene_returns_none_without_http(data_dir, monkeypatch):
+def test_unknown_and_removed_router_scene_returns_none_without_http(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    (data_dir / "decision.json").write_text(
+        json.dumps({"enabled": True, "scenes": {"router": {"enabled": True}}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
     calls = _mock_no_network(monkeypatch)
 
     assert gateway.decide("routr", "上下文", CHOICE_Q, options=["a"]) is None
+    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a"]) is None
     assert calls == []
 
 
@@ -131,7 +135,7 @@ def test_legacy_shadow_fields_do_not_block_decision(data_dir, monkeypatch):
             {
                 "enabled": True,
                 "shadow_mode": True,
-                "scenes": {"router": {"enabled": True, "shadow": True}},
+                "scenes": {"secretary": {"enabled": True, "shadow": True}},
             },
             ensure_ascii=False,
         ),
@@ -139,17 +143,17 @@ def test_legacy_shadow_fields_do_not_block_decision(data_dir, monkeypatch):
     )
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "a"}}}))
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) == "a"
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) == "a"
     assert len(calls) == 1
     assert _last_audit(data_dir)["adopted"] is True
 
 
 def test_live_choice_returns_option_and_backfills_adopted(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "b"}}}))
 
-    picked = gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"])
+    picked = gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"])
 
     assert picked == "b"
     assert len(calls) == 1
@@ -161,18 +165,18 @@ def test_live_choice_returns_option_and_backfills_adopted(data_dir, monkeypatch)
 
 def test_live_choice_accepts_bare_value_answer_shape(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": " a "}}))
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) == "a"
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) == "a"
 
 
 def test_live_choice_falls_back_to_single_answer_key(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"anything": "b"}}))
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) == "b"
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) == "b"
 
 
 def test_live_choice_keeps_option_type_for_non_string_options(data_dir, monkeypatch):
@@ -183,29 +187,74 @@ def test_live_choice_keeps_option_type_for_non_string_options(data_dir, monkeypa
     assert gateway.decide("search", "上下文", CHOICE_Q, options=[3, 5, 8]) == 8
 
 
+def test_choice_probabilities_below_threshold_returns_none(data_dir, monkeypatch):
+    _write_user_config(data_dir, [PROVIDER])
+    _enable("secretary", threshold=0.6)
+    _mock_post(
+        monkeypatch,
+        lambda i, call: _resp(
+            200,
+            {"answers": {"q": {"type": "choice", "choice": "b", "probabilities": {"a": 0.41, "b": 0.59}}}},
+        ),
+    )
+
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert _last_audit(data_dir)["adopted"] is False
+
+
+def test_choice_probabilities_at_threshold_returns_option_for_int_options(data_dir, monkeypatch):
+    _write_user_config(data_dir, [PROVIDER])
+    _enable("search", threshold=0.5)
+    _mock_post(
+        monkeypatch,
+        lambda i, call: _resp(
+            200,
+            {"answers": {"q": {"type": "choice", "choice": "8", "probabilities": {"3": 0.1, "5": 0.4, "8": 0.5}}}},
+        ),
+    )
+
+    assert gateway.decide("search", "上下文", CHOICE_Q, options=[3, 5, 8]) == 8
+    assert _last_audit(data_dir)["adopted"] is True
+
+
+def test_auto_task_choice_without_configured_threshold_ignores_probabilities(data_dir, monkeypatch):
+    _write_user_config(data_dir, [PROVIDER])
+    svc.save_decision_config({"enabled": True})
+    _mock_post(
+        monkeypatch,
+        lambda i, call: _resp(
+            200,
+            {"answers": {"q": {"type": "choice", "choice": "option_1", "probabilities": {"option_1": 0.42}}}},
+        ),
+    )
+
+    assert gateway.decide("auto_question", "上下文", CHOICE_Q, options=["option_1", "ask_user"]) == "option_1"
+    assert _last_audit(data_dir)["adopted"] is True
+
+
 def test_choice_answer_not_in_options_returns_none(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "z"}}}))
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
     assert _last_audit(data_dir)["adopted"] is False
 
 
 def test_choice_answer_missing_returns_none(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
 
 
 def test_choice_without_options_skips_candidate_check(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "任意值"}}}))
 
-    assert gateway.decide("router", "上下文", CHOICE_Q) == "任意值"
+    assert gateway.decide("secretary", "上下文", CHOICE_Q) == "任意值"
 
 
 def test_noul_below_threshold_returns_none(data_dir, monkeypatch):
@@ -240,10 +289,10 @@ def test_noul_scene_threshold_comes_from_config(data_dir, monkeypatch):
 @pytest.mark.parametrize("bad", [1.5, -0.1, "不是数字", None, True])
 def test_noul_illegal_probability_returns_none(data_dir, monkeypatch, bad):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router", threshold=0.0)
+    _enable("safety", threshold=0.0)
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": bad}}}))
 
-    assert gateway.decide("router", "上下文", NOUL_Q) is None
+    assert gateway.decide("safety", "上下文", NOUL_Q) is None
 
 
 @pytest.mark.parametrize(
@@ -259,15 +308,15 @@ def test_noul_illegal_probability_returns_none(data_dir, monkeypatch, bad):
 )
 def test_upstream_failures_return_none_without_raising(data_dir, monkeypatch, handler):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, handler)
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
 
 
 def test_mark_adopted_failure_is_swallowed_and_returns_picked(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "a"}}}))
 
     def boom(trace_id):
@@ -275,7 +324,7 @@ def test_mark_adopted_failure_is_swallowed_and_returns_picked(data_dir, monkeypa
 
     monkeypatch.setattr(svc, "mark_adopted", boom)
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) == "a"
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) == "a"
 
 
 def test_broken_config_returns_none(data_dir, monkeypatch):
@@ -283,55 +332,55 @@ def test_broken_config_returns_none(data_dir, monkeypatch):
     (data_dir / "decision.json").write_text("{ 这不是 JSON", encoding="utf-8")
     calls = _mock_no_network(monkeypatch)
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
     assert calls == []
 
 
 def test_no_key_returns_none(data_dir, monkeypatch):
-    _enable("router")
+    _enable("secretary")
     calls = _mock_no_network(monkeypatch)
 
-    assert gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"]) is None
+    assert gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"]) is None
     assert calls == []
 
 
-def test_default_timeout_is_250ms(data_dir, monkeypatch):
+def test_default_timeout_is_1500ms(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router", timeout_ms=250)
+    _enable("secretary")
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "a"}}}))
 
-    gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"])
+    gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"])
 
-    assert calls[0]["timeout"] == pytest.approx(0.25)
+    assert calls[0]["timeout"] == pytest.approx(1.5)
 
 
 def test_timeout_below_min_is_raised_to_min(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "a"}}}))
 
-    gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"], timeout_ms=10)
+    gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"], timeout_ms=10)
 
     assert calls[0]["timeout"] == pytest.approx(svc.MIN_TIMEOUT_MS / 1000.0)
 
 
 def test_timeout_above_max_is_capped(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "a"}}}))
 
-    gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"], timeout_ms=99999)
+    gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"], timeout_ms=99999)
 
     assert calls[0]["timeout"] == pytest.approx(svc.MAX_TIMEOUT_MS / 1000.0)
 
 
 def test_scene_timeout_overrides_default_and_caller_wins(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router", timeout_ms=1200)
+    _enable("secretary", timeout_ms=1200)
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"choice": "a"}}}))
 
-    gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"])
-    gateway.decide("router", "上下文", CHOICE_Q, options=["a", "b"], timeout_ms=400)
+    gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"])
+    gateway.decide("secretary", "上下文", CHOICE_Q, options=["a", "b"], timeout_ms=400)
 
     assert calls[0]["timeout"] == pytest.approx(1.2)
     assert calls[1]["timeout"] == pytest.approx(0.4)
@@ -343,10 +392,10 @@ def test_scene_timeout_overrides_default_and_caller_wins(data_dir, monkeypatch):
 )
 def test_unsupported_question_returns_none_without_http(data_dir, monkeypatch, question):
     _write_user_config(data_dir, [PROVIDER])
-    _enable("router")
+    _enable("secretary")
     calls = _mock_no_network(monkeypatch)
 
-    assert gateway.decide("router", "上下文", question, options=["a"]) is None
+    assert gateway.decide("secretary", "上下文", question, options=["a"]) is None
     assert calls == []
 
 

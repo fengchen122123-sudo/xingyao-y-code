@@ -15,6 +15,11 @@ import httpx
 
 from core.credentials import unprotect_secret
 
+DEFAULT_SCENE_TIMEOUT_MS = 1500
+# 旧版场景超时默认值：实测 250ms 必然超时，读盘时统一迁移到新默认。
+# 场景超时没有编辑入口（设置页只改开关与阈值），因此 250 只可能来自旧默认。
+LEGACY_SCENE_TIMEOUT_MS = 250
+
 DEFAULT_CONFIG: dict = {
     "version": 1,
     "enabled": False,
@@ -23,21 +28,19 @@ DEFAULT_CONFIG: dict = {
     "model_id": "NeoHorse-Jev-4B",
     "endpoint_style": "decision",
     "key_mode": "auto",
-    "timeout_ms": 800,
+    "timeout_ms": DEFAULT_SCENE_TIMEOUT_MS,
     "scenes": {
-        "router": {"enabled": False, "threshold": 0.5, "timeout_ms": 250},
-        "secretary": {"enabled": False, "threshold": 0.6, "timeout_ms": 250},
-        "search": {"enabled": False, "threshold": 0.5, "timeout_ms": 250},
-        "safety": {"enabled": False, "threshold": 0.9, "timeout_ms": 250},
+        "secretary": {"enabled": False, "threshold": 0.6, "timeout_ms": DEFAULT_SCENE_TIMEOUT_MS},
+        "search": {"enabled": False, "threshold": 0.5, "timeout_ms": DEFAULT_SCENE_TIMEOUT_MS},
+        "safety": {"enabled": False, "threshold": 0.9, "timeout_ms": DEFAULT_SCENE_TIMEOUT_MS},
     },
     "audit_enabled": True,
 }
 
 DECISION_SCENE_META = (
-    ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
-    ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
-    ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
-    ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
+    ("secretary", "秘书", "任务派发给哪个候选会话；低于置信阈值或失败回退原有派发规则"),
+    ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；低于置信阈值或失败用默认 5 条"),
+    ("safety", "安全", "高风险命令是否放行（安全概率低于阈值转人工确认，推荐 0.9）；失败回退原判定结果"),
 )
 DECISION_SCENE_MODES = ("off", "live")
 DECISION_SCENE_MODE_TEXT = {"off": "关闭", "live": "开启"}
@@ -134,13 +137,22 @@ def _state_digest(state) -> str:
 
 
 def _strip_legacy_shadow_fields(cfg: dict) -> dict:
-    """清理历史影子模式配置字段，确保旧版 decision.json 与旧入参平滑过渡。"""
+    """清理已下线字段并迁移旧默认超时，确保旧版 decision.json 平滑过渡。"""
     cfg.pop("shadow_mode", None)
     scenes = cfg.get("scenes")
     if isinstance(scenes, dict):
+        scenes.pop("router", None)
         for scene_cfg in scenes.values():
-            if isinstance(scene_cfg, dict):
-                scene_cfg.pop("shadow", None)
+            if not isinstance(scene_cfg, dict):
+                continue
+            scene_cfg.pop("shadow", None)
+            raw_timeout = scene_cfg.get("timeout_ms")
+            if (
+                not isinstance(raw_timeout, bool)
+                and isinstance(raw_timeout, (int, float))
+                and int(raw_timeout) == LEGACY_SCENE_TIMEOUT_MS
+            ):
+                scene_cfg["timeout_ms"] = DEFAULT_SCENE_TIMEOUT_MS
     return cfg
 
 
@@ -191,7 +203,7 @@ def save_decision_config(patch: dict) -> dict:
 
 
 def build_decision_scene_rows(cfg: dict) -> list[dict]:
-    """构造四个业务场景的二态快照（off 关闭 / live 开启）。"""
+    """构造业务场景的二态快照（off 关闭 / live 开启）。"""
     scenes = cfg.get("scenes") if isinstance(cfg.get("scenes"), dict) else {}
     rows: list[dict] = []
     for scene, label, description in DECISION_SCENE_META:
@@ -204,9 +216,9 @@ def build_decision_scene_rows(cfg: dict) -> list[dict]:
             threshold = 0.5
         else:
             threshold = max(0.0, min(1.0, float(raw_threshold)))
-        raw_timeout = scene_cfg.get("timeout_ms", 250)
+        raw_timeout = scene_cfg.get("timeout_ms", DEFAULT_SCENE_TIMEOUT_MS)
         if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
-            timeout_ms = 250
+            timeout_ms = DEFAULT_SCENE_TIMEOUT_MS
         else:
             timeout_ms = int(raw_timeout)
         rows.append(
@@ -224,6 +236,14 @@ def build_decision_scene_rows(cfg: dict) -> list[dict]:
     return rows
 
 
+def safe_decision_scene_rows() -> list[dict]:
+    """容错读取场景快照：失败一律返回空列表（用于错误返回体，绝不二次抛错）。"""
+    try:
+        return build_decision_scene_rows(load_decision_config())
+    except Exception:
+        return []
+
+
 def build_scene_change_feedback(cfg: dict, row: dict, mode_name: str) -> tuple[str, str]:
     """根据当前总开关与场景新状态返回人类可读提示语 (msg, hint)。"""
     label = str(row.get("label") or row.get("scene") or "")
@@ -238,6 +258,64 @@ def build_scene_change_feedback(cfg: dict, row: dict, mode_name: str) -> tuple[s
         msg = f"{label}场景已关闭（零请求、零记录，走原逻辑）"
         hint = "关闭后该场景不再询问决策模型，行为与未接入时一致"
     return msg, hint
+
+
+def update_decision_scene(scene: str, mode: str, threshold=None) -> dict:
+    """校验并保存单个业务场景配置（off / live 与可选 0~1 阈值）。"""
+    scene_name = str(scene or "").strip()
+    mode_name = str(mode or "").strip().lower()
+    known_scenes = [item[0] for item in DECISION_SCENE_META]
+    if scene_name not in known_scenes:
+        return {
+            "ok": False,
+            "msg": f"未知场景「{scene_name or '(空)'}」；合法值为 {' / '.join(known_scenes)}",
+            "scenes": [],
+        }
+    if mode_name not in DECISION_SCENE_MODES:
+        return {
+            "ok": False,
+            "msg": f"未知模式「{mode_name or '(空)'}」；合法值为 off / live",
+            "scenes": [],
+        }
+
+    scene_patch: dict = {"enabled": mode_name != "off"}
+    if threshold is not None:
+        if isinstance(threshold, bool):
+            return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+        try:
+            threshold_value = float(threshold)
+        except (TypeError, ValueError):
+            return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+        if threshold_value != threshold_value:  # NaN：拒绝写入，避免污染配置
+            return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
+        scene_patch["threshold"] = round(max(0.0, min(1.0, threshold_value)), 2)
+
+    try:
+        save_decision_config({"scenes": {scene_name: scene_patch}})
+        cfg = load_decision_config()
+    except ValueError as error:
+        return {"ok": False, "msg": str(error), "scenes": safe_decision_scene_rows()}
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).exception("update_decision_scene 失败")
+        return {"ok": False, "msg": str(exc), "scenes": safe_decision_scene_rows()}
+
+    rows = build_decision_scene_rows(cfg)
+    row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
+    effective_mode = str(row.get("mode") or "off")
+    mode_text = DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭")
+    msg, hint = build_scene_change_feedback(cfg, row, mode_name)
+    return {
+        "ok": True,
+        "msg": msg,
+        "hint": hint,
+        "scene": row,
+        "scenes": rows,
+        "mode": effective_mode,
+        "mode_text": mode_text,
+        "settings": cfg,
+    }
 
 
 class _KeyState:
@@ -838,7 +916,11 @@ def probe_decision() -> dict:
         provider = _resolve_provider(cfg)
         base_url = _resolve_base_url(cfg, provider)
         keys = _load_keys(cfg, provider)
-        timeout_seconds = _effective_timeout_ms(cfg, None) / 1000.0
+        # 探针同样跑真实上游请求：旧配置里可能还留着更短的全局超时，
+        # 按实测延迟保底到与场景一致的 1500ms，避免探针误报 timeout。
+        timeout_seconds = max(
+            _effective_timeout_ms(cfg, None), DEFAULT_SCENE_TIMEOUT_MS
+        ) / 1000.0
         url = (
             _endpoint_url(base_url, cfg.get("endpoint_style") or "decision")
             if base_url

@@ -27,7 +27,7 @@ def _write_user_config(data_dir, providers):
     )
 
 
-def _enable(data_dir, scene="router", **extra):
+def _enable(data_dir, scene="secretary", **extra):
     patch = {
         "enabled": True,
         "scenes": {scene: {"enabled": True}},
@@ -101,21 +101,22 @@ def test_default_config_full_table(data_dir):
     assert cfg["endpoint_style"] == "decision"
     assert cfg["key_mode"] == "auto"
     assert "shadow_mode" not in cfg
-    assert cfg["timeout_ms"] == 800
+    assert cfg["timeout_ms"] == 1500
     assert cfg["audit_enabled"] is True
-    assert set(cfg["scenes"]) == {"router", "secretary", "search", "safety"}
+    assert set(cfg["scenes"]) == {"secretary", "search", "safety"}
     for scene in cfg["scenes"].values():
         assert scene["enabled"] is False
         assert "shadow" not in scene
         assert isinstance(scene["threshold"], float)
+        assert scene["timeout_ms"] == 1500
 
 
 def test_load_returns_isolated_copy(data_dir):
     cfg = svc.load_decision_config()
     cfg["enabled"] = True
-    cfg["scenes"]["router"]["enabled"] = True
+    cfg["scenes"]["secretary"]["enabled"] = True
     assert svc.DEFAULT_CONFIG["enabled"] is False
-    assert svc.DEFAULT_CONFIG["scenes"]["router"]["enabled"] is False
+    assert svc.DEFAULT_CONFIG["scenes"]["secretary"]["enabled"] is False
     assert svc.load_decision_config()["enabled"] is False
 
 
@@ -161,7 +162,7 @@ def test_ask_request_shape_and_result(data_dir, monkeypatch):
     calls = _mock_post(
         monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 1.0}}})
     )
-    result = svc.ask_decision("上下文", NOUL_Q, scene="router")
+    result = svc.ask_decision("上下文", NOUL_Q, scene="secretary")
     assert result is not None
     assert result["answers"] == {"q": {"noul": 1.0}}
     assert isinstance(result["trace_id"], str) and result["trace_id"]
@@ -174,7 +175,7 @@ def test_ask_request_shape_and_result(data_dir, monkeypatch):
         "questions": NOUL_Q,
     }
     assert call["headers"]["Authorization"] == "Bearer sk_key_one"
-    assert call["timeout"] == pytest.approx(0.8)
+    assert call["timeout"] == pytest.approx(1.5)
 
 
 def test_ask_packs_multiple_questions_into_one_call(data_dir, monkeypatch):
@@ -185,7 +186,7 @@ def test_ask_packs_multiple_questions_into_one_call(data_dir, monkeypatch):
         f"q{i}": {"type": "choice", "instructions": "选一个", "criteria": ["a", "b"]}
         for i in range(16)
     }
-    assert svc.ask_decision("s", questions, scene="router") is not None
+    assert svc.ask_decision("s", questions, scene="secretary") is not None
     assert len(calls) == 1
     assert calls[0]["payload"]["questions"] == questions
 
@@ -196,7 +197,7 @@ def test_ask_rejects_more_than_16_questions(data_dir, monkeypatch):
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200))
     questions = {f"q{i}": {"type": "noul", "instructions": "?"} for i in range(17)}
     with pytest.raises(ValueError):
-        svc.ask_decision("s", questions, scene="router")
+        svc.ask_decision("s", questions, scene="secretary")
     assert calls == []
 
 
@@ -205,7 +206,7 @@ def test_ask_image_goes_top_level_and_limits_single_question(data_dir, monkeypat
     _enable(data_dir)
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
     image = "data:image/png;base64,AAAA"
-    result = svc.ask_decision("s", NOUL_Q, scene="router", image_b64=image)
+    result = svc.ask_decision("s", NOUL_Q, scene="secretary", image_b64=image)
     assert result is not None
     assert calls[0]["payload"]["image"] == image
     two = {
@@ -213,20 +214,20 @@ def test_ask_image_goes_top_level_and_limits_single_question(data_dir, monkeypat
         "q2": {"type": "noul", "instructions": "?"},
     }
     with pytest.raises(ValueError):
-        svc.ask_decision("s", two, scene="router", image_b64=image)
+        svc.ask_decision("s", two, scene="secretary", image_b64=image)
     assert len(calls) == 1
 
 
 def test_disabled_makes_zero_requests(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert calls == []
 
 
 def test_scene_disabled_makes_zero_requests(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
-    _enable(data_dir, scene="router")
+    _enable(data_dir, scene="secretary")
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200))
     assert svc.ask_decision("s", NOUL_Q, scene="safety") is None
     assert calls == []
@@ -239,7 +240,7 @@ def test_missing_provider_audits_no_key(data_dir, monkeypatch):
     )
     _enable(data_dir)
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert calls == []
     assert _last_audit(data_dir)["fallback_reason"] == "no_key"
 
@@ -254,12 +255,12 @@ def test_403_switches_key_then_success_and_remembers(data_dir, monkeypatch):
         return _resp(200, {"answers": {"q": {"noul": 1.0}}})
 
     calls = _mock_post(monkeypatch, handler)
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is not None
     assert [c["headers"]["Authorization"] for c in calls] == [
         "Bearer sk_key_one",
         "Bearer sk_key_two",
     ]
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is not None
     assert len(calls) == 3
     assert calls[2]["headers"]["Authorization"] == "Bearer sk_key_two"
     snap = svc.get_decision_settings_snapshot()
@@ -270,10 +271,10 @@ def test_all_keys_403_reports_no_permission(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir)
     calls = _mock_post(monkeypatch, lambda i, call: _resp(403))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(calls) == 2
     assert _last_audit(data_dir)["fallback_reason"] == "no_permission"
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(calls) == 2
 
 
@@ -281,7 +282,7 @@ def test_all_keys_401_reports_unauthorized(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir)
     calls = _mock_post(monkeypatch, lambda i, call: _resp(401))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(calls) == 2
     assert _last_audit(data_dir)["fallback_reason"] == "unauthorized"
 
@@ -296,7 +297,7 @@ def test_429_switches_to_next_key(data_dir, monkeypatch):
         return _resp(200, {"answers": {"q": {"noul": 1.0}}})
 
     calls = _mock_post(monkeypatch, handler)
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is not None
     assert len(calls) == 2
     assert calls[1]["headers"]["Authorization"] == "Bearer sk_key_two"
 
@@ -307,14 +308,14 @@ def test_429_all_keys_cools_down_then_recovers(data_dir, monkeypatch):
     clock = {"now": 1000.0}
     monkeypatch.setattr(svc, "_now", lambda: clock["now"])
     all_429 = _mock_post(monkeypatch, lambda i, call: _resp(429))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(all_429) == 2
     assert _last_audit(data_dir)["fallback_reason"] == "rate_limited"
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(all_429) == 2
     clock["now"] += 61.0
     ok_calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is not None
     assert len(ok_calls) == 1
 
 
@@ -328,7 +329,7 @@ def test_timeout_returns_none_without_retry(data_dir, monkeypatch):
         raise httpx.TimeoutException("slow")
 
     monkeypatch.setattr(svc, "_post", fake)
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(calls) == 1
     assert _last_audit(data_dir)["fallback_reason"] == "upstream_error"
 
@@ -343,12 +344,12 @@ def test_network_error_and_5xx_return_none_without_retry(data_dir, monkeypatch):
         raise httpx.ConnectError("boom")
 
     monkeypatch.setattr(svc, "_post", fake)
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(calls) == 1
     assert _last_audit(data_dir)["fallback_reason"] == "upstream_error"
 
     calls2 = _mock_post(monkeypatch, lambda i, call: _resp(502))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is None
     assert len(calls2) == 1
     assert _last_audit(data_dir)["fallback_reason"] == "upstream_error"
 
@@ -357,18 +358,21 @@ def test_key_mode_fixed_index_uses_only_that_key(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir, key_mode="index:1")
     calls = _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
-    assert svc.ask_decision("s", NOUL_Q, scene="router") is not None
+    assert svc.ask_decision("s", NOUL_Q, scene="secretary") is not None
     assert calls[0]["headers"]["Authorization"] == "Bearer sk_key_two"
 
 
-def test_legacy_shadow_fields_are_stripped_and_answers_returned(data_dir, monkeypatch):
+def test_legacy_shadow_and_router_fields_are_stripped(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     (data_dir / "decision.json").write_text(
         json.dumps(
             {
                 "enabled": True,
                 "shadow_mode": True,
-                "scenes": {"router": {"enabled": True, "shadow": True}},
+                "scenes": {
+                    "router": {"enabled": True, "shadow": True},
+                    "secretary": {"enabled": True, "shadow": True, "timeout_ms": 250},
+                },
             },
             ensure_ascii=False,
         ),
@@ -376,10 +380,14 @@ def test_legacy_shadow_fields_are_stripped_and_answers_returned(data_dir, monkey
     )
     cfg = svc.load_decision_config()
     assert "shadow_mode" not in cfg
-    assert "shadow" not in cfg["scenes"]["router"]
+    assert "router" not in cfg["scenes"]
+    assert "shadow" not in cfg["scenes"]["secretary"]
+    # 旧默认 250ms 必须迁到新默认，否则升级后仍按旧超时频繁失败
+    assert cfg["scenes"]["secretary"]["timeout_ms"] == 1500
 
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 0.9}}}))
-    result = svc.ask_decision("s", NOUL_Q, scene="router")
+    assert svc.ask_decision("s", NOUL_Q, scene="router") is None
+    result = svc.ask_decision("s", NOUL_Q, scene="secretary")
     assert result is not None
     assert result["answers"]["q"]["noul"] == 0.9
 
@@ -403,11 +411,11 @@ def test_audit_record_fields_and_no_key_leak(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir)
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {"q": {"noul": 1.0}}}))
-    svc.ask_decision("很长的上下文" * 30, NOUL_Q, scene="router")
+    svc.ask_decision("很长的上下文" * 30, NOUL_Q, scene="secretary")
     record = _last_audit(data_dir)
     for field in AUDIT_FIELDS:
         assert field in record, field
-    assert record["scene"] == "router"
+    assert record["scene"] == "secretary"
     assert record["model_id"] == "NeoHorse-Jev-4B"
     assert record["key_hint"] == "key#0"
     assert isinstance(record["latency_ms"], int)
@@ -431,8 +439,8 @@ def test_audit_splits_by_day(data_dir, monkeypatch):
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
     days = iter(["20261015", "20261016"])
     monkeypatch.setattr(svc, "_today", lambda: next(days))
-    svc.ask_decision("s", NOUL_Q, scene="router")
-    svc.ask_decision("s", NOUL_Q, scene="router")
+    svc.ask_decision("s", NOUL_Q, scene="secretary")
+    svc.ask_decision("s", NOUL_Q, scene="secretary")
     names = sorted(path.name for path in (data_dir / "decision_audit").glob("*.jsonl"))
     assert names == ["20261015.jsonl", "20261016.jsonl"]
 
@@ -441,7 +449,7 @@ def test_mark_adopted_updates_record(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     _enable(data_dir, shadow=False)
     _mock_post(monkeypatch, lambda i, call: _resp(200, {"answers": {}}))
-    result = svc.ask_decision("s", NOUL_Q, scene="router")
+    result = svc.ask_decision("s", NOUL_Q, scene="secretary")
     assert result is not None
     svc.mark_adopted(result["trace_id"])
     assert _last_audit(data_dir)["adopted"] is True
@@ -987,14 +995,14 @@ def test_ask_decision_writes_audit_extra(data_dir, monkeypatch):
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "scenes": {"router": {"enabled": True, "threshold": 0.5}},
+        "scenes": {"secretary": {"enabled": True, "threshold": 0.6}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"tier": "c1"}}))
 
     result = svc.ask_decision(
         "帮我重构一下代码",
         NOUL_Q,
-        scene="router",
+        scene="secretary",
         audit_extra={"baseline_tier": "c0", "message_chars": 8},
     )
     assert result is not None
@@ -1016,20 +1024,20 @@ def test_ask_decision_records_session_id(data_dir, monkeypatch):
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "scenes": {"router": {"enabled": True}},
+        "scenes": {"secretary": {"enabled": True}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
 
     _stub_session(monkeypatch, "线程会话", "进程会话")
-    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="secretary")
     assert _last_audit(data_dir)["session_id"] == "线程会话"
 
     _stub_session(monkeypatch, None, "进程会话")
-    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="secretary")
     assert _last_audit(data_dir)["session_id"] == "进程会话"
 
     _stub_session(monkeypatch, None, "")
-    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="secretary")
     assert _last_audit(data_dir)["session_id"] == ""
 
 
@@ -1038,7 +1046,7 @@ def test_ask_decision_session_id_survives_app_context_failure(data_dir, monkeypa
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "scenes": {"router": {"enabled": True}},
+        "scenes": {"secretary": {"enabled": True}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
     from core import app_context
@@ -1048,17 +1056,17 @@ def test_ask_decision_session_id_survives_app_context_failure(data_dir, monkeypa
 
     monkeypatch.setattr(app_context, "get_thread_session", boom)
     monkeypatch.setattr(app_context, "get_current_session", boom)
-    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="router")
+    svc.ask_decision("帮我重构一下代码", NOUL_Q, scene="secretary")
     record = _last_audit(data_dir)
     assert record["session_id"] == ""
     assert record["answers"] == {"intent": "dispatch"}
 
 
 def test_audit_brief_carries_session_id(data_dir):
-    brief = svc._audit_brief({"ts": "2026-10-18T10:00:00", "scene": "router",
+    brief = svc._audit_brief({"ts": "2026-10-18T10:00:00", "scene": "secretary",
                              "session_id": "会话A"})
     assert brief["session_id"] == "会话A"
-    assert svc._audit_brief({"scene": "router"})["session_id"] == ""
+    assert svc._audit_brief({"scene": "secretary"})["session_id"] == ""
 
 
 def test_ask_decision_explicit_session_id_overrides_context(data_dir, monkeypatch):
@@ -1066,12 +1074,12 @@ def test_ask_decision_explicit_session_id_overrides_context(data_dir, monkeypatc
     svc.save_decision_config({
         "enabled": True,
         "audit_enabled": True,
-        "scenes": {"router": {"enabled": True}},
+        "scenes": {"secretary": {"enabled": True}},
     })
     _mock_post(monkeypatch, lambda index, call: _resp(200, {"answers": {"intent": "dispatch"}}))
     _stub_session(monkeypatch, "线程会话", "进程会话")
 
-    svc.ask_decision("上下文", NOUL_Q, scene="router", session_id="显式指定会话")
+    svc.ask_decision("上下文", NOUL_Q, scene="secretary", session_id="显式指定会话")
     assert _last_audit(data_dir)["session_id"] == "显式指定会话"
 
 

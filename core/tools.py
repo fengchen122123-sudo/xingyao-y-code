@@ -1224,7 +1224,7 @@ _SEARCH_NUM_RESULTS_QUESTION = {
     },
 }
 _SEARCH_NUM_RESULTS_OPTIONS = (3, 5, 8)
-_SEARCH_DECISION_TIMEOUT_MS = 250
+_SEARCH_DECISION_TIMEOUT_MS = 1500
 
 
 def _decide_search_num_results(query):
@@ -5482,7 +5482,7 @@ _SECRETARY_TARGET_INSTRUCTIONS = (
     "判断这条任务应该派发到哪个已有会话执行；如果没有明显相关的会话，"
     "选 new 表示新建会话。只依据任务描述与会话名判断。"
 )
-_SECRETARY_DECISION_TIMEOUT_MS = 250
+_SECRETARY_DECISION_TIMEOUT_MS = 1500
 # 候选上限：只把最近的 10 个会话交给模型，避免题目与上下文膨胀
 _SECRETARY_CANDIDATE_LIMIT = 10
 _SECRETARY_STATE_PROMPT_CHARS = 300

@@ -10,9 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import decision_service as svc
 from gui_bridge import ApiBridge
 
-SCENES = ("router", "secretary", "search", "safety")
+SCENES = ("secretary", "search", "safety")
 LABELS = {
-    "router": "路由",
     "secretary": "秘书",
     "search": "搜索",
     "safety": "安全",
@@ -57,7 +56,7 @@ def test_get_decision_scenes_default_all_off(data_dir):
         assert row["enabled"] is False
         assert row["label"] == LABELS[row["scene"]]
         assert isinstance(row["description"], str) and row["description"]
-        assert row["timeout_ms"] == 250
+        assert row["timeout_ms"] == 1500
     assert "shadow_mode" not in result
     assert result["enabled"] is False
 
@@ -65,7 +64,6 @@ def test_get_decision_scenes_default_all_off(data_dir):
 def test_get_decision_scenes_default_thresholds(data_dir):
     rows = _rows_by_scene(_make_bridge())
 
-    assert rows["router"]["threshold"] == pytest.approx(0.5)
     assert rows["secretary"]["threshold"] == pytest.approx(0.6)
     assert rows["search"]["threshold"] == pytest.approx(0.5)
     assert rows["safety"]["threshold"] == pytest.approx(0.9)
@@ -77,7 +75,7 @@ def test_get_decision_scenes_broken_config_falls_back_to_off(data_dir):
     result = _make_bridge().get_decision_scenes()
 
     assert result["ok"] is True
-    assert [row["mode"] for row in result["scenes"]] == ["off"] * 4
+    assert [row["mode"] for row in result["scenes"]] == ["off"] * 3
 
 
 @pytest.mark.parametrize(
@@ -89,13 +87,13 @@ def test_get_decision_scenes_broken_config_falls_back_to_off(data_dir):
 )
 def test_set_decision_scene_writes_enabled_flag(data_dir, mode, expect_enabled):
     bridge = _make_bridge()
-    svc.save_decision_config({"scenes": {"router": {"enabled": False}}})
+    svc.save_decision_config({"scenes": {"secretary": {"enabled": False}}})
 
-    result = bridge.set_decision_scene("router", mode)
+    result = bridge.set_decision_scene("secretary", mode)
 
     assert result["ok"] is True
     assert result["mode"] == mode
-    scene = svc.load_decision_config()["scenes"]["router"]
+    scene = svc.load_decision_config()["scenes"]["secretary"]
     assert scene["enabled"] is expect_enabled
     assert "shadow" not in scene
 
@@ -109,7 +107,7 @@ def test_set_decision_scene_live_returns_live_snapshot(data_dir):
     scene = svc.load_decision_config()["scenes"]["safety"]
     assert scene["enabled"] is True
     assert result["mode"] == "live"
-    assert len(result["scenes"]) == 4
+    assert len(result["scenes"]) == 3
     assert result["scene"]["mode"] == "live"
 
 
@@ -122,25 +120,36 @@ def test_set_decision_scene_returns_fresh_snapshot(data_dir):
     rows = {row["scene"]: row for row in result["scenes"]}
     assert rows["secretary"]["mode"] == "live"
     assert rows["search"]["mode"] == "live"
-    assert rows["router"]["mode"] == "off"
+    assert rows["safety"]["mode"] == "off"
     assert result["settings"]["scenes"]["secretary"]["enabled"] is True
 
 
 def test_set_decision_scene_rejects_removed_shadow_mode(data_dir):
-    result = _make_bridge().set_decision_scene("router", "shadow")
+    result = _make_bridge().set_decision_scene("secretary", "shadow")
 
     assert result["ok"] is False
     assert "模式" in result["msg"]
     assert not (data_dir / "decision.json").exists()
 
 
-def test_get_decision_scenes_ignores_legacy_shadow_fields(data_dir):
+def test_set_decision_scene_rejects_removed_router_scene(data_dir):
+    result = _make_bridge().set_decision_scene("router", "live")
+
+    assert result["ok"] is False
+    assert "场景" in result["msg"]
+    assert not (data_dir / "decision.json").exists()
+
+
+def test_get_decision_scenes_ignores_legacy_shadow_and_router_fields(data_dir):
     (data_dir / "decision.json").write_text(
         json.dumps(
             {
                 "enabled": True,
                 "shadow_mode": True,
-                "scenes": {"router": {"enabled": True, "shadow": True}},
+                "scenes": {
+                    "router": {"enabled": True, "shadow": True},
+                    "secretary": {"enabled": True, "shadow": True},
+                },
             },
             ensure_ascii=False,
         ),
@@ -149,10 +158,11 @@ def test_get_decision_scenes_ignores_legacy_shadow_fields(data_dir):
 
     rows = _rows_by_scene(_make_bridge())
 
-    assert rows["router"]["mode"] == "live"
-    assert rows["router"]["enabled"] is True
-    assert "shadow" not in rows["router"]
-    assert "global_shadow" not in rows["router"]
+    assert "router" not in rows
+    assert rows["secretary"]["mode"] == "live"
+    assert rows["secretary"]["enabled"] is True
+    assert "shadow" not in rows["secretary"]
+    assert "global_shadow" not in rows["secretary"]
 
 
 def test_set_decision_scene_rejects_unknown_scene(data_dir):
@@ -176,7 +186,7 @@ def test_set_decision_scene_rejects_empty_scene(data_dir):
 def test_set_decision_scene_rejects_unknown_mode(data_dir):
     bridge = _make_bridge()
 
-    result = bridge.set_decision_scene("router", "turbo")
+    result = bridge.set_decision_scene("secretary", "turbo")
 
     assert result["ok"] is False
     assert "模式" in result["msg"]
@@ -184,10 +194,10 @@ def test_set_decision_scene_rejects_unknown_mode(data_dir):
 
 
 def test_set_decision_scene_accepts_uppercase_mode(data_dir):
-    result = _make_bridge().set_decision_scene("router", "LIVE")
+    result = _make_bridge().set_decision_scene("secretary", "LIVE")
 
     assert result["ok"] is True
-    assert svc.load_decision_config()["scenes"]["router"]["enabled"] is True
+    assert svc.load_decision_config()["scenes"]["secretary"]["enabled"] is True
 
 
 @pytest.mark.parametrize(
@@ -205,22 +215,22 @@ def test_set_decision_scene_clamps_threshold(data_dir, raw, expected):
 
 
 def test_set_decision_scene_rejects_non_numeric_threshold(data_dir):
-    result = _make_bridge().set_decision_scene("router", "live", "很高")
+    result = _make_bridge().set_decision_scene("secretary", "live", "很高")
 
     assert result["ok"] is False
     assert "阈值" in result["msg"]
-    assert svc.load_decision_config()["scenes"]["router"]["threshold"] == pytest.approx(0.5)
+    assert svc.load_decision_config()["scenes"]["secretary"]["threshold"] == pytest.approx(0.6)
 
 
 def test_get_decision_scenes_clamps_corrupted_threshold(data_dir):
-    svc.save_decision_config({"scenes": {"router": {"threshold": 0.5}}})
+    svc.save_decision_config({"scenes": {"search": {"threshold": 0.5}}})
     path = data_dir / "decision.json"
     payload = path.read_text(encoding="utf-8").replace('"threshold": 0.5', '"threshold": 3.0', 1)
     path.write_text(payload, encoding="utf-8")
 
     rows = _rows_by_scene(_make_bridge())
 
-    assert rows["router"]["threshold"] == pytest.approx(1.0)
+    assert rows["search"]["threshold"] == pytest.approx(1.0)
 
 
 def test_set_decision_scene_swallows_save_exception(data_dir, monkeypatch):
@@ -229,7 +239,7 @@ def test_set_decision_scene_swallows_save_exception(data_dir, monkeypatch):
 
     monkeypatch.setattr(svc, "save_decision_config", boom)
 
-    result = _make_bridge().set_decision_scene("router", "live")
+    result = _make_bridge().set_decision_scene("secretary", "live")
 
     assert result["ok"] is False
     assert "磁盘只读" in result["msg"]
@@ -256,7 +266,7 @@ def test_set_decision_scene_value_error_returns_message(data_dir, monkeypatch):
 
     monkeypatch.setattr(svc, "save_decision_config", reject)
 
-    result = _make_bridge().set_decision_scene("router", "live")
+    result = _make_bridge().set_decision_scene("secretary", "live")
 
     assert result["ok"] is False
     assert "scenes" in result["msg"]
@@ -288,7 +298,7 @@ def test_existing_bridge_methods_untouched(data_dir):
     assert snapshot["settings"]["model_id"] == "NeoHorse-Jev-4B"
     assert "runtime" in snapshot
 
-    assert [row["mode"] for row in bridge.get_decision_scenes()["scenes"]] == ["off"] * 4
+    assert [row["mode"] for row in bridge.get_decision_scenes()["scenes"]] == ["off"] * 3
 
 
 SUMMARY_KEYS = {
