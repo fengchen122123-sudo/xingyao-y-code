@@ -251,7 +251,7 @@ const modelIdDraft = ref('');
 const endpointStyleDraft = ref<'decision' | 'systemone'>('decision');
 const keyModeDraft = ref<'auto' | 'index'>('auto');
 const keyIndexDraft = ref(1);
-const timeoutDraft = ref(800);
+const timeoutDraft = ref(1500);
 const providerRef = ref('auto');
 const baseUrlDraft = ref('');
 const providerOptions = ref<DecisionProviderOption[]>([]);
@@ -380,7 +380,7 @@ function applySettings(settings: Partial<DecisionSettingsSnapshot>) {
     keyModeDraft.value = 'auto';
     keyIndexDraft.value = 1;
   }
-  timeoutDraft.value = Number(settings.timeout_ms ?? 800) || 800;
+  timeoutDraft.value = Number(settings.timeout_ms ?? 1500) || 1500;
   providerRef.value = String(settings.provider_ref ?? 'auto');
   baseUrlDraft.value = String(settings.base_url ?? '');
 }
@@ -532,7 +532,7 @@ function normalizeScene(raw: Partial<DecisionSceneRow>): DecisionSceneRow {
     mode_text: String(raw.mode_text ?? (mode === 'live' ? '开启' : '关闭')),
     enabled: raw.enabled === true || mode === 'live',
     threshold: Number.isFinite(threshold) ? threshold : 0.5,
-    timeout_ms: Number(raw.timeout_ms ?? 250) || 250,
+    timeout_ms: Number(raw.timeout_ms ?? 1500) || 1500,
   };
 }
 

@@ -1,6 +1,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
-[![Version 1.4.1](https://img.shields.io/badge/Version-1.4.1-green.svg)](core/version.py)
+[![Version 1.4.2](https://img.shields.io/badge/Version-1.4.2-green.svg)](core/version.py)
 
 # Xingyao (Y-code)
 

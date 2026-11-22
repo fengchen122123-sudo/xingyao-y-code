@@ -5878,23 +5878,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             logger.exception("set_decision_settings 失败")
             return {"ok": False, "msg": str(e)}
 
-    _DECISION_SCENE_META = (
-        ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
-        ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
-        ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
-        ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
-    )
-    _DECISION_SCENE_MODES = ("off", "live")
-    # 二态 → 中文文案（前端直接用这份，避免两边各写一套）
-    _DECISION_SCENE_MODE_TEXT = {"off": "关闭", "live": "开启"}
-
     def _decision_scene_rows(self, cfg: dict) -> list:
         from core import decision_service
 
         return decision_service.build_decision_scene_rows(cfg)
 
     def get_decision_scenes(self) -> Dict[str, Any]:
-        """返回四个业务场景的二态快照（设置页「业务场景」区块用）。"""
+        """返回业务场景的二态快照（设置页「业务场景」区块用）。"""
         from core import decision_service
 
         try:
@@ -5913,68 +5903,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
     def set_decision_scene(self, scene: str, mode: str, threshold=None) -> Dict[str, Any]:
         from core import decision_service
 
-        scene_name = str(scene or "").strip()
-        mode_name = str(mode or "").strip().lower()
-        known_scenes = [item[0] for item in self._DECISION_SCENE_META]
-        if scene_name not in known_scenes:
-            return {
-                "ok": False,
-                "msg": f"未知场景「{scene_name or '(空)'}」；合法值为 {' / '.join(known_scenes)}",
-                "scenes": [],
-            }
-        if mode_name not in self._DECISION_SCENE_MODES:
-            return {
-                "ok": False,
-                "msg": f"未知模式「{mode_name or '(空)'}」；合法值为 off / live",
-                "scenes": [],
-            }
-
-        scene_patch: Dict[str, Any] = {"enabled": mode_name != "off"}
-        if threshold is not None:
-            if isinstance(threshold, bool):
-                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
-            try:
-                threshold_value = float(threshold)
-            except (TypeError, ValueError):
-                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
-            if threshold_value != threshold_value:  # NaN：拒绝写入，避免污染配置
-                return {"ok": False, "msg": "阈值必须是 0.0~1.0 之间的数字", "scenes": []}
-            scene_patch["threshold"] = round(max(0.0, min(1.0, threshold_value)), 2)
-
-        try:
-            # 保存统一走 decision_service（校验 + 原子写盘），本层不碰 decision.json
-            decision_service.save_decision_config({"scenes": {scene_name: scene_patch}})
-            cfg = decision_service.load_decision_config()
-            rows = self._decision_scene_rows(cfg)
-            row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
-            effective_mode = str(row.get("mode") or "off")
-            mode_text = self._DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭")
-            msg, hint = decision_service.build_scene_change_feedback(cfg, row, mode_name)
-            return {
-                "ok": True,
-                "msg": msg,
-                "hint": hint,
-                "scene": row,
-                "scenes": rows,
-                "mode": effective_mode,
-                "mode_text": mode_text,
-                "settings": cfg,
-            }
-        except ValueError as error:
-            # 校验拒绝（如全局配置已有非法值）：回显中文原因，不回写任何东西
-            return {"ok": False, "msg": str(error), "scenes": self._decision_scene_rows_safe()}
-        except Exception as e:  # pragma: no cover - 防御性兜底
-            logger.exception("set_decision_scene 失败")
-            return {"ok": False, "msg": str(e), "scenes": self._decision_scene_rows_safe()}
-
-    def _decision_scene_rows_safe(self) -> list:
-        """容错读取场景行：失败一律返回空列表（用于错误返回体，绝不二次抛错）。"""
-        from core import decision_service
-
-        try:
-            return self._decision_scene_rows(decision_service.load_decision_config())
-        except Exception:
-            return []
+        return decision_service.update_decision_scene(scene, mode, threshold)
 
     def probe_decision(self) -> Dict[str, Any]:
         """逐 Key 各跑一次无害探针，返回分类结果与目标任务模型。"""
@@ -9669,10 +9598,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             api_key = active_model.get("api_key", "")
             api_base = active_model.get("base_url", "")
             ctx_win = active_model.get("context_window", 128000)
-            # 本回合实际发请求所用的模型 id（默认=会话激活模型）。router 场景可能
-            # 把它一次性换成副模型 id；必须与 model_name 成对替换——llm_dialects
-            # 按 id 读 thinking / max_tokens 等模型级配置，只换名字不换 id 会把主
-            # 模型的推理参数发给副模型（上游可能直接 400）。
+            # 本回合实际发请求所用的模型 id（= 会话激活模型）。
             model_id = active_model.get("id")
             # 首轮必须先创建会话再写模型绑定；后续模型未变化时不重复写库。
             session_workdir = pending_workdir or self._session_workdir(session_name)
@@ -9817,58 +9743,6 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                         "session_name": session_name,
                         "images": _images,
                     })
-
-            try:
-                from core.turn_model_override import router_scene_live, resolve_turn_model
-
-                # 内部回合（后台汇总 / 星轨自动化 / 命令总结）始终用会话主模型：
-                # 这类回合由系统构造 prompt，降级到副模型只会让汇总质量变差，且用户
-                # 无从察觉。只看用户亲手发起的回合，才有"本回合值不值得用强模型"的问题。
-                if router_scene_live() and not internal_kind:
-                    from core.agent_service import get_session_token_baseline
-
-                    # 窗口硬护栏的基线：本会话当前上下文占用（真实用量与估算取较小值）。
-                    # 这段在 JEV 未开启时根本不会执行；拿不到基线就传 0 跳过护栏，
-                    # 不能让一次基线计算失败把本回合的覆盖逻辑整体带崩。
-                    try:
-                        baseline_tokens = get_session_token_baseline(
-                            self._memory, session_name, model_name, api_base=api_base
-                        )
-                    except Exception:
-                        baseline_tokens = 0
-                    # 本轮是否带图：带图时 router 只能切到「确实支持视觉」的副模型，
-                    # 否则等于把用户的图片丢给不识图的便宜模型，视觉链路会直接降级成
-                    # 「无法分析图片」占位提示（用户发图就是要人看图，不能为省钱吞掉）。
-                    turn_has_image = isinstance(parsed_content, list) and any(
-                        isinstance(block, dict)
-                        and block.get("type") in ("image_url", "image")
-                        for block in parsed_content
-                    )
-                    turn_override = resolve_turn_model(
-                        active_model,
-                        turn_source=turn_source,
-                        pending_model_id=pending_model_id,
-                        baseline_tokens=baseline_tokens,
-                        user_text=user_text,
-                        has_image=turn_has_image,
-                    )
-                    if turn_override:
-                        logger.info(
-                            "router 场景覆盖本回合模型 [%s]：%s → %s（原因：JEV 判定本回合"
-                            "复杂度只需副模型；基线 %s tokens，副模型窗口 %s tokens）",
-                            session_name,
-                            model_name,
-                            turn_override["litellm_model"],
-                            baseline_tokens,
-                            turn_override["context_window"],
-                        )
-                        model_name = turn_override["litellm_model"]
-                        api_key = turn_override["api_key"]
-                        api_base = turn_override["base_url"]
-                        ctx_win = turn_override["context_window"]
-                        model_id = turn_override["model_id"]
-            except Exception:
-                logger.debug("router 场景模型档位覆盖失败，本回合沿用主模型", exc_info=True)
 
             from core.agent_service import prepare_turn_messages
             history = prepare_turn_messages(

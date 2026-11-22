@@ -239,7 +239,7 @@ def test_decision_candidate_name_becomes_target(data_dir, service, monkeypatch):
     assert len(calls) == 1
     assert calls[0]["scene"] == "secretary"
     assert calls[0]["kwargs"]["options"] == ["new", "会话甲", "会话乙"]
-    assert calls[0]["kwargs"]["timeout_ms"] == 250
+    assert calls[0]["kwargs"]["timeout_ms"] == 1500
     assert [c["target"] for c in service.dispatch_calls] == ["会话乙"]
     assert service.dispatch_calls[0]["prompt"] == "把登录报错修掉", "任务正文必须原样透传"
     payload = json.loads(out)
@@ -423,6 +423,24 @@ def test_live_mode_illegal_answer_from_upstream_falls_back(data_dir, service, mo
     _mock_post(
         monkeypatch,
         lambda i, call: _resp(200, {"answers": {"q": {"choice": "根本不存在的会话"}}}),
+    )
+
+    out = tools_mod.dispatch_task(prompt="接着修登录报错")
+
+    assert [c["target"] for c in service.dispatch_calls] == [""]
+    assert out == _expected_output()
+    assert _audit_records(data_dir)[-1]["adopted"] is False
+
+
+def test_live_mode_low_confidence_probability_falls_back(data_dir, service, monkeypatch):
+    _write_user_config(data_dir, [PROVIDER])
+    _enable_secretary_scene()
+    _mock_post(
+        monkeypatch,
+        lambda i, call: _resp(
+            200,
+            {"answers": {"q": {"choice": "会话乙", "probabilities": {"new": 0.45, "会话乙": 0.55}}}},
+        ),
     )
 
     out = tools_mod.dispatch_task(prompt="接着修登录报错")

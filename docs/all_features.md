@@ -226,7 +226,7 @@ KAIROS 系统是星瑶的跨会话长期记忆核，保证大模型能够进行�
 
 - **`feishu_manage`**：`get` / `set` / `test` / `status`（飞书集成配置、连通性测试与运行状态）。
 - **`lan_manage`**：`status` / `start` / `stop`（局域网手机远程服务的启停与状态）。
-- **`decision_manage`**：`get` / `set` / `probe` / `scenes` / `set_scene`（决策模型配置与探针；场景为 `router` / `secretary` / `search` / `safety`，二态 `off` / `live`）。
+- **`decision_manage`**：`get` / `set` / `probe` / `scenes` / `set_scene`（决策模型配置与探针；场景为 `secretary` / `search` / `safety`，二态 `off` / `live`）。
 
 ### 7. 交互面板与屏幕（`core/tools_admin_interaction.py`）
 

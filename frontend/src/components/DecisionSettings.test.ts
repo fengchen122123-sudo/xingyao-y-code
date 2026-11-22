@@ -323,18 +323,8 @@ describe('DecisionSettings', () => {
     expect(wrapper.find('[data-test="decision-audit-summary"]').text()).toContain('暂无决策记录');
   });
 
-  it('业务场景：四行二态开关渲染，开启给警示且可切换到关闭', async () => {
+  it('业务场景：三行二态开关渲染，开启给警示且可切换到关闭', async () => {
     const rows = [
-      {
-        scene: 'router',
-        label: '路由',
-        description: '本回合用主模型还是副模型',
-        mode: 'live',
-        mode_text: '开启',
-        enabled: true,
-        threshold: 0.5,
-        timeout_ms: 250,
-      },
       {
         scene: 'secretary',
         label: '秘书',
@@ -343,7 +333,7 @@ describe('DecisionSettings', () => {
         mode_text: '关闭',
         enabled: false,
         threshold: 0.6,
-        timeout_ms: 250,
+        timeout_ms: 1500,
       },
       {
         scene: 'search',
@@ -353,7 +343,7 @@ describe('DecisionSettings', () => {
         mode_text: '开启',
         enabled: true,
         threshold: 0.5,
-        timeout_ms: 250,
+        timeout_ms: 1500,
       },
       {
         scene: 'safety',
@@ -363,7 +353,7 @@ describe('DecisionSettings', () => {
         mode_text: '关闭',
         enabled: false,
         threshold: 0.9,
-        timeout_ms: 250,
+        timeout_ms: 1500,
       },
     ];
     const api = mockApi(
@@ -375,8 +365,8 @@ describe('DecisionSettings', () => {
         })),
         set_decision_scene: vi.fn(async () => ({
           ok: true,
-          msg: '路由场景已关闭',
-          scenes: rows.map((row) => (row.scene === 'router' ? { ...row, mode: 'off', mode_text: '关闭', enabled: false } : row)),
+          msg: '搜索场景已关闭',
+          scenes: rows.map((row) => (row.scene === 'search' ? { ...row, mode: 'off', mode_text: '关闭', enabled: false } : row)),
         })),
       },
       { enabled: true },
@@ -384,7 +374,7 @@ describe('DecisionSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
-    for (const scene of ['router', 'secretary', 'search', 'safety']) {
+    for (const scene of ['secretary', 'search', 'safety']) {
       expect(wrapper.find(`[data-test="decision-scene-${scene}"]`).exists()).toBe(true);
       for (const mode of ['off', 'live']) {
         expect(
@@ -396,20 +386,20 @@ describe('DecisionSettings', () => {
     }
 
     expect(
-      (wrapper.find('[data-test="decision-scene-router-mode-live"]').element as HTMLInputElement).checked,
+      (wrapper.find('[data-test="decision-scene-search-mode-live"]').element as HTMLInputElement).checked,
     ).toBe(true);
     expect(
       (wrapper.find('[data-test="decision-scene-secretary-mode-off"]').element as HTMLInputElement).checked,
     ).toBe(true);
 
-    expect(wrapper.find('[data-test="decision-scene-router-live-warning"]').text()).toContain('真实影响任务行为');
+    expect(wrapper.find('[data-test="decision-scene-search-live-warning"]').text()).toContain('真实影响任务行为');
     expect(wrapper.find('[data-test="decision-scene-secretary-live-warning"]').exists()).toBe(false);
 
     const setScene = (api as unknown as { set_decision_scene: ReturnType<typeof vi.fn> }).set_decision_scene;
-    await wrapper.find('[data-test="decision-scene-router-mode-off"]').setValue();
+    await wrapper.find('[data-test="decision-scene-search-mode-off"]').setValue();
     await flushPromises();
-    expect(setScene).toHaveBeenCalledWith('router', 'off');
-    expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('路由场景已关闭');
+    expect(setScene).toHaveBeenCalledWith('search', 'off');
+    expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('搜索场景已关闭');
   });
 
   it('业务场景：切换失败时回显后端原因', async () => {
@@ -419,14 +409,14 @@ describe('DecisionSettings', () => {
           ok: true,
           scenes: [
             {
-              scene: 'router',
-              label: '路由',
+              scene: 'secretary',
+              label: '秘书',
               description: '',
               mode: 'off',
               mode_text: '关闭',
               enabled: false,
-              threshold: 0.5,
-              timeout_ms: 250,
+              threshold: 0.6,
+              timeout_ms: 1500,
             },
           ],
           enabled: true,
@@ -438,7 +428,7 @@ describe('DecisionSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
-    await wrapper.find('[data-test="decision-scene-router-mode-live"]').setValue();
+    await wrapper.find('[data-test="decision-scene-secretary-mode-live"]').setValue();
     await flushPromises();
 
     expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('未知场景');

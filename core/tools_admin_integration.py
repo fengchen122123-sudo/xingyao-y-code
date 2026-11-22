@@ -446,30 +446,23 @@ def lan_manage(action: str = "status") -> str:
 
 DECISION_ACTIONS = ("get", "set", "probe", "scenes", "set_scene")
 
-_DECISION_SCENE_META = (
-    ("router", "路由", "本回合用会话主模型还是副模型；换模型失败或低置信自动回退主模型"),
-    ("secretary", "秘书", "任务派发给哪个候选会话；失败回退原有派发规则"),
-    ("search", "搜索", "一次搜索取回几条结果（3 / 5 / 8）；失败用默认 5 条"),
-    ("safety", "安全", "高风险命令是否放行（阈值最高 0.9）；失败回退原判定结果"),
-)
-_DECISION_SCENES = tuple(item[0] for item in _DECISION_SCENE_META)
-_DECISION_SCENE_MODES = ("off", "live")
-_DECISION_SCENE_MODE_TEXT = {"off": "关闭", "live": "开启"}
+
+def _decision_scene_names() -> list[str]:
+    from core import decision_service
+
+    return [item[0] for item in decision_service.DECISION_SCENE_META]
+
+
+def _decision_scene_modes() -> list[str]:
+    from core import decision_service
+
+    return list(decision_service.DECISION_SCENE_MODES)
 
 
 def _decision_scene_rows(cfg: dict) -> list[dict[str, Any]]:
     from core import decision_service
 
     return decision_service.build_decision_scene_rows(cfg)
-
-
-def _decision_scene_rows_safe() -> list[dict[str, Any]]:
-    from core import decision_service
-
-    try:
-        return decision_service.build_decision_scene_rows(decision_service.load_decision_config())
-    except Exception:
-        return []
 
 
 def _decision_key_count(cfg: dict) -> int:
@@ -572,53 +565,19 @@ def decision_manage(
             key_count=_decision_key_count(current_cfg),
         )
 
-    scene_name = str(scene or "").strip()
-    mode_name = str(mode or "").strip().lower()
-    if scene_name not in _DECISION_SCENES:
-        return _fail(
-            f"未知场景「{scene_name or '(空)'}」；合法值为 {' / '.join(_DECISION_SCENES)}",
-            scenes=_decision_scene_rows_safe(),
-        )
-    if mode_name not in _DECISION_SCENE_MODES:
-        return _fail(
-            f"未知模式「{mode_name or '(空)'}」；合法值为 off / live",
-            scenes=_decision_scene_rows_safe(),
-        )
+    res = decision_service.update_decision_scene(scene, mode, threshold)
+    if not res.get("ok"):
+        return _fail(str(res.get("msg") or "保存场景设置失败"), scenes=res.get("scenes") or [])
 
-    scene_patch: dict[str, Any] = {"enabled": mode_name != "off"}
-
-    if threshold is not None:
-        if isinstance(threshold, bool):
-            return _fail("阈值必须是 0.0~1.0 之间的数字", scenes=_decision_scene_rows_safe())
-        try:
-            threshold_value = float(threshold)
-        except (TypeError, ValueError):
-            return _fail("阈值必须是 0.0~1.0 之间的数字", scenes=_decision_scene_rows_safe())
-        if threshold_value != threshold_value:  # NaN：拒绝写入，避免污染配置
-            return _fail("阈值必须是 0.0~1.0 之间的数字", scenes=_decision_scene_rows_safe())
-        scene_patch["threshold"] = round(max(0.0, min(1.0, threshold_value)), 2)
-
-    try:
-        decision_service.save_decision_config({"scenes": {scene_name: scene_patch}})
-    except ValueError as error:
-        return _fail(str(error), scenes=_decision_scene_rows_safe())
-    except Exception as error:  # noqa: BLE001 - 写盘失败要带真实原因
-        return _fail(f"保存场景设置失败：{error}", scenes=_decision_scene_rows_safe())
-
-    cfg = decision_service.load_decision_config()
-    rows = _decision_scene_rows(cfg)
-    row = next((item for item in rows if item["scene"] == scene_name), {}) or {}
-    effective_mode = str(row.get("mode") or "off")
-    msg, hint = decision_service.build_scene_change_feedback(cfg, row, mode_name)
     return _ok(
         action="set_scene",
-        msg=msg,
-        hint=hint,
-        scene=row,
-        scenes=rows,
-        mode=effective_mode,
-        mode_text=_DECISION_SCENE_MODE_TEXT.get(effective_mode, "关闭"),
-        settings=_sanitize(cfg),
+        msg=res["msg"],
+        hint=res["hint"],
+        scene=res["scene"],
+        scenes=res["scenes"],
+        mode=res["mode"],
+        mode_text=res["mode_text"],
+        settings=_sanitize(res["settings"]),
     )
 
 
@@ -686,7 +645,7 @@ def build_specs() -> list[ToolSpec]:
             name="decision_manage",
             description=(
                 "管理 JEV 决策模型：get 读配置与运行状态（密钥脱敏）、set 保存开关与全局参数、"
-                "probe 逐 Key 真实探测可用性、scenes 查看四个业务场景开关、"
+                "probe 逐 Key 真实探测可用性、scenes 查看三个业务场景开关、"
                 "set_scene 设置单个场景（off 关闭 / live 开启，可同时改阈值）。"
             ),
             input_schema=_schema(
@@ -708,12 +667,12 @@ def build_specs() -> list[ToolSpec]:
                     },
                     "scene": {
                         "type": "string",
-                        "enum": list(_DECISION_SCENES),
-                        "description": "set_scene 的目标场景：router / secretary / search / safety",
+                        "enum": _decision_scene_names(),
+                        "description": "set_scene 的目标场景：secretary / search / safety",
                     },
                     "mode": {
                         "type": "string",
-                        "enum": list(_DECISION_SCENE_MODES),
+                        "enum": _decision_scene_modes(),
                         "description": "set_scene 的开关：off 关闭 / live 开启",
                     },
                     "threshold": {

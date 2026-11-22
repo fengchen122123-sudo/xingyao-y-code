@@ -13,7 +13,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import decision_gateway as gateway
 from core import decision_service as svc
 from core import task_decision_hooks as hooks
-from core.turn_model_override import router_scene_live
 
 PROVIDER = {
     "id": "tr-1",
@@ -104,10 +103,10 @@ def test_disabled_by_default_zero_requests(data_dir, monkeypatch):
     assert _audit_records(data_dir) == []
 
 
-def test_global_enabled_auto_activates_task_scenes_without_enabling_router(data_dir, monkeypatch):
+def test_global_enabled_auto_activates_task_scenes_without_enabling_business_scenes(data_dir, monkeypatch):
     _write_user_config(data_dir, [PROVIDER])
     svc.save_decision_config({"enabled": True})
-    assert router_scene_live() is False
+    assert all(not row["enabled"] for row in svc.build_decision_scene_rows(svc.load_decision_config()))
 
     answers = iter(["pivot", "accepted", "split_smaller", "keep_facts_only"])
     calls = _mock_post(

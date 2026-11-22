@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SAFETY_THRESHOLD = 0.9
 
-# safety 场景单次决策超时（毫秒）：真实决策宁可不用，也不拖慢权限流程
-SAFETY_DECISION_TIMEOUT_MS = 250
+# safety 场景单次决策超时（毫秒）：与任务钩子一致留足 1500ms 余量以免实机超时回退
+SAFETY_DECISION_TIMEOUT_MS = 1500
 
 _STATE_COMMAND_LIMIT = 300
 

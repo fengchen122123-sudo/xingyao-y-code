@@ -24,21 +24,70 @@ def _capture_popen(monkeypatch):
     return calls
 
 
-def test_schedule_cleanup_builds_detached_delayed_delete_command(installer, monkeypatch):
+def test_schedule_cleanup_builds_hidden_powershell_delete_command(installer, monkeypatch):
     calls = _capture_popen(monkeypatch)
 
     assert schedule_installer_self_cleanup(str(installer)) is True
 
     assert len(calls) == 1
     cmd, kwargs = calls[0]
-    assert cmd == f'cmd /c ping -n 3 127.0.0.1 >nul & del /f /q "{installer}"'
-    assert kwargs["shell"] is True
+    assert isinstance(cmd, list)
+    assert cmd[:6] == [
+        "powershell.exe", "-NoProfile", "-NonInteractive",
+        "-WindowStyle", "Hidden", "-Command",
+    ]
+    assert f"'{installer}'" in cmd[6]
+    assert "-LiteralPath $target" in cmd[6]
+    assert "ping" not in " ".join(cmd).lower()
+    assert kwargs["shell"] is False
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
     assert kwargs["close_fds"] is True
-    expected_flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
-        subprocess, "CREATE_NO_WINDOW", 0x08000000
-    )
-    assert kwargs["creationflags"] == expected_flags
+    expected_flag = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert kwargs["creationflags"] == expected_flag
+    assert not (kwargs["creationflags"] & getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
     assert installer.exists()
+
+
+def test_schedule_cleanup_escapes_single_quotes_in_path(tmp_path, monkeypatch):
+    quoted_dir = tmp_path / "Tom's $dir"
+    quoted_dir.mkdir()
+    installer = quoted_dir / "Y-CODE-Setup-v1.4.1.exe"
+    installer.write_bytes(b"MZ" + b"\x00" * 32)
+    calls = _capture_popen(monkeypatch)
+
+    assert schedule_installer_self_cleanup(str(installer)) is True
+
+    cmd, _ = calls[0]
+    escaped = str(installer).replace("'", "''")
+    assert f"$target = '{escaped}'" in cmd[6]
+
+
+def test_schedule_cleanup_rejects_control_chars_in_path(tmp_path, monkeypatch):
+    calls = _capture_popen(monkeypatch)
+    monkeypatch.setattr(ycode_setup.os.path, "isfile", lambda _p: True)
+
+    assert schedule_installer_self_cleanup("C:\\tmp\\Y-CODE-Setup-v1.4.1.exe\nwhoami") is False
+    assert calls == []
+
+
+def test_schedule_cleanup_deletes_real_temp_installer(tmp_path):
+    import sys
+    import time
+
+    if sys.platform != "win32":
+        pytest.skip("Windows only")
+
+    target = tmp_path / "Y-CODE-Setup-v9.9.9.exe"
+    target.write_bytes(b"MZ" + b"\x00" * 32)
+
+    assert schedule_installer_self_cleanup(str(target)) is True
+
+    deadline = time.monotonic() + 10.0
+    while target.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("name", ["python.exe", "evil.bat", "Y-CODE-Setup-v1.2.6.txt"])

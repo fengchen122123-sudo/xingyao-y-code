@@ -49,6 +49,29 @@ def broadcast_environment_change():
     )
 
 
+def refresh_icon_cache(paths=()):
+    """通知 Windows Explorer 刷新图标缓存，避免同路径覆盖升级后仍显示旧图标。"""
+    try:
+        import ctypes
+        shell32 = ctypes.windll.shell32
+        SHCNE_UPDATEITEM = 0x00002000
+        SHCNE_ASSOCCHANGED = 0x08000000
+        SHCNF_IDLIST = 0x0000
+        SHCNF_PATHW = 0x0005
+        SHCNF_FLUSH = 0x1000
+        for p in paths:
+            if p and os.path.exists(p):
+                shell32.SHChangeNotify(
+                    SHCNE_UPDATEITEM,
+                    SHCNF_PATHW | SHCNF_FLUSH,
+                    ctypes.c_wchar_p(os.path.abspath(str(p))),
+                    None,
+                )
+        shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None)
+    except Exception:
+        pass
+
+
 def is_user_an_admin():
     """当前进程是否已拥有管理员权限。"""
     try:

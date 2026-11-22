@@ -213,7 +213,7 @@ def test_state_contains_only_query_and_question_shape(monkeypatch):
     call = calls[0]
     assert call["state"] == "用户检索词：量子计算最新进展"
     assert call["kwargs"]["options"] == (3, 5, 8)
-    assert call["kwargs"]["timeout_ms"] == 250
+    assert call["kwargs"]["timeout_ms"] == 1500
     question = call["question"]
     assert question["type"] == "choice"
     assert "判断这次联网检索的信息量需求" in question["instructions"]
@@ -274,3 +274,22 @@ def test_live_mode_end_to_end_uses_decided_value(data_dir, monkeypatch):
     assert "shadow" not in record
     assert record["adopted"] is True
     assert record["trace_id"]
+
+
+def test_live_mode_low_confidence_probability_falls_back_to_default(data_dir, monkeypatch):
+    _write_user_config(data_dir, [PROVIDER])
+    _enable_scene("search")
+    _mock_post(
+        monkeypatch,
+        lambda i, call: _resp(
+            200,
+            {"answers": {"q": {"choice": "8", "probabilities": {"3": 0.2, "5": 0.35, "8": 0.45}}}},
+        ),
+    )
+    requests = _install_fake_ddgs(monkeypatch)
+
+    result = tools_mod.search_news("需要核对的话题", num_results=5)
+
+    assert [r["max_results"] for r in requests] == [5]
+    assert not result.startswith("🚨")
+    assert _audit_records(data_dir)[-1]["adopted"] is False

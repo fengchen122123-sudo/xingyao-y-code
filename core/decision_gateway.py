@@ -7,7 +7,7 @@ from core import decision_service
 
 logger = logging.getLogger(__name__)
 
-SCENES = ("router", "secretary", "search", "safety")
+SCENES = ("secretary", "search", "safety")
 
 TASK_SCENES = (
     "loop_guard",
@@ -19,9 +19,8 @@ TASK_SCENES = (
 )
 ALL_SCENES = SCENES + TASK_SCENES
 
-# 单题决策的超时兜底：真实决策宁可不用，也不能拖慢主流程
-DEFAULT_TIMEOUT_MS = 250
-# 任务执行期决策超时：实测 JEV 单次约 600~900ms，留足余量以免每次超时回退
+# 单题决策的超时兜底：实测 JEV 单次约 440~1480ms，统一留足 1500ms 余量以免频繁超时回退
+DEFAULT_TIMEOUT_MS = 1500
 TASK_DEFAULT_TIMEOUT_MS = 1500
 
 DEFAULT_THRESHOLD = 0.5
@@ -123,20 +122,81 @@ def _unwrap(payload):
     return payload
 
 
-def _extract_answer(result: dict):
-    """从 ask_decision 结果里提取本题答案；键名优先 "q"，否则取唯一一项。"""
+def _extract_answer_entry(result: dict):
+    """从 ask_decision 结果里提取原始题项（未解包）；键名优先 "q"，否则取唯一一项。"""
     answers = result.get("answers")
     if answers is None:
         return _MISSING
     if not isinstance(answers, dict):
-        return _unwrap(answers)
+        return answers
     if "q" in answers:
-        payload = answers["q"]
-    elif len(answers) == 1:
-        payload = next(iter(answers.values()))
+        return answers["q"]
+    if len(answers) == 1:
+        return next(iter(answers.values()))
+    return _MISSING
+
+
+def _extract_answer(result: dict):
+    """从 ask_decision 结果里提取本题答案；键名优先 "q"，否则取唯一一项。"""
+    entry = _extract_answer_entry(result)
+    return _MISSING if entry is _MISSING else _unwrap(entry)
+
+
+def _parse_unit_probability(value):
+    """解析 0~1 区间内的概率数值；非法类型、布尔值或越界返回 None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    probability = float(value)
+    if not 0.0 <= probability <= 1.0:
+        return None
+    return probability
+
+
+def _resolve_choice_threshold(scene_cfg: dict, override=None):
+    """仅当场景配置了 threshold 或显式传参时返回阈值；未配置返回 None（不拦截）。"""
+    if override is None and "threshold" not in scene_cfg:
+        return None
+    return _resolve_threshold(scene_cfg, override)
+
+
+def _choice_meets_threshold(raw_entry, picked, threshold) -> bool:
+    """校验 choice 答案的置信度是否达到阈值；未附带 probabilities 时保持兼容放行。"""
+    if threshold is None or threshold <= 0.0:
+        return True
+    entry = raw_entry
+    if isinstance(entry, (list, tuple)) and len(entry) == 1:
+        entry = entry[0]
+    if not isinstance(entry, dict):
+        return True
+    probs = entry.get("probabilities")
+    if not isinstance(probs, dict) or not probs:
+        return True
+    picked_text = _as_text(picked)
+    if picked_text is None:
+        return False
+    raw_prob = _MISSING
+    if picked in probs:
+        raw_prob = probs[picked]
+    elif picked_text in probs:
+        raw_prob = probs[picked_text]
     else:
-        return _MISSING
-    return _unwrap(payload)
+        for key, value in probs.items():
+            if _as_text(key) == picked_text:
+                raw_prob = value
+                break
+    if raw_prob is _MISSING:
+        return True
+    prob = _parse_unit_probability(raw_prob)
+    if prob is None:
+        return False
+    return prob >= threshold
 
 
 def _pick_choice(answer, options):
@@ -180,20 +240,8 @@ def _pick_noul(answer, threshold: float):
     """noul 题：概率必须是 0~1 的数字且 >= threshold。"""
     if answer is _MISSING:
         return _MISSING
-    if isinstance(answer, bool):
-        return _MISSING
-    value = answer
-    if isinstance(value, str):
-        try:
-            value = float(value.strip())
-        except (TypeError, ValueError):
-            return _MISSING
-    if not isinstance(value, (int, float)):
-        return _MISSING
-    probability = float(value)
-    if not 0.0 <= probability <= 1.0:
-        return _MISSING
-    if probability < threshold:
+    probability = _parse_unit_probability(answer)
+    if probability is None or probability < threshold:
         return _MISSING
     return probability
 
@@ -257,9 +305,16 @@ def decide(scene, state, question, *, options=None, timeout_ms=None, threshold=N
         if not isinstance(result, dict):
             return None
 
-        answer = _extract_answer(result)
+        raw_entry = _extract_answer_entry(result)
+        answer = _MISSING if raw_entry is _MISSING else _unwrap(raw_entry)
         if question_type == "choice":
             picked = _pick_choice(answer, options)
+            if picked is not _MISSING and not _choice_meets_threshold(
+                raw_entry,
+                picked,
+                _resolve_choice_threshold(effective_scene_cfg, threshold),
+            ):
+                picked = _MISSING
         else:
             picked = _pick_noul(answer, _resolve_threshold(effective_scene_cfg, threshold))
         if picked is _MISSING:

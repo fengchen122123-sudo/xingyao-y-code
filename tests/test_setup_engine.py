@@ -36,13 +36,15 @@ def _fake_bundle(tmp_path, as_zip=False):
 
 @pytest.fixture()
 def patched_env(tmp_path, monkeypatch):
-    calls = {"path": [], "shortcut": [], "registry": []}
+    calls = {"path": [], "shortcut": [], "registry": [], "icon_refresh": []}
     monkeypatch.setattr(ycode_setup, "add_to_user_path",
                         lambda d, log=print: calls["path"].append(d))
     monkeypatch.setattr(ycode_setup, "create_shortcut",
                         lambda *a, **k: calls["shortcut"].append(a))
     monkeypatch.setattr(ycode_setup, "write_uninstall_registry_key",
                         lambda **kw: calls["registry"].append(kw))
+    monkeypatch.setattr(ycode_setup, "refresh_icon_cache",
+                        lambda paths=(): calls["icon_refresh"].append(tuple(paths)))
     monkeypatch.setattr(ycode_setup, "get_desktop_dir", lambda: str(tmp_path / "Desktop"))
     monkeypatch.setattr(ycode_setup.os.path, "expanduser", lambda p: str(tmp_path / "home"))
     return calls
@@ -404,6 +406,8 @@ def test_full_install_machine_scope_uses_hklm_system_path_and_public_desktop(tmp
                         lambda **kw: calls["registry"].append(kw))
     monkeypatch.setattr(ycode_setup, "create_shortcut",
                         lambda *a, **k: calls["shortcut"].append(a))
+    monkeypatch.setattr(ycode_setup, "refresh_icon_cache",
+                        lambda paths=(): None)
     monkeypatch.setattr(ycode_setup, "get_common_desktop_dir",
                         lambda: str(tmp_path / "PublicDesktop"))
     monkeypatch.setattr(ycode_setup.os.path, "expanduser", lambda p: str(tmp_path / "home"))
@@ -1377,3 +1381,39 @@ def test_on_window_close_refuses_while_installing(monkeypatch):
     wizard._current_page = "finish"
     wizard._on_window_close()
     assert events == ["cleanup", "destroy"]
+
+
+def test_full_install_refreshes_icon_cache_for_exe_and_shortcut(tmp_path, patched_env):
+    bundle = _fake_bundle(tmp_path)
+    install_dir = str(tmp_path / "installed")
+    run_install(
+        "full", str(bundle),
+        InstallOptions(install_dir, install_cli=False, create_desktop_shortcut=True),
+        _startupinfo(), log=lambda m: None,
+    )
+    expected_exe = os.path.join(install_dir, "Y-code.exe")
+    expected_lnk = os.path.join(str(tmp_path / "Desktop"), ycode_setup.DESKTOP_SHORTCUT_NAME)
+    assert patched_env["icon_refresh"] == [(expected_exe, expected_lnk)]
+
+
+def test_refresh_icon_cache_notifies_shell_for_existing_paths_and_assoc(tmp_path, monkeypatch):
+    import installer_common
+
+    calls = []
+    fake_shell32 = SimpleNamespace(
+        SHChangeNotify=lambda event_id, flags, item1, item2: calls.append(
+            (event_id, flags, getattr(item1, "value", item1), item2)
+        )
+    )
+    monkeypatch.setattr(ctypes.windll, "shell32", fake_shell32)
+
+    existing = tmp_path / "Y-code.exe"
+    existing.write_bytes(b"exe")
+    missing = tmp_path / "missing.lnk"
+
+    installer_common.refresh_icon_cache((str(existing), str(missing)))
+
+    assert calls == [
+        (0x00002000, 0x0005 | 0x1000, os.path.abspath(str(existing)), None),
+        (0x08000000, 0x0000, None, None),
+    ]
