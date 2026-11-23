@@ -234,7 +234,20 @@ def _action_rename(manager, session: str, new_name: str) -> str:
     if not target:
         return _fail("rename 需要 new_name（新会话名不能为空）")
     _require_existing_session(manager, old_name)
-    renamed, final_name = manager.rename_session(old_name, target)
+    if old_name == target:
+        return _ok(session=old_name, new_name=target, unchanged=True)
+    # 回合运行中改当前会话名会让 GUI 的活跃回合字典按旧名失联（停止按钮
+    # 失效、同一会话可再开一个并发回合），也会让前缀缓存亲和键漂移。
+    # harness 提交侧已改为按 session_id 归属（不再崩），但工具层仍须明确拒绝。
+    from core import app_context
+
+    running_session = str(app_context.get_thread_session() or "").strip()
+    if running_session and running_session == old_name:
+        return _fail(
+            "当前会话正在运行回合，不能在回合内改名；请等本回合结束后重试",
+            session=old_name,
+        )
+    renamed, final_name = manager.rename_session(old_name, target, title_source="manual")
     if not renamed:
         return _fail(f"重命名失败: {old_name} → {target}")
     payload: dict[str, Any] = {"session": old_name, "new_name": final_name}

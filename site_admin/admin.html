@@ -373,15 +373,49 @@ function giteeReleaseFrom(release) {
   return { version: version, windowsUrl: url, fileName: asset.name };
 }
 
+var GITEE_RELEASES_API =
+  "https://gitee.com/api/v5/repos/feng-chenhao/xingyao-y-code/releases?per_page=30";
+
+function versionParts(version) {
+  var parts = String(version || "").split(/[.+-]/), out = [], i, n;
+  for (i = 0; i < parts.length; i++) {
+    n = parseInt(parts[i], 10);
+    out.push(isNaN(n) ? 0 : n);
+  }
+  while (out.length < 4) out.push(0);
+  return out.slice(0, 4);
+}
+
+function versionNewerThan(a, b) {
+  var pa = versionParts(a), pb = versionParts(b), i;
+  for (i = 0; i < 4; i++) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i];
+  }
+  return false;
+}
+
+function newestDownloadFrom(releases) {
+  var list = releases || [], best = null, i, next;
+  for (i = 0; i < list.length; i++) {
+    next = giteeReleaseFrom(list[i]);
+    if (!next) continue;
+    if (!best || versionNewerThan(next.version, best.version)) best = next;
+  }
+  return best;
+}
+
 function syncDownloadFromGitee() {
   setStatus("正在从 Gitee 读取最新正式版…");
-  return fetch("https://gitee.com/api/v5/repos/feng-chenhao/xingyao-y-code/releases/latest")
+  // 不用 /releases/latest：Gitee 该接口的「最新」索引可能滞后于实际发布，
+  // 一旦它指向的版本没传 exe 附件，后台就会永远同步不到更新的版本。
+  // 改为拉最近若干条 release，自行按版本号取最高、且确实带安装包的那一条。
+  return fetch(GITEE_RELEASES_API)
     .then(function (res) {
       if (!res.ok) throw new Error("release");
       return res.json();
     })
-    .then(function (release) {
-      var next = giteeReleaseFrom(release);
+    .then(function (releases) {
+      var next = newestDownloadFrom(releases);
       if (!next) throw new Error("empty");
       var changed = state.download.version !== next.version
         || state.download.windowsUrl !== next.windowsUrl

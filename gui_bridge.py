@@ -1572,6 +1572,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         # 防止被取消的任务被“接手完成”机制复活；用户发新消息时解除
         self._user_cancelled_sessions: set = set()
         self._goal_runs: dict[str, threading.Event] = {}
+        # 会话 AI 总结命名：已派发线程的会话去重，防止同一会话并发起两个
+        # 命名请求（首轮结束与手动改名/重复收尾的竞态）
+        self._pending_title_sessions: set = set()
+        self._pending_title_lock = threading.Lock()
 
         # 按会话隔离的流式 delta 缓冲，防止多会话并行时 token 混合
         self._delta_lock = threading.Lock()
@@ -4980,7 +4984,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 return {"ok": False, "msg": "该会话正在运行回合，请先停止或等待完成后再重命名", "name": old_name}
             if old_name in self._goal_runs_map():
                 return {"ok": False, "msg": "该会话有进行中的目标，请先 /goal stop 再重命名", "name": old_name}
-            success, final_name = self._memory.rename_session(old_name, new_name)
+            success, final_name = self._memory.rename_session(
+                old_name, new_name, title_source="manual"
+            )
             if not success:
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
@@ -10666,15 +10672,32 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         return first_text[:12] if first_text else None
 
     def _rename_session_to_title(
-        self, session_name: str, base_title: str, *, holds_turn_start_lock: bool = False
+        self,
+        session_name: str,
+        base_title: str,
+        *,
+        holds_turn_start_lock: bool = False,
+        title_source: Optional[str] = None,
+        require_untitled: bool = False,
     ) -> str:
         existing = {s.get("name") for s in self._memory.get_all_sessions(workdir=None)}
+        # 自动命名兜底标题可能与当前名相同（起步截断名），不能把自己当重名
+        existing.discard(session_name)
         new_title = base_title
         suffix = 2
         while new_title in existing:
             new_title = f"{base_title}({suffix})"
             suffix += 1
-        success, final_name = self._memory.rename_session(session_name, new_title)
+        if require_untitled:
+            # AI 总结命名专用：条件更新在同一事务内判定 title_source，
+            # 用户已手动改名时原子失败，绝不覆盖用户输入
+            success, final_name = self._memory.rename_session_if_untitled(
+                session_name, new_title
+            )
+        else:
+            success, final_name = self._memory.rename_session(
+                session_name, new_title, title_source=title_source
+            )
         if success:
             if self._current_session == session_name:
                 self._set_current_session(final_name)
@@ -10692,20 +10715,124 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             return final_name
         return session_name
 
+    def _claim_title_job(self, session_name: str) -> bool:
+        lock = getattr(self, "_pending_title_lock", None)
+        pending = getattr(self, "_pending_title_sessions", None)
+        if lock is None or pending is None:
+            self._pending_title_lock = lock = threading.Lock()
+            self._pending_title_sessions = pending = set()
+        with lock:
+            if session_name in pending:
+                return False
+            pending.add(session_name)
+            return True
+
+    def _release_title_job(self, session_name: str) -> None:
+        lock = getattr(self, "_pending_title_lock", None)
+        pending = getattr(self, "_pending_title_sessions", None)
+        if lock is None or pending is None:
+            return
+        with lock:
+            pending.discard(session_name)
+
     def _maybe_auto_rename(self, session_name: str) -> str:
-        """首轮对话完成后，把默认的 session_xxxxxx 命名换成提炼出的标题。"""
-        if not re.match(r"^session_[a-f0-9]{6}$", session_name or ""):
+        """首轮问答完成后异步把会话改成 AI 总结标题；立即返回原名。
+
+        只要标题来源仍为空（未 AI 命名、未被手动改名）就会在回合结束时
+        尝试一次；成功后 title_source 落为 'ai'，之后永不自动变化。
+        模型调用放在 daemon 线程里，绝不阻塞回合收尾；落库走
+        rename_session_if_untitled 的条件更新，与用户手动改名并发时不会覆盖。
+        """
+        if not session_name:
             return session_name
         if session_name in self._goal_runs_map():
             return session_name
         try:
-            base_title = self._derive_title_from_first_user_msg(session_name)
-            if not base_title:
-                return session_name
-            return self._rename_session_to_title(session_name, base_title)
+            source = self._memory.get_session_title_source(session_name)
         except Exception:
-            logger.debug("自动重命名会话失败", exc_info=True)
+            logger.debug("读取会话标题来源失败", exc_info=True)
+            return session_name
+        if source not in (None, "", "default"):
+            return session_name
+        if not self._claim_title_job(session_name):
+            return session_name
+
+        def _job():
+            try:
+                self._run_auto_title_job(session_name)
+            except Exception:
+                logger.debug("会话 AI 总结命名失败", exc_info=True)
+            finally:
+                self._release_title_job(session_name)
+
+        threading.Thread(
+            target=_job,
+            name=f"session-title-{session_name}",
+            daemon=True,
+        ).start()
         return session_name
+
+    def _run_auto_title_job(self, session_name: str) -> None:
+        # 等当前回合彻底收尾（_active_turns 已清理）再改名，避免 stop/消息队列
+        # 等按旧名键控的状态失联；最多等 5 秒，超时放弃，下一轮结束会再试
+        for _ in range(25):
+            if not self._is_turn_active(session_name):
+                break
+            time.sleep(0.2)
+        else:
+            return
+
+        try:
+            history = self._memory.get_history(session_name)
+        except Exception:
+            logger.debug("读取首轮对话失败", exc_info=True)
+            return
+        from core.session_title import message_text
+
+        user_msgs = [m for m in history if m.get("role") == "user"]
+        assistant_msgs = [m for m in history if m.get("role") == "assistant"]
+        raw_user = message_text(user_msgs[0].get("content", "")) if user_msgs else ""
+        raw_assistant = (
+            message_text(assistant_msgs[0].get("content", "")) if assistant_msgs else ""
+        )
+        try:
+            from core.agent_service import strip_context_suffix
+
+            user_text = str(strip_context_suffix(raw_user)).strip()
+        except Exception:
+            user_text = str(raw_user).strip()
+
+        title = None
+        active = get_active_model(session_name) or {}
+        model = str(active.get("litellm_model") or "")
+        if model:
+            from core.session_title import generate_session_title
+
+            title = generate_session_title(
+                model,
+                str(active.get("api_key") or ""),
+                str(active.get("base_url") or ""),
+                user_text,
+                str(raw_assistant).strip(),
+            )
+        if not title:
+            # 兜底沿用旧的本地截断规则，保证首轮结束后总能定下名字
+            title = self._derive_title_from_first_user_msg(session_name)
+        if not title:
+            return
+
+        # 二次校验：等待模型返回期间用户可能已手动改名或又发起了下一轮
+        try:
+            source = self._memory.get_session_title_source(session_name)
+        except Exception:
+            return
+        if source not in (None, "", "default"):
+            return
+        if self._is_turn_active(session_name):
+            return
+        self._rename_session_to_title(
+            session_name, title, require_untitled=True
+        )
 
     def get_token_usage_statistics(self, days: int = 30) -> Dict[str, Any]:
         if type(days) is not int or days not in (0, 1, 7, 30, 365):

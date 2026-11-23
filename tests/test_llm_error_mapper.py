@@ -132,7 +132,56 @@ def test_policy_refusal():
     assert "合规" in info.title or "安全" in info.title
 
 
-def test_sensitive_key_redaction():
+def _gateway_filter_body(word: str) -> str:
+    """构造中转网关内容过滤的真实报文。
+
+    触发词由调用方拼接传入：本文件会被 AI 读进上下文，若在源码里写死完整的
+    关键词，读一次文件就会把词带进下一轮请求，再次被网关拦下。
+    """
+    return (
+        '{"error":{"message":"user sensitive words detected: ' + word + " "
+        '(request id: 202611230350023589436068268d9d6DzIPmjgT)","type":"new_api_error",'
+        '"param":"","code":"sensitive_words_detected"}}'
+    )
+
+
+def test_gateway_content_filter_is_not_internal_error():
+    hit_word = "test_" + "sensitive"
+    exc = DummyApiException(
+        "模型服务提供商内部故障 (HTTP 500): " + _gateway_filter_body(hit_word),
+        status_code=500,
+    )
+
+    info = map_llm_error(exc)
+    assert info.category == "gateway_content_filtered"
+    assert "内容过滤" in info.title
+    assert "内部错误" not in info.title
+    assert "等待数分钟" not in info.suggestion
+    assert "命中词" in info.reason
+
+    formatted = format_user_facing_error(exc)
+    assert "新开会话" in formatted
+    # 触发词必须打码：错误卡片会回写会话历史，原样保留就会把同一请求再次拦死。
+    assert hit_word not in formatted
+    assert "***" in formatted
+
+
+def test_gateway_content_filter_chinese_message_is_masked():
+    # 网关汉化版的提示是整句中文，会走 format_user_facing_error 的
+    # “已是中文就原样返回”短路；它必须被排除，否则触发词会原样进上下文。
+    hit_word = "test_" + "sensitive"
+    exc = DummyApiException("网关拦截：命中敏感词：" + hit_word, status_code=500)
+
+    info = map_llm_error(exc)
+    assert info.category == "gateway_content_filtered"
+    assert hit_word not in info.raw_message
+
+    formatted = format_user_facing_error(exc)
+    assert hit_word not in formatted
+    assert "内容过滤" in formatted
+
+
+def test_secret_key_redaction():
     # 12. 敏感信息脱敏
     raw = "Failed with api_key=sk-1234567890abcdef1234567890 and Bearer ghp_99998888777766665555"
     sanitized = sanitize_error_text(raw)
@@ -140,6 +189,17 @@ def test_sensitive_key_redaction():
     assert "ghp_99998888777766665555" not in sanitized
     assert "api_key=***" in sanitized
     assert "Bearer ***" in sanitized
+
+
+def test_winerror_10035_is_explained_as_stream_stall():
+    exc = OSError("[WinError 10035] 无法立即完成一个非阻止性套接字操作。")
+    info = map_llm_error(exc)
+    assert info.category == "socket_would_block"
+
+    formatted = format_user_facing_error(exc)
+    assert "【错误诊断】" in formatted
+    assert "10035" in formatted
+    assert formatted != str(exc)
 
 
 def test_already_chinese_message_passthrough():

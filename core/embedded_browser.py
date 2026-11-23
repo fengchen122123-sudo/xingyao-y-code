@@ -492,6 +492,10 @@ class EmbeddedBrowserController:
                     core.Navigate(pending)
                 except Exception:
                     logger.debug("内嵌浏览器补导航失败: %s", pending, exc_info=True)
+            with self._lock:
+                should_present = self._visible and not self._explicit_hidden
+            if should_present:
+                self._present_surface()
             self._schedule_emit()
         except Exception:
             logger.warning("内嵌 WebView2 事件挂接失败", exc_info=True)
@@ -750,6 +754,10 @@ class EmbeddedBrowserController:
                                 )
                                 return
                         self._create_control(form)
+                        # 先露出控件再摆位置。自动化重建会把控件留在隐藏态，
+                        # 而 Bounds 写到未就绪的 WebView2 上可能一直不返回；
+                        # 若把 Visible 放在那之后，右栏就会停在「正在准备」。
+                        self._present_surface()
                         self._apply_bounds(form, rect, zoom)
                         with self._lock:
                             if op_gen < self._latest_surface_generation:
@@ -764,8 +772,7 @@ class EmbeddedBrowserController:
                                 return
                             self._explicit_hidden = False
                             self._visible = True
-                        if self._webview is not None:
-                            self._webview.Visible = True
+                        self._present_surface()
                         target = normalize_url(url)
                         if target and self._webview is not None:
                             self._url = target
@@ -845,8 +852,8 @@ class EmbeddedBrowserController:
                             )
                             if should_show:
                                 self._visible = True
-                        if should_show and self._webview is not None:
-                            self._webview.Visible = True
+                        if should_show:
+                            self._present_surface()
                         box["ok"] = True
                     except Exception as exc:
                         box["ok"] = False
@@ -872,12 +879,35 @@ class EmbeddedBrowserController:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def _present_surface(self) -> None:
+        """把已有控件摆到主 WebView 之上。必须先于摆矩形：Bounds/Zoom 卡住时
+        也不能继续把已经加载好的页面藏着。"""
+        webview = self._webview
+        if webview is None:
+            return
+        try:
+            webview.Visible = True
+        except Exception:
+            logger.debug("显示内嵌浏览器控件失败", exc_info=True)
+        bring = getattr(webview, "BringToFront", None)
+        if not callable(bring):
+            return
+        try:
+            bring()
+        except Exception:
+            logger.debug("内嵌浏览器置顶失败", exc_info=True)
+
     def _apply_bounds(self, form, rect: Dict[str, Any], zoom: float = 1.0) -> None:
         scale = self._compute_scale(form)
         x, y, w, h = css_rect_to_physical(rect, scale)
         self._webview.Bounds = self._make_rectangle(x, y, w, h)
         self._apply_zoom(zoom)
-        self._webview.BringToFront()
+        bring = getattr(self._webview, "BringToFront", None)
+        if callable(bring):
+            try:
+                bring()
+            except Exception:
+                logger.debug("内嵌浏览器置顶失败", exc_info=True)
         self._bounds = (x, y, w, h)
 
     def _apply_zoom(self, zoom: float) -> None:

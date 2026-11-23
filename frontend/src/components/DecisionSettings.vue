@@ -113,22 +113,23 @@
             <span class="scene-name">{{ row.label }}</span>
             <span class="scene-mode-badge" :class="row.mode">{{ row.mode_text }}</span>
             <span class="scene-desc">{{ row.description }}</span>
+            <label
+              class="scene-switch"
+              :class="{ disabled: controlsDisabled || sceneSaving === row.scene }"
+              :title="row.mode === 'live' ? `关闭「${row.label}」场景` : `开启「${row.label}」场景`"
+            >
+              <input
+                :data-test="`decision-scene-${row.scene}-switch`"
+                type="checkbox"
+                :checked="row.mode === 'live'"
+                :disabled="controlsDisabled || sceneSaving === row.scene"
+                :aria-label="`启用${row.label}场景`"
+                @change="toggleSceneMode(row, $event)"
+              />
+              <span class="scene-switch-track" aria-hidden="true"></span>
+            </label>
           </div>
           <div class="scene-controls">
-            <div class="radio-row scene-modes">
-              <label v-for="option in SCENE_MODE_OPTIONS" :key="option.value" class="radio-item">
-                <input
-                  :data-test="`decision-scene-${row.scene}-mode-${option.value}`"
-                  type="radio"
-                  :name="`decision-scene-mode-${row.scene}`"
-                  :value="option.value"
-                  v-model="row.mode"
-                  :disabled="controlsDisabled || sceneSaving === row.scene"
-                  @change="changeSceneMode(row, option.value)"
-                />
-                <span>{{ option.label }}</span>
-              </label>
-            </div>
             <label class="scene-threshold">
               <span>阈值</span>
               <input
@@ -231,12 +232,6 @@ const PROBE_LABELS: Record<string, string> = {
   rate_limited: '限流',
   error: '失败',
 };
-
-// 业务场景二态（关闭 / 开启；文案与后端 mode_text 一致）
-const SCENE_MODE_OPTIONS: { value: DecisionSceneMode; label: string }[] = [
-  { value: 'off', label: '关闭' },
-  { value: 'live', label: '开启' },
-];
 
 const loading = ref(false);
 const saving = ref(false);
@@ -600,6 +595,21 @@ async function changeSceneMode(row: DecisionSceneRow, mode: DecisionSceneMode) {
   }
 }
 
+/** 开关直连后端二态：勾选 = 开启（live），取消 = 关闭（off） */
+async function toggleSceneMode(row: DecisionSceneRow, event: Event) {
+  const input = event.target as HTMLInputElement;
+  // 其它场景正在保存时直接回滚视觉，避免开关停在未落盘的位置
+  if (sceneSaving.value) {
+    input.checked = row.mode === 'live';
+    return;
+  }
+  const next: DecisionSceneMode = input.checked ? 'live' : 'off';
+  if (next === row.mode) return;
+  await changeSceneMode(row, next);
+  // 保存失败时 changeSceneMode 会回滚 row.mode；DOM 勾选始终跟随真实状态
+  input.checked = row.mode === 'live';
+}
+
 async function changeSceneThreshold(row: DecisionSceneRow, event: Event) {
   if (sceneSaving.value) return;
   const input = event.target as HTMLInputElement;
@@ -782,10 +792,17 @@ onMounted(() => {
 .scene-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
 .scene-name { font-weight: 600; font-size: 13px; }
 .scene-mode-badge { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); background: var(--bg3); }
-.scene-mode-badge.live { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); }
+.scene-mode-badge.live { color: var(--yellow); border-color: color-mix(in srgb, var(--yellow) 45%, transparent); }
 .scene-desc { color: var(--text-faint); font-size: 12px; flex: 1; min-width: 200px; }
 .scene-controls { display: flex; align-items: center; gap: 18px; margin-top: 10px; flex-wrap: wrap; }
-.scene-modes { gap: 16px; }
+.scene-switch { position: relative; display: inline-block; width: 34px; height: 18px; margin-left: auto; flex-shrink: 0; cursor: pointer; }
+.scene-switch.disabled { cursor: not-allowed; opacity: .5; }
+.scene-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.scene-switch-track { position: absolute; inset: 0; background: var(--bg3); border: 1px solid var(--border); border-radius: 99px; transition: 0.15s; }
+.scene-switch-track::before { content: ''; position: absolute; width: 12px; height: 12px; left: 2px; top: 2px; background: var(--text-faint); border-radius: 50%; transition: 0.15s; }
+.scene-switch input:checked + .scene-switch-track { background: var(--accent); border-color: transparent; }
+.scene-switch input:checked + .scene-switch-track::before { transform: translateX(16px); background: #fff; }
+.scene-switch input:focus-visible + .scene-switch-track { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 2px; }
 .scene-threshold { display: inline-flex; align-items: center; gap: 7px; color: var(--text-dim); font-size: 12px; }
 .scene-threshold-input { width: 92px; min-height: 34px; padding: 0 9px; }
 .audit-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
@@ -803,7 +820,7 @@ onMounted(() => {
 .secondary-button { background: var(--bg3); color: var(--text); }
 .secondary-button:disabled { opacity: .5; cursor: not-allowed; }
 .decision-note { margin: 8px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
-.decision-note.warn { color: var(--warning); }
+.decision-note.warn { color: var(--yellow); }
 .decision-error { margin: 12px 0 0; color: var(--red); font-size: 12px; }
 .decision-saved { margin: 12px 0 0; color: var(--green); font-size: 12px; }
 

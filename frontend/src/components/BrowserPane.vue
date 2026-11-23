@@ -401,6 +401,13 @@ const surface = useEmbeddedBrowserSurface({
 });
 const surfaceVisible = surface.surfaceVisible;
 
+watch(
+  () => [store.embeddedBrowser.ready, store.embeddedBrowser.visible] as const,
+  ([ready, visible]) => {
+    if (ready && visible) surface.noteHostState({ ready: true, visible: true, phase: 'ready' });
+  },
+);
+
 const addrInputRef = ref<HTMLInputElement | null>(null);
 const editing = ref(false);
 const draft = ref('');

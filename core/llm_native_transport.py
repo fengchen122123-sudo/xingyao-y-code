@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import re
+import ssl
 import threading
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import httpx
+from httpcore._backends.sync import SyncBackend, SyncStream
 
 from core.llm_policy import (
     ModelPolicy,
@@ -15,6 +19,12 @@ from core.llm_policy import (
     DEFAULT_USER_AGENT,
     tokenrhythm_agent_headers,
     session_id_headers,
+)
+# 内容过滤的识别与打码只保留一份实现（mapper 是纯工具模块，不反向依赖传输层）。
+from core.llm_error_mapper import (
+    gateway_filter_hit_words,
+    looks_like_gateway_content_filter,
+    mask_gateway_filter_words,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +69,16 @@ class APIConnectionError(NativeLLMError):
 
 class APIError(NativeLLMError):
     """其他通用 API 异常。"""
+    pass
+
+
+class ContentFilteredError(NativeLLMError):
+    """请求文本被中转网关的内容过滤规则拦截（不是上游模型故障）。
+
+    new-api / one-api 系网关命中后台配置的关键词后，会在转发前直接回 HTTP 500
+    并附 {"code":"sensitive_words_detected"}。它与上游无关，且同一上下文重试必然
+    再次被拦，所以不能用 APIConnectionError 归类去触发“等待重试”。
+    """
     pass
 
 
@@ -415,6 +435,132 @@ class NativeSyncResponse:
 _client_instance: Optional[httpx.Client] = None
 _client_lock = threading.Lock()
 
+# 共享 HTTP/2 连接上，读线程和写线程会交替 settimeout。Windows 上这次
+# recv 可能立刻返回 WSAEWOULDBLOCK（WinError 10035），表示「这一下还没有
+# 数据」，并没有断开。httpcore 会把它收成 ReadError 并毒死整条连接，回合
+# 就被判异常结束。读是幂等的（10035 没有吃掉字节），在超时预算内再读即可。
+_WOULD_BLOCK_PAUSE_MAX = 0.2
+_UNBOUNDED_WOULD_BLOCK_ATTEMPTS = 50
+_would_block_log_at = 0.0
+
+
+def _is_would_block(exc: BaseException) -> bool:
+    """沿异常链识别「非阻塞套接字这一下没有数据」。"""
+    would_block_errnos = {errno.EWOULDBLOCK, 10035}
+    if errno.EAGAIN == errno.EWOULDBLOCK or os.name != "nt":
+        would_block_errnos.add(errno.EAGAIN)
+
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (BlockingIOError, ssl.SSLWantReadError)):
+            return True
+        if getattr(current, "winerror", None) == 10035:
+            return True
+        if getattr(current, "errno", None) in would_block_errnos:
+            return True
+        text = str(current)
+        if "10035" in text or "WSAEWOULDBLOCK" in text.upper() or "非阻止性套接字" in text:
+            return True
+        current = current.__cause__
+    return False
+
+
+def _note_would_block_retry() -> None:
+    global _would_block_log_at
+    now = time.monotonic()
+    if now - _would_block_log_at < 60:
+        return
+    _would_block_log_at = now
+    logger.info("模型流读取暂时无数据 (WinError 10035)，继续等待，不中断本轮")
+
+
+def _call_retrying_would_block(
+    operation: Callable[[Optional[float]], Any],
+    timeout: Optional[float],
+    *,
+    sleeper: Optional[Callable[[float], None]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    pause_start: float = 0.01,
+) -> Any:
+    """在读超时预算内重试 WSAEWOULDBLOCK。timeout=0 是有意的非阻塞读，不重试。"""
+    if sleeper is None:
+        sleeper = time.sleep
+    if clock is None:
+        clock = time.monotonic
+
+    deadline = None if timeout is None else clock() + timeout
+    pause = pause_start
+    unbounded_left = _UNBOUNDED_WOULD_BLOCK_ATTEMPTS
+    last_exc: Optional[BaseException] = None
+
+    while True:
+        remaining = None if deadline is None else deadline - clock()
+        if remaining is not None and remaining <= 0:
+            if last_exc is not None:
+                raise last_exc
+            remaining = timeout
+        try:
+            return operation(remaining)
+        except Exception as exc:
+            if timeout == 0 or not _is_would_block(exc):
+                raise
+            last_exc = exc
+            now = clock()
+            if deadline is not None and now >= deadline:
+                raise
+            if deadline is None:
+                unbounded_left -= 1
+                if unbounded_left <= 0:
+                    raise
+            step = pause
+            if deadline is not None:
+                step = min(step, deadline - now)
+            if step <= 0:
+                raise
+            _note_would_block_retry()
+            sleeper(step)
+            pause = min(pause * 2, _WOULD_BLOCK_PAUSE_MAX)
+
+
+class _WouldBlockRetryStream(SyncStream):
+    """HTTPS 升级后的套接字仍走这里，read 遇到 10035 不把连接判死。"""
+
+    def read(self, max_bytes: int, timeout: Optional[float] = None) -> bytes:
+        def operation(remaining: Optional[float]) -> bytes:
+            return SyncStream.read(self, max_bytes, remaining)
+
+        return _call_retrying_would_block(operation, timeout)
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> SyncStream:
+        upgraded = SyncStream.start_tls(self, ssl_context, server_hostname, timeout)
+        sock = upgraded.get_extra_info("socket")
+        if sock is None:
+            return upgraded
+        return _WouldBlockRetryStream(sock)
+
+
+class _WouldBlockRetryBackend(SyncBackend):
+    def connect_tcp(self, *args: Any, **kwargs: Any) -> SyncStream:
+        stream = super().connect_tcp(*args, **kwargs)
+        sock = stream.get_extra_info("socket")
+        return _WouldBlockRetryStream(sock)
+
+
+def _install_would_block_retry(client: httpx.Client) -> None:
+    """把已建好的连接池后端换成会重试 10035 的实现。此时还没有任何连接。"""
+    transports = [client._transport, *client._mounts.values()]
+    for transport in transports:
+        pool = getattr(transport, "_pool", None)
+        if pool is not None and hasattr(pool, "_network_backend"):
+            pool._network_backend = _WouldBlockRetryBackend()
+
 
 def _http2_enabled() -> bool:
     env_flag = os.environ.get("YCODE_HTTP2", "").strip().lower()
@@ -455,6 +601,7 @@ def _get_shared_client() -> httpx.Client:
                 timeout=timeout,
                 http2=_http2_enabled(),
             )
+            _install_would_block_retry(_client_instance)
         return _client_instance
 
 
@@ -564,6 +711,19 @@ def _map_http_error(resp: httpx.Response) -> NativeLLMError:
     code = resp.status_code
     body = resp.text
     clean_body = body[:500] if body else ""
+
+    # 中转网关的内容过滤：命中后网关在转发前直接回错，报文里带过滤标记。
+    # 必须前置于 code >= 500 判定，否则会被当成“服务商内部故障”把人引向等待重试。
+    # 报文全文参与识别（截断到 500 字符的 clean_body 可能丢掉尾部的 code 字段）。
+    if looks_like_gateway_content_filter(body):
+        hit_words = gateway_filter_hit_words(body)
+        masked_body = mask_gateway_filter_words(clean_body, hit_words)
+        return ContentFilteredError(
+            f"请求被中转网关内容过滤拦截 (HTTP {code}): {masked_body}",
+            status_code=code,
+            response=resp,
+            body=masked_body,
+        )
 
     if code == 401 or code == 403:
         return AuthenticationError(

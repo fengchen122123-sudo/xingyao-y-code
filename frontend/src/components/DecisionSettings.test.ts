@@ -376,27 +376,25 @@ describe('DecisionSettings', () => {
 
     for (const scene of ['secretary', 'search', 'safety']) {
       expect(wrapper.find(`[data-test="decision-scene-${scene}"]`).exists()).toBe(true);
-      for (const mode of ['off', 'live']) {
-        expect(
-          wrapper.find(`[data-test="decision-scene-${scene}-mode-${mode}"]`).exists(),
-        ).toBe(true);
-      }
-      expect(wrapper.find(`[data-test="decision-scene-${scene}-mode-shadow"]`).exists()).toBe(false);
+      // 二态改用开关：radio 组不再渲染，开关替代它携带状态
+      expect(wrapper.find(`[data-test="decision-scene-${scene}-mode-off"]`).exists()).toBe(false);
+      expect(wrapper.find(`[data-test="decision-scene-${scene}-mode-live"]`).exists()).toBe(false);
+      expect(wrapper.find(`[data-test="decision-scene-${scene}-switch"]`).exists()).toBe(true);
       expect(wrapper.find(`[data-test="decision-scene-${scene}-threshold"]`).exists()).toBe(true);
     }
 
     expect(
-      (wrapper.find('[data-test="decision-scene-search-mode-live"]').element as HTMLInputElement).checked,
+      (wrapper.find('[data-test="decision-scene-search-switch"]').element as HTMLInputElement).checked,
     ).toBe(true);
     expect(
-      (wrapper.find('[data-test="decision-scene-secretary-mode-off"]').element as HTMLInputElement).checked,
-    ).toBe(true);
+      (wrapper.find('[data-test="decision-scene-secretary-switch"]').element as HTMLInputElement).checked,
+    ).toBe(false);
 
     expect(wrapper.find('[data-test="decision-scene-search-live-warning"]').text()).toContain('真实影响任务行为');
     expect(wrapper.find('[data-test="decision-scene-secretary-live-warning"]').exists()).toBe(false);
 
     const setScene = (api as unknown as { set_decision_scene: ReturnType<typeof vi.fn> }).set_decision_scene;
-    await wrapper.find('[data-test="decision-scene-search-mode-off"]').setValue();
+    await wrapper.find('[data-test="decision-scene-search-switch"]').setValue(false);
     await flushPromises();
     expect(setScene).toHaveBeenCalledWith('search', 'off');
     expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('搜索场景已关闭');
@@ -428,7 +426,7 @@ describe('DecisionSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
-    await wrapper.find('[data-test="decision-scene-secretary-mode-live"]').setValue();
+    await wrapper.find('[data-test="decision-scene-secretary-switch"]').setValue(true);
     await flushPromises();
 
     expect(wrapper.find('[data-test="decision-scenes-msg"]').text()).toContain('未知场景');

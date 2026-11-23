@@ -516,6 +516,16 @@ class MemoryManager:
                 # 星瑶人设互不影响；同样只走 ALTER ADD COLUMN 幂等添加。
                 if "secretary_persona" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN secretary_persona TEXT")
+                # 会话标题来源：NULL/空/'default' = 仍是起步名，首轮结束允许 AI
+                # 总结命名一次；'ai' = 已完成 AI 命名；'manual' = 用户手动改名，
+                # 永久锁定。只走 ALTER ADD COLUMN 幂等添加，不动历史行。
+                if "title_source" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN title_source TEXT")
+                    # 存量会话视为已命名：升级后旧对话不能因为来源为空
+                    # 在下一回合被 AI 总结命名覆盖
+                    cursor.execute(
+                        "UPDATE sessions SET title_source = 'manual' WHERE title_source IS NULL"
+                    )
                 if "search_text" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN search_text TEXT")
                     backfill_search_text = True
@@ -2110,18 +2120,40 @@ class MemoryManager:
         turn_id,
         step_id,
     ):
+        """校验 turn/step 归属并返回 turn 绑定的 session_id。
+
+        会话名是可变展示属性（rename_session 只改名字、复用同一 session_id），
+        而「消息落到哪个会话」的事实源是 harness_turns.session_id。以名字做键
+        会让回合运行中被改名后的提交查不到行、被误判为致命错误（用户侧表现为
+        “模型请求异常”）。因此这里以 session_id 为锚：只要求 turn/step 两个 ID
+        真实存在且 turn 对应的会话行未被删除；名字不一致仅告警，不阻断提交。
+        """
         cursor.execute(
-            "SELECT sessions.id FROM sessions "
-            "JOIN harness_turns ON harness_turns.session_id = sessions.id "
-            "JOIN harness_steps ON harness_steps.turn_id = harness_turns.turn_id "
-            "WHERE sessions.session_name = ? AND harness_turns.turn_id = ? "
-            "AND harness_steps.step_id = ?",
-            (session_name, turn_id, step_id),
+            "SELECT harness_turns.session_id, sessions.session_name "
+            "FROM harness_turns "
+            "LEFT JOIN sessions ON sessions.id = harness_turns.session_id "
+            "WHERE harness_turns.turn_id = ?",
+            (turn_id,),
         )
         row = cursor.fetchone()
-        if row is None:
+        if row is None or row[1] is None:
             raise RuntimeError(
                 "missing or mismatched harness session, turn, or step"
+            )
+        cursor.execute(
+            "SELECT 1 FROM harness_steps WHERE step_id = ? AND turn_id = ?",
+            (step_id, turn_id),
+        )
+        if cursor.fetchone() is None:
+            raise RuntimeError(
+                "missing or mismatched harness session, turn, or step"
+            )
+        if str(row[1]) != str(session_name):
+            logging.getLogger("py.warnings").warning(
+                "harness commit: 会话在回合运行中被重命名 %r -> %r，"
+                "消息按 turn 绑定的 session_id 提交",
+                session_name,
+                row[1],
             )
         return row[0]
 
@@ -2140,11 +2172,21 @@ class MemoryManager:
                 step_id,
             )
 
-    def _insert_message_batch_locked(self, cursor, session_name, serialized):
-        cursor.execute(
-            "SELECT id, search_text FROM sessions WHERE session_name = ?",
-            (session_name,),
-        )
+    def _insert_message_batch_locked(
+        self, cursor, session_name, serialized, session_id=None
+    ):
+        if session_id is None:
+            cursor.execute(
+                "SELECT id, search_text FROM sessions WHERE session_name = ?",
+                (session_name,),
+            )
+        else:
+            # harness 提交以 turn 绑定的 session_id 为锚：会话名可能已被
+            # rename_session 改动，按名字查会误报“会话丢失”。
+            cursor.execute(
+                "SELECT id, search_text FROM sessions WHERE id = ?",
+                (session_id,),
+            )
         row = cursor.fetchone()
         if row is None:
             raise RuntimeError(f"missing message session: {session_name}")
@@ -2203,8 +2245,8 @@ class MemoryManager:
                 else:
                     target_wdir = self.workdir
                     cursor.execute('''
-                        INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
-                        VALUES (?, ?, ?, ?, 'GUI')
+                        INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, title_source)
+                        VALUES (?, ?, ?, ?, 'GUI', 'default')
                     ''', (session_name, target_wdir, now, now))
                     cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
                     row = cursor.fetchone()
@@ -2291,6 +2333,7 @@ class MemoryManager:
                     cursor,
                     session_name,
                     serialized,
+                    session_id=session_id,
                 )
                 if link_checkpoint_id is not None:
                     from core.turn_undo.storage import insert_message_turn_links_locked
@@ -2520,8 +2563,8 @@ class MemoryManager:
                 if cursor.fetchone() is not None:
                     return False
                 cursor.execute('''
-                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, title_source)
+                    VALUES (?, ?, ?, ?, ?, 'default')
                 ''', (session_name, wdir, now, now, source))
                 self.conn.commit()
                 return True
@@ -2715,8 +2758,8 @@ class MemoryManager:
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
                 cursor.execute('''
-                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, secretary_name, secretary_persona)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, secretary_name, secretary_persona, title_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'default')
                 ''', (session_name, wdir, now, now, source, sec_name or None, sec_persona or None))
                 self.conn.commit()
             except Exception:
@@ -3606,8 +3649,65 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
-    def rename_session(self, old_name, new_name):
-        """重命名指定会话，确保新名称在数据库中唯一。如果名字冲突则自动加数字后缀。"""
+    @staticmethod
+    def _resolve_unique_session_name(cursor, session_id, base_name):
+        final_name = base_name
+        suffix = 1
+        while True:
+            cursor.execute(
+                'SELECT id FROM sessions WHERE session_name = ? AND id != ?',
+                (final_name, session_id),
+            )
+            if not cursor.fetchone():
+                return final_name
+            final_name = f"{base_name}_{suffix}"
+            suffix += 1
+
+    @staticmethod
+    def _migrate_session_reference_rows(cursor, old_name, final_name):
+        """迁移所有按会话名键控的关联表（调用方负责事务提交）。"""
+        cursor.execute(
+            'UPDATE deepseek_prompt_generations SET session_name = ? WHERE session_name = ?',
+            (final_name, old_name),
+        )
+        cursor.execute(
+            'UPDATE session_summary_generations SET session_name = ? WHERE session_name = ?',
+            (final_name, old_name),
+        )
+        cursor.execute(
+            'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
+            (final_name, old_name),
+        )
+        # 秘书派活台账按 session_name 键控：改名后同时迁移归属秘书与目标会话，
+        # 避免结果查询或自动汇报唤醒按旧会话名失联（与上方更新同事务）
+        cursor.execute(
+            'UPDATE secretary_dispatches SET secretary_session = ? WHERE secretary_session = ?',
+            (final_name, old_name),
+        )
+        cursor.execute(
+            'UPDATE secretary_dispatches SET target_session = ?, '
+            'target_display = CASE WHEN target_display = \'\' OR target_display = \'新会话\' OR target_display = ? '
+            'THEN ? ELSE target_display END '
+            'WHERE target_session = ?',
+            (final_name, old_name, final_name, old_name),
+        )
+
+    @staticmethod
+    def _post_rename_runtime(old_name, final_name):
+        from core.llm import rename_cache_usage_session
+        rename_cache_usage_session(old_name, final_name)
+        try:
+            from core.decision_service import rename_session_audit
+            rename_session_audit(old_name, final_name)
+        except Exception:
+            pass
+
+    def rename_session(self, old_name, new_name, *, title_source=None):
+        """重命名指定会话，确保新名称在数据库中唯一。如果名字冲突则自动加数字后缀。
+
+        title_source 为 None 时不改动 sessions.title_source；显式传入 'ai'/'manual'
+        时在同一事务内落库，用于区分 AI 总结命名与用户手动改名。
+        """
         # 空名字/纯空白名字无意义，直接拒绝，避免产生空 session_name
         if not isinstance(new_name, str) or not new_name.strip():
             return False, old_name
@@ -3621,58 +3721,80 @@ class MemoryManager:
                 return False, old_name
 
             session_id = row[0]
-
-            base_name = new_name.strip()
-            final_name = base_name
-            suffix = 1
-            while True:
-                cursor.execute('SELECT id FROM sessions WHERE session_name = ? AND id != ?', (final_name, session_id))
-                if not cursor.fetchone():
-                    break
-                final_name = f"{base_name}_{suffix}"
-                suffix += 1
+            final_name = self._resolve_unique_session_name(
+                cursor, session_id, new_name.strip()
+            )
 
             try:
-                cursor.execute('UPDATE sessions SET session_name = ? WHERE id = ?', (final_name, session_id))
-                cursor.execute(
-                    'UPDATE deepseek_prompt_generations SET session_name = ? WHERE session_name = ?',
-                    (final_name, old_name),
-                )
-                cursor.execute(
-                    'UPDATE session_summary_generations SET session_name = ? WHERE session_name = ?',
-                    (final_name, old_name),
-                )
-                cursor.execute(
-                    'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
-                    (final_name, old_name),
-                )
-                # 秘书派活台账按 session_name 键控：改名后同时迁移归属秘书与目标会话，
-                # 避免结果查询或自动汇报唤醒按旧会话名失联（与上方更新同事务）
-                cursor.execute(
-                    'UPDATE secretary_dispatches SET secretary_session = ? WHERE secretary_session = ?',
-                    (final_name, old_name),
-                )
-                cursor.execute(
-                    'UPDATE secretary_dispatches SET target_session = ?, '
-                    'target_display = CASE WHEN target_display = \'\' OR target_display = \'新会话\' OR target_display = ? '
-                    'THEN ? ELSE target_display END '
-                    'WHERE target_session = ?',
-                    (final_name, old_name, final_name, old_name),
-                )
+                if title_source is None:
+                    cursor.execute(
+                        'UPDATE sessions SET session_name = ? WHERE id = ?',
+                        (final_name, session_id),
+                    )
+                else:
+                    cursor.execute(
+                        'UPDATE sessions SET session_name = ?, title_source = ? WHERE id = ?',
+                        (final_name, title_source, session_id),
+                    )
+                self._migrate_session_reference_rows(cursor, old_name, final_name)
                 self.conn.commit()
                 result = (True, final_name)
             except Exception:
                 # 回滚半残更新，避免被下一次 commit 幽灵提交
                 self.conn.rollback()
                 return False, old_name
-        from core.llm import rename_cache_usage_session
-        rename_cache_usage_session(old_name, final_name)
-        try:
-            from core.decision_service import rename_session_audit
-            rename_session_audit(old_name, final_name)
-        except Exception:
-            pass
+        self._post_rename_runtime(old_name, final_name)
         return result
+
+    def get_session_title_source(self, session_name):
+        """读取标题来源：None/''/'default' = 可自动命名，'ai'/'manual' = 已锁定。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT title_source FROM sessions WHERE session_name = ?',
+                (str(session_name or ""),),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return str(row[0] or "").strip() or None
+
+    def rename_session_if_untitled(self, old_name, new_name):
+        """仅当标题未被 AI 命名或手动改名锁定时改名，用于首轮总结命名。
+
+        条件更新与改名在同一事务内完成：与用户手动改名并发时，后到者按
+        title_source 判定失败，绝不覆盖用户输入。
+        """
+        if not isinstance(new_name, str) or not new_name.strip():
+            return False, old_name
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (old_name,))
+            row = cursor.fetchone()
+            if not row:
+                return False, old_name
+
+            session_id = row[0]
+            final_name = self._resolve_unique_session_name(
+                cursor, session_id, new_name.strip()
+            )
+            try:
+                cursor.execute(
+                    "UPDATE sessions SET session_name = ?, title_source = 'ai' "
+                    "WHERE id = ? AND (title_source IS NULL OR title_source = '' "
+                    "OR title_source = 'default')",
+                    (final_name, session_id),
+                )
+                if cursor.rowcount != 1:
+                    self.conn.rollback()
+                    return False, old_name
+                self._migrate_session_reference_rows(cursor, old_name, final_name)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                return False, old_name
+        self._post_rename_runtime(old_name, final_name)
+        return True, final_name
 
     def archive_session(self, session_name, archived_at=None) -> bool:
         stamp = (

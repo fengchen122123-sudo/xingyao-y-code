@@ -666,6 +666,39 @@ it('宿主串行代次门控：hide 后迟到 resolve 的 open ack 不得复活 
   wrapper.unmount();
 });
 
+it('open 回执仍是 opening 时，内核随后报就绪就收起准备中占位', async () => {
+  const api = mockApi();
+  api.browser_pane_open.mockResolvedValue({
+    ok: true,
+    ack: true,
+    phase: 'opening',
+    state: { phase: 'opening', ready: false, visible: true, url: 'https://www.baidu.com/' },
+  });
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.embeddedBrowser.url = 'https://www.baidu.com/';
+
+  const wrapper = await mountPane(true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalled());
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('opening');
+  expect(wrapper.find('[data-test="bp-surface-pending"]').exists()).toBe(true);
+
+  store.handleBridgeEvent({
+    type: 'embedded_browser',
+    data: {
+      url: 'https://www.baidu.com/',
+      ready: true,
+      visible: true,
+      phase: 'ready',
+    },
+  } as any);
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('ready');
+  expect(wrapper.find('[data-test="bp-surface-pending"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
 it('330px 窄面板遇 1440×900 视口时不篡改右栏宽度、隐藏被裁的原生视图并显示缩略图/展开提示，拖宽至 >=392px 后恢复', async () => {
   const api = mockApi();
   (window as any).pywebview = { api };

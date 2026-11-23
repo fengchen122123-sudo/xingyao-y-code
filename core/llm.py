@@ -145,7 +145,7 @@ from core.llm_transport import (
 
 from core.llm_error_mapper import map_llm_error
 
-# 这几类失败重试没用（额度用完 / 密钥无效 / 权限不够 / 模型不存在），
+# 这几类失败重试没用（额度用完 / 密钥无效 / 权限不够 / 模型不存在 / 网关内容过滤），
 # 命中即直接报错收尾；限流等临时性错误继续重试
 _DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
     "insufficient_quota",
@@ -154,6 +154,8 @@ _DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
     "model_not_found",
     "model_unavailable",
     "policy_refusal",
+    # 网关内容过滤是确定性的：上下文里带着触发词，重试多少次都会命中同一条规则。
+    "gateway_content_filtered",
 })
 
 
@@ -3598,6 +3600,15 @@ def _chat_with_model_generator(
         if e is persistence_failure:
             raise
         if event_callback is not None:
+            # 这条兜底只发事件、不 raise，上层不会再有 logger.exception，等于异常来源
+            # 彻底丢失（WinError 10035 这类瞬时报错就是这样查不到是谁抛的）。此处落一条
+            # 带堆栈的 warning：堆栈只含调用链与异常文本，不含请求头或凭证。
+            logger.warning(
+                "回合异常兜底（%s）：%s",
+                type(e).__name__,
+                _sanitize_error_text(str(e)),
+                exc_info=True,
+            )
             user_facing_msg = _format_user_facing_error(e)
             _notify_event(event_callback, "error", {
                 "message": user_facing_msg,

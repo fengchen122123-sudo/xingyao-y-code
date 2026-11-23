@@ -924,7 +924,7 @@ def test_background_worker_survives_malformed_task(monkeypatch):
 def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
 
     class ImmediateThread:
-        def __init__(self, target, daemon):
+        def __init__(self, target, daemon=False, name=None, **kwargs):
             self.target = target
 
         def start(self):
@@ -942,9 +942,26 @@ def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
     scheduled = []
     monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(
-        "core.llm_native_transport.native_completion", lambda **kwargs: FakeResponse()
+        "core.session_title.native_completion", lambda **kwargs: FakeResponse()
     )
-    monkeypatch.setattr(main.manager, "rename_session", lambda session, title: (True, title))
+    monkeypatch.setattr(
+        main.manager, "get_session_title_source", lambda session: None, raising=False
+    )
+    monkeypatch.setattr(
+        main.manager,
+        "get_history",
+        lambda session: [
+            {"role": "user", "content": "帮我写个冒泡排序"},
+            {"role": "assistant", "content": "好的，这是实现"},
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main.manager,
+        "rename_session_if_untitled",
+        lambda session, title: (True, title),
+        raising=False,
+    )
     monkeypatch.setattr(main, "schedule_ui", scheduled.append)
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
     monkeypatch.setattr(main, "app_instance", None)
@@ -954,6 +971,14 @@ def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
     assert result is None
     assert len(scheduled) == 1
     scheduled[0]()
+
+    # 用户已手动改名（或已 AI 命名）后不再触发
+    monkeypatch.setattr(
+        main.manager, "get_session_title_source", lambda session: "manual"
+    )
+    scheduled.clear()
+    main.trigger_session_auto_rename("session_abc123", "帮我写个冒泡排序", "m", "k", "u")
+    assert scheduled == []
 
 
 class _FakeManager:

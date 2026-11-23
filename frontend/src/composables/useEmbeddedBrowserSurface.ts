@@ -36,6 +36,8 @@ export interface UseEmbeddedBrowserSurfaceApi {
   syncNow: () => Promise<any> | null;
   navigate: (url: string) => void;
   request: (method: string, ...args: unknown[]) => void;
+  /** 宿主稍后推送的就绪状态。open 回执可能停在 opening，不能据此一直盖住页面。 */
+  noteHostState: (state: { ready?: boolean; visible?: boolean; phase?: string }) => void;
 }
 
 const MIN_SIDE = 2;
@@ -225,11 +227,26 @@ export function useEmbeddedBrowserSurface(
             surfacePhase.value = 'error';
           }
         } else {
-          surfacePhase.value = res?.phase === 'opening' ? 'opening' : 'ready';
+          const next = res?.phase === 'opening' ? 'opening' : 'ready';
+          // 就绪事件可能先于这条回执到达。迟到的 opening 不能把占位层再盖回去。
+          if (!(surfacePhase.value === 'ready' && next === 'opening')) {
+            surfacePhase.value = next;
+          }
         }
         return res;
       });
     });
+  }
+
+  function noteHostState(state: { ready?: boolean; visible?: boolean; phase?: string }): void {
+    if (disposed || !lastVisible || surfacePhase.value !== 'opening') return;
+    if (state?.phase === 'error') {
+      surfacePhase.value = 'error';
+      return;
+    }
+    if (state?.phase === 'ready' || (state?.ready && state?.visible)) {
+      surfacePhase.value = 'ready';
+    }
   }
 
   function move(rect: BrowserRect): void {
@@ -250,6 +267,8 @@ export function useEmbeddedBrowserSurface(
           } else if (res.error !== 'not_open') {
             surfacePhase.value = 'error';
           }
+        } else if (res?.phase === 'ready' && surfacePhase.value === 'opening') {
+          surfacePhase.value = 'ready';
         }
       });
     });
@@ -345,5 +364,6 @@ export function useEmbeddedBrowserSurface(
     syncNow,
     navigate,
     request,
+    noteHostState,
   };
 }
