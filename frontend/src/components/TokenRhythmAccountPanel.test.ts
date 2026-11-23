@@ -490,3 +490,90 @@ it('非登录类失败不出现「重新登录」，只保留重试', async () =
   expect(w!.find('[data-test="tr-acc-relogin"]').exists()).toBe(false);
   expect(w!.find('[data-test="tr-acc-retry"]').exists()).toBe(true);
 });
+
+it('有模型专属赠金时展示各模型剩余额度与合计，用完的项不展示', async () => {
+  const exp = '2026-11-30T15:59:00.000Z';
+  installBridge({
+    tr_account_overview: vi.fn(async () => okOverview({
+      model_credits: [
+        {
+          id: 'mg-1',
+          model_id: 'deepseek-v4.1-flash-1017',
+          model_name: 'DeepSeek V4.1 Flash 1017',
+          remaining_cny: '16.64283356',
+          granted_cny: '17.00000000',
+          expires_at: exp,
+        },
+        {
+          id: 'mg-2',
+          model_id: 'hy4',
+          model_name: 'Hy4',
+          remaining_cny: '17.00000000',
+          granted_cny: '17.00000000',
+          expires_at: exp,
+        },
+        {
+          id: 'mg-used',
+          model_id: 'glm-5.3',
+          model_name: 'GLM-5.3',
+          remaining_cny: '0.00000000',
+          granted_cny: '17.00000000',
+          expires_at: exp,
+        },
+      ],
+    })),
+  });
+  const { store, wrapper: w } = setup();
+
+  await openPanel(store);
+
+  expect(w!.find('[data-test="tr-acc-model-gifts"]').exists()).toBe(true);
+  expect(w!.get('[data-test="tr-acc-model-gifts-total"]').text()).toBe('共 ¥33.64');
+  const names = w!.findAll('[data-test="tr-acc-model-gift-name"]').map((n) => n.text());
+  const amounts = w!.findAll('[data-test="tr-acc-model-gift-amount"]').map((n) => n.text());
+  expect(names).toEqual(['DeepSeek V4.1 Flash 1017', 'Hy4']);
+  expect(amounts).toEqual(['¥16.64', '¥17.00']);
+  expect(w!.findAll('[data-test="tr-acc-model-gift-item"]')[0].attributes('title')).toContain('初始 ¥17.00');
+});
+
+it('模型专属赠金全部用完或为空时不渲染该区块', async () => {
+  const api = installBridge({
+    tr_account_overview: vi
+      .fn()
+      .mockResolvedValueOnce(okOverview({
+        model_credits: [
+          {
+            id: 'mg-small',
+            model_id: 'hy4',
+            model_name: 'Hy4',
+            remaining_cny: '0.00420000',
+            granted_cny: '17.00000000',
+            expires_at: '',
+          },
+        ],
+      }))
+      .mockResolvedValueOnce(okOverview({
+        model_credits: [
+          {
+            id: 'mg-small',
+            model_id: 'hy4',
+            model_name: 'Hy4',
+            remaining_cny: '0.00000000',
+            granted_cny: '17.00000000',
+            expires_at: '',
+          },
+        ],
+      })),
+  });
+  const { store, wrapper: w } = setup();
+
+  await openPanel(store);
+  expect(w!.find('[data-test="tr-acc-model-gifts"]').exists()).toBe(true);
+  expect(w!.get('[data-test="tr-acc-model-gift-amount"]').text()).toBe('¥0.0042');
+
+  await w!.get('[data-test="tr-acc-refresh"]').trigger('click');
+  await flushPromises();
+
+  expect(api.tr_account_overview).toHaveBeenCalledTimes(2);
+  expect(w!.find('[data-test="tr-acc-model-gifts"]').exists()).toBe(false);
+});

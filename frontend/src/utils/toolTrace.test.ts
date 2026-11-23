@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildSubagentFileChanges,
   buildSubagentFlatView,
+  buildSubagentProcessSteps,
   buildSubagentRoundGroups,
   buildToolTraceRows,
   cleanSubagentTitle,
+  commandFamily,
   countDiffChanges,
   reduceExecutionState,
   type ToolDisplay,
@@ -490,5 +493,79 @@ describe('cleanSubagentTitle & buildSubagentRoundGroups', () => {
     expect(timeline.hasStructuredTools).toBe(false);
     expect(timeline.rounds).toBe(1);
     expect(timeline.toolOk).toBe(1);
+  });
+});
+
+describe('commandFamily, buildToolTraceRows command grouping & buildSubagentProcessSteps', () => {
+  it('extracts normalized command family across flags and directory prefixes', () => {
+    expect(commandFamily('git -C "D:\\repo" show f388d8a:README.md')).toBe('git show');
+    expect(commandFamily('cd /d E:\\repo && git status')).toBe('git status');
+    expect(commandFamily('pytest tests/test_a.py')).toBe('pytest');
+  });
+
+  it('groups consecutive completed commands of the same family when groupCommands is enabled', () => {
+    const rows = buildToolTraceRows(
+      [
+        commandCall('c1', 'git -C D:\\repo show a:README.md', true, 1200),
+        commandCall('c2', 'git -C D:\\repo show a:AGENTS.md', true, 800),
+        commandCall('c3', 'git -C D:\\repo status', true, 100),
+        commandCall('c4', 'git -C D:\\repo show a:DEPLOY.md', false, 500),
+      ],
+      [],
+      'completed',
+      { groupCommands: true },
+    );
+
+    expect(rows.map((r) => [r.kind, r.count, r.detail])).toEqual([
+      ['command-group', 2, 'git show'],
+      ['command', 1, 'git -C D:\\repo status'],
+      ['command', 1, 'git -C D:\\repo show a:DEPLOY.md'],
+    ]);
+    expect(rows[0].durationMs).toBe(2000);
+  });
+
+  it('merges consecutive pure-tool rounds while preserving thinking and intro text steps', () => {
+    const model = buildSubagentProcessSteps({
+      status: 'running',
+      stage: 'thinking',
+      roundNotes: [
+        { round: 1, started_at: 100, thinking: '先列出目录并读取文档', text: '正在读取相关文件。' },
+        { round: 4, started_at: 140, thinking: '分析第 4 轮输出结果', text: '' },
+      ],
+      toolRecords: [
+        {
+          id: 't1', seq: 1, round: 1, name: 'read_file', category: 'read',
+          action: '读取文件', target: 'README.md', status: 'ok', started_at: 101, duration_ms: 20,
+        },
+        {
+          id: 't2', seq: 2, round: 2, name: 'read_file', category: 'read',
+          action: '读取文件', target: 'AGENTS.md', status: 'ok', started_at: 110, duration_ms: 30,
+        },
+        {
+          id: 't3', seq: 3, round: 3, name: 'execute_command', category: 'command',
+          action: '运行命令', target: 'git show a:README.md', status: 'ok', started_at: 120, duration_ms: 500,
+        },
+      ],
+    });
+
+    expect(model.hasStructuredProcess).toBe(true);
+    expect(model.steps).toHaveLength(2);
+    expect(model.steps[0].thinkingSummary).toBe('先列出目录并读取文档');
+    expect(model.steps[0].text).toBe('正在读取相关文件。');
+    // 第 2、3 轮无思考无过渡正文，自动合并进第 1 步调用流以便横向聚合同类工具
+    expect(model.steps[0].calls.map((c) => c.id)).toEqual(['t1', 't2', 't3']);
+    expect(model.steps[1].thinkingLive).toBe(true);
+    expect(model.steps[1].thinkingSummary).toBe('分析第 4 轮输出结果');
+  });
+
+  it('collects diffs and fallback paths into FileChangeEntry list', () => {
+    const changes = buildSubagentFileChanges({
+      fileDiffs: [{ file_path: 'src/a.ts', diff_text: '--- a\n+++ b\n-1\n+2\n+3', added: 2, removed: 1 }],
+      changedFiles: ['src/a.ts', 'docs/b.md'],
+    });
+    expect(changes).toEqual([
+      { name: 'a.ts', path: 'src/a.ts', added: 2, removed: 1, diffText: '--- a\n+++ b\n-1\n+2\n+3' },
+      { name: 'b.md', path: 'docs/b.md', added: 0, removed: 0, diffText: '' },
+    ]);
   });
 });

@@ -745,11 +745,15 @@ _MULTIMODAL_TODAY_PATH = (
 )
 _ME_PATH = "/api/auth/me"
 _TEMPORARY_CREDITS_PATH = (
-    "/api/wallet/expiring-credits?page=1&pageSize=100&includeInactive=false"
+    "/api/wallet/expiring-credits?page=1&pageSize=100"
+    "&includeInactive=false&includeModelCredits=true"
 )
 _TEMPORARY_CREDITS_HORIZON = timedelta(days=365 * 10)
 _TEMPORARY_CREDITS_TIMEOUT = 45.0
 _RETRYABLE_CREDITS_CODES = frozenset({"INTERNAL_ERROR", "TIMEOUT", "SERVICE_UNAVAILABLE"})
+_INACTIVE_CREDIT_STATUSES = frozenset(
+    {"EXPIRED", "USED_UP", "VOIDED", "CANCELLED", "INACTIVE", "DEPLETED"}
+)
 
 
 def _is_retryable_credits_error(error: TokenRhythmAuthError) -> bool:
@@ -797,6 +801,11 @@ def _usage_default() -> dict:
 def _temporary_credits_default() -> dict:
     """临时额度接口失败时的降级值：金额 "0"、条数 0、最早到期时间与金额为空。"""
     return {"total_cny": "0", "count": 0, "nearest_expires_at": "", "nearest_amount_cny": "0"}
+
+
+def _model_credits_default() -> list[dict]:
+    """模型专属赠金接口失败或无数据时的降级值：空列表。"""
+    return []
 
 
 def _credit_items(payload: dict) -> list[dict]:
@@ -882,7 +891,66 @@ def _first_field(item: dict, keys: tuple[str, ...]) -> Any:
     return None
 
 
-def _fetch_temporary_credits() -> dict:
+def _is_model_gift_item(item: dict) -> bool:
+    kind = str(item.get("kind") or "").strip().upper()
+    source = str(item.get("source") or "").strip().upper()
+    return kind == "MODEL_GIFT" or source == "MODEL_GIFT"
+
+
+def _parse_model_credit(item: dict, now: datetime) -> tuple[datetime, dict] | None:
+    """解析单条有效模型专属赠金；已用完、已过期或非活跃状态返回 None。"""
+    status = str(item.get("status") or "").strip().upper()
+    if status in _INACTIVE_CREDIT_STATUSES:
+        return None
+    remaining = _decimal_amount(
+        _first_field(item, ("remainingCny", "remainingAmountCny", "remaining", "amountCny"))
+    )
+    if remaining is None or not remaining.is_finite() or remaining <= 0:
+        return None
+
+    raw_expires = _first_field(item, ("expiresAt", "expireAt", "expires_at", "validUntil"))
+    expires_raw = str(raw_expires if raw_expires is not None else "").strip()
+    expires_at: datetime | None = None
+    if expires_raw:
+        expires_at = _parse_expires_at(raw_expires)
+        if expires_at is None or expires_at <= now:
+            return None
+
+    granted = _decimal_amount(
+        _first_field(item, ("grantedCny", "grantedAmountCny", "totalCny"))
+    )
+    granted_cny = (
+        format(granted, "f")
+        if granted is not None and granted.is_finite() and granted > 0
+        else ""
+    )
+    model_id = str(_first_field(item, ("modelId", "model_id")) or "").strip()
+    model_name = str(
+        _first_field(item, ("modelName", "model_name", "modelId", "model_id")) or ""
+    ).strip()
+    if not model_name:
+        model_name = str(_first_field(item, ("sourceLabel",)) or "").strip() or "模型专属赠金"
+    credit_id = str(_first_field(item, ("id", "creditId", "giftId")) or "").strip()
+
+    sort_dt = (
+        expires_at
+        if expires_at is not None
+        else datetime.max.replace(tzinfo=timezone.utc)
+    )
+    return (
+        sort_dt,
+        {
+            "id": credit_id,
+            "model_id": model_id,
+            "model_name": model_name,
+            "remaining_cny": format(remaining, "f"),
+            "granted_cny": granted_cny,
+            "expires_at": expires_raw,
+        },
+    )
+
+
+def _fetch_credits() -> tuple[dict, list[dict]]:
     try:
         payload = _request("GET", _TEMPORARY_CREDITS_PATH)
     except TokenRhythmAuthError as error:
@@ -902,7 +970,16 @@ def _fetch_temporary_credits() -> dict:
     total = Decimal("0")
     count = 0
     valid: list[tuple[datetime, Decimal, str]] = []
+    model_entries: list[tuple[datetime, dict]] = []
     for item in items:
+        if _is_model_gift_item(item):
+            parsed_model = _parse_model_credit(item, now)
+            if parsed_model is not None:
+                model_entries.append(parsed_model)
+            continue
+        status = str(item.get("status") or "").strip().upper()
+        if status in _INACTIVE_CREDIT_STATUSES:
+            continue
         remaining = _decimal_amount(
             _first_field(item, ("remainingCny", "remainingAmountCny", "remaining", "amountCny"))
         )
@@ -933,6 +1010,16 @@ def _fetch_temporary_credits() -> dict:
         ),
         Decimal("0"),
     )
+    model_entries.sort(
+        key=lambda entry: (
+            entry[0],
+            entry[1]["model_name"].lower(),
+            entry[1]["model_id"].lower(),
+            entry[1]["id"],
+        )
+    )
+    model_credits = [entry[1] for entry in model_entries]
+
     data = payload.get("data")
     server_total = data.get("total") if isinstance(data, dict) else None
     if isinstance(server_total, int) and server_total > len(items):
@@ -940,7 +1027,7 @@ def _fetch_temporary_credits() -> dict:
             "临时额度列表未取全：服务端共 %d 条，本页返回 %d 条", server_total, len(items)
         )
 
-    if not count and items:
+    if not count and not model_credits and items:
         # 接口有返回但一条都没算进合计（全是伪永久 / 已过期 / 字段不匹配）：
         # 把首条的字段名记进日志（不含金额），方便按服务端真实字段补兜底，不必靠猜。
         try:
@@ -950,12 +1037,17 @@ def _fetch_temporary_credits() -> dict:
         logger.warning(
             "临时额度未匹配到有效项：共 %d 条，首条字段 %s", len(items), sample_keys
         )
-    return {
+    temporary_credits = {
         "total_cny": format(total, "f"),
         "count": count,
         "nearest_expires_at": nearest_raw,
         "nearest_amount_cny": format(nearest_amount, "f"),
     }
+    return temporary_credits, model_credits
+
+
+def _fetch_temporary_credits() -> dict:
+    return _fetch_credits()[0]
 
 
 def _fetch_wallet() -> dict:
@@ -1029,10 +1121,11 @@ def account_overview() -> dict:
         user = {}
 
     try:
-        temporary_credits = _fetch_temporary_credits()
+        temporary_credits, model_credits = _fetch_credits()
     except TokenRhythmAuthError as error:
         errors["temporary_credits"] = str(error)
         temporary_credits = _temporary_credits_default()
+        model_credits = _model_credits_default()
 
     if all(key in errors for key in ("wallet", "usage", "user")):
         raise TokenRhythmAuthError(
@@ -1054,6 +1147,7 @@ def account_overview() -> dict:
         "wallet": wallet,
         "usage_today": usage_today,
         "temporary_credits": temporary_credits,
+        "model_credits": model_credits,
     }
     if errors:
         result["partial"] = True

@@ -1,4 +1,5 @@
-import type { SubagentToolRecord } from '../types/pywebview.d';
+import type { SubagentFileDiff, SubagentRoundNote, SubagentToolRecord } from '../types/pywebview.d';
+import type { FileChangeEntry } from './turnGroups';
 
 export type ExecutionState = 'running' | 'completed' | 'cancelled' | 'error';
 export type ExecutionLifecycleEvent =
@@ -67,6 +68,7 @@ export interface ToolExecutionCall {
   name: string;
   label: string;
   started_at_ms?: number;
+  args_preview?: string;
   display?: ToolDisplay;
   result?: ToolExecutionResult;
   diff?: LegacyDiff;
@@ -78,6 +80,7 @@ export interface ToolTraceRow {
   kind:
     | 'read-group'
     | 'search-group'
+    | 'command-group'
     | 'command'
     | 'mutation'
     | 'skill'
@@ -95,6 +98,10 @@ export interface ToolTraceRow {
   metrics: Record<string, number>;
   calls: ToolExecutionCall[];
   legacyDiffs?: LegacyDiff[];
+}
+
+export interface BuildToolTraceOptions {
+  groupCommands?: boolean;
 }
 
 export const SUBAGENT_TOOL_NAME = 'run_subagent';
@@ -168,10 +175,62 @@ function rowFor(call: ToolExecutionCall, index: number, state: ExecutionState): 
   };
 }
 
-function canJoinGroup(row: ToolTraceRow, next: ToolTraceRow): boolean {
+const SUBCOMMAND_CLIS = new Set([
+  'git', 'npm', 'pnpm', 'yarn', 'cargo', 'docker', 'kubectl', 'pip', 'uv', 'mvn', 'gradle',
+]);
+
+function tokenizeSimpleShell(cmd: string): string[] {
+  const matches = cmd.match(/"[^"]*"|'[^']*'|\S+/g);
+  return matches ? matches.map((t) => t.replace(/^["']|["']$/g, '')) : [];
+}
+
+export function commandFamily(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .replace(/^(?:cd(?:\s+\/d)?|Set-Location)\s+(?:"[^"]+"|'[^']+'|[^\s;&]+)\s*(?:;|&&)\s*/i, '')
+    .trim();
+  if (!cleaned) return '';
+  const tokens = tokenizeSimpleShell(cleaned);
+  if (tokens.length === 0) return '';
+  const base = (tokens[0]!.replace(/\\/g, '/').split('/').pop() || '')
+    .replace(/\.(?:exe|cmd|bat|ps1)$/i, '')
+    .toLowerCase();
+  if (!base) return '';
+  if (SUBCOMMAND_CLIS.has(base)) {
+    for (let i = 1; i < tokens.length; i += 1) {
+      const tok = tokens[i]!;
+      if (tok === '-C' || tok === '-c' || tok === '--git-dir' || tok === '--work-tree' || tok === '--prefix') {
+        i += 1;
+        continue;
+      }
+      if (tok.startsWith('-')) continue;
+      return `${base} ${tok}`;
+    }
+  }
+  return base;
+}
+
+function canJoinGroup(
+  row: ToolTraceRow,
+  next: ToolTraceRow,
+  options?: BuildToolTraceOptions,
+): boolean {
   const groupedKind = row.kind === 'read-group' || row.kind === 'search-group';
-  if (!groupedKind || row.kind !== next.kind || row.status !== next.status) return false;
-  return row.status === 'completed' || row.status === 'running';
+  if (groupedKind && row.kind === next.kind && row.status === next.status) {
+    return row.status === 'completed' || row.status === 'running';
+  }
+  if (
+    options?.groupCommands &&
+    (row.kind === 'command' || row.kind === 'command-group') &&
+    next.kind === 'command' &&
+    row.status === 'completed' &&
+    next.status === 'completed'
+  ) {
+    const famA = commandFamily(row.command || row.detail);
+    const famB = commandFamily(next.command || next.detail);
+    return Boolean(famA) && famA === famB;
+  }
+  return false;
 }
 
 function mergeMetrics(
@@ -190,8 +249,13 @@ function appendToGroup(group: ToolTraceRow, row: ToolTraceRow): ToolTraceRow {
     group.durationMs === undefined || row.durationMs === undefined
       ? undefined
       : group.durationMs + row.durationMs;
+  const isCmd = group.kind === 'command' || group.kind === 'command-group';
   return {
     ...group,
+    ...(isCmd ? {
+      kind: 'command-group' as const,
+      detail: commandFamily(group.command || group.detail) || group.detail,
+    } : {}),
     count: group.count + row.count,
     ...(durationMs === undefined ? { durationMs: undefined } : { durationMs }),
     metrics: mergeMetrics(group.metrics, row.metrics),
@@ -227,13 +291,14 @@ export function buildToolTraceRows(
   calls: ToolExecutionCall[],
   legacyDiffs: LegacyDiff[] = [],
   state: ExecutionState = 'running',
+  options?: BuildToolTraceOptions,
 ): ToolTraceRow[] {
   const rows: ToolTraceRow[] = [];
   const rowIdCounts = new Map<string, number>();
   for (const [index, call] of calls.entries()) {
     const next = rowFor(call, index, state);
     const previous = rows.at(-1);
-    if (previous && canJoinGroup(previous, next)) {
+    if (previous && canJoinGroup(previous, next, options)) {
       rows[rows.length - 1] = appendToGroup(previous, next);
     } else {
       const occurrence = (rowIdCounts.get(next.id) ?? 0) + 1;
@@ -485,4 +550,272 @@ export function buildSubagentRoundGroups(params: {
     toolOk: Math.max(params.toolOk ?? 0, okCount),
     toolErr: Math.max(params.toolErr ?? 0, errCount),
   };
+}
+
+export interface SubagentProcessStep {
+  id: string;
+  round: number;
+  thinking: string;
+  thinkingSummary: string;
+  thinkingLive: boolean;
+  text: string;
+  calls: ToolExecutionCall[];
+  milestones: SubagentMilestoneItem[];
+}
+
+export interface SubagentProcessModel {
+  hasStructuredProcess: boolean;
+  steps: SubagentProcessStep[];
+  rounds: number;
+  toolOk: number;
+  toolErr: number;
+}
+
+const VALID_TOOL_CATEGORIES = new Set<ToolCategory>([
+  'read', 'search', 'command', 'mutation', 'skill', 'computer', 'other',
+]);
+
+function normalizeToolCategory(category?: string, name?: string): ToolCategory {
+  if (category && VALID_TOOL_CATEGORIES.has(category as ToolCategory)) {
+    return category as ToolCategory;
+  }
+  if (name && LEGACY_CATEGORIES[name]) {
+    return LEGACY_CATEGORIES[name]!;
+  }
+  return 'other';
+}
+
+export function subagentToolToExecutionCall(rec: SubagentToolRecord): ToolExecutionCall {
+  const category = normalizeToolCategory(rec.category, rec.name);
+  const display: ToolDisplay = {
+    category,
+    action: rec.action || rec.name,
+    target: rec.target || '',
+    command: category === 'command' ? (rec.target || '') : '',
+    metrics: {},
+    error_summary: rec.error_summary || '',
+    is_skill: rec.category === 'skill',
+  };
+  const isFinished = rec.status !== 'running';
+  const ok = rec.status === 'ok';
+  return {
+    id: rec.id || `tool-${rec.seq}`,
+    name: rec.name,
+    label: rec.action || rec.name,
+    ...(rec.started_at ? { started_at_ms: rec.started_at * 1000 } : {}),
+    ...(rec.args_preview ? { args_preview: rec.args_preview } : {}),
+    display,
+    ...(rec.diff ? { diff: rec.diff } : {}),
+    ...(isFinished ? {
+      result: {
+        ok,
+        summary: rec.error_summary || (ok ? '完成' : rec.status === 'cancelled' ? '已取消' : '失败'),
+        result: rec.result_preview || rec.error_summary || '',
+        ...(rec.duration_ms !== null && rec.duration_ms !== undefined ? { duration_ms: rec.duration_ms } : {}),
+        display,
+      },
+    } : {}),
+  };
+}
+
+function cleanThinkLine(line: string, fromTail: boolean): string {
+  const plain = line
+    .replace(/^\s*```[A-Za-z0-9_+-]*/, '')
+    .replace(/^[\s>#*+\-–—\d.、:：)）]+/, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!plain) return '';
+  if (plain.length <= 90) return plain;
+  return fromTail ? `…${plain.slice(-90)}` : `${plain.slice(0, 90)}…`;
+}
+
+function thinkingHeadline(raw: string, live: boolean): string {
+  if (!raw.trim()) return '';
+  const lines = raw.split('\n');
+  if (live) {
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const cleaned = cleanThinkLine(lines[i]!, true);
+      if (cleaned) return cleaned;
+    }
+    return '';
+  }
+  for (let i = 0; i < lines.length; i += 1) {
+    const cleaned = cleanThinkLine(lines[i]!, false);
+    if (cleaned) return cleaned;
+  }
+  return '';
+}
+
+export function buildSubagentProcessSteps(params: {
+  toolRecords?: SubagentToolRecord[];
+  roundNotes?: SubagentRoundNote[];
+  stages?: SubagentStage[];
+  status?: string;
+  stage?: string;
+  rounds?: number;
+  toolOk?: number;
+  toolErr?: number;
+  filterFailed?: boolean;
+}): SubagentProcessModel {
+  const records = Array.isArray(params.toolRecords) ? params.toolRecords : [];
+  const notes = Array.isArray(params.roundNotes) ? params.roundNotes : [];
+  const stages = Array.isArray(params.stages) ? params.stages : [];
+  const flat = buildSubagentFlatView(stages);
+
+  if (records.length === 0 && notes.length === 0) {
+    return {
+      hasStructuredProcess: false,
+      steps: [],
+      rounds: Math.max(params.rounds ?? 0, flat.rounds),
+      toolOk: Math.max(params.toolOk ?? 0, flat.toolOk),
+      toolErr: Math.max(params.toolErr ?? 0, flat.toolErr),
+    };
+  }
+
+  let okCount = 0;
+  let errCount = 0;
+  interface RoundBucket {
+    round: number;
+    startedAt: number;
+    thinking: string;
+    text: string;
+    calls: ToolExecutionCall[];
+    milestones: SubagentMilestoneItem[];
+  }
+  const bucketMap = new Map<number, RoundBucket>();
+  const ensureBucket = (roundNum: number, startedAt = 0): RoundBucket => {
+    const key = Math.max(1, Number(roundNum) || 1);
+    let b = bucketMap.get(key);
+    if (!b) {
+      b = { round: key, startedAt, thinking: '', text: '', calls: [], milestones: [] };
+      bucketMap.set(key, b);
+    } else if (startedAt && (!b.startedAt || startedAt < b.startedAt)) {
+      b.startedAt = startedAt;
+    }
+    return b;
+  };
+
+  for (const note of notes) {
+    const b = ensureBucket(note.round, Number(note.started_at) || 0);
+    if (note.thinking && note.thinking.trim()) b.thinking = note.thinking.trim();
+    if (note.text && note.text.trim()) b.text = note.text.trim();
+  }
+
+  for (const rec of records) {
+    if (rec.status === 'ok') okCount += 1;
+    else if (rec.status === 'err') errCount += 1;
+    if (params.filterFailed && rec.status !== 'err') continue;
+    const b = ensureBucket(rec.round, Number(rec.started_at) || 0);
+    b.calls.push(subagentToolToExecutionCall(rec));
+  }
+
+  const buckets = Array.from(bucketMap.values()).sort((a, b) => a.round - b.round);
+  if (!params.filterFailed && buckets.length > 0) {
+    for (const stage of stages) {
+      if (!MILESTONE_STAGES.has(stage.name)) continue;
+      let target = buckets[0]!;
+      for (const b of buckets) {
+        if (b.startedAt <= 0 || stage.at >= b.startedAt) target = b;
+        else break;
+      }
+      target.milestones.push({
+        kind: 'milestone',
+        name: stage.name,
+        at: stage.at,
+        detail: stage.detail || '',
+      });
+    }
+  }
+
+  const terminal = params.status === 'completed' || params.status === 'failed'
+    || params.status === 'timed_out' || params.status === 'cancelled';
+  const maxRound = buckets.length > 0 ? buckets[buckets.length - 1]!.round : 0;
+
+  const steps: SubagentProcessStep[] = [];
+  for (const b of buckets) {
+    if (params.filterFailed && b.calls.length === 0) continue;
+    const isThinkingLive = !terminal && params.stage === 'thinking' && b.round === maxRound && b.calls.length === 0;
+    const prev = steps.at(-1);
+    const isPureToolContinuation =
+      !params.filterFailed &&
+      !b.thinking &&
+      !b.text &&
+      b.milestones.length === 0 &&
+      b.calls.length > 0 &&
+      prev !== undefined &&
+      prev.milestones.length === 0 &&
+      prev.calls.length > 0;
+
+    if (isPureToolContinuation && prev) {
+      prev.calls.push(...b.calls);
+      continue;
+    }
+
+    steps.push({
+      id: `step-${b.round}`,
+      round: b.round,
+      thinking: params.filterFailed ? '' : b.thinking,
+      thinkingSummary: params.filterFailed ? '' : thinkingHeadline(b.thinking, isThinkingLive),
+      thinkingLive: isThinkingLive,
+      text: params.filterFailed ? '' : b.text,
+      calls: b.calls,
+      milestones: b.milestones,
+    });
+  }
+
+  return {
+    hasStructuredProcess: true,
+    steps,
+    rounds: Math.max(params.rounds ?? 0, buckets.length),
+    toolOk: Math.max(params.toolOk ?? 0, okCount),
+    toolErr: Math.max(params.toolErr ?? 0, errCount),
+  };
+}
+
+export function buildSubagentFileChanges(params: {
+  fileDiffs?: SubagentFileDiff[];
+  toolRecords?: SubagentToolRecord[];
+  changedFiles?: string[];
+}): FileChangeEntry[] {
+  const byPath = new Map<string, FileChangeEntry>();
+  const baseName = (p: string): string => {
+    const norm = p.replace(/\\/g, '/');
+    const i = norm.lastIndexOf('/');
+    return i >= 0 ? norm.slice(i + 1) : norm;
+  };
+  const push = (diff: SubagentFileDiff) => {
+    const p = String(diff.file_path || '').trim();
+    if (!p) return;
+    const diffText = String(diff.diff_text || '');
+    const counts = diffCounts({ file_path: p, diff_text: diffText, added: diff.added, removed: diff.removed });
+    const existing = byPath.get(p);
+    if (existing) {
+      if (diffText && !existing.diffText) existing.diffText = diffText;
+      if (existing.added === 0 && existing.removed === 0) {
+        existing.added = counts.added;
+        existing.removed = counts.removed;
+      }
+    } else {
+      byPath.set(p, {
+        name: baseName(p),
+        path: p,
+        added: counts.added,
+        removed: counts.removed,
+        diffText,
+      });
+    }
+  };
+
+  for (const d of params.fileDiffs ?? []) push(d);
+  for (const rec of params.toolRecords ?? []) {
+    if (rec.diff) push(rec.diff);
+  }
+  for (const fp of params.changedFiles ?? []) {
+    const p = String(fp || '').trim();
+    if (p && !byPath.has(p)) {
+      byPath.set(p, { name: baseName(p), path: p, added: 0, removed: 0, diffText: '' });
+    }
+  }
+  return [...byPath.values()];
 }

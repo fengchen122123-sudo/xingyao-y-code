@@ -376,6 +376,8 @@ export interface EmbeddedBrowserPaneResult {
   error?: string;
   ack?: boolean;
   stale?: boolean;
+  deferred?: boolean;
+  session_name?: string;
   surface_generation?: number;
   phase?: EmbeddedBrowserSurfacePhase;
 }
@@ -766,6 +768,20 @@ export interface SubagentStagePayload {
   detail: string;
 }
 
+export interface SubagentFileDiff {
+  file_path: string;
+  diff_text: string;
+  added?: number;
+  removed?: number;
+}
+
+export interface SubagentRoundNote {
+  round: number;
+  started_at: number;
+  thinking?: string;
+  text?: string;
+}
+
 export interface SubagentToolRecord {
   id: string;
   seq: number;
@@ -782,6 +798,7 @@ export interface SubagentToolRecord {
   duration_text?: string;
   error_summary?: string;
   result_preview?: string;
+  diff?: SubagentFileDiff;
 }
 
 export interface SubagentTaskDetail {
@@ -808,6 +825,8 @@ export interface SubagentTaskDetail {
   finished_at?: number | null;
   stages: SubagentStagePayload[];
   tool_records?: SubagentToolRecord[];
+  round_notes?: SubagentRoundNote[];
+  file_diffs?: SubagentFileDiff[];
   changed_files?: string[];
   result: string;
   result_truncated?: boolean;

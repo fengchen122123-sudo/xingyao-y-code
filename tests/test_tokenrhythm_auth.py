@@ -1335,7 +1335,7 @@ def _credits_ok(items=None):
 
 _CREDITS_URL = (
     "https://tokenrhythm.studio/api/wallet/expiring-credits"
-    "?page=1&pageSize=100&includeInactive=false"
+    "?page=1&pageSize=100&includeInactive=false&includeModelCredits=true"
 )
 
 
@@ -1391,6 +1391,7 @@ def test_account_overview_success(http):
             "nearest_expires_at": _iso(_in(30)),
             "nearest_amount_cny": "5.00000000",
         },
+        "model_credits": [],
     }
     assert "partial" not in result
     assert "errors" not in result
@@ -1870,9 +1871,132 @@ def test_account_overview_temporary_credits_failure_partial(http):
         "nearest_expires_at": "",
         "nearest_amount_cny": "0",
     }
+    assert result["model_credits"] == []
     assert result["wallet"]["available_balance_cny"] == "298.09757398"
     assert result["usage_today"]["calls"] == 12
     assert result["user"]["id"] == "u1"
+
+
+def test_model_credits_extracts_active_and_keeps_temporary_separate(http):
+    exp_near = _iso(_in(7))
+    exp_later = _iso(_in(14))
+    result = _overview_with_credits(
+        http,
+        {
+            "list": [
+                {
+                    "id": "mg-2",
+                    "source": "MODEL_GIFT",
+                    "kind": "MODEL_GIFT",
+                    "modelId": "kimi-k3",
+                    "modelName": "Kimi K3",
+                    "grantedCny": "17.00000000",
+                    "remainingCny": "17.00000000",
+                    "status": "ACTIVE",
+                    "expiresAt": exp_later,
+                },
+                {
+                    "id": "mg-1",
+                    "source": "MODEL_GIFT",
+                    "kind": "MODEL_GIFT",
+                    "modelId": "deepseek-v4.1-flash-1017",
+                    "modelName": "DeepSeek V4.1 Flash 1017",
+                    "grantedCny": "17.00000000",
+                    "remainingCny": "16.64283356",
+                    "status": "ACTIVE",
+                    "expiresAt": exp_near,
+                },
+                _credit(remaining="5.00000000", expires=exp_later, kind="WALLET_GIFT"),
+            ]
+        },
+    )
+
+    assert result["temporary_credits"] == {
+        "total_cny": "5.00000000",
+        "count": 1,
+        "nearest_expires_at": exp_later,
+        "nearest_amount_cny": "5.00000000",
+    }
+    assert result["model_credits"] == [
+        {
+            "id": "mg-1",
+            "model_id": "deepseek-v4.1-flash-1017",
+            "model_name": "DeepSeek V4.1 Flash 1017",
+            "remaining_cny": "16.64283356",
+            "granted_cny": "17.00000000",
+            "expires_at": exp_near,
+        },
+        {
+            "id": "mg-2",
+            "model_id": "kimi-k3",
+            "model_name": "Kimi K3",
+            "remaining_cny": "17.00000000",
+            "granted_cny": "17.00000000",
+            "expires_at": exp_later,
+        },
+    ]
+
+
+def test_model_credits_excludes_depleted_expired_and_inactive(http):
+    future_far = "2099-12-31T15:59:59.000Z"
+    result = _overview_with_credits(
+        http,
+        {
+            "list": [
+                {
+                    "id": "mg-zero",
+                    "kind": "MODEL_GIFT",
+                    "modelId": "hy4",
+                    "modelName": "Hy4",
+                    "grantedCny": "17.00000000",
+                    "remainingCny": "0.00000000",
+                    "status": "ACTIVE",
+                    "expiresAt": future_far,
+                },
+                {
+                    "id": "mg-used-up",
+                    "kind": "MODEL_GIFT",
+                    "modelId": "glm-5.3",
+                    "modelName": "GLM-5.3",
+                    "grantedCny": "17.00000000",
+                    "remainingCny": "1.00000000",
+                    "status": "USED_UP",
+                    "expiresAt": future_far,
+                },
+                {
+                    "id": "mg-expired",
+                    "kind": "MODEL_GIFT",
+                    "modelId": "kimi-k3",
+                    "modelName": "Kimi K3",
+                    "grantedCny": "17.00000000",
+                    "remainingCny": "17.00000000",
+                    "status": "ACTIVE",
+                    "expiresAt": "2020-01-01T00:00:00Z",
+                },
+                {
+                    "id": "mg-perm",
+                    "source": "MODEL_GIFT",
+                    "modelId": "glm-5.3",
+                    "modelName": "GLM-5.3",
+                    "grantedCny": "17.00000000",
+                    "remainingCny": "12.34567890",
+                    "status": "ACTIVE",
+                    "expiresAt": None,
+                },
+            ]
+        },
+    )
+
+    assert result["model_credits"] == [
+        {
+            "id": "mg-perm",
+            "model_id": "glm-5.3",
+            "model_name": "GLM-5.3",
+            "remaining_cny": "12.34567890",
+            "granted_cny": "17.00000000",
+            "expires_at": "",
+        }
+    ]
 
 def _api_model(model_id, name=None, type_="chat", status="online", **extra):
     model = {

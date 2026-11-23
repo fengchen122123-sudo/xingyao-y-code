@@ -292,6 +292,8 @@ class BrowserBridgeMixin:
             target = str(session_name or "").strip() or str(
                 getattr(self, "_current_session", "") or ""
             )
+            prev_owner = self._browser_pane_owner()
+            content = self._browser_pane_content_session()
             self._browser_pane_owner_session = target
             item = self._browser_pane_pending().pop(target, None)
             if item and item.get("url"):
@@ -304,9 +306,15 @@ class BrowserBridgeMixin:
                     logger.debug("推送内嵌浏览器激活事件失败", exc_info=True)
             elif item is None:
                 # 目标会话没有待显示页面：收起仍挂着旧会话内容的原生控件。
-                # 前端切会话时通常已随组件卸载 hide，这里只作跨端兜底。
+                # 前端切会话时通常已随组件卸载 hide，这里只作跨端兜底；
+                # 若当前控件已由目标会话在前台正常打开且内容归属目标会话，避免竞态误收起。
                 ctrl = getattr(self, "_embedded_browser", None)
-                if ctrl is not None:
+                already_showing_target = (
+                    prev_owner == target
+                    and content == target
+                    and bool(getattr(ctrl, "_visible", False))
+                )
+                if ctrl is not None and not already_showing_target:
                     try:
                         ctrl.hide()
                     except Exception:

@@ -60,19 +60,26 @@ describe('CloudRelaySettings', () => {
     await new Promise((r) => setTimeout(r, 0));
 
     const toggle = wrapper.find('[data-test="cloud-relay-enabled"]');
-    await toggle.setValue(true);
+    expect(toggle.attributes('role')).toBe('switch');
+    expect(toggle.attributes('aria-checked')).toBe('false');
+    expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
+    expect(wrapper.findAll('input[type="radio"]')).toHaveLength(0);
+
+    await toggle.trigger('click');
     await new Promise((r) => setTimeout(r, 0));
 
     expect(save_cloud_relay_settings).not.toHaveBeenCalled();
+    expect(toggle.attributes('aria-checked')).toBe('false');
     expect(wrapper.find('[data-test="cloud-relay-message"]').text()).toContain('星瑶自动部署');
 
     await wrapper.find('[data-test="cloud-relay-url"]').setValue('wss://xingyaocode.cn/xy/bot/relay/device');
     await wrapper.find('[data-test="cloud-relay-device-id"]').setValue('dev-1');
     await wrapper.find('[data-test="cloud-relay-token"]').setValue('tok-1');
-    await toggle.setValue(true);
+    await toggle.trigger('click');
     await new Promise((r) => setTimeout(r, 0));
 
     expect(save_cloud_relay_settings).toHaveBeenCalledTimes(1);
+    expect(toggle.attributes('aria-checked')).toBe('true');
     expect(save_cloud_relay_settings).toHaveBeenCalledWith({
       enabled: true,
       url: 'wss://xingyaocode.cn/xy/bot/relay/device',

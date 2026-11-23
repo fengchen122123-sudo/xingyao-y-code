@@ -10224,6 +10224,39 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             self._active_turns[sec] = worker
             worker.start()
 
+    @staticmethod
+    def _format_subagent_live_detail(snap: Any) -> str:
+        stage = str(getattr(snap, "stage", "") or "")
+        if stage == "waiting_approval":
+            approval = str(getattr(snap, "approval_summary", "") or "").strip()
+            if approval:
+                return approval[:80]
+        if stage == "thinking":
+            for note in reversed(getattr(snap, "round_notes", ()) or ()):
+                thinking = str(note.get("thinking") or "").strip()
+                if thinking:
+                    lines = [ln.strip() for ln in thinking.splitlines() if ln.strip()]
+                    if lines:
+                        return lines[-1][:80]
+        if stage == "tool":
+            records = getattr(snap, "tool_records", ()) or ()
+            running = next((r for r in reversed(records) if r.get("status") == "running"), None)
+            rec = running or (records[-1] if records else None)
+            if rec:
+                action = str(rec.get("action") or rec.get("name") or "").strip()
+                target = str(rec.get("target") or "").strip()
+                joined = f"{action} {target}".strip() if target else action
+                if joined:
+                    return joined[:80]
+        if stage == "composing":
+            partial = str(getattr(snap, "partial_result", "") or "").strip()
+            if partial:
+                lines = [ln.strip() for ln in partial.splitlines() if ln.strip()]
+                if lines:
+                    return lines[-1][:80]
+        stages = getattr(snap, "stages", ()) or ()
+        return str(stages[-1].detail if stages else "")
+
     def _subagent_progress_poller(self, session_name: str, stop: threading.Event) -> None:
         from core.tools import subagent_manager
 
@@ -10239,7 +10272,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     elapsed = 0
                     if snap.started_at:
                         elapsed = int((snap.finished_at or now) - snap.started_at)
-                    last_detail = snap.stages[-1].detail if snap.stages else ""
+                    last_detail = self._format_subagent_live_detail(snap)
                     tasks.append({
                         "id": snap.task_id,
                         "description": snap.description,
@@ -12383,7 +12416,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     "type": snap.subagent_type,
                     "status": snap.status,
                     "stage": snap.stage,
-                    "stage_detail": snap.stages[-1].detail if snap.stages else "",
+                    "stage_detail": self._format_subagent_live_detail(snap),
                     "elapsed": elapsed,
                     "execution_elapsed": exec_elapsed,
                     "approval_wait_elapsed": wait_elapsed,
@@ -12418,7 +12451,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     {"name": s.name, "at": s.at, "detail": s.detail}
                     for s in target.stages
                 ],
-                "tool_records": [dict(r) for r in (getattr(target, "tool_records", ()) or ())],
+                "tool_records": [
+                    {
+                        **dict(r),
+                        **({"diff": dict(r["diff"])} if isinstance(r.get("diff"), dict) else {}),
+                    }
+                    for r in (getattr(target, "tool_records", ()) or ())
+                ],
+                "round_notes": [dict(n) for n in (getattr(target, "round_notes", ()) or ())],
+                "file_diffs": [dict(d) for d in (getattr(target, "file_diffs", ()) or ())],
                 "changed_files": list(getattr(target, "changed_files", ()) or ()),
                 "result": raw_result[:12000],
                 "result_truncated": len(raw_result) > 12000,
@@ -12799,12 +12840,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             if not isinstance(credits, dict):
                 # 老版本 core 或字段缺失：给一份和 core 降级值一样的空值，前端不用判空
                 credits = {"total_cny": "0", "count": 0, "nearest_expires_at": "", "nearest_amount_cny": "0"}
+            raw_model_credits = overview.get("model_credits")
+            if not isinstance(raw_model_credits, list):
+                model_credits: list[dict[str, Any]] = []
+            else:
+                model_credits = [
+                    item for item in raw_model_credits if isinstance(item, dict)
+                ]
             result: Dict[str, Any] = {
                 "ok": True,
                 "user": overview.get("user") or {},
                 "wallet": overview.get("wallet") or {},
                 "usage_today": overview.get("usage_today") or {},
                 "temporary_credits": credits,
+                "model_credits": model_credits,
             }
             if overview.get("partial"):
                 result["partial"] = True

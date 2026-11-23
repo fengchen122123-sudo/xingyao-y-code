@@ -78,13 +78,13 @@
         <AppIcon name="blocks" :size="20" :stroke-width="1.6" />
         <div class="suba-empty-title">当前会话尚未派发子代理</div>
         <div class="suba-empty-desc">
-          主代理调度探索、实现、测试或审查子任务时，可点击对话中的「查看」在此实时追踪步骤、参数与结论。
+          主代理调度探索、实现、测试或审查子任务时，可点击对话中的「查看」在此按主代理同款时间线追踪步骤与结论。
         </div>
       </div>
 
       <div v-else class="suba-hub-list" data-test="subagent-hub-list">
         <button
-          v-for="(t, idx) in sessionTasks"
+          v-for="(t, idx) in orderedHubTasks"
           :key="t.id"
           type="button"
           class="suba-hub-card"
@@ -101,6 +101,7 @@
             <span class="suba-hub-time suba-mono">{{ formatElapsed(t.elapsed) }}</span>
           </div>
           <div class="suba-hub-desc">{{ cleanSubagentTitle(t.description) || t.description }}</div>
+          <div v-if="t.stage_detail" class="suba-hub-live">{{ t.stage_detail }}</div>
           <div class="suba-hub-foot">
             <span v-if="(t.rounds ?? 0) > 0">轮次 {{ t.rounds }}</span>
             <span v-if="(t.tool_ok ?? 0) > 0 || (t.tool_err ?? 0) > 0">
@@ -115,19 +116,30 @@
       </div>
     </template>
 
-    <!-- 任务详情模式 -->
+    <!-- 任务详情模式（对齐主代理 TurnGroup 视图） -->
     <template v-else-if="detail">
-      <!-- 任务头卡 -->
-      <section class="suba-head-card">
-        <div class="suba-head-top">
-          <div class="suba-meta">
+      <!-- 轻量任务上下文抬头 -->
+      <header class="suba-ctx-head">
+        <div class="suba-ctx-top">
+          <div class="assistant-name">
             <span class="suba-dot" :class="statusClass(detail.status)"></span>
-            <span class="suba-stage" :class="statusClass(detail.status)">{{ taskStatusLabel(detail) }}</span>
+            <b class="an-agent">星舰</b>
             <span v-if="detail.type" class="suba-badge">{{ detail.type }}</span>
             <span v-if="detail.background" class="suba-badge">后台</span>
-            <span v-if="detail.model_name" class="suba-badge accent" :title="detail.model_name">{{ detail.model_name }}</span>
+            <span v-if="detail.model_name" class="an-model" :title="detail.model_name">{{ detail.model_name }}</span>
+            <span class="suba-stage" :class="statusClass(detail.status)">{{ taskStatusLabel(detail) }}</span>
           </div>
           <div class="suba-head-actions">
+            <button
+              v-if="processModel.toolErr > 0"
+              type="button"
+              class="suba-mini-btn err"
+              :class="{ active: filterMode === 'failed' }"
+              data-test="subagent-filter-failed"
+              @click="toggleFailedFilter"
+            >
+              ✕ {{ processModel.toolErr }} 失败{{ filterMode === 'failed' ? ' · 恢复' : '' }}
+            </button>
             <button
               type="button"
               class="suba-mini-btn"
@@ -149,8 +161,8 @@
 
         <div v-if="actionNotice" class="suba-toast" data-test="subagent-toast">{{ actionNotice }}</div>
 
-        <!-- 可折叠任务指令框 -->
-        <div class="suba-prompt-box">
+        <!-- 轻量可展开任务指令 -->
+        <div class="suba-prompt-line">
           <div
             class="suba-title"
             :class="{ collapsed: !promptExpanded }"
@@ -162,12 +174,18 @@
             <span class="suba-mono suba-prompt-id">
               {{ detail.id }}<template v-if="detail.plan_item_id"> · {{ detail.plan_item_id }}</template>
             </span>
-            <button
-              type="button"
-              class="suba-link-btn"
-              data-test="subagent-toggle-prompt"
-              @click="promptExpanded = !promptExpanded"
-            >{{ promptExpanded ? '收起指令' : '展开全文' }}</button>
+            <span class="suba-prompt-right">
+              <span class="suba-mono">
+                {{ formatElapsed(displayExecElapsed) }}<template v-if="budgetSeconds > 0"> / {{ formatElapsed(budgetSeconds) }}</template>
+                <template v-if="waitElapsed > 0"> · 等审批 {{ formatElapsed(waitElapsed) }}</template>
+              </span>
+              <button
+                type="button"
+                class="suba-link-btn"
+                data-test="subagent-toggle-prompt"
+                @click="promptExpanded = !promptExpanded"
+              >{{ promptExpanded ? '收起' : '全文' }}</button>
+            </span>
           </div>
         </div>
 
@@ -182,59 +200,16 @@
           >{{ detail.description }}</div>
         </Teleport>
 
-        <!-- 预算进度条 -->
-        <div class="suba-budget">
-          <div class="suba-budget-row">
-            <span>
-              已用 <b class="suba-num">{{ formatElapsed(displayExecElapsed) }}</b>
-              <template v-if="budgetSeconds > 0"> / 预算 {{ formatElapsed(budgetSeconds) }}</template>
-              <template v-if="waitElapsed > 0"> · 等审批 {{ formatElapsed(waitElapsed) }}</template>
-            </span>
-            <span v-if="timeRangeText" class="suba-mono">{{ timeRangeText }}</span>
-          </div>
-          <div v-if="budgetSeconds > 0" class="suba-progress-track">
-            <div
-              class="suba-progress-fill"
-              :class="budgetToneClass"
-              :style="{ width: budgetPercent + '%' }"
-            ></div>
-          </div>
-          <div v-if="handoffText" class="suba-handoff-note">{{ handoffText }}</div>
+        <!-- 2px 细预算进度条 -->
+        <div v-if="budgetSeconds > 0" class="suba-progress-track">
+          <div
+            class="suba-progress-fill"
+            :class="budgetToneClass"
+            :style="{ width: budgetPercent + '%' }"
+          ></div>
         </div>
-
-        <!-- 可点击统计筛选胶囊 -->
-        <div class="suba-filter-pills">
-          <button
-            type="button"
-            class="suba-filter-pill"
-            :class="{ active: filterMode === 'all' }"
-            data-test="subagent-filter-all"
-            @click="filterMode = 'all'"
-          >
-            全部 · 轮次 <b class="suba-num">{{ timeline.rounds }}</b> · 工具 <b class="suba-num">{{ timeline.toolOk }}</b> 成功
-          </button>
-          <button
-            v-if="timeline.toolErr > 0"
-            type="button"
-            class="suba-filter-pill err"
-            :class="{ active: filterMode === 'failed' }"
-            data-test="subagent-filter-failed"
-            @click="filterMode = filterMode === 'failed' ? 'all' : 'failed'"
-          >
-            ✗ <b class="suba-num bad">{{ timeline.toolErr }}</b> 失败（{{ filterMode === 'failed' ? '点此恢复' : '点击聚焦' }}）
-          </button>
-          <button
-            v-if="changedFiles.length > 0"
-            type="button"
-            class="suba-filter-pill"
-            :class="{ active: filterMode === 'files' }"
-            data-test="subagent-filter-files"
-            @click="filterMode = filterMode === 'files' ? 'all' : 'files'"
-          >
-            改动 <b class="suba-num">{{ changedFiles.length }}</b> 文件
-          </button>
-        </div>
-      </section>
+        <div v-if="handoffText" class="suba-handoff-note">{{ handoffText }}</div>
+      </header>
 
       <!-- 等待权限审批提示横幅 -->
       <div
@@ -250,160 +225,225 @@
         </div>
       </div>
 
-      <!-- 改动文件列表模式 -->
-      <section v-if="filterMode === 'files'" class="suba-card-sec" data-test="subagent-files">
-        <div class="suba-sec-title">本子代理改动的文件（{{ changedFiles.length }}）</div>
-        <div class="suba-file-list">
-          <button
-            v-for="filePath in changedFiles"
-            :key="filePath"
-            type="button"
-            class="suba-file-item"
-            @click="openChangedFile(filePath)"
-          >
-            <AppIcon name="file" :size="13" :stroke-width="1.9" />
-            <span class="suba-file-path">{{ filePath }}</span>
-            <span class="suba-file-open">预览</span>
-          </button>
-        </div>
-      </section>
-
-      <!-- 执行过程时间线 -->
-      <section v-else class="suba-timeline-sec">
-        <div class="suba-flow" data-test="subagent-flow">
-          <!-- 结构化轮次分组视图 -->
-          <template v-if="timeline.hasStructuredTools">
-            <div v-if="filteredGroups.length === 0" class="suba-empty">
-              {{ filterMode === 'failed' ? '当前没有失败的工具调用' : '暂无执行记录' }}
-            </div>
-            <div v-for="group in filteredGroups" :key="group.round" class="suba-round-group">
-              <div class="suba-round-head">
-                <span class="suba-round-title">Round {{ group.round }}</span>
-                <span v-if="group.startedAt" class="suba-mono suba-round-clock">{{ stageClock(group.startedAt) }}</span>
-              </div>
-
-              <template v-if="filterMode === 'all'">
-                <div
-                  v-for="(ms, mi) in group.milestones"
-                  :key="'ms-' + group.round + '-' + mi"
-                  class="suba-milestone"
-                  :class="{ wait: ms.name === 'waiting_approval' }"
-                >
-                  <span class="suba-mono">{{ stageClock(ms.at) }}</span>
-                  <span>{{ stageNameLabel(ms.name) }}</span>
-                  <span v-if="ms.detail" class="suba-milestone-detail">{{ ms.detail }}</span>
+      <!-- 主代理同款：执行过程折叠 / 展开容器 -->
+      <section v-if="hasProcessSection" class="suba-turn-sec" data-test="subagent-flow">
+        <!-- 运行中：展开式 .xy-process-card，支持收起为单行微光 -->
+        <div v-if="!isTerminal" class="xy-run-process">
+          <div v-if="runningExpanded" class="xy-process-card">
+            <button
+              type="button"
+              class="xy-process-head"
+              @click="runningExpanded = false"
+            >
+              <span class="xy-process-head-l">
+                <AppIcon name="loader" :size="12.5" :stroke-width="2.2" class="xy-spin" />
+                <span class="xy-process-title">{{ runningProcessTitle }}</span>
+              </span>
+              <span class="xy-process-meta">{{ formatElapsed(displayExecElapsed) }} · 收起 ▴</span>
+            </button>
+            <div class="xy-process-body">
+              <template v-if="processModel.hasStructuredProcess">
+                <div v-if="processModel.steps.length === 0" class="suba-empty-inline">
+                  {{ filterMode === 'failed' ? '当前没有失败的工具调用' : '暂无执行记录' }}
                 </div>
-              </template>
-
-              <div class="suba-tool-list">
-                <div
-                  v-for="tool in group.tools"
-                  :key="tool.id"
-                  class="suba-tool-card"
-                  :class="{ err: tool.status === 'err', run: tool.status === 'running' }"
-                  :data-test="'subagent-tool-' + tool.id"
-                >
-                  <button
-                    type="button"
-                    class="suba-tool-btn"
-                    @click="toggleToolExpand(tool.id)"
-                  >
-                    <span class="suba-tool-left">
-                      <AppIcon
-                        :name="toolCategoryIcon(tool.category)"
-                        :size="13"
-                        :stroke-width="2"
-                        class="suba-tool-ico"
-                        :class="'cat-' + (tool.category || 'other')"
-                      />
-                      <span class="suba-tool-action">{{ tool.action || tool.name }}</span>
-                      <span v-if="tool.target" class="suba-tool-target" :title="tool.target">{{ tool.target }}</span>
-                    </span>
-                    <span class="suba-tool-right">
-                      <span v-if="tool.status === 'ok'" class="suba-row-res ok">✓ {{ tool.duration_text || '0ms' }}</span>
-                      <span v-else-if="tool.status === 'err'" class="suba-row-res err">✗ 失败</span>
-                      <span v-else-if="tool.status === 'cancelled'" class="suba-row-res warn">已取消</span>
-                      <span v-else class="suba-row-res run">运行 {{ runningSeconds(tool.started_at) }}s</span>
-                      <AppIcon
-                        name="chevron-right"
-                        :size="12"
-                        :stroke-width="2"
-                        class="suba-chevron"
-                        :class="{ open: isToolExpanded(tool.id) }"
-                      />
-                    </span>
-                  </button>
+                <div v-for="step in processModel.steps" :key="step.id" class="suba-step">
+                  <div v-if="step.thinking" class="think-block">
+                    <FoldCard
+                      :open="isThinkingOpen(step.id)"
+                      caret="end"
+                      @update:open="(v) => setThinkingOpen(step.id, v)"
+                    >
+                      <template #title>
+                        <span class="tk-head">
+                          <AppIcon class="tk-brain" name="lightbulb" :size="13" :stroke-width="1.8" />
+                          <span class="tk-label" :class="{ 'is-thinking': step.thinkingLive }">
+                            {{ step.thinkingLive ? '正在思考' : '思考' }}
+                          </span>
+                          <template v-if="step.thinkingSummary">
+                            <span class="tk-sep">·</span>
+                            <span class="tk-summary">{{ step.thinkingSummary }}</span>
+                          </template>
+                        </span>
+                      </template>
+                      <div class="tk-cnt">{{ step.thinking }}</div>
+                    </FoldCard>
+                  </div>
 
                   <div
-                    v-if="tool.status === 'err' && !isToolExpanded(tool.id) && tool.error_summary"
-                    class="suba-tool-err-inline"
-                  >{{ tool.error_summary }}</div>
+                    v-if="step.text"
+                    class="suba-step-prose md-body"
+                    v-html="renderStepMarkdown(step.text)"
+                    @click="onResultMdClick"
+                  ></div>
 
-                  <div v-if="isToolExpanded(tool.id)" class="suba-tool-detail">
-                    <div class="suba-detail-kv">
-                      <span class="suba-mono">{{ tool.name }}</span>
-                      <span class="suba-mono">{{ stageClock(tool.started_at) }}</span>
-                    </div>
-                    <template v-if="tool.args_preview">
-                      <div class="suba-detail-lbl">调用参数</div>
-                      <pre class="suba-detail-pre">{{ tool.args_preview }}</pre>
-                    </template>
-                    <template v-if="tool.result_preview || tool.error_summary">
-                      <div class="suba-detail-lbl" :class="{ err: tool.status === 'err' }">
-                        {{ tool.status === 'err' ? '错误详情' : '结果摘要' }}
-                      </div>
-                      <pre class="suba-detail-pre" :class="{ err: tool.status === 'err' }">{{ tool.result_preview || tool.error_summary }}</pre>
-                    </template>
+                  <div
+                    v-for="(ms, mi) in step.milestones"
+                    :key="`ms-${step.id}-${mi}`"
+                    class="suba-milestone"
+                    :class="{ wait: ms.name === 'waiting_approval' }"
+                  >
+                    <span class="suba-mono">{{ stageClock(ms.at) }}</span>
+                    <span>{{ stageNameLabel(ms.name) }}</span>
+                    <span v-if="ms.detail" class="suba-milestone-detail">{{ ms.detail }}</span>
                   </div>
-                </div>
-              </div>
-            </div>
-          </template>
 
-          <!-- 兼容旧版 stages 的扁平回退渲染 -->
-          <template v-else>
-            <div v-if="legacyFlatView.rows.length === 0" class="suba-empty">暂无执行记录</div>
-            <div
-              v-for="(row, i) in legacyFlatView.rows"
-              :key="i"
-              class="suba-row"
-              :class="legacyRowClass(row, i)"
-            >
-              <span class="suba-row-time">{{ stageClock(row.at) }}</span>
-              <template v-if="row.kind === 'tool'">
-                <span class="suba-row-label">{{ row.name }}</span>
-                <span v-if="row.status === 'ok'" class="suba-row-res ok">✓ {{ row.durationText }}</span>
-                <span v-else-if="row.status === 'err'" class="suba-row-res err">✗ {{ row.errorText || '执行失败' }}</span>
-                <span v-else class="suba-row-res run">运行 {{ runningSeconds(row.at) }}s</span>
+                  <ToolExecutionTrace
+                    v-if="step.calls.length > 0"
+                    :calls="step.calls"
+                    :legacy-diffs="[]"
+                    :state="executionState"
+                    :group-commands="true"
+                    :show-inline-error="true"
+                    tool-test-prefix="subagent-tool-"
+                  />
+                </div>
               </template>
+
+              <!-- 兼容仅含 stages 的旧版扁平回退 -->
               <template v-else>
-                <span class="suba-row-label dim">{{ stageNameLabel(row.name) }}</span>
+                <div v-if="legacyFlatView.rows.length === 0" class="suba-empty-inline">暂无执行记录</div>
+                <div
+                  v-for="(row, i) in legacyFlatView.rows"
+                  :key="i"
+                  class="suba-row"
+                  :class="legacyRowClass(row, i)"
+                >
+                  <span class="suba-row-time">{{ stageClock(row.at) }}</span>
+                  <template v-if="row.kind === 'tool'">
+                    <span class="suba-row-label">{{ row.name }}</span>
+                    <span v-if="row.status === 'ok'" class="suba-row-res ok">✓ {{ row.durationText }}</span>
+                    <span v-else-if="row.status === 'err'" class="suba-row-res err">✗ {{ row.errorText || '执行失败' }}</span>
+                    <span v-else class="suba-row-res run">运行 {{ runningSeconds(row.at) }}s</span>
+                  </template>
+                  <template v-else>
+                    <span class="suba-row-label dim">{{ stageNameLabel(row.name) }}</span>
+                  </template>
+                </div>
               </template>
             </div>
-          </template>
+          </div>
+          <button
+            v-else
+            type="button"
+            class="xy-process-collapsed"
+            @click="runningExpanded = true"
+          >
+            <AppIcon name="loader" :size="12.5" :stroke-width="2.2" class="xy-spin" />
+            <span class="xy-shimmer-text">{{ liveBannerText }}</span>
+            <span class="xy-process-expand-hint">展开 ▾</span>
+          </button>
         </div>
 
-        <!-- 方案 A：底部单行实时状态条 -->
-        <div v-if="!isTerminal" class="suba-live-banner" data-test="subagent-live-banner">
-          <span class="suba-dot run"></span>
-          <span class="suba-live-text">{{ liveBannerText }}</span>
-          <button
-            v-if="userScrolledUp"
-            type="button"
-            class="suba-scroll-btn"
-            @click="scrollToBottom(true)"
-          >↓ 回到底部</button>
+        <!-- 已完成：对齐 TurnGroup 的 FoldCard（有结论时默认折叠，优先展示结论与改动文件） -->
+        <div v-else class="turn-fold" :class="{ 'is-open': completedExpanded }">
+          <FoldCard :open="completedExpanded" @update:open="onCompletedFoldToggle">
+            <template #title>
+              <span>{{ completedProcessTitle }}<template v-if="!completedExpanded && displayExecElapsed > 0"> · {{ formatElapsed(displayExecElapsed) }}</template></span>
+            </template>
+            <template v-if="completedExpanded" #head-right>
+              <span class="xy-process-meta">{{ displayExecElapsed > 0 ? `${formatElapsed(displayExecElapsed)} · ` : '' }}收起 ▴</span>
+            </template>
+            <div class="xy-process-body">
+              <template v-if="processModel.hasStructuredProcess">
+                <div v-if="processModel.steps.length === 0" class="suba-empty-inline">
+                  {{ filterMode === 'failed' ? '当前没有失败的工具调用' : '暂无执行记录' }}
+                </div>
+                <div v-for="step in processModel.steps" :key="step.id" class="suba-step">
+                  <div v-if="step.thinking" class="think-block">
+                    <FoldCard
+                      :open="isThinkingOpen(step.id)"
+                      caret="end"
+                      @update:open="(v) => setThinkingOpen(step.id, v)"
+                    >
+                      <template #title>
+                        <span class="tk-head">
+                          <AppIcon class="tk-brain" name="lightbulb" :size="13" :stroke-width="1.8" />
+                          <span class="tk-label">思考</span>
+                          <template v-if="step.thinkingSummary">
+                            <span class="tk-sep">·</span>
+                            <span class="tk-summary">{{ step.thinkingSummary }}</span>
+                          </template>
+                        </span>
+                      </template>
+                      <div class="tk-cnt">{{ step.thinking }}</div>
+                    </FoldCard>
+                  </div>
+
+                  <div
+                    v-if="step.text"
+                    class="suba-step-prose md-body"
+                    v-html="renderStepMarkdown(step.text)"
+                    @click="onResultMdClick"
+                  ></div>
+
+                  <div
+                    v-for="(ms, mi) in step.milestones"
+                    :key="`ms-${step.id}-${mi}`"
+                    class="suba-milestone"
+                    :class="{ wait: ms.name === 'waiting_approval' }"
+                  >
+                    <span class="suba-mono">{{ stageClock(ms.at) }}</span>
+                    <span>{{ stageNameLabel(ms.name) }}</span>
+                    <span v-if="ms.detail" class="suba-milestone-detail">{{ ms.detail }}</span>
+                  </div>
+
+                  <ToolExecutionTrace
+                    v-if="step.calls.length > 0"
+                    :calls="step.calls"
+                    :legacy-diffs="[]"
+                    :state="executionState"
+                    :group-commands="true"
+                    :show-inline-error="true"
+                    tool-test-prefix="subagent-tool-"
+                  />
+                </div>
+              </template>
+
+              <template v-else>
+                <div v-if="legacyFlatView.rows.length === 0" class="suba-empty-inline">暂无执行记录</div>
+                <div
+                  v-for="(row, i) in legacyFlatView.rows"
+                  :key="i"
+                  class="suba-row"
+                  :class="legacyRowClass(row, i)"
+                >
+                  <span class="suba-row-time">{{ stageClock(row.at) }}</span>
+                  <template v-if="row.kind === 'tool'">
+                    <span class="suba-row-label">{{ row.name }}</span>
+                    <span v-if="row.status === 'ok'" class="suba-row-res ok">✓ {{ row.durationText }}</span>
+                    <span v-else-if="row.status === 'err'" class="suba-row-res err">✗ {{ row.errorText || '执行失败' }}</span>
+                    <span v-else class="suba-row-res run">运行 {{ runningSeconds(row.at) }}s</span>
+                  </template>
+                  <template v-else>
+                    <span class="suba-row-label dim">{{ stageNameLabel(row.name) }}</span>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </FoldCard>
         </div>
       </section>
 
-      <!-- 失败原因 / Markdown 执行结论 / 实时过程草稿 -->
+      <!-- 实时过程状态条（仅运行中显示） -->
+      <div v-if="!isTerminal" class="suba-live-banner" data-test="subagent-live-banner">
+        <span class="suba-dot run"></span>
+        <span class="suba-live-text">{{ liveBannerText }}</span>
+        <button
+          v-if="userScrolledUp"
+          type="button"
+          class="suba-scroll-btn"
+          @click="scrollToBottom(true)"
+        >↓ 回到底部</button>
+      </div>
+
+      <!-- 失败原因 / Markdown 执行结论 / 实时过程草稿（置为主位呈现） -->
       <section v-if="detail.error" class="suba-card-sec err">
         <div class="suba-sec-title">失败原因</div>
         <pre class="suba-sec-body err">{{ detail.error }}</pre>
       </section>
 
-      <section v-else-if="detail.result" class="suba-card-sec" data-test="subagent-result">
-        <div class="suba-sec-title">
+      <section v-else-if="detail.result" class="suba-answer-sec" data-test="subagent-result">
+        <div class="suba-answer-head">
           <span>执行结论</span>
           <div class="suba-sec-actions">
             <button
@@ -421,7 +461,7 @@
           </div>
         </div>
         <div
-          class="suba-md md-body"
+          class="suba-answer-md md-body"
           v-html="renderedResultHtml"
           @click="onResultMdClick"
         ></div>
@@ -430,8 +470,8 @@
         </div>
       </section>
 
-      <section v-else-if="detail.partial" class="suba-card-sec" data-test="subagent-partial">
-        <div class="suba-sec-title">
+      <section v-else-if="detail.partial" class="suba-partial-sec" data-test="subagent-partial">
+        <div class="suba-answer-head">
           <span>实时过程草稿</span>
           <button
             type="button"
@@ -441,11 +481,36 @@
         </div>
         <div
           v-if="partialExpanded"
-          class="suba-md md-body"
+          class="suba-partial-md md-body"
           v-html="renderedPartialHtml"
           @click="onResultMdClick"
         ></div>
       </section>
+
+      <!-- 主代理同款改动文件面板 -->
+      <ChangedFilesPanel
+        v-if="fileChanges.length > 0"
+        :changes="fileChanges"
+        class="suba-changes"
+        data-test="subagent-files"
+      />
+
+      <!-- 主代理同款收尾时长条 -->
+      <div v-if="isTerminal" class="xy-turn-footer">
+        <span class="working-indicator done">
+          <AppIcon
+            :name="detail.status === 'completed' ? 'check' : 'triangle-alert'"
+            :size="13"
+            :stroke-width="2.2"
+            :class="detail.status === 'completed' ? 'wi-check' : 'wi-warn'"
+          />
+          <span class="wi-text">星舰本轮工作 {{ formatElapsed(displayExecElapsed) }}</span>
+        </span>
+        <span class="msg-metrics-bar">
+          <template v-if="processModel.rounds > 0">{{ processModel.rounds }} 轮 · </template>
+          {{ totalToolCount }} 次工具调用
+        </span>
+      </div>
 
       <!-- 全览结论弹窗 -->
       <Teleport to="body">
@@ -490,13 +555,18 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
+import ChangedFilesPanel from './ChangedFilesPanel.vue';
+import FoldCard from './FoldCard.vue';
+import ToolExecutionTrace from './ToolExecutionTrace.vue';
 import { useAppStore } from '../stores/appStore';
 import { renderMarkdown } from '../utils/markdown';
 import { toAbsoluteLocalPath } from '../utils/localPath';
 import {
+  buildSubagentFileChanges,
   buildSubagentFlatView,
-  buildSubagentRoundGroups,
+  buildSubagentProcessSteps,
   cleanSubagentTitle,
+  type ExecutionState,
   type SubagentFlatRow,
 } from '../utils/toolTrace';
 import type { SubagentTaskDetail, SubagentTaskListItem } from '../types/pywebview.d';
@@ -516,8 +586,11 @@ const showHub = ref(false);
 const promptExpanded = ref(false);
 const partialExpanded = ref(true);
 const fullResultOpen = ref(false);
-const filterMode = ref<'all' | 'failed' | 'files'>('all');
-const expandedTools = ref<Set<string>>(new Set());
+const filterMode = ref<'all' | 'failed'>('all');
+const runningExpanded = ref(true);
+const completedExpanded = ref(false);
+const userFoldOverriddenTask = ref('');
+const openThinkingSteps = ref<Set<string>>(new Set());
 const stopping = ref(false);
 const userScrolledUp = ref(false);
 
@@ -544,29 +617,108 @@ const isTerminal = computed(() => {
   return !!s && TERMINAL.has(s);
 });
 
-const timeline = computed(() =>
-  buildSubagentRoundGroups({
+const executionState = computed<ExecutionState>(() => {
+  const s = detail.value?.status || '';
+  if (s === 'completed') return 'completed';
+  if (s === 'cancelled') return 'cancelled';
+  if (s === 'failed' || s === 'timed_out') return 'error';
+  return 'running';
+});
+
+const processModel = computed(() =>
+  buildSubagentProcessSteps({
     toolRecords: detail.value?.tool_records,
+    roundNotes: detail.value?.round_notes,
     stages: detail.value?.stages,
+    status: detail.value?.status,
+    stage: detail.value?.stage,
     rounds: detail.value?.rounds,
     toolOk: detail.value?.tool_ok,
     toolErr: detail.value?.tool_err,
+    filterFailed: filterMode.value === 'failed',
   }),
 );
 
 const legacyFlatView = computed(() => buildSubagentFlatView(detail.value?.stages ?? []));
 
-const filteredGroups = computed(() => {
-  if (filterMode.value !== 'failed') return timeline.value.groups;
-  return timeline.value.groups
-    .map((g) => ({
-      ...g,
-      tools: g.tools.filter((t) => t.status === 'err'),
-    }))
-    .filter((g) => g.tools.length > 0);
+const hasProcessSection = computed(() => {
+  if (processModel.value.hasStructuredProcess) return true;
+  if (legacyFlatView.value.rows.length > 0) return true;
+  return !isTerminal.value;
 });
 
-const changedFiles = computed(() => detail.value?.changed_files ?? []);
+const fileChanges = computed(() =>
+  buildSubagentFileChanges({
+    fileDiffs: detail.value?.file_diffs,
+    toolRecords: detail.value?.tool_records,
+    changedFiles: detail.value?.changed_files,
+  }),
+);
+
+const totalToolCount = computed(() => {
+  const recLen = detail.value?.tool_records?.length ?? 0;
+  const agg = processModel.value.toolOk + processModel.value.toolErr;
+  return Math.max(recLen, agg);
+});
+
+const runningProcessTitle = computed(() => {
+  const count = totalToolCount.value;
+  if (count > 0) return `星舰执行过程 · ${count} 个动作`;
+  return '星舰执行过程 · 正在处理';
+});
+
+const completedProcessTitle = computed(() => {
+  const count = totalToolCount.value;
+  const label = taskStatusLabel(detail.value || { status: 'completed', stage: 'completed' });
+  if (count > 0) return `星舰执行过程 · ${count} 个工具调用 · ${label}`;
+  return `星舰执行过程 · ${Math.max(1, processModel.value.rounds)} 轮 · ${label}`;
+});
+
+function syncDefaultCompletedFold(d: SubagentTaskDetail | null) {
+  if (!d || !TERMINAL.has(d.status)) return;
+  if (userFoldOverriddenTask.value === d.id) return;
+  // 有结果时默认收起过程（与主代理 TurnGroup 一致），报错或无结论时保持展开以便排查
+  completedExpanded.value = Boolean(d.error || !d.result?.trim());
+}
+
+function onCompletedFoldToggle(nextOpen: boolean) {
+  completedExpanded.value = nextOpen;
+  if (detail.value?.id) userFoldOverriddenTask.value = detail.value.id;
+}
+
+function toggleFailedFilter() {
+  filterMode.value = filterMode.value === 'failed' ? 'all' : 'failed';
+  if (filterMode.value === 'failed') {
+    runningExpanded.value = true;
+    completedExpanded.value = true;
+    if (detail.value?.id) userFoldOverriddenTask.value = detail.value.id;
+  }
+}
+
+function isThinkingOpen(stepId: string): boolean {
+  return openThinkingSteps.value.has(stepId);
+}
+
+function setThinkingOpen(stepId: string, open: boolean) {
+  const next = new Set(openThinkingSteps.value);
+  if (open) next.add(stepId);
+  else next.delete(stepId);
+  openThinkingSteps.value = next;
+}
+
+function renderStepMarkdown(text: string): string {
+  return renderMarkdown(String(text || '').replace(/\r\n/g, '\n'));
+}
+
+const orderedHubTasks = computed(() => {
+  const active: SubagentTaskListItem[] = [];
+  const done: SubagentTaskListItem[] = [];
+  for (const t of sessionTasks.value) {
+    if (TERMINAL.has(t.status)) done.push(t);
+    else active.push(t);
+  }
+  return [...active, ...done];
+});
 
 const activeTaskIndex = computed(() => {
   const idx = sessionTasks.value.findIndex((t) => t.id === (detail.value?.id || store.subagentDetailId));
@@ -628,10 +780,12 @@ const liveBannerText = computed(() => {
   if (d.stage === 'waiting_approval') return '挂起等待权限审批中…';
   if (d.stage === 'composing') {
     const len = (d.partial || '').length;
-    return len > 0 ? `正在生成回复（已实时产出 ${len} 字）` : '正在生成回复…';
+    return len > 0 ? `正在生成结论（已输出 ${len} 字）` : '正在生成结论…';
   }
-  if (d.stage === 'thinking') return '正在深度思考…';
-  if (d.stage === 'tool' && d.stage_detail) return `正在执行工具：${d.stage_detail}`;
+  if (d.stage === 'thinking') {
+    return d.stage_detail ? `正在思考 · ${d.stage_detail}` : '正在深度思考…';
+  }
+  if (d.stage === 'tool' && d.stage_detail) return `正在执行 · ${d.stage_detail}`;
   return `${taskStatusLabel(d)}…`;
 });
 
@@ -653,24 +807,6 @@ function statusClass(status: string) {
   if (status === 'completed') return 'ok';
   if (TERMINAL.has(status)) return 'err';
   return 'run';
-}
-function toolCategoryIcon(category: string) {
-  if (category === 'read') return 'file';
-  if (category === 'search') return 'search';
-  if (category === 'command') return 'square-terminal';
-  if (category === 'mutation') return 'pencil';
-  if (category === 'skill') return 'sparkles';
-  if (category === 'computer') return 'scan';
-  return 'box';
-}
-function isToolExpanded(id: string) {
-  return expandedTools.value.has(id);
-}
-function toggleToolExpand(id: string) {
-  const next = new Set(expandedTools.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  expandedTools.value = next;
 }
 function legacyRowClass(row: SubagentFlatRow, index: number) {
   const classes: string[] = [row.kind];
@@ -703,13 +839,6 @@ function runningSeconds(at: number) {
   if (!at) return 0;
   return Math.max(0, Math.floor(Date.now() / 1000 - at));
 }
-const timeRangeText = computed(() => {
-  const d = detail.value;
-  if (!d?.started_at) return '';
-  const start = stageClock(d.started_at);
-  if (d.finished_at) return `${start} → ${stageClock(d.finished_at)}`;
-  return `${start} 开始`;
-});
 
 function selectTask(taskId: string) {
   switcherOpen.value = false;
@@ -925,6 +1054,7 @@ async function fetchDetail() {
       const prevCount = detail.value?.tool_records?.length ?? detail.value?.stages?.length ?? 0;
       detail.value = res.task;
       missingText.value = '';
+      syncDefaultCompletedFold(res.task);
       const nextCount = res.task.tool_records?.length ?? res.task.stages?.length ?? 0;
       if (nextCount > prevCount && !TERMINAL.has(res.task.status)) {
         await nextTick();
@@ -952,7 +1082,9 @@ watch(
       detail.value = null;
       showHub.value = false;
       filterMode.value = 'all';
-      expandedTools.value = new Set();
+      runningExpanded.value = true;
+      userFoldOverriddenTask.value = '';
+      openThinkingSteps.value = new Set();
       missingText.value = '正在读取子代理执行过程…';
     } else {
       showHub.value = false;
@@ -980,17 +1112,18 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 10px;
   font-size: 12px;
-  color: var(--text);
+  color: var(--xy-text, var(--text));
 }
 
 .suba-mono {
   font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
 }
 .suba-dim {
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .suba-bad {
-  color: var(--red);
+  color: var(--xy-rose, var(--red));
 }
 
 /* ── 顶部切换器 ── */
@@ -1007,16 +1140,16 @@ onUnmounted(() => {
   gap: 6px;
   padding: 5px 9px;
   border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--text);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg2));
+  color: var(--xy-text, var(--text));
   font-size: 12px;
   font-family: inherit;
   cursor: pointer;
   transition: border-color 0.15s;
 }
 .suba-switch-trigger:hover {
-  border-color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
 }
 .suba-switch-single {
   flex: 1;
@@ -1024,13 +1157,13 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12px;
 }
 .suba-switch-idx {
   flex-shrink: 0;
   font-family: var(--mono);
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .suba-switch-name {
   flex: 1;
@@ -1045,25 +1178,25 @@ onUnmounted(() => {
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 5px;
-  background: var(--bg3);
-  color: var(--text-faint);
+  background: var(--xy-card, var(--bg3));
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 11px;
 }
 .suba-hub-btn {
   flex-shrink: 0;
   padding: 5px 9px;
   border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--text-dim);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg2));
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12px;
   font-family: inherit;
   cursor: pointer;
   transition: 0.15s;
 }
 .suba-hub-btn:hover {
-  color: var(--text);
-  border-color: var(--text-faint);
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-text-3, var(--text-faint));
 }
 
 .suba-switch-menu {
@@ -1072,8 +1205,8 @@ onUnmounted(() => {
   gap: 4px;
   padding: 6px;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg2));
 }
 .suba-chip {
   display: flex;
@@ -1084,7 +1217,7 @@ onUnmounted(() => {
   border-radius: 7px;
   border: 1px solid transparent;
   background: transparent;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 12px;
   font-family: inherit;
   text-align: left;
@@ -1092,13 +1225,13 @@ onUnmounted(() => {
   transition: 0.15s;
 }
 .suba-chip:hover {
-  background: var(--bg1);
-  color: var(--text);
+  background: var(--xy-canvas, var(--bg1));
+  color: var(--xy-text, var(--text));
 }
 .suba-chip.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
+  background: var(--xy-accent-soft, var(--accent-soft));
+  color: var(--xy-accent, var(--accent));
   font-weight: 500;
 }
 .suba-chip-idx {
@@ -1118,7 +1251,7 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 11px;
 }
 
@@ -1132,12 +1265,12 @@ onUnmounted(() => {
 .suba-hub-title {
   font-size: 13px;
   font-weight: 600;
-  color: var(--text-bright, var(--text));
+  color: var(--xy-text, var(--text-bright));
 }
 .suba-hub-sub {
   margin-top: 2px;
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .suba-hub-list {
   display: flex;
@@ -1147,13 +1280,13 @@ onUnmounted(() => {
 .suba-hub-card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
   width: 100%;
   padding: 10px 11px;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--text);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg2));
+  color: var(--xy-text, var(--text));
   font-family: inherit;
   text-align: left;
   cursor: pointer;
@@ -1161,7 +1294,7 @@ onUnmounted(() => {
 }
 .suba-hub-card:hover,
 .suba-hub-card.active {
-  border-color: var(--accent);
+  border-color: var(--xy-accent, var(--accent));
 }
 .suba-hub-row {
   display: flex;
@@ -1171,7 +1304,7 @@ onUnmounted(() => {
 }
 .suba-hub-time {
   margin-left: auto;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 11.5px;
 }
 .suba-hub-desc {
@@ -1184,12 +1317,19 @@ onUnmounted(() => {
   line-height: 1.45;
   word-break: break-word;
 }
+.suba-hub-live {
+  font-size: 11.5px;
+  color: var(--xy-text-2, var(--text-dim));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .suba-hub-foot {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 10px;
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 
 .suba-empty-card {
@@ -1199,15 +1339,15 @@ onUnmounted(() => {
   gap: 8px;
   padding: 28px 14px;
   border-radius: 10px;
-  border: 1px dashed var(--border);
-  background: var(--bg2);
-  color: var(--text-faint);
+  border: 1px dashed var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg2));
+  color: var(--xy-text-3, var(--text-faint));
   text-align: center;
 }
 .suba-empty-title {
   font-size: 13px;
   font-weight: 600;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
 }
 .suba-empty-desc {
   font-size: 12px;
@@ -1220,13 +1360,13 @@ onUnmounted(() => {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--orange);
+  background: var(--xy-accent, var(--accent));
 }
 .suba-dot.ok {
-  background: var(--green);
+  background: var(--xy-green, var(--green));
 }
 .suba-dot.err {
-  background: var(--red);
+  background: var(--xy-rose, var(--red));
 }
 .suba-dot.run {
   animation: suba-pulse 1.6s ease-in-out infinite;
@@ -1238,63 +1378,69 @@ onUnmounted(() => {
 .suba-stage {
   flex-shrink: 0;
   border-radius: 99px;
-  padding: 1px 8px;
+  padding: 1px 7px;
   font-size: 11px;
   font-weight: 500;
 }
 .suba-stage.run {
-  background: color-mix(in srgb, var(--orange) 15%, transparent);
-  color: var(--orange);
+  background: var(--xy-accent-soft, rgba(79, 134, 247, 0.14));
+  color: var(--xy-accent, var(--accent));
 }
 .suba-stage.ok {
-  background: color-mix(in srgb, var(--green) 15%, transparent);
-  color: var(--green);
+  background: var(--xy-green-soft, rgba(74, 222, 128, 0.13));
+  color: var(--xy-green, var(--green));
 }
 .suba-stage.err {
-  background: color-mix(in srgb, var(--red) 15%, transparent);
-  color: var(--red);
+  background: var(--xy-rose-soft, rgba(248, 113, 113, 0.13));
+  color: var(--xy-rose, var(--red));
 }
 .suba-badge {
   flex-shrink: 0;
-  padding: 1px 7px;
+  padding: 1px 6px;
   border-radius: 99px;
-  border: 1px solid var(--border);
-  color: var(--text-faint);
+  border: 1px solid var(--xy-border, var(--border));
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 11px;
-  max-width: 120px;
+  max-width: 110px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.suba-badge.accent {
-  border-color: transparent;
-  background: var(--accent-soft);
-  color: var(--accent);
-}
 
-/* ── 任务头卡 ── */
-.suba-head-card {
+/* ── 轻量上下文抬头（对齐 TurnGroup） ── */
+.suba-ctx-head {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 11px;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
+  gap: 6px;
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid var(--xy-border, var(--border));
 }
-.suba-head-top {
+.suba-ctx-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
 }
-.suba-meta {
+.assistant-name {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   flex-wrap: wrap;
   min-width: 0;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+}
+.assistant-name .an-agent {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--xy-text, var(--text));
+}
+.assistant-name .an-model {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
 }
 .suba-head-actions {
   display: inline-flex;
@@ -1305,25 +1451,30 @@ onUnmounted(() => {
 .suba-mini-btn {
   padding: 2px 8px;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
-  color: var(--text-dim);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 11.5px;
   font-family: inherit;
   cursor: pointer;
   transition: 0.15s;
 }
 .suba-mini-btn:hover:not(:disabled) {
-  color: var(--text);
-  border-color: var(--text-faint);
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-text-3, var(--text-faint));
+}
+.suba-mini-btn.err {
+  color: var(--xy-rose, var(--red));
+  border-color: color-mix(in srgb, var(--xy-rose, var(--red)) 35%, transparent);
+}
+.suba-mini-btn.err.active {
+  background: var(--xy-rose-soft, rgba(248, 113, 113, 0.13));
+  border-color: var(--xy-rose, var(--red));
 }
 .suba-mini-btn.danger {
-  color: var(--red);
-  border-color: color-mix(in srgb, var(--red) 36%, transparent);
-  background: color-mix(in srgb, var(--red) 10%, transparent);
-}
-.suba-mini-btn.danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--red) 18%, transparent);
+  color: var(--xy-rose, var(--red));
+  border-color: color-mix(in srgb, var(--xy-rose, var(--red)) 36%, transparent);
+  background: var(--xy-rose-soft, rgba(248, 113, 113, 0.1));
 }
 .suba-mini-btn:disabled {
   opacity: 0.55;
@@ -1332,24 +1483,19 @@ onUnmounted(() => {
 .suba-toast {
   padding: 5px 8px;
   border-radius: 6px;
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--xy-accent-soft, var(--accent-soft));
+  color: var(--xy-accent, var(--accent));
   font-size: 11.5px;
 }
 
-.suba-prompt-box {
+.suba-prompt-line {
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  padding: 8px 9px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
+  gap: 4px;
 }
 .suba-title {
   font-size: 12.5px;
-  font-weight: 500;
-  color: var(--text);
+  color: var(--xy-text-2, var(--text-dim));
   line-height: 1.5;
   word-break: break-word;
 }
@@ -1366,7 +1512,7 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 8px;
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
 }
 .suba-prompt-id {
   min-width: 0;
@@ -1374,12 +1520,18 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.suba-prompt-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
 .suba-link-btn {
   flex-shrink: 0;
   border: none;
   background: none;
   padding: 0;
-  color: var(--accent);
+  color: var(--xy-accent, var(--accent));
   font-size: 11.5px;
   font-family: inherit;
   cursor: pointer;
@@ -1392,10 +1544,10 @@ onUnmounted(() => {
   position: fixed;
   z-index: 1500;
   padding: 8px 11px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--xy-border, var(--border));
   border-radius: 9px;
-  background: var(--bg1);
-  color: var(--text);
+  background: var(--xy-canvas, var(--bg1));
+  color: var(--xy-text, var(--text));
   font-size: 12px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -1404,90 +1556,25 @@ onUnmounted(() => {
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
 }
 
-/* ── 预算进度条 ── */
-.suba-budget {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.suba-budget-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 11.5px;
-  color: var(--text-faint);
-}
-.suba-num {
-  font-weight: 600;
-  color: var(--text-dim);
-  font-family: var(--mono);
-  font-style: normal;
-}
-.suba-num.bad {
-  color: var(--red);
-}
 .suba-progress-track {
-  height: 5px;
+  height: 2px;
   width: 100%;
   border-radius: 99px;
-  background: var(--bg3);
+  background: var(--xy-border, var(--border));
   overflow: hidden;
 }
 .suba-progress-fill {
   height: 100%;
   border-radius: 99px;
-  background: var(--accent);
+  background: var(--xy-accent, var(--accent));
   transition: width 0.25s ease;
 }
-.suba-progress-fill.ok {
-  background: var(--green);
-}
-.suba-progress-fill.warn {
-  background: var(--orange);
-}
-.suba-progress-fill.err {
-  background: var(--red);
-}
+.suba-progress-fill.ok { background: var(--xy-green, var(--green)); }
+.suba-progress-fill.warn { background: var(--xy-amber, var(--orange)); }
+.suba-progress-fill.err { background: var(--xy-rose, var(--red)); }
 .suba-handoff-note {
   font-size: 11.5px;
-  color: var(--orange);
-}
-
-/* ── 可点击统计筛选胶囊 ── */
-.suba-filter-pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.suba-filter-pill {
-  padding: 3px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
-  color: var(--text-dim);
-  font-size: 11.5px;
-  font-family: inherit;
-  cursor: pointer;
-  transition: 0.15s;
-}
-.suba-filter-pill:hover {
-  border-color: var(--text-faint);
-  color: var(--text);
-}
-.suba-filter-pill.active {
-  border-color: var(--accent);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.suba-filter-pill.err {
-  border-color: color-mix(in srgb, var(--red) 35%, transparent);
-  color: var(--red);
-}
-.suba-filter-pill.err.active {
-  background: color-mix(in srgb, var(--red) 14%, transparent);
-  border-color: var(--red);
+  color: var(--xy-amber, var(--orange));
 }
 
 /* ── 待审批提醒横幅 ── */
@@ -1497,9 +1584,9 @@ onUnmounted(() => {
   gap: 8px;
   padding: 9px 10px;
   border-radius: 9px;
-  border: 1px solid color-mix(in srgb, var(--yellow, #c9a24a) 42%, transparent);
-  background: color-mix(in srgb, var(--yellow, #c9a24a) 12%, transparent);
-  color: var(--yellow, #c9a24a);
+  border: 1px solid color-mix(in srgb, var(--xy-amber, #c9a24a) 42%, transparent);
+  background: var(--xy-amber-soft, rgba(201, 162, 74, 0.12));
+  color: var(--xy-amber, #c9a24a);
 }
 .suba-wait-ico {
   flex-shrink: 0;
@@ -1517,99 +1604,226 @@ onUnmounted(() => {
 .suba-wait-cmd {
   font-family: var(--mono);
   word-break: break-all;
-  color: var(--text);
+  color: var(--xy-text, var(--text));
 }
 .suba-wait-hint {
   font-size: 11.5px;
   opacity: 0.9;
 }
 
-/* ── 改动文件列表 ── */
-.suba-file-list {
+/* ── 主代理同款 TurnGroup 过程卡 ── */
+.suba-turn-sec {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-.suba-file-item {
+.xy-process-card,
+.turn-fold.is-open {
+  border-radius: 12px;
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
+  padding: 10px 12px;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.xy-process-head {
+  width: 100%;
   display: flex;
   align-items: center;
-  gap: 7px;
-  width: 100%;
-  padding: 7px 9px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
-  color: var(--text);
+  justify-content: space-between;
+  gap: 10px;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
   font-size: 12px;
-  font-family: var(--mono);
+  color: var(--xy-text-3, var(--text-faint));
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.15s;
 }
-.suba-file-item:hover {
-  border-color: var(--accent);
-}
-.suba-file-path {
-  flex: 1;
+.xy-process-head-l {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
+}
+.xy-process-title {
+  font-weight: 500;
+  color: var(--xy-text-2, var(--text-dim));
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.suba-file-open {
+.xy-process-meta {
   flex-shrink: 0;
-  font-family: inherit;
-  font-size: 11.5px;
-  color: var(--accent);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
 }
-
-/* ── 结构化轮次时间线 ── */
-.suba-timeline-sec {
+.xy-process-body {
+  margin-top: 8px;
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
-.suba-flow {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+.xy-process-collapsed {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+  cursor: pointer;
 }
-.suba-round-group {
+.xy-process-collapsed:hover {
+  color: var(--xy-text-2, var(--text-dim));
+}
+.xy-shimmer-text {
+  font-weight: 500;
+  background: linear-gradient(90deg, var(--xy-text-2, var(--text-dim)) 25%, var(--xy-text, var(--text)) 50%, var(--xy-text-2, var(--text-dim)) 75%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: xy-shimmer 2.6s linear infinite;
+}
+@keyframes xy-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.xy-spin {
+  color: var(--xy-accent, var(--accent));
+  animation: xy-spin 1.1s linear infinite;
+}
+@keyframes xy-spin {
+  to { transform: rotate(360deg); }
+}
+
+.turn-fold :deep(.fold-head) {
+  padding: 2px 0;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+}
+.turn-fold :deep(.fold-head:hover) {
+  color: var(--xy-text-2, var(--text-dim));
+}
+.turn-fold :deep(.fold-title) {
+  font-weight: 400;
+}
+.turn-fold.is-open :deep(.fold-head) {
+  width: 100%;
+}
+.turn-fold.is-open :deep(.xy-process-meta) {
+  margin-left: auto;
+}
+.turn-fold :deep(.fold-body) {
+  margin-top: 0;
+}
+
+.suba-step {
   display: flex;
   flex-direction: column;
   gap: 5px;
 }
-.suba-round-head {
-  display: flex;
+.suba-step-prose {
+  font-size: 13px;
+  line-height: 1.62;
+  color: var(--xy-text, var(--text));
+}
+
+/* ── 主代理同款思考折叠块 ── */
+.think-block {
+  margin: 2px 0;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+}
+.think-block :deep(.fold-head) {
+  width: fit-content;
+  max-width: 100%;
+  gap: 6px;
+  padding: 1px 0;
+  color: inherit;
+}
+.think-block :deep(.fold-head:hover) {
+  color: var(--xy-text-2, var(--text-dim));
+}
+.tk-head {
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 0 2px;
+  gap: 6px;
+  min-width: 0;
 }
-.suba-round-title {
-  font-weight: 600;
-  color: var(--text-dim);
+.tk-brain {
+  flex: none;
+  opacity: 0.85;
 }
-.suba-round-clock {
-  font-size: 11px;
-  color: var(--text-faint);
+.tk-label {
+  flex: none;
+  font-weight: 400;
+  white-space: nowrap;
+}
+.tk-label.is-thinking {
+  background: linear-gradient(
+    90deg,
+    var(--xy-text-3, var(--text-faint)) 0%,
+    var(--xy-text, var(--text-bright)) 45%,
+    var(--xy-text-3, var(--text-faint)) 90%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: tk-shimmer 2.4s linear infinite;
+}
+@keyframes tk-shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+.tk-sep {
+  flex: none;
+  opacity: 0.65;
+}
+.tk-summary {
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 400;
+  color: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tk-cnt {
+  margin: 4px 0 2px;
+  padding-left: 20px;
+  max-height: calc(1.6em * 10 + 2px);
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--xy-text-3, var(--text-faint));
 }
 
 .suba-milestone {
   display: flex;
   align-items: baseline;
   gap: 7px;
-  padding: 5px 8px;
+  padding: 4px 8px;
   border-radius: 7px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--text-dim);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg2));
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 11.5px;
 }
 .suba-milestone.wait {
-  border-color: color-mix(in srgb, var(--yellow, #c9a24a) 40%, transparent);
-  background: color-mix(in srgb, var(--yellow, #c9a24a) 12%, transparent);
-  color: var(--yellow, #c9a24a);
+  border-color: color-mix(in srgb, var(--xy-amber, #c9a24a) 40%, transparent);
+  background: var(--xy-amber-soft, rgba(201, 162, 74, 0.12));
+  color: var(--xy-amber, #c9a24a);
 }
 .suba-milestone-detail {
   min-width: 0;
@@ -1618,146 +1832,16 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-.suba-tool-list {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.suba-tool-card {
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  overflow: hidden;
-  transition: border-color 0.15s;
-}
-.suba-tool-card:hover {
-  border-color: var(--text-faint);
-}
-.suba-tool-card.err {
-  border-color: color-mix(in srgb, var(--red) 40%, transparent);
-}
-.suba-tool-card.run {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-}
-.suba-tool-btn {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  padding: 7px 9px;
-  border: none;
-  background: transparent;
-  color: var(--text);
-  font-size: 12px;
-  font-family: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-.suba-tool-left {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1;
-  min-width: 0;
-}
-.suba-tool-ico.cat-read { color: var(--cyan, var(--accent)); }
-.suba-tool-ico.cat-search { color: var(--accent); }
-.suba-tool-ico.cat-command { color: var(--orange); }
-.suba-tool-ico.cat-mutation { color: var(--green); }
-.suba-tool-ico.cat-skill { color: var(--purple, var(--accent)); }
-.suba-tool-ico.cat-other { color: var(--text-faint); }
-.suba-tool-action {
-  flex-shrink: 0;
-  font-weight: 500;
-  color: var(--text);
-}
-.suba-tool-target {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-dim);
-}
-.suba-tool-right {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-}
-.suba-chevron {
-  color: var(--text-faint);
-  transition: transform 0.15s;
-}
-.suba-chevron.open {
-  transform: rotate(90deg);
-}
-.suba-switch-trigger .suba-chevron.open {
-  transform: rotate(180deg);
-}
-.suba-tool-err-inline {
-  padding: 0 9px 7px;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--red);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.suba-tool-detail {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 7px 9px 9px;
-  border-top: 1px solid var(--border);
-  background: var(--bg1);
-}
-.suba-detail-kv {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--text-faint);
-}
-.suba-detail-lbl {
-  font-size: 11px;
-  color: var(--text-faint);
-}
-.suba-detail-lbl.err {
-  color: var(--red);
-}
-.suba-detail-pre {
-  margin: 0;
-  padding: 7px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--code-bg);
-  font-family: var(--mono);
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--text-dim);
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 200px;
-  overflow-y: auto;
-}
-.suba-detail-pre.err {
-  color: var(--red);
-  border-color: color-mix(in srgb, var(--red) 35%, transparent);
-}
-
 /* ── 实时状态条 ── */
 .suba-live-banner {
   display: flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 10px;
+  padding: 6px 10px;
   border-radius: 8px;
-  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  background: var(--accent-soft);
-  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--xy-accent, var(--accent)) 35%, transparent);
+  background: var(--xy-accent-soft, var(--accent-soft));
+  color: var(--xy-accent, var(--accent));
 }
 .suba-live-text {
   flex: 1;
@@ -1771,9 +1855,9 @@ onUnmounted(() => {
   flex-shrink: 0;
   padding: 2px 7px;
   border-radius: 5px;
-  border: 1px solid var(--accent);
-  background: var(--bg1);
-  color: var(--accent);
+  border: 1px solid var(--xy-accent, var(--accent));
+  background: var(--xy-canvas, var(--bg1));
+  color: var(--xy-accent, var(--accent));
   font-size: 11px;
   font-family: inherit;
   cursor: pointer;
@@ -1785,8 +1869,8 @@ onUnmounted(() => {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  padding: 3px 0 3px 10px;
-  font-size: 12px;
+  padding: 2px 0 2px 10px;
+  font-size: 12.5px;
   line-height: 1.5;
 }
 .suba-row::before {
@@ -1799,62 +1883,90 @@ onUnmounted(() => {
   border-radius: 2px;
   background: transparent;
 }
-.suba-row.current::before {
-  background: var(--accent);
-}
+.suba-row.current::before { background: var(--xy-accent, var(--accent)); }
 .suba-row-time {
   flex-shrink: 0;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 11px;
   font-family: var(--mono);
 }
 .suba-row-label {
   flex-shrink: 0;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   font-weight: 600;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12px;
 }
 .suba-row-label.dim {
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-weight: 400;
   font-family: inherit;
 }
 .suba-row-res {
   min-width: 0;
   font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text-faint);
+  font-size: 11.5px;
+  color: var(--xy-text-3, var(--text-faint));
   word-break: break-word;
 }
-.suba-row-res.ok { color: var(--green); }
-.suba-row-res.err { color: var(--red); white-space: normal; }
-.suba-row-res.run { color: var(--orange); }
+.suba-row-res.ok { color: var(--xy-green, var(--green)); }
+.suba-row-res.err { color: var(--xy-rose, var(--red)); white-space: normal; }
+.suba-row-res.run { color: var(--xy-amber, var(--orange)); }
 .suba-row.wait {
   border-radius: 6px;
-  background: rgba(201, 162, 74, 0.12);
-  padding-left: 10px;
+  background: var(--xy-amber-soft, rgba(201, 162, 74, 0.12));
 }
 .suba-row.wait .suba-row-label {
-  color: var(--yellow, #c9a24a);
-  font-weight: 600;
-}
-.suba-row.current .suba-row-label {
-  color: var(--accent);
+  color: var(--xy-amber, #c9a24a);
 }
 
-/* ── 结论与草稿卡片 ── */
+/* ── 主位结论与草稿 ── */
+.suba-answer-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.suba-answer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--xy-text-3, var(--text-faint));
+}
+.suba-answer-md {
+  font-size: 13.5px;
+  line-height: 1.68;
+  color: var(--xy-text, var(--text));
+}
+.suba-partial-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.suba-partial-md {
+  border-left: 2px solid var(--xy-accent, var(--accent));
+  padding-left: 10px;
+  font-size: 13px;
+  line-height: 1.62;
+  color: var(--xy-text-2, var(--text-dim));
+}
+.suba-changes {
+  margin-top: 2px;
+}
+
 .suba-card-sec {
   display: flex;
   flex-direction: column;
   gap: 7px;
   padding: 10px 11px;
   border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--bg2);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg2));
 }
 .suba-card-sec.err {
-  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+  border-color: color-mix(in srgb, var(--xy-rose, var(--red)) 40%, transparent);
 }
 .suba-sec-title {
   display: flex;
@@ -1863,7 +1975,7 @@ onUnmounted(() => {
   gap: 8px;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text);
+  color: var(--xy-text, var(--text));
 }
 .suba-sec-actions {
   display: inline-flex;
@@ -1873,49 +1985,71 @@ onUnmounted(() => {
 .suba-copy {
   padding: 2px 8px;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
-  color: var(--text-dim);
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-canvas, var(--bg1));
+  color: var(--xy-text-2, var(--text-dim));
   font-size: 11px;
   font-family: inherit;
   cursor: pointer;
   transition: 0.15s;
 }
 .suba-copy:hover {
-  color: var(--text);
-  border-color: var(--text-faint);
+  color: var(--xy-text, var(--text));
+  border-color: var(--xy-text-3, var(--text-faint));
 }
 .suba-sec-body {
   margin: 0;
   padding: 8px 10px;
   background: var(--code-bg);
-  border: 1px solid var(--border);
+  border: 1px solid var(--xy-border, var(--border));
   border-radius: 8px;
   font-family: var(--mono);
   font-size: 11.5px;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
-  color: var(--text-dim);
+  color: var(--xy-text-2, var(--text-dim));
   max-height: 280px;
   overflow-y: auto;
 }
 .suba-sec-body.err {
-  color: var(--red);
-}
-.suba-md {
-  padding: 9px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg1);
-  font-size: 12.5px;
-  line-height: 1.6;
-  max-height: 360px;
-  overflow-y: auto;
+  color: var(--xy-rose, var(--red));
 }
 .suba-trunc-note {
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
+}
+
+/* ── 主代理同款收尾栏 ── */
+.xy-turn-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 2px 0;
+  border-top: 1px solid var(--xy-border, var(--border));
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
+  user-select: none;
+}
+.working-indicator.done {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.wi-check {
+  color: var(--xy-accent, var(--accent));
+  flex-shrink: 0;
+}
+.wi-warn {
+  color: var(--xy-amber, var(--orange));
+  flex-shrink: 0;
+}
+.msg-metrics-bar {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--xy-text-3, var(--text-faint));
 }
 
 /* ── 全览模态框 ── */
@@ -1935,7 +2069,7 @@ onUnmounted(() => {
 .suba-full-sub {
   margin: 2px 0 0;
   font-size: 11.5px;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1946,13 +2080,21 @@ onUnmounted(() => {
   overflow-y: auto;
   font-size: 13px;
   line-height: 1.7;
-  background: var(--bg1);
+  background: var(--xy-canvas, var(--bg1));
 }
 
-.suba-empty {
-  padding: 20px 10px;
+.suba-empty,
+.suba-empty-inline {
+  padding: 16px 10px;
   text-align: center;
-  color: var(--text-faint);
+  color: var(--xy-text-3, var(--text-faint));
   font-size: 12px;
+}
+.suba-chevron {
+  color: var(--xy-text-3, var(--text-faint));
+  transition: transform 0.15s;
+}
+.suba-switch-trigger .suba-chevron.open {
+  transform: rotate(180deg);
 }
 </style>

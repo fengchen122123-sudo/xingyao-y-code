@@ -1,5 +1,9 @@
 <template>
-  <div class="trace-row" :class="[`status-${row.status}`, { 'is-open': rowOpen }]">
+  <div
+    class="trace-row"
+    :class="[`status-${row.status}`, { 'is-open': rowOpen }]"
+    :data-test="toolTestPrefix && row.calls.length === 1 ? toolTestPrefix + row.calls[0]!.id : undefined"
+  >
     <div
       class="trace-line"
       :class="{ 'can-toggle': canExpand }"
@@ -40,6 +44,11 @@
         :stroke-width="2"
       />
     </div>
+
+    <div
+      v-if="showInlineError && row.status === 'failed' && !rowOpen && row.errorSummary"
+      class="trace-err-inline"
+    >{{ row.errorSummary }}</div>
 
     <div v-if="rowOpen" class="trace-detail">
       <div v-if="isComputerRow" class="computer-detail">
@@ -100,7 +109,7 @@
       <div v-if="subagentTasks.length > 0" class="subagent-tasks">
         <div v-for="task in subagentTasks" :key="task.id" class="subagent-task">
           <span class="subagent-stage" :class="subagentStageClass(task)">{{ subagentStageLabel(task) }}</span>
-          <span class="subagent-desc" :title="task.description">{{ task.description }}</span>
+          <span class="subagent-desc" :title="task.description">{{ cleanSubagentTitle(task.description) || task.description }}</span>
           <span v-if="task.stage_detail" class="subagent-detail">{{ task.stage_detail }}</span>
           <span class="subagent-time">{{ task.elapsed }}s</span>
           <button
@@ -112,6 +121,7 @@
         </div>
       </div>
 
+      <pre v-if="argsPreviewText" class="trace-args">{{ argsPreviewText }}</pre>
       <pre v-if="hasResult" class="trace-result">{{ resultText }}</pre>
     </div>
   </div>
@@ -122,6 +132,7 @@ import { computed, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import {
+  cleanSubagentTitle,
   diffCounts,
   type LegacyDiff,
   type SubagentTaskSnapshot,
@@ -131,6 +142,8 @@ import {
 const props = defineProps<{
   row: ToolTraceRow;
   elapsedMs?: number;
+  showInlineError?: boolean;
+  toolTestPrefix?: string;
 }>();
 
 const store = useAppStore();
@@ -145,6 +158,7 @@ function onLineClick() {
 const NODE_TONES: Record<ToolTraceRow['kind'], string> = {
   'read-group': 'read',
   'search-group': 'search',
+  'command-group': 'command',
   command: 'command',
   mutation: 'mutation',
   skill: 'skill',
@@ -156,6 +170,7 @@ const NODE_TONES: Record<ToolTraceRow['kind'], string> = {
 const KIND_LABELS: Record<ToolTraceRow['kind'], string> = {
   'read-group': '读取',
   'search-group': '搜索',
+  'command-group': '运行',
   command: '运行',
   mutation: '编辑',
   skill: '技能',
@@ -216,12 +231,22 @@ const lineTitle = computed(() => {
   return parts.filter(Boolean).join(' · ');
 });
 
-const isGroup = computed(() => props.row.kind === 'read-group' || props.row.kind === 'search-group');
+const isGroup = computed(
+  () => props.row.kind === 'read-group'
+    || props.row.kind === 'search-group'
+    || props.row.kind === 'command-group',
+);
 const groupFiles = computed(() => {
   if (!isGroup.value) return [];
-  return props.row.calls.map(
-    (call) => call.result?.display?.target || call.display?.target || call.label,
-  );
+  return props.row.calls.map((call) => {
+    if (props.row.kind === 'command-group') {
+      const cmd = call.result?.display?.command || call.display?.command
+        || call.result?.display?.target || call.display?.target || call.label;
+      const dur = call.result?.duration_ms !== undefined ? formatDuration(call.result.duration_ms) : '';
+      return dur ? `${cmd} (${dur})` : cmd;
+    }
+    return call.result?.display?.target || call.display?.target || call.label;
+  });
 });
 
 function compactTargetDisplay(raw: string, isCommand: boolean): string {
@@ -248,7 +273,20 @@ function shortPathBase(filePath: string): string {
 }
 
 const targetText = computed(() => {
+  if (props.row.kind === 'command-group') {
+    return `${props.row.detail || '命令'} · ${props.row.count} 次`;
+  }
   if (isGroup.value) return `${props.row.count} 个文件`;
+  if (props.row.kind === 'subagent') {
+    if (subagentTasks.value.length > 1) {
+      const first = cleanSubagentTitle(subagentTasks.value[0]?.description || '');
+      return first ? `${subagentTasks.value.length} 个星舰并行 · ${first}` : `${subagentTasks.value.length} 个星舰并行`;
+    }
+    if (subagentTasks.value.length === 1) {
+      return cleanSubagentTitle(subagentTasks.value[0]?.description || '') || compactTargetDisplay(props.row.detail || '', false);
+    }
+    return cleanSubagentTitle(props.row.detail || '') || compactTargetDisplay(props.row.detail || '', false);
+  }
   if (props.row.kind === 'legacy-diffs' && diffs.value.length > 1) {
     const first = shortPathBase(diffs.value[0]?.file_path || '');
     return first ? `${first} 等 ${diffs.value.length} 个文件` : `${diffs.value.length} 个文件`;
@@ -334,6 +372,14 @@ const takeoverBadge = computed(() => {
   return '';
 });
 
+const argsPreviewText = computed(() => {
+  if (isGroup.value) return '';
+  return props.row.calls
+    .map((call) => call.args_preview ?? '')
+    .filter((text) => text.trim().length > 0)
+    .join('\n');
+});
+
 const resultText = computed(() =>
   props.row.calls
     .map((call) => call.result?.result ?? '')
@@ -410,6 +456,7 @@ const canExpand = computed(
   () => groupFiles.value.length > 0
     || diffs.value.length > 0
     || subagentTasks.value.length > 0
+    || Boolean(argsPreviewText.value)
     || hasResult.value
     || isComputerRow.value,
 );
@@ -743,6 +790,16 @@ function diffLineClass(line: string) {
   opacity: 1;
   text-decoration: underline;
 }
+.trace-err-inline {
+  margin: 1px 0 3px 18px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--xy-rose, var(--red));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.trace-args,
 .trace-result {
   display: block;
   margin: 4px 0 0;
@@ -752,9 +809,13 @@ function diffLineClass(line: string) {
   font-family: var(--mono);
   font-size: 11.5px;
   white-space: pre-wrap;
+  word-break: break-word;
   color: var(--text-dim);
   max-height: 240px;
   overflow-y: auto;
+}
+.trace-args {
+  color: var(--text-faint);
 }
 .trace-row button {
   background: none;

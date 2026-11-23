@@ -457,6 +457,7 @@ class EmbeddedBrowserController:
                 )
                 if sender is self._webview:
                     self._recycle_failed_control()
+                self._schedule_emit()
                 return
             self._init_error = ""
             core = self._webview.CoreWebView2
@@ -693,7 +694,7 @@ class EmbeddedBrowserController:
             can_fwd = box.get("can_go_forward", can_fwd)
         with self._lock:
             phase = self._surface_phase_locked()
-            generation = self._surface_generation
+            generation = max(self._surface_generation, self._latest_surface_generation)
         return {
             "url": url,
             "title": title,
