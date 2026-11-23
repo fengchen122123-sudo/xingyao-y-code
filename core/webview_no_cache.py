@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 
 logger = logging.getLogger(__name__)
 
@@ -10,11 +11,14 @@ _applied = False
 
 
 def apply() -> None:
-    """包一层 bottle.static_file，确保静态响应带上 no-cache 头。
+    """修正 JS MIME，并包一层 bottle.static_file 补 no-cache 头。
 
+    Windows 注册表可能把 .js 映射成 text/plain，导致浏览器拒绝执行 ES Module。
     幂等：重复调用只包一层。pywebview 依赖缺失或 import 失败时静默跳过，
     绝不影响 GUI 启动。
     """
+    mimetypes.add_type("text/javascript", ".js")
+
     global _applied
     if _applied:
         return
