@@ -24,9 +24,6 @@
     <section class="setting-card hero-card">
       <div class="hero-master-row">
         <div class="hero-copy">
-          <div class="hero-icon" :class="{ on: enabledDraft, connected: settings.status.state === 'connected' }">
-            <AppIcon name="message-square" :size="18" :stroke-width="1.9" />
-          </div>
           <div class="hero-text">
             <div class="hero-title-line">
               <h2>启用飞书通道</h2>
@@ -616,36 +613,8 @@ onMounted(load);
 }
 
 .hero-copy {
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
   min-width: 0;
   flex: 1 1 auto;
-}
-
-.hero-icon {
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
-  display: grid;
-  place-items: center;
-  flex: none;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--text-faint);
-  transition: background .18s ease, color .18s ease, border-color .18s ease;
-}
-
-.hero-icon.on {
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
-  color: var(--accent);
-}
-
-.hero-icon.connected {
-  background: color-mix(in srgb, var(--green) 12%, transparent);
-  border-color: color-mix(in srgb, var(--green) 34%, transparent);
-  color: var(--green);
 }
 
 .hero-text {

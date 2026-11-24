@@ -22,19 +22,14 @@
     <!-- 自我演化与学习控制卡片 -->
     <section class="setting-card">
       <div class="setting-row">
-        <div class="setting-copy-with-icon">
-          <div class="row-icon" :class="{ on: enabledDraft }">
-            <AppIcon name="brain" :size="16" :stroke-width="1.9" />
+        <div class="setting-copy">
+          <div class="title-line">
+            <h3>启用自我演化</h3>
+            <span class="state-pill" :class="{ on: enabledDraft }">
+              {{ enabledDraft ? '已启用' : '已关闭' }}
+            </span>
           </div>
-          <div class="setting-copy">
-            <div class="title-line">
-              <h3>启用自我演化</h3>
-              <span class="state-pill" :class="{ on: enabledDraft }">
-                {{ enabledDraft ? '已启用' : '已关闭' }}
-              </span>
-            </div>
-            <p>随长期对话积累形成稳定的自我模型。</p>
-          </div>
+          <p>随长期对话积累形成稳定的自我模型。</p>
         </div>
         <button
           type="button"
@@ -51,19 +46,14 @@
       </div>
 
       <div class="setting-row">
-        <div class="setting-copy-with-icon">
-          <div class="row-icon" :class="{ on: learningDraft }">
-            <AppIcon name="lightbulb" :size="16" :stroke-width="1.9" />
+        <div class="setting-copy">
+          <div class="title-line">
+            <h3>启用经验学习</h3>
+            <span class="state-pill" :class="{ on: learningDraft }">
+              {{ learningDraft ? '已启用' : '已关闭' }}
+            </span>
           </div>
-          <div class="setting-copy">
-            <div class="title-line">
-              <h3>启用经验学习</h3>
-              <span class="state-pill" :class="{ on: learningDraft }">
-                {{ learningDraft ? '已启用' : '已关闭' }}
-              </span>
-            </div>
-            <p>从历史任务提炼可复用经验并用于后续任务。</p>
-          </div>
+          <p>从历史任务提炼可复用经验并用于后续任务。</p>
         </div>
         <button
           type="button"
@@ -543,33 +533,6 @@ onUnmounted(() => {
 
 .setting-row:last-child {
   border-bottom: 0;
-}
-
-.setting-copy-with-icon {
-  display: flex;
-  align-items: flex-start;
-  gap: 13px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.row-icon {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  display: grid;
-  place-items: center;
-  flex: none;
-  border: 1px solid var(--border);
-  background: var(--bg2);
-  color: var(--text-faint);
-  transition: background .18s ease, color .18s ease, border-color .18s ease;
-}
-
-.row-icon.on {
-  background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
-  color: var(--accent);
 }
 
 .setting-copy {
