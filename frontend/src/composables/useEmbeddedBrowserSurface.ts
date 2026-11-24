@@ -44,6 +44,8 @@ export interface UseEmbeddedBrowserSurfaceApi {
   syncNow: () => Promise<any> | null;
   navigate: (url: string) => void;
   request: (method: string, ...args: unknown[]) => void;
+  /** 宿主进程回推的就绪状态：Open 回调可能停在 opening，不能据此一直盖住页面。 */
+  noteHostState: (state: { ready?: boolean; visible?: boolean; phase?: string }) => void;
 }
 
 const MIN_SIDE = 2;
@@ -287,6 +289,17 @@ export function useEmbeddedBrowserSurface(
     });
   }
 
+  function noteHostState(state: { ready?: boolean; visible?: boolean; phase?: string }): void {
+    if (disposed || !lastVisible || surfacePhase.value !== 'opening') return;
+    if (state?.phase === 'error') {
+      surfacePhase.value = 'error';
+      return;
+    }
+    if (state?.phase === 'ready' || (state?.ready && state?.visible)) {
+      surfacePhase.value = 'ready';
+    }
+  }
+
   function move(rect: BrowserRect, retryCount = 0): void {
     const gen = desiredGeneration;
     const zoom = currentZoom(opts);
@@ -512,5 +525,6 @@ export function useEmbeddedBrowserSurface(
     syncNow,
     navigate,
     request,
+    noteHostState,
   };
 }
