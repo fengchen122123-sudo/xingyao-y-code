@@ -363,6 +363,12 @@ def summarize_tool_finished(
             payload = None
         if isinstance(payload, dict):
             status = str(payload.get("status") or status)
+        elif content.startswith("子代理执行超时（"):
+            status = "timed_out"
+        elif content.startswith("子代理执行已取消（"):
+            status = "cancelled"
+        elif content.startswith("子代理执行失败（"):
+            status = "failed"
         copy = {
             "running": "子代理已在后台启动",
             "completed": "子代理已完成",

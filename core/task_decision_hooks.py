@@ -178,18 +178,27 @@ def decide_subagent_review(
             return None
         from core.decision_gateway import decide
 
-        desc_summary = _collapse(description, 150)
-        if len(text) > 260:
-            result_summary = _collapse(text[:150], 150) + " ... " + _collapse(text[-110:], 110)
-        else:
-            result_summary = _collapse(text, 260)
+        desc_summary = _collapse(description, 120)
         err_names = ",".join(list((tool_errors or {}).keys())[:4]) or "无"
-        state = (
+        header = (
             f"角色：{subagent_type or 'general'}；计划项：{plan_item_id or '无'}\n"
             f"工具成功：{int(tool_success_count)}；遗留报错工具：{err_names}\n"
             f"任务：{desc_summary}\n"
-            f"汇报：{result_summary}"
-        )[:500]
+            "汇报："
+        )
+        summary_budget = max(120, 500 - len(header))
+        collapsed_text = _collapse(text, len(text))
+        if len(collapsed_text) > summary_budget:
+            head_len = int(summary_budget * 0.6)
+            tail_len = max(40, summary_budget - head_len - 5)
+            result_summary = (
+                collapsed_text[:head_len].rstrip()
+                + " ... "
+                + collapsed_text[-tail_len:].lstrip()
+            )
+        else:
+            result_summary = collapsed_text
+        state = (header + result_summary)[:500]
         picked = decide(
             "subagent_review",
             state,

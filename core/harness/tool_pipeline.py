@@ -256,6 +256,8 @@ def _repeat_call_blocked_result(decoded: DecodedToolCall) -> dict:
 
 _TOOL_WORKER_POOL_LOCK = threading.Lock()
 _TOOL_WORKER_POOL = None
+_ORCHESTRATION_WORKER_POOL = None
+_ORCHESTRATION_TOOL_NAMES = frozenset({"run_subagent", "ask_user"})
 
 
 def _get_tool_worker_pool():
@@ -274,7 +276,23 @@ def _get_tool_worker_pool():
         return _TOOL_WORKER_POOL
 
 
-def _submit_daemon_call(function, *args, **kwargs):
+def _get_orchestration_worker_pool():
+    """隔离阻塞等待型的编排工具线程池，避免与子代理内部的叶子工具争夺同一池名额。"""
+    global _ORCHESTRATION_WORKER_POOL
+    if _ORCHESTRATION_WORKER_POOL is not None:
+        return _ORCHESTRATION_WORKER_POOL
+    with _TOOL_WORKER_POOL_LOCK:
+        if _ORCHESTRATION_WORKER_POOL is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _ORCHESTRATION_WORKER_POOL = ThreadPoolExecutor(
+                max_workers=16,
+                thread_name_prefix="ycode-orch-worker",
+            )
+        return _ORCHESTRATION_WORKER_POOL
+
+
+def _submit_on_pool(pool, function, *args, **kwargs):
     from core.workspace_context import get_workdir, workspace_scope
 
     workdir = get_workdir()
@@ -319,7 +337,15 @@ def _submit_daemon_call(function, *args, **kwargs):
             except Exception:
                 pass
 
-    return _get_tool_worker_pool().submit(runner)
+    return pool.submit(runner)
+
+
+def _submit_daemon_call(function, *args, **kwargs):
+    return _submit_on_pool(_get_tool_worker_pool(), function, *args, **kwargs)
+
+
+def _submit_orchestration_call(function, *args, **kwargs):
+    return _submit_on_pool(_get_orchestration_worker_pool(), function, *args, **kwargs)
 
 
 def _legacy_group_tool_batches(
@@ -600,12 +626,24 @@ class ToolBatchExecutor:
     def execute_batch(self, batch, context, on_event):
         self._raise_if_cancelled(context.cancel_event)
         if batch.parallel and len(batch.calls) > 1:
-            futures = [
-                self.submit_call(
+            def _submit_parallel_call(prepared_call):
+                if (
+                    self.submit_call is _submit_daemon_call
+                    and prepared_call.decoded.name in _ORCHESTRATION_TOOL_NAMES
+                ):
+                    return _submit_orchestration_call(
+                        self._execute_parallel,
+                        prepared_call,
+                        context,
+                    )
+                return self.submit_call(
                     self._execute_parallel,
                     prepared_call,
                     context,
                 )
+
+            futures = [
+                _submit_parallel_call(prepared_call)
                 for prepared_call in batch.calls
             ]
             results = [

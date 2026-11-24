@@ -1261,12 +1261,15 @@ from core.llm_execution import (
     _TOOL_RESULT_TAIL_TOOLS,
     _build_tool_pipeline_and_context,
     _call_vision_model_for_content,
+    _SUBAGENT_COMMAND_EVIDENCE_TYPES,
     _canonical_arguments_signature,
     _claims_verification_without_evidence,
+    _compact_ephemeral_messages_in_place,
     _describe_images_with_secondary,
     _escape_control_chars_in_json_strings,
     _execute_single_tool_call,
     _get_imom_active_publish_root,
+    _is_ephemeral_subagent_turn,
     _persisted_tool_calls,
     _raw_tool_call_arguments,
     _read_file_result_limit,
@@ -2342,6 +2345,20 @@ def _chat_with_model_generator(
                                 "建议 /new 开新会话，或移除超大附件/图片后重试。"
                             ) from api_err
                         overflow_compress_attempts += 1
+                        if _is_ephemeral_subagent_turn(stream, parent_session, cache_scope):
+                            if event_callback is not None:
+                                _notify_event(event_callback, "status", {
+                                    "message": "子代理上下文窗口超限，正在精简内部执行历史后重试。",
+                                })
+                            if not _compact_ephemeral_messages_in_place(messages):
+                                raise RuntimeError(
+                                    "子代理单步载荷已超出模型上下文窗口且无法继续精简，"
+                                    "请缩小子任务范围或拆分为多个子代理后重试。"
+                                ) from api_err
+                            turn_snapshot = deepcopy(messages)
+                            if attempt < max_api_retries - 1:
+                                continue
+                            raise api_err
                         try:
                             if event_callback is None:
                                 print("\n[⚠️ 检测到上下文窗口超限，正在尝试压缩历史记录以缩减 Prompt 长度...]")
@@ -3439,8 +3456,15 @@ def _chat_with_model_generator(
                         _sub_args = json.loads((_tc.get("function") or {}).get("arguments") or "{}")
                     except (TypeError, ValueError):
                         _sub_args = {}
-                    if _subagent_counts_as_command_evidence(
-                        (_sub_args or {}).get("subagent_type"), _msg.get("content")
+                    _sub_type = str((_sub_args or {}).get("subagent_type") or "").strip().lower()
+                    _sub_content = str(_msg.get("content") or "")
+                    _is_foreground_completed = (
+                        _sub_type in _SUBAGENT_COMMAND_EVIDENCE_TYPES
+                        and not bool((_sub_args or {}).get("run_in_background"))
+                        and not _sub_content.lstrip().startswith("{")
+                    )
+                    if _is_foreground_completed or _subagent_counts_as_command_evidence(
+                        _sub_type, _sub_content
                     ):
                         used_command_tools = True
                         break

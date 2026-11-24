@@ -3259,6 +3259,38 @@ def _with_tool_error_footer(result: str, tool_errors: dict, turn_error: str = ""
     return result + "\n".join(lines)
 
 
+def _is_diagnostic_command_exit_only(task: "SubagentTask") -> bool:
+    """Allow test role to report root-cause analysis when tests exit non-zero."""
+    if str(task.subagent_type or "").strip().lower() != "test":
+        return False
+    if set(task.tool_errors.keys()) != {"execute_command"}:
+        return False
+    detail = str(task.tool_errors.get("execute_command") or "")
+    return "命令执行失败（退出码" in detail
+
+
+def _build_subagent_continuation_messages(
+    messages: list[dict[str, Any]],
+    result_text: str,
+    continuation_prompt: str,
+) -> list[dict[str, Any]]:
+    """Build continuation messages while preserving prior tool-call history."""
+    cont_messages = list(messages)
+    fallback_reply = result_text.strip() or "（未输出最终结论）"
+    if cont_messages and cont_messages[-1].get("role") == "assistant":
+        last_msg = dict(cont_messages[-1])
+        if last_msg.get("tool_calls"):
+            cont_messages.append({"role": "assistant", "content": fallback_reply})
+        else:
+            if not last_msg.get("content"):
+                last_msg["content"] = fallback_reply
+            cont_messages[-1] = last_msg
+    else:
+        cont_messages.append({"role": "assistant", "content": fallback_reply})
+    cont_messages.append({"role": "user", "content": continuation_prompt})
+    return cont_messages
+
+
 def _truncate_subagent_result(result: str, max_len: int, trailer: str) -> str:
     if len(result) <= max_len:
         return result
@@ -3921,8 +3953,13 @@ class SubagentManager:
                             for name, detail in task.tool_errors.items()
                         )
                     self._terminate(task.task_id, "failed", reason)
-                elif task.tool_errors and task.tool_success_count == 0:
+                elif (
+                    task.tool_errors
+                    and task.tool_success_count == 0
+                    and not _is_diagnostic_command_exit_only(task)
+                ):
                     # 所有工具调用都失败：结论只是错误复述，不能当成功
+                    # （test 角色执行测试命令非零退出且产出了有效诊断结论时，保留告警尾注并交付结果）
                     details = "; ".join(
                         f"{name}: {detail}" for name, detail in task.tool_errors.items()
                     )
@@ -5141,27 +5178,15 @@ class SubagentManager:
             and not turn_error_message
         ):
             continuation_prompt = (
-                "你之前的回答过于简短。请提供更完整的总结，包含：\n"
+                "你之前的回答过于简短。请直接基于上面已经获取的工具结果和信息提供更完整的中文总结，包含：\n"
                 "1. 具体的技术细节和实现要点\n"
                 "2. 关键发现与分析结论\n"
                 "3. 主 Agent 需要知晓的所有重要信息\n"
-                "请直接输出完整内容，不要重复之前的简短回答。"
+                "请直接输出完整内容，不要重复之前的简短回答，也不要重新调用已经完成的读写或命令工具。"
             )
-            cont_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        f"你是{_agent_display_name()}子代理({task.task_id})，角色是 {role}。"
-                        f"{instruction_text}"
-                        "你只执行主 Agent 已分配的单一子任务；"
-                        "结束时只输出供主 Agent 汇总的公开结论。"
-                        "所有输出必须使用中文。"
-                    ),
-                },
-                {"role": "user", "content": f"请完成以下子任务：\n{task.description}"},
-                {"role": "assistant", "content": result_text or "（未输出最终结论）"},
-                {"role": "user", "content": continuation_prompt},
-            ]
+            cont_messages = _build_subagent_continuation_messages(
+                messages, result_text, continuation_prompt
+            )
             self._record_stage(task.task_id, "summarizing")
             try:
                 cont_events = chat_with_model_events(
@@ -5173,23 +5198,71 @@ class SubagentManager:
                     turn_id=task.task_id,
                     cancel_event=task.cancel_event,
                     allow_subagents=False,
-                    allowed_tools=None,
+                    allowed_tools=allowed_tools,
                     consume_background_notifications=False,
                     parent_session=None,
                     parent_turn_id=None,
                     permission_owner=task.task_id,
                     permission_source=f"子代理总结：{task.description[:40]}",
+                    cache_scope=f"subagent:{role}",
+                    cache_session_id=task.parent_session,
                     model_id=current_model_id,
+                    budget_notice_provider=_budget_notice_provider,
                 )
                 cont_answer = []
+                cont_turn_error = ""
                 with _subagent_depth_scope():
                     for event in cont_events:
                         if event.kind == "assistant_delta":
                             cont_answer.append(str(event.payload.get("text", "")))
+                        elif event.kind == "tool_started":
+                            _advance_round_if_needed()
+                            self._record_tool_started(
+                                task.task_id,
+                                str(event.payload.get("id") or ""),
+                                current_round,
+                                dict(event.payload),
+                            )
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                str(event.payload.get("name", "")),
+                            )
+                        elif event.kind == "tool_finished":
+                            saw_tool_finished = True
+                            name = str(event.payload.get("name", "tool"))
+                            self._record_tool_finished(
+                                task.task_id,
+                                str(event.payload.get("id") or ""),
+                                current_round,
+                                dict(event.payload),
+                            )
+                            if event.payload.get("ok") is False:
+                                err = str(
+                                    event.payload.get("summary")
+                                    or event.payload.get("error")
+                                    or "工具执行失败"
+                                )
+                                task.tool_errors[name] = err
+                            else:
+                                task.tool_errors.pop(name, None)
+                                task.tool_success_count += 1
+                        elif event.kind == "diff_ready":
+                            self._record_file_diff(task.task_id, dict(event.payload))
+                            if task.event_callback is not None:
+                                try:
+                                    task.event_callback("diff_ready", dict(event.payload))
+                                except Exception:
+                                    _logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+                        elif event.kind == "turn_error":
+                            cont_turn_error = str(
+                                event.payload.get("message") or cont_turn_error
+                            )
                 continued = "".join(cont_answer).strip()
-                # 只有重试结果更长时才采用，避免重试反而更差
-                if len(continued) > len(result_text.strip()):
+                # 只有在未触发续写异常且结果更完整时才替换，避免报错/截断覆盖原有结论
+                if not cont_turn_error and len(continued) > len(result_text.strip()):
                     result_text = continued
+                    self._record_partial(task.task_id, result_text)
             except Exception:
                 # 总结续写失败不影响主流程，返回原始结果
                 pass
