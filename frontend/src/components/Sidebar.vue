@@ -497,6 +497,9 @@
             @click="goToCloudRelaySettings()"
           >去服务器配置</button>
         </div>
+        <div v-if="remoteBind.refresh_notice" class="bind-notice" data-test="remote-bind-refresh-notice">
+          {{ remoteBind.refresh_notice }}
+        </div>
         <div class="bind-hint" data-test="remote-bind-hint">
           {{ remoteBindRefreshing ? '正在刷新配对链接…' : `链接有效期：${formatExpiry(remoteBind.expires_in)}，请在过期前扫码` }}
         </div>
@@ -1053,6 +1056,8 @@ const remoteBind = ref<null | {
   permanent?: boolean;
   // 云中转开着却回落局域网时后端给的原因；为空表示就是局域网/公网正常出码
   relay_notice?: string;
+  // 点「刷新」时换票被拒（网关限流）但保留了旧链接的说明；换新票成功／普通出码时为空
+  refresh_notice?: string;
 }>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
@@ -1772,6 +1777,7 @@ async function fetchRemoteBind(forceNew: boolean) {
         expires_in: result.expires_in ?? 0,
         permanent: !(result.expires_in > 0),
         relay_notice: result.relay_notice || '',
+        refresh_notice: result.refresh_notice || '',
       };
       let cloudMissing = Boolean(result.relay_notice);
       if (typeof (api as any).get_cloud_relay_settings === 'function') {

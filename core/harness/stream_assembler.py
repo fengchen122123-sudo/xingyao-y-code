@@ -111,6 +111,7 @@ class StreamAssembler:
         self._finish_public_text = ""
         self._raw_reasoning_content = ""
         self._finished = False
+        self._visible_output = False
 
     @property
     def finish_public_text(self) -> str:
@@ -119,6 +120,15 @@ class StreamAssembler:
     @property
     def raw_reasoning_content(self) -> str:
         return self._raw_reasoning_content
+
+    @property
+    def has_visible_output(self) -> bool:
+        """是否已产出用户可见内容（正文 / 工具调用 / 结束标记）。
+
+        纯 reasoning（思考）不计入：模型只思考就被断流时，换连接重发不会
+        造成可见内容重复，属于可安全重发的场景。
+        """
+        return self._visible_output
 
     def observe_usage(self, usage) -> None:
         """Replace stream usage with a later provider-reported value."""
@@ -143,6 +153,7 @@ class StreamAssembler:
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason:
             self._finish_reason = finish_reason
+            self._visible_output = True
 
         delta = choice.delta
         complete_blocks = complete_thinking_blocks(delta)
@@ -171,8 +182,10 @@ class StreamAssembler:
                 self._in_native_think = False
             emitted.append(content)
             self._accumulated_content += content
+            self._visible_output = True
 
         for tool_call in getattr(delta, "tool_calls", None) or ():
+            self._visible_output = True
             index = tool_call.index
             if index not in self._tool_calls:
                 self._tool_calls[index] = {
@@ -200,6 +213,7 @@ class StreamAssembler:
         computer_call = getattr(delta, "computer_call", None)
         if computer_call is not None:
             self._computer_call = computer_call
+            self._visible_output = True
 
         return StreamUpdate("".join(emitted), reasoning)
 

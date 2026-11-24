@@ -24,7 +24,22 @@ def issue_remote_token(secret: str, device_id: str, now: int | None = None) -> d
         secret,
         algorithm="HS256",
     )
-    return {"token": token, "expires_at": now + REMOTE_ACCESS_SECONDS}
+    return {"token": token, "jti": jti, "expires_at": now + REMOTE_ACCESS_SECONDS}
+
+
+def bind_active_token(database, device_id: str, jti: str) -> None:
+    """把这票登记为设备当前唯一有效的远端票：旧 jti 在写入瞬间就作废。"""
+    database.execute("UPDATE devices SET active_jti = ? WHERE id = ?", (jti, device_id))
+    database.commit()
+
+
+def issue_device_token(
+    database, secret: str, device_id: str, now: int | None = None
+) -> dict:
+    """签发并绑定为设备唯一有效票。调用方随后应踢掉该设备已建立的远端连接。"""
+    payload = issue_remote_token(secret, device_id, now=now)
+    bind_active_token(database, device_id, payload["jti"])
+    return payload
 
 
 def read_remote_token(
@@ -48,8 +63,19 @@ def read_remote_token(
     if int(payload.get("exp") or 0) <= now:
         return None
     row = database.execute(
-        "SELECT revoked FROM devices WHERE id = ?", (device_id,)
+        "SELECT revoked, active_jti FROM devices WHERE id = ?", (device_id,)
     ).fetchone()
     if row is None or int(row["revoked"]):
         return None
-    return SimpleNamespace(jti=str(payload.get("jti") or ""), device_id=device_id)
+    jti = str(payload.get("jti") or "")
+    if not jti:
+        return None
+    active = str(row["active_jti"] or "")
+    if not active:
+        # 旧版本签发的票（库里还没有独占标记）：首次使用就地绑定，之后任何新签发
+        # 都会让它失效；用这种方式平滑升级，不一次性废掉手机里正在用的链接。
+        bind_active_token(database, device_id, jti)
+    elif not secrets.compare_digest(active, jti):
+        # 刷新已签出新票：旧链接（包括泄露出去的那张）到此为止
+        return None
+    return SimpleNamespace(jti=jti, device_id=device_id)

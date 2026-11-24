@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .auth import issue_remote_token, read_remote_token
+from .auth import issue_device_token, issue_remote_token, read_remote_token
 from .db import connect
 from .registry import (
     OUTBOUND_LIMIT,
@@ -62,6 +62,7 @@ async def _fanout(
     device_id: str,
     on_text=None,
     app_key: str | None = None,
+    stop: asyncio.Event | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     pending_frames: asyncio.Queue = asyncio.Queue()
@@ -71,16 +72,24 @@ async def _fanout(
 
     item = relay.listen(device_id, send, app_key=app_key)
     receive = asyncio.create_task(websocket.receive_text())
+    # kicked 只建一次、不反复 cancel：签发新票时由它的 closer 置位，立即断开本连接
+    kicked = asyncio.create_task(stop.wait()) if stop is not None else None
     try:
         while True:
             incoming = asyncio.create_task(pending_frames.get())
+            waits = {receive, incoming}
+            if kicked is not None:
+                waits.add(kicked)
             done, pending = await asyncio.wait(
-                {receive, incoming},
+                waits,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in pending:
-                if task is not receive:
+                if task is not receive and task is not kicked:
                     task.cancel()
+            if stop is not None and stop.is_set():
+                await websocket.close(code=4401)
+                return
             # 同批完成的任务必须全部消费：incoming 与 receive 同时就绪时
             # 既发帧也处理上行帧，严禁 continue 丢弃同批另一个结果。
             if incoming in done:
@@ -104,6 +113,12 @@ async def _fanout(
             await receive
         except (asyncio.CancelledError, Exception):
             pass
+        if kicked is not None:
+            kicked.cancel()
+            try:
+                await kicked
+            except (asyncio.CancelledError, Exception):
+                pass
         relay.unlisten(item)
 
 
@@ -273,7 +288,11 @@ def create_app(
         # 限流只计已验证设备：无效令牌不占额度，防止伪造请求把合法设备的换票锁死。
         if not _ticket_allowed(body.device_id, time.time()):
             raise HTTPException(status_code=429, detail="换票过于频繁")
-        return issue_remote_token(jwt_secret, body.device_id)
+        payload = issue_device_token(database, jwt_secret, body.device_id)
+        # 签发新票即换代：旧链接（含泄露出去的那张）立刻作废，
+        # 已连着的远端页面一并踢下线，并回收旧 jti 的 App 名额
+        relay.kick_apps(body.device_id)
+        return payload
 
     @app.post("/api/relay/device-enroll")
     def relay_device_enroll(body: DeviceEnrollBody, request: Request):
@@ -439,6 +458,14 @@ def create_app(
             await websocket.close(code=4401)
             return
         app_key = attached["key"]
+        loop = asyncio.get_running_loop()
+        stop = asyncio.Event()
+
+        def closer() -> None:
+            # 可能从 HTTP 路由（线程池）调用，必须回到本连接的事件循环置位
+            loop.call_soon_threadsafe(stop.set)
+
+        relay.bind_app_closer(device_id, app_key, closer)
         try:
             plan = relay.frames_for(device_id, first.get("last_seq"), first.get("last_boot_id"))
             await websocket.send_text(json.dumps(plan, ensure_ascii=False))
@@ -451,8 +478,11 @@ def create_app(
                 send(json.dumps(frame, ensure_ascii=False) if frame is not None else raw)
                 return True
 
-            await _fanout(websocket, relay, device_id, on_text=forward, app_key=app_key)
+            await _fanout(
+                websocket, relay, device_id, on_text=forward, app_key=app_key, stop=stop
+            )
         finally:
+            relay.unbind_app_closer(device_id, app_key)
             # 断开/登出都要释放名额，否则名额泄漏会把第 5 个 App 误判成超限。
             relay.detach_app(device_id, app_key)
 

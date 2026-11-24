@@ -99,7 +99,7 @@ def _bridge_with_offline_relay():
 
     bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
 
-    def _pair_url(mobile: bool, reason=None):
+    def _pair_url(mobile: bool, reason=None, force_new: bool = False):
         if reason is not None:
             reason["code"] = "offline"
             reason["message"] = "云中转未连上，已使用局域网地址（手机需与电脑连同一 WiFi）"

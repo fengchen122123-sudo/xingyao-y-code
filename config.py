@@ -426,6 +426,8 @@ CLOUD_RELAY_TOKEN_KEY = "cloud_relay_token"
 CLOUD_RELAY_TOKEN_DEFAULT = ""
 CLOUD_RELAY_DEVICE_ID_KEY = "cloud_relay_device_id"
 CLOUD_RELAY_DEVICE_ID_DEFAULT = ""
+# 上一次签发的远端票（加密存储）：桌面重启后继续复用，避免自动换票把手机踢下线
+CLOUD_RELAY_REMOTE_TICKET_KEY = "cloud_relay_remote_ticket"
 
 if not os.path.exists(_CONFIG_FILE):
     default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -749,6 +751,7 @@ KNOWN_CONFIG_KEYS = frozenset({
     "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
     "feishu_notify_chat_id",
     "cloud_relay_enabled", "cloud_relay_url", "cloud_relay_token", "cloud_relay_device_id",
+    "cloud_relay_remote_ticket",
     "media_v1_migration_done",
     "strict_config",
     "route_request_overrides", "cache_keepalive_routes", "deepseek_cache_routes",

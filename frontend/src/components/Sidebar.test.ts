@@ -189,6 +189,46 @@ it('点击刷新按钮以 force_new 重新获取 token', async () => {
   expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,NEW');
 });
 
+it('刷新被网关限流时展示 refresh_notice 提示并保留当前二维码', async () => {
+  // 换票有频率限制（6 次/10 分钟）：刷新失败要明确告诉用户，否则二维码没变
+  // 会被当成「刷新按钮失灵」——正是这条链路上曾经的 bug 体验
+  const get_remote_bind_qr = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      url: 'https://xingyaocode.cn/xy/bot/m/dev-1?token=old',
+      token: 'old',
+      qr: 'data:image/png;base64,T0xE',
+      expires_in: 3600,
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      url: 'https://xingyaocode.cn/xy/bot/m/dev-1?token=old',
+      token: 'old',
+      qr: 'data:image/png;base64,T0xE',
+      expires_in: 3500,
+      refresh_notice: '刷新过于频繁，已保留当前链接（稍后再试）',
+    });
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  expect(wrapper.find('[data-test="remote-bind-refresh-notice"]').exists()).toBe(false);
+
+  await wrapper.find('[data-test="remote-bind-refresh"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  const notice = wrapper.find('[data-test="remote-bind-refresh-notice"]');
+  expect(notice.exists()).toBe(true);
+  expect(notice.text()).toContain('刷新过于频繁');
+  expect(wrapper.find('[data-test="remote-bind-modal"] img').attributes('src'))
+    .toBe('data:image/png;base64,T0xE');
+});
+
 it('永久有效（expires_in=0）时不做倒计时自动刷新', async () => {
   vi.useFakeTimers();
   try {

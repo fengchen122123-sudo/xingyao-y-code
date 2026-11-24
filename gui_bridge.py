@@ -7231,11 +7231,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         try:
             self._sync_cloud_relay_from_disk()
             fallback: Dict[str, str] = {}
-            public = self._cloud_relay_pair_url(mobile=bool(mobile), reason=fallback)
+            public = self._cloud_relay_pair_url(
+                mobile=bool(mobile), reason=fallback, force_new=bool(force_new)
+            )
             if public is not None:
                 from core.lan_server import build_pair_payload
 
-                return build_pair_payload(public["url"], public["token"], public["expires_in"])
+                payload = build_pair_payload(
+                    public["url"], public["token"], public["expires_in"]
+                )
+                notice = str(public.get("refresh_notice") or "")
+                if notice:
+                    payload["refresh_notice"] = notice
+                return payload
             srv = self._ensure_lan_server()
             if srv is None:
                 return {"ok": False, "msg": "远程服务启动失败"}
@@ -7259,7 +7267,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             return ""
 
     def _cloud_relay_pair_url(
-        self, mobile: bool, reason: Optional[Dict[str, str]] = None
+        self,
+        mobile: bool,
+        reason: Optional[Dict[str, str]] = None,
+        force_new: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """云中转公网二维码；不可用时返回 None（内部已兜住所有异常）。"""
         try:
@@ -7269,7 +7280,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             ttl = int(
                 data.get(config.REMOTE_TOKEN_TTL_KEY, config.REMOTE_TOKEN_TTL_DEFAULT) or 0
             )
-            return build_pair_url(self, mobile=mobile, ttl_seconds=ttl, reason=reason)
+            return build_pair_url(
+                self, mobile=mobile, ttl_seconds=ttl, reason=reason, force_new=force_new
+            )
         except Exception:
             logger.debug("云中转公网二维码不可用，回落局域网", exc_info=True)
             return None

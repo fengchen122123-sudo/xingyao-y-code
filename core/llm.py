@@ -166,6 +166,51 @@ def _is_deterministic_api_failure(exc):
         return False
 
 
+_RETRYABLE_STREAM_EXC_TYPE_MARKERS = (
+    "remoteprotocolerror",
+    "readerror",
+    "writeerror",
+    "networkerror",
+    "connecterror",
+    "connectionerror",
+    "connectionreseterror",
+    "connectionabortederror",
+    "brokenpipeerror",
+    "incompleteread",
+    "apiconnectionerror",
+)
+
+_RETRYABLE_STREAM_TEXT_MARKERS = (
+    "connectionterminated",
+    "server disconnected",
+    "connection reset",
+    "connection aborted",
+    "remote end closed",
+    "goaway",
+)
+
+
+def _is_retryable_stream_interruption(exc):
+    """流式阶段「对端主动断开连接」类异常，零产出时可换连接重发。
+
+    httpcore 收到 HTTP/2 GOAWAY 会把整条连接判死，并对当前流抛
+    RemoteProtocolError("<ConnectionTerminated ...>")——与请求内容无关，
+    换新连接重发完全等价。读超时、等待首字节超时、协议违规、用户取消
+    都不在此列。
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
+        return False
+    name = type(exc).__name__.lower()
+    if "localprotocolerror" in name:
+        return False
+    if any(marker in name for marker in _RETRYABLE_STREAM_EXC_TYPE_MARKERS):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _RETRYABLE_STREAM_TEXT_MARKERS)
+
+
 _KEY_RELATED_FAILURE_CATEGORIES = frozenset({
     "insufficient_quota",
     "auth_invalid",
@@ -2073,6 +2118,7 @@ def _chat_with_model_generator(
             cache_control_downgraded = False
             affinity_downgraded = False
             wait_started_at = None
+            prepared_request = None
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -2433,31 +2479,61 @@ def _chat_with_model_generator(
                     else:
                         raise api_err
 
-            stream_assembler = StreamAssembler(
-                keep_reasoning_fields=_supports_reasoning_fields(
-                    model_name, api_base
-                ),
-                keep_thinking_blocks=(
-                    str(model_name or "").split("/")[0].lower() == "anthropic"
-                ),
-                require_tool_call_reasoning=_requires_tool_call_reasoning(
-                    model_name, api_base
-                ),
-            )
-            first_token_time = None
-            for chunk in _stream_chunks_with_idle_notice(
-                response_stream, event_callback, raise_if_cancelled,
-                inflight_holder=inflight_holder, cancel_event=cancel_event,
-            ):
-                raise_if_cancelled()
-                if chunk is None:
-                    yield ""
-                    continue
-                if first_token_time is None:
-                    first_token_time = time.monotonic()
-                update = stream_assembler.consume(chunk)
-                if update.public_text:
-                    yield update.public_text
+            # 流式阶段「零产出 + 连接被对端回收」允许换连接重发一次：此时
+            # 用户还没看到任何内容，重发与首次请求字节完全等价；一旦已产出
+            # 可见内容，重发会造成重复，必须放弃并把异常交回上层兜底。
+            stream_reconnect_used = False
+            while True:
+                stream_assembler = StreamAssembler(
+                    keep_reasoning_fields=_supports_reasoning_fields(
+                        model_name, api_base
+                    ),
+                    keep_thinking_blocks=(
+                        str(model_name or "").split("/")[0].lower() == "anthropic"
+                    ),
+                    require_tool_call_reasoning=_requires_tool_call_reasoning(
+                        model_name, api_base
+                    ),
+                )
+                first_token_time = None
+                try:
+                    for chunk in _stream_chunks_with_idle_notice(
+                        response_stream, event_callback, raise_if_cancelled,
+                        inflight_holder=inflight_holder, cancel_event=cancel_event,
+                    ):
+                        raise_if_cancelled()
+                        if chunk is None:
+                            yield ""
+                            continue
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        update = stream_assembler.consume(chunk)
+                        if update.public_text:
+                            yield update.public_text
+                    break
+                except Exception as stream_err:
+                    if (
+                        stream_reconnect_used
+                        or prepared_request is None
+                        or stream_assembler.has_visible_output
+                        or not _is_retryable_stream_interruption(stream_err)
+                    ):
+                        raise
+                    stream_reconnect_used = True
+                    logger.warning(
+                        "模型流式连接被对端回收且本轮零产出，换新连接重发一次：%s",
+                        _sanitize_error_text(str(stream_err)),
+                    )
+                    _notify_event(event_callback, "status", {
+                        "message": "模型流式连接被服务端回收（本轮尚未产出内容），正在换新连接重发一次。",
+                    })
+                    try:
+                        response_stream.close()
+                    except Exception:
+                        pass
+                    response_stream, inflight_holder = _request_stream(
+                        prepared_request, cancel_event=cancel_event
+                    )
 
             _tail_chunks = getattr(response_stream, "chunks", None)
             if _tail_chunks:
