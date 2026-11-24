@@ -511,15 +511,18 @@ Y-code 默认注册 94 个工具（开启电脑操控后另附 `computer_action`
 
 ### 子代理（Subagent）
 
-通过 `run_subagent` 工具启动辅助 Agent，支持 5 种内置类型：
+通过 `run_subagent` 工具启动辅助 Agent，支持 6 种内置类型：
 
 | 类型 | 用途 | 默认超时 |
 |------|------|---------|
-| `explore` | 只读探索（预计超过 3 次工具调用的探索优先用） | 240s |
-| `implement` | 改代码 | 600s |
-| `test` | 跑测试与定位失败 | 480s |
-| `review` | 只读评审 | 300s |
-| `general` | 综合任务 | 600s |
+| `explore` | 只读探索代码与文件，没有命令 | 300s |
+| `operate` | 本机命令、技能脚本、内网取证，不改代码 | 900s |
+| `implement` | 改代码 | 900s |
+| `test` | 跑测试与定位失败 | 900s |
+| `review` | 只读评审，不执行命令 | 420s |
+| `general` | 综合任务，工具面最全（含 MCP） | 900s |
+
+需要本机命令、技能脚本或内网接口时用 `operate`。`explore` 做不了这些，也不要把本机缓存当成实时数据。计划项没指定类型时，`stage=plan` 派 `operate`，`stage=build` 派 `implement`，`stage=review` 派 `review`；计划内确实需要 `general` 的全部工具（含 MCP）时传 `force_general=true`。`plan` 阶段子代理的权限档封顶为 `confirm`：只读查询照常放行，写命令、删除、提交必须由用户当场批准（命令改动不在撤销范围内）。
 
 **自定义子代理**：在 `~/.ycode/agents/*.md`（用户级）或 `<cwd>/.ycode/agents/*.md`（项目级）创建 Markdown 文件，含 frontmatter 字段：`name` / `description` / `when_to_use` / `base_type` / `model` / `allowed_tools`。
 

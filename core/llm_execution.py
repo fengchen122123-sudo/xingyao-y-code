@@ -296,6 +296,32 @@ def _tool_call_activity_kinds(tool_calls):
     return used_write_tools, used_command_tools
 
 
+# 成功完成的这些角色子代理视为「真实执行了命令」：test 跑测试、operate 跑技能
+# 脚本与内网取证。计划门禁下主 Agent 不能自己调 execute_command，这两类角色是
+# 主要执行者；只认 test 会让 operate 跑出来的结果被误判成「未执行命令」。
+_SUBAGENT_COMMAND_EVIDENCE_TYPES = frozenset({"test", "operate"})
+
+_SUBAGENT_STATUS_COMPLETED = "completed"
+
+
+def _subagent_counts_as_command_evidence(subagent_type, result_content):
+    """子代理结果能否作为「本回合真实执行过命令」的证据。
+
+    只认命令型角色（test/operate）且结果为 status=completed；解析失败、
+    非对象、非 completed 一律不算，绝不把模糊内容当成通过证据。
+    """
+    role = str(subagent_type or "").strip().lower()
+    if role not in _SUBAGENT_COMMAND_EVIDENCE_TYPES:
+        return False
+    try:
+        payload = json.loads(str(result_content if result_content is not None else "{}"))
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("status") == _SUBAGENT_STATUS_COMPLETED
+
+
 def _claims_verification_without_evidence(
     final_text, used_write_tools, used_command_tools
 ):

@@ -1276,6 +1276,7 @@ from core.llm_execution import (
     _sandbox_outside_guard,
     _show_file_diff,
     _step_progress_observation,
+    _subagent_counts_as_command_evidence,
     _tool_call_activity_kinds,
     _tool_call_arguments,
     _tool_call_name,
@@ -3423,8 +3424,8 @@ def _chat_with_model_generator(
 
             substantive_op_count += _count_substantive_ops(tool_calls_list)
 
-            # 已成功完成（status == "completed"）的 test 子代理等同真实测试验证证据，
-            # 避免主代理把测试派发给 subagent_type="test" 后仍触发验证声明误报。
+            # 已成功完成（status == "completed"）的 test/operate 子代理等同真实命令
+            # 验证证据，避免主代理把测试或取证派发出去后仍触发验证声明误报。
             if not used_command_tools:
                 _tc_by_id = {
                     tc.get("id"): tc for tc in tool_calls_list if isinstance(tc, dict) and tc.get("id")
@@ -3438,14 +3439,11 @@ def _chat_with_model_generator(
                         _sub_args = json.loads((_tc.get("function") or {}).get("arguments") or "{}")
                     except (TypeError, ValueError):
                         _sub_args = {}
-                    if str((_sub_args or {}).get("subagent_type") or "").strip().lower() == "test":
-                        try:
-                            _sub_res = json.loads(str(_msg.get("content") or "{}"))
-                        except (TypeError, ValueError):
-                            _sub_res = {}
-                        if isinstance(_sub_res, dict) and _sub_res.get("status") == "completed":
-                            used_command_tools = True
-                            break
+                    if _subagent_counts_as_command_evidence(
+                        (_sub_args or {}).get("subagent_type"), _msg.get("content")
+                    ):
+                        used_command_tools = True
+                        break
 
             results = [record.message for record in records]
             followup_messages = [

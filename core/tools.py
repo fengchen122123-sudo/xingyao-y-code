@@ -80,6 +80,11 @@ _SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
         "novel_status", "novel_wordcount", "novel_audit",
     }),
     "review": _SUBAGENT_READ_ONLY_TOOLS,
+    # 本机取证：只读集合 ∪ execute_command。不给 write_file / edit_file / multi_edit，
+    # 避免「查数据」变成改仓库（只读集合里的 fetch_image 会落盘到 AI 输出目录，
+    # 属既有只读工具行为）。
+    # fetch_url 仍在集合里，但私网会被 SSRF 拒绝，内网要走 execute_command。
+    "operate": _SUBAGENT_READ_ONLY_TOOLS | frozenset({"execute_command"}),
     "general": None,
 }
 
@@ -87,6 +92,80 @@ _SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
 def default_subagent_allowed_tools(role: str):
     """内置角色默认工具白名单；未知角色按 general 处理（不限定）。"""
     return _SUBAGENT_DEFAULT_ALLOWED_TOOLS.get(role, None)
+
+
+# run_subagent 的 schema 默认值是 general。计划项没写具体角色时，general 和空值
+# 都表示「请按 stage 代选」，不能把分析项降成没有命令的 explore。
+_PLAN_STAGE_SUBAGENT_TYPES = {
+    "plan": "operate",
+    "build": "implement",
+    "review": "review",
+}
+
+# 内置角色名做小写归一：模型偶尔传 "Operate"/"Explore"，不能因为大小写
+# 掉进「自定义名字查不到 → 静默回退 general」的降级路径。
+_BUILTIN_SUBAGENT_ROLE_NAMES = frozenset(
+    {"explore", "operate", "implement", "test", "review", "general"}
+)
+
+# 可用次模型（便宜快）的角色：纯检索与跑测试。operate 要按技能脚本取实时数据、
+# 跟主模型节奏，不能落到次模型上。
+_SUBAGENT_SECONDARY_MODEL_ROLES = frozenset({"explore", "test"})
+
+
+def normalize_builtin_subagent_type(subagent_type: str) -> str:
+    """内置角色名转小写，自定义名字原样返回（注册中心的 name 区分大小写）。"""
+    raw = str(subagent_type or "").strip()
+    lowered = raw.lower()
+    return lowered if lowered in _BUILTIN_SUBAGENT_ROLE_NAMES else raw
+
+
+def resolve_plan_subagent_type(
+    subagent_type: str, stage: str, *, force_general: bool = False
+) -> str:
+    """计划项未指定具体角色时按 stage 选择子代理。
+
+    显式的 explore / operate / implement / test / review 以及自定义名字保持不变。
+    force_general=True 是显式出口：计划项合法 stage 只有 plan/build/review，
+    没有它的话 general（唯一含 MCP 工具的角色）在计划内永远不可达。
+    """
+    if force_general:
+        return "general"
+    chosen = normalize_builtin_subagent_type(subagent_type)
+    if chosen and chosen != "general":
+        return chosen
+    return _PLAN_STAGE_SUBAGENT_TYPES.get(str(stage or "").strip().lower(), "general")
+
+
+def _plan_stage_permission_mode(stage: str) -> str | None:
+    """plan 阶段子代理的权限档封顶：宽档降为 confirm，None 表示沿用父档位。
+
+    plan 阶段语义是「只读取证分析」。accept_edits/full 档下 execute_command 的
+    普通写命令（Set-Content / Copy-Item / Out-File）只判 NORMAL_MUTATION 直接放行，
+    会让子代理绕过「build 阶段才能改文件」的计划门禁，且命令改动的副作用不在
+    撤销范围内（execute_command 会登记 uncovered effects）。confirm 档下只读查询
+    仍自动放行，写操作必须由用户当场批准。
+    """
+    if str(stage or "").strip().lower() != "plan":
+        return None
+    from core import app_context as _app_context
+
+    parent_mode = str(_app_context.get_permission_mode() or "").strip()
+    if parent_mode in {"accept_edits", "full"}:
+        return "confirm"
+    return None
+
+
+def _subagent_skill_catalog() -> str:
+    try:
+        from core.skills import get_active_skills_catalog
+
+        return str(get_active_skills_catalog() or "").strip()
+    except Exception as error:
+        # 只降级为「本次没有技能目录」，但必须留痕：operate 的工作方式依赖
+        # 先读 SKILL.md，静默失效会让它退化成盲跑命令。
+        _logger.warning("子代理技能目录扫描失败，本次省略技能目录: %s", error)
+        return ""
 
 
 def _agent_display_name() -> str:
@@ -3532,26 +3611,30 @@ class SubagentManager:
         event_callback: Callable | None = None,
         task_id: str | None = None,
         tool_call_id: str = "",
+        permission_mode: str | None = None,
     ) -> str:
         if not 30 <= timeout_seconds <= 3600:
             raise ValueError("timeout_seconds must be between 30 and 3600")
         description = str(task_description or "").strip()
         if not description:
             raise ValueError("task_description must not be empty")
-        normalized_type = str(subagent_type or "general")
+        normalized_type = normalize_builtin_subagent_type(subagent_type or "general")
+        if not normalized_type:
+            normalized_type = "general"
         if model_config is None and self._uses_default_runner:
-            prefer_secondary = normalized_type in {"explore", "test"}
+            # explore/test 偏检索和跑测试，可用次模型。
+            # operate 要按技能脚本取实时数据，跟主模型。
+            prefer_secondary = normalized_type in _SUBAGENT_SECONDARY_MODEL_ROLES
             model_config = _snapshot_model_config(
                 prefer_secondary=prefer_secondary,
                 session_name=parent_session,
             )
 
-        # 加载自定义子 agent 配置：subagent_type 非内置 5 种时尝试从注册中心获取
+        # 加载自定义子 agent 配置：subagent_type 非内置角色时尝试从注册中心获取
         # 容错：加载失败回退到 None（_run_default_subagent 会按内置 general 处理）
         custom_config = None
-        if normalized_type and normalized_type not in {
-            "explore", "implement", "test", "review", "general"
-        }:
+        from core.subagent_registry import BUILTIN_SUBAGENT_TYPES
+        if normalized_type and normalized_type not in BUILTIN_SUBAGENT_TYPES:
             try:
                 from core.subagent_registry import get_custom_subagent
                 custom_config = get_custom_subagent(normalized_type)
@@ -3562,7 +3645,11 @@ class SubagentManager:
         # 权限档位随任务快照：子代理线程不继承调用线程的线程本地档位，
         # 必须在创建时（仍处于父回合线程）取值，_run_task 内再用 scope 恢复。
         from core import app_context as _app_context
-        _parent_permission_mode = _app_context.get_permission_mode()
+        # 调用方可显式指定更严的档位（见 run_subagent 的 plan 阶段封顶）；
+        # 未指定时沿用父回合快照。
+        _parent_permission_mode = (
+            str(permission_mode or "").strip() or _app_context.get_permission_mode()
+        )
         _init_model, _, _, _init_model_id = _unpack_model_config(model_config)
         task = SubagentTask(
             task_id=str(task_id or _new_subagent_task_id()),
@@ -4731,17 +4818,18 @@ class SubagentManager:
 
         role_instructions = {
             "explore": (
-                "只读探索代码和资料，不修改文件，不执行有副作用命令。"
+                "只读探索代码和资料，不修改文件，不执行命令。"
                 "尽可能并行发起多个 search_code/glob_files/read_file 调用以最大化速度："
                 "用 glob_files 按模式定位文件，用 search_code 搜索内容，用 read_file 读取已知路径。"
                 "【工具失败降级】任一工具失败时优先尝试同类替代工具，不要直接返回失败："
                 "  · get_weather 失败（403/超时/SSRF）→ search_news 搜'城市名 天气'或 fetch_url 抓天气网页"
-                "  · fetch_url 失败 → 检查 URL 拼写，或改用 search_news 搜索相同关键词"
+                "  · fetch_url 失败 → 检查 URL 拼写，或改用 search_news 搜索相同关键词。"
+                "    私网地址被 SSRF 拒绝是预期结果，不要重试。"
                 "  · search_news 失败 → 可能网络受限，明确告知主 Agent 当前环境无法联网"
                 "  · search_code 无结果 → 改用 glob_files 按文件名模式查找，或扩大搜索范围"
                 "  · read_file 路径不存在 → 先用 list_directory 或 glob_files 定位正确路径"
-                "【本地优先】获取系统时间/日期/主机信息等本地可完成的任务，优先用 execute_command "
-                "执行本地命令（如 PowerShell 的 Get-Date），不要依赖联网工具。"
+                "本角色没有 execute_command。任务需要本机命令、技能脚本或内网接口时，"
+                "立即结束并说明应改派 operate，不要把本机缓存文件写成实时结果。"
                 "所有替代尝试都失败后，明确说明失败原因和已尝试的替代方案，由主 Agent 决策下一步。"
             ),
             "implement": (
@@ -4755,21 +4843,25 @@ class SubagentManager:
                 "改用更细粒度的命令（如单测）重试，避免一次跑全量测试。"
             ),
             "review": (
-                "只读审查实现和测试结果，列出风险和未覆盖项，不修改文件。"
+                "只读审查实现和测试结果，列出风险和未覆盖项，不修改文件，不执行命令。"
+                "需要 git diff、跑测试或访问内网时，结束并说明应改派 operate 或 test。"
                 "【工具失败降级】read_file/search_code 失败时参考 explore 角色的降级策略。"
+            ),
+            "operate": (
+                "负责本机取证和实时数据：执行命令、运行技能脚本、访问内网接口。"
+                "不修改项目源代码；没有 write_file/edit_file。需要改代码时结束并说明应交 implement。"
+                "先对照可用技能目录，相关技能必须先 read_file 读取 SKILL.md，再按其中的命令执行。"
+                "私网地址不要用 fetch_url，SSRF 会拒绝；改用 execute_command 调用本机脚本或 pwsh/curl。"
+                "磁盘上的缓存 JSON、快照、上次导出的结果不是实时数据；技能要求调接口时必须真的执行命令。"
+                "命令只用于读取和取证，不要用命令改文件、安装依赖、提交或删除。"
+                "【工具失败降级】命令失败时先读错误输出，修正参数后最多重试 1 次；"
+                "仍失败就说明命令、退出码和错误，不要改用缓存蒙混。"
             ),
             "general": (
                 "独立完成任务，按需使用可用工具。"
                 "【工具失败降级】任一工具失败时优先尝试同类替代工具，"
                 "所有替代都失败后明确说明原因，由主 Agent 决策下一步。"
             ),
-        }
-        role_when_to_use = {
-            "explore": "只读探索代码库、查找文件、搜索内容、回答代码相关问题时使用，预期会超过 3 次工具调用的探索任务优先用此类型。",
-            "implement": "需要修改代码、实现功能、修复 bug 时使用，会读写文件和执行命令。",
-            "test": "需要运行测试、定位失败根因、验证实现时使用，可执行命令但不修改业务代码。",
-            "review": "需要审查代码质量、安全性、可维护性时使用，只读不修改。",
-            "general": "独立完成综合性任务时使用，按需调用所有可用工具。",
         }
         if custom:
             role = custom.get("base_type", "general")
@@ -4789,10 +4881,15 @@ class SubagentManager:
             else default_subagent_allowed_tools(role)
         )
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
+        # 技能目录与主代理同源。子代理要先读到 SKILL.md 才知道该跑哪条命令；
+        # 扫描失败时省略目录，不阻断子任务。
+        skill_catalog = _subagent_skill_catalog()
+        if skill_catalog:
+            instruction_text = instruction_text + "\n" + skill_catalog
         # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪 / 信源分级五条对内置与自定义子代理
         # 一律生效。拼进 instruction_text 而非仅在首请求拼接——后续「续写总结」请求
         # （cont_messages）同样复用 instruction_text，两处请求自动带上同一份约束。
-        # 顺序：身份正文在前、公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
+        # 顺序：身份正文、技能目录在前，公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
         instruction_text = instruction_text + "\n" + build_subagent_common_block(allowed_tools)
         messages = [
             {
@@ -5108,6 +5205,7 @@ subagent_manager = SubagentManager()
 _SUBAGENT_DEFAULT_TIMEOUTS = {
     "explore": 300,
     "review": 420,
+    "operate": 900,
     "test": 900,
     "implement": 900,
     "general": 900,
@@ -5117,6 +5215,10 @@ _SUBAGENT_DEFAULT_TIMEOUTS = {
 # 超过该预算的大任务应转后台（后台默认预算按系数放宽）。
 SUBAGENT_FOREGROUND_MAX_TIMEOUT = 900
 SUBAGENT_BACKGROUND_TIMEOUT_FACTOR = 1.5
+
+# plan 阶段子代理的默认预算上限：该阶段是取证与分析，不是长任务执行；
+# 一个分析项拖满 900s 会把整个计划回合卡住 15 分钟。显式传入的预算不受影响。
+PLAN_STAGE_SUBAGENT_TIMEOUT = 600
 
 
 def make_authorized_verification_runner(
@@ -5181,6 +5283,7 @@ def run_subagent(
     subagent_type="general",
     plan_item_id="",
     event_callback=None,
+    force_general=False,
 ):
     # 子代理深度硬限制：防止无限递归（参考 OpenCode limit subagent nesting depth）
     # 主代理线程 depth=0，子代理 depth=1，孙代理 depth=2，重孙 depth=3 → 超限拒绝
@@ -5256,6 +5359,10 @@ def run_subagent(
         parent_session = parent_session or app_context.get_current_session()
         parent_turn_id = parent_turn_id or f"standalone-{uuid.uuid4().hex[:8]}"
     scheduler = None
+    plan_item = None
+    plan_stage = ""
+    # plan 阶段权限封顶值（None = 沿用父档位），见 _plan_stage_permission_mode
+    subagent_permission_mode = None
     if plan_item_id:
         from core.task_scheduler import get_default_scheduler
 
@@ -5264,6 +5371,8 @@ def run_subagent(
             (item for item in scheduler.plan.snapshot() if item["id"] == str(plan_item_id)),
             None,
         )
+        if plan_item is not None:
+            plan_stage = str(plan_item.get("stage") or "").strip().lower()
         if plan_item is None:
             # 计划项查无此项时必须区分两种根因，否则会把平台侧路由缺陷
             # 谎报成“计划项不存在”，误导模型放弃或改写计划：
@@ -5300,12 +5409,11 @@ def run_subagent(
                 "plan_item_id": str(plan_item_id),
                 "error": "用户输入准备项必须由 ask_user 执行，不能分配给子代理。",
             }, ensure_ascii=False)
-        if plan_item is not None and (not subagent_type or subagent_type == "general"):
-            subagent_type = {
-                "plan": "explore",
-                "build": "implement",
-                "review": "review",
-            }.get(plan_item.get("stage"), "general")
+        if plan_item is not None:
+            subagent_type = resolve_plan_subagent_type(
+                subagent_type, plan_stage, force_general=bool(force_general)
+            )
+            subagent_permission_mode = _plan_stage_permission_mode(plan_stage)
         if plan_item is not None and bool(plan_item.get("takeover_required", False)):
             # 首次超时后主 Agent 已接管（或排队等待接管）：同一计划项禁止再次
             # 派发子代理（timed_out → takeover ≠ retry → 新子代理）。
@@ -5461,6 +5569,8 @@ def run_subagent(
     # 后台任务不阻塞用户，默认预算再放宽 1.5 倍；显式传入的预算不做放大。
     if timeout_seconds is None:
         timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 900)
+        if plan_stage == "plan":
+            timeout_seconds = min(timeout_seconds, PLAN_STAGE_SUBAGENT_TIMEOUT)
         if run_in_background:
             timeout_seconds = min(
                 3600,
@@ -5481,6 +5591,7 @@ def run_subagent(
             event_callback=event_callback,
             task_id=delegated_task_id if scheduler is not None else None,
             tool_call_id=_current_tool_call_id(),
+            permission_mode=subagent_permission_mode,
         )
     except Exception as error:
         if scheduler is not None and plan_item_id:

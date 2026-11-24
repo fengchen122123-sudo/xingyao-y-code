@@ -303,6 +303,30 @@ def test_tool_call_activity_kinds_classification():
     assert kinds([]) == (False, False)
 
 
+def test_subagent_command_evidence_matrix():
+    from core.llm_execution import _subagent_counts_as_command_evidence as f
+
+    completed = '{"status": "completed", "result": "ok"}'
+    # 命令型角色（test 跑测试 / operate 跑技能脚本与内网取证）+ completed 才算
+    assert f("test", completed) is True
+    assert f("operate", completed) is True
+    assert f("OPERATE", completed) is True
+    assert f(" operate ", completed) is True
+    # 非命令型角色不能冒充「本回合执行过命令」的证据
+    assert f("explore", completed) is False
+    assert f("review", completed) is False
+    assert f("general", completed) is False
+    assert f("", completed) is False
+    assert f(None, completed) is False
+    # 非 completed / 非对象 / 解析失败都不算，绝不把模糊内容当成通过证据
+    assert f("operate", '{"status": "failed"}') is False
+    assert f("operate", '{"status": "running"}') is False
+    assert f("operate", "not json") is False
+    assert f("operate", "[]") is False
+    assert f("operate", None) is False
+    assert f("operate", "") is False
+
+
 def test_verify_claim_nudge_injected_once_then_converges(mocker):
     mocker.patch("core.llm._claims_verification_without_evidence", return_value=True)
 

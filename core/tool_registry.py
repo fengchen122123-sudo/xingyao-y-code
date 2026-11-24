@@ -1046,8 +1046,14 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
                     "type": "string",
                     "default": "general",
                     "description": (
-                        "子 Agent 类型。内置：explore（只读探索）/ implement（修改代码）/ "
-                        "test（运行测试）/ review（只读审查）/ general（综合）。"
+                        "子 Agent 类型。内置：explore（只读探索代码，无命令）/ "
+                        "operate（本机命令、技能脚本、内网取证，不改代码）/ "
+                        "implement（修改代码）/ test（运行测试）/ review（只读审查）/ "
+                        "general（综合，工具面最全，含 MCP）。"
+                        "需要本机命令、技能脚本或内网数据时用 operate，不要用 explore。"
+                        "带 plan_item_id 时：未传或传 general 会按 stage 代选 "
+                        "（plan→operate、build→implement、review→review）；"
+                        "确实需要 general 的全部工具（含 MCP）时传 force_general=true。"
                         "也可传 ~/.ycode/agents/*.md 中定义的自定义子 agent name；"
                         "自定义子 agent 加载失败时自动回退为 general。"
                     ),
@@ -1056,6 +1062,14 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
                     "type": "string",
                     "default": "",
                     "description": "与当前计划项关联的 ID；有计划时必须填写。",
+                },
+                "force_general": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "仅带 plan_item_id 时有意义：为 true 时跳过按 stage 代选，"
+                        "强制用 general（需要 MCP 等全量工具时用）。"
+                    ),
                 },
                 "run_in_background": {"type": "boolean", "default": False},
             }, ["task_description"]),

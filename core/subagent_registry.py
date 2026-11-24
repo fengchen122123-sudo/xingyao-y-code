@@ -6,7 +6,7 @@ import threading
 
 from core.workspace_context import get_workdir
 
-BUILTIN_SUBAGENT_TYPES = {"explore", "implement", "test", "review", "general"}
+BUILTIN_SUBAGENT_TYPES = {"explore", "implement", "test", "review", "operate", "general"}
 
 _FINGERPRINT_HASH_MAX_BYTES = 256 * 1024
 
