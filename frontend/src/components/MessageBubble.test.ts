@@ -570,3 +570,79 @@ describe('MessageBubble 登录过期入口', () => {
     wrapper.unmount();
   });
 });
+
+describe('MessageBubble 导出目录入口', () => {
+  it('导出成功提示显示「打开目录」按钮，点击通过桥定位到导出文件', async () => {
+    const reveal = vi.fn().mockResolvedValue({ ok: true });
+    (window as any).pywebview = { api: { reveal_in_explorer: reveal } };
+    const exportPath = 'C:\\Users\\冯晨昊\\.ycode\\exports\\会话_20261122.html';
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'notice', content: `导出成功: ${exportPath}` } },
+    });
+
+    try {
+      const btn = wrapper.get('[data-test="notice-open-export-dir"]');
+      expect(btn.text()).toContain('打开目录');
+      await btn.trigger('click');
+      await flushPromises();
+      expect(reveal).toHaveBeenCalledTimes(1);
+      expect(reveal).toHaveBeenCalledWith(exportPath);
+    } finally {
+      wrapper.unmount();
+      delete (window as any).pywebview;
+    }
+  });
+
+  it('旧后端缺少 reveal_in_explorer 时回退打开导出目录', async () => {
+    const openFolder = vi.fn().mockResolvedValue({ ok: true });
+    (window as any).pywebview = { api: { open_folder_in_explorer: openFolder } };
+    const exportPath = 'C:\\Users\\冯晨昊\\.ycode\\exports\\会话_20261122.md';
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'notice', content: `导出成功: ${exportPath}` } },
+    });
+
+    try {
+      await wrapper.get('[data-test="notice-open-export-dir"]').trigger('click');
+      await flushPromises();
+      expect(openFolder).toHaveBeenCalledTimes(1);
+      expect(openFolder).toHaveBeenCalledWith('C:\\Users\\冯晨昊\\.ycode\\exports');
+    } finally {
+      wrapper.unmount();
+      delete (window as any).pywebview;
+    }
+  });
+
+  it('普通提示、导出失败或空路径的导出成功提示不显示按钮', () => {
+    for (const content of [
+      '已切换活动模型: k3-256k',
+      '导出失败: 磁盘空间不足',
+      '导出成功',
+      '导出成功:   ',
+    ]) {
+      const wrapper = mount(MessageBubble, {
+        props: { msg: { role: 'notice', content } },
+      });
+      expect(wrapper.find('[data-test="notice-open-export-dir"]').exists()).toBe(false);
+      wrapper.unmount();
+    }
+  });
+
+  it('远端非本机回环宿主访问时不显示打开目录按钮', () => {
+    const origLocation = window.location;
+    Object.defineProperty(window, 'location', {
+      value: { ...origLocation, hostname: '192.168.1.50' },
+      configurable: true,
+    });
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'notice', content: '导出成功: C:\\Users\\x\\.ycode\\exports\\a.html' } },
+    });
+    try {
+      expect(wrapper.find('[data-test="notice-open-export-dir"]').exists()).toBe(false);
+    } finally {
+      wrapper.unmount();
+      Object.defineProperty(window, 'location', { value: origLocation, configurable: true });
+    }
+  });
+});

@@ -34,14 +34,13 @@ class _FakeBridge:
 
 @pytest.fixture
 def relay_config(monkeypatch):
-    monkeypatch.setattr(
-        config,
-        "_load",
-        lambda: {
-            config.CLOUD_RELAY_URL_KEY: "wss://example.com/xy/bot/relay/device",
-            config.CLOUD_RELAY_TOKEN_KEY: "plain-device-token",
-        },
-    )
+    data = {
+        config.CLOUD_RELAY_URL_KEY: "wss://example.com/xy/bot/relay/device",
+        config.CLOUD_RELAY_TOKEN_KEY: "plain-device-token",
+    }
+    monkeypatch.setattr(config, "_load", lambda: data)
+    # 持久化写盘换成内存副本，测试不碰真实 config.json
+    monkeypatch.setattr(config, "save_config_value", lambda key, value: data.__setitem__(key, value) is None)
     monkeypatch.setattr(portal, "_TICKET_CACHE", {})
     monkeypatch.setattr(portal, "device_token", lambda: "plain-device-token")
     monkeypatch.setattr(
@@ -104,7 +103,7 @@ def test_bind_qr_prefers_public_url_when_relay_connected(monkeypatch):
     monkeypatch.setattr(
         bridge,
         "_cloud_relay_pair_url",
-        lambda mobile, reason=None: {
+        lambda mobile, reason=None, force_new=False: {
             "url": "https://example.com/xy/bot/m/dev-1?token=jwt",
             "token": "jwt",
             "expires_in": 3600,
@@ -122,9 +121,113 @@ def test_bind_qr_falls_back_to_lan_when_relay_unavailable(monkeypatch):
 
     bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
     monkeypatch.setattr(
-        bridge, "_cloud_relay_pair_url", lambda mobile, reason=None: None
+        bridge,
+        "_cloud_relay_pair_url",
+        lambda mobile, reason=None, force_new=False: None,
     )
     monkeypatch.setattr(bridge, "_ensure_lan_server", lambda: None)
     result = bridge.get_remote_bind_qr(mobile=True)
     assert result["ok"] is False
     assert "启动失败" in result["msg"]
+
+
+def test_force_new_bypasses_ticket_cache(relay_config, monkeypatch):
+    """用户点「刷新」必须真去网关换新票，不能被本地换票缓存吞掉。"""
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    tokens = iter(["jwt-old", "jwt-new"])
+
+    def _ticket(base, device_id, token):
+        return {"token": next(tokens), "expires_at": int(time.time()) + 3600}
+
+    monkeypatch.setattr(portal, "request_ticket", _ticket)
+    bridge = _FakeBridge(_FakeService(True, "dev-1"))
+    first = portal.build_pair_url(bridge, mobile=True)
+    cached = portal.build_pair_url(bridge, mobile=True)
+    refreshed = portal.build_pair_url(bridge, mobile=True, force_new=True)
+    assert first["token"] == cached["token"] == "jwt-old"
+    assert refreshed["token"] == "jwt-new"
+
+
+def test_force_new_keeps_cached_link_when_exchange_fails(relay_config, monkeypatch):
+    """换票被网关限流拒绝时，刷新保留仍有效的旧链接并给出提示，不能直接失败。"""
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    bridge = _FakeBridge(_FakeService(True, "dev-1"))
+    original = portal.build_pair_url(bridge, mobile=True)
+    assert original is not None
+
+    monkeypatch.setattr(portal, "request_ticket", lambda base, device_id, token: None)
+    refreshed = portal.build_pair_url(bridge, mobile=True, force_new=True)
+    assert refreshed is not None
+    assert refreshed["token"] == original["token"]
+    assert refreshed.get("refresh_notice")
+
+
+def test_persisted_ticket_survives_restart(relay_config, monkeypatch):
+    """桌面重启后要能读回上次的票：否则自动换票会把手机里正在用的链接踢下线。"""
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    bridge = _FakeBridge(_FakeService(True, "dev-1"))
+    first = portal.build_pair_url(bridge, mobile=True)
+    assert first["token"] == "remote-jwt"
+
+    portal._TICKET_CACHE.clear()  # 模拟进程重启：内存缓存丢失
+    calls = []
+
+    def _explode(base, device_id, token):
+        calls.append(device_id)
+        return {"token": "should-not-be-called", "expires_at": int(time.time()) + 3600}
+
+    monkeypatch.setattr(portal, "request_ticket", _explode)
+    again = portal.build_pair_url(bridge, mobile=True)
+    assert calls == []
+    assert again["token"] == "remote-jwt"
+
+
+def test_force_new_replaces_persisted_ticket_and_warns(relay_config, monkeypatch):
+    """显式刷新要换新票、覆盖持久化缓存，并明确告知旧链接已失效。"""
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    tokens = iter(["jwt-old", "jwt-new"])
+    monkeypatch.setattr(
+        portal,
+        "request_ticket",
+        lambda base, device_id, token: {
+            "token": next(tokens),
+            "expires_at": int(time.time()) + 3600,
+        },
+    )
+    bridge = _FakeBridge(_FakeService(True, "dev-1"))
+    first = portal.build_pair_url(bridge, mobile=True)
+    refreshed = portal.build_pair_url(bridge, mobile=True, force_new=True)
+    assert first["token"] == "jwt-old"
+    assert refreshed["token"] == "jwt-new"
+    assert "失效" in refreshed["refresh_notice"]
+
+    portal._TICKET_CACHE.clear()
+    monkeypatch.setattr(
+        portal,
+        "request_ticket",
+        lambda *a: {"token": "no-more", "expires_at": int(time.time()) + 3600},
+    )
+    restored = portal.build_pair_url(bridge, mobile=True)
+    assert restored["token"] == "jwt-new"
+
+
+def test_bind_qr_passes_force_new_to_relay(monkeypatch):
+    """刷新按钮的 force_new 必须一路传到云中转换票，并把刷新提示透传给前端。"""
+    import gui_bridge
+
+    bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
+    seen = {}
+
+    def _pair_url(mobile, reason=None, force_new=False):
+        seen["force_new"] = force_new
+        return {
+            "url": "https://example.com/xy/bot/m/dev-1?token=jwt",
+            "token": "jwt",
+            "expires_in": 3600,
+            "refresh_notice": "刷新过于频繁",
+        }
+
+    monkeypatch.setattr(bridge, "_cloud_relay_pair_url", _pair_url)
+    result = bridge.get_remote_bind_qr(force_new=True, mobile=True)
+    assert seen["force_new"] is True
+    assert result["refresh_notice"] == "刷新过于频繁"

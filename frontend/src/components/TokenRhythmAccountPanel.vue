@@ -57,6 +57,37 @@
         >最近到期 {{ temporaryExpireText }}<template v-if="temporaryNearestText">{{ ` ${temporaryNearestText}` }}</template></span>
       </div>
 
+      <div
+        v-if="activeModelCredits.length"
+        class="tr-acc-model-gifts"
+        data-test="tr-acc-model-gifts"
+      >
+        <div class="tr-acc-model-gifts-head">
+          <span class="tr-acc-model-gifts-label">模型专属赠金</span>
+          <span
+            class="tr-acc-model-gifts-total"
+            data-test="tr-acc-model-gifts-total"
+          >共 {{ modelCreditsTotalText }}</span>
+        </div>
+        <ul class="tr-acc-model-gifts-list">
+          <li
+            v-for="item in activeModelCredits"
+            :key="item.key"
+            class="tr-acc-model-gift-item"
+            data-test="tr-acc-model-gift-item"
+            :title="item.tip"
+          >
+            <span class="tr-acc-model-gift-name" data-test="tr-acc-model-gift-name">{{ item.name }}</span>
+            <span
+              v-if="item.expireShort"
+              class="tr-acc-model-gift-expire"
+              data-test="tr-acc-model-gift-expire"
+            >{{ item.expireShort }}到期</span>
+            <b class="tr-acc-model-gift-amount" data-test="tr-acc-model-gift-amount">{{ item.amountText }}</b>
+          </li>
+        </ul>
+      </div>
+
       <div class="tr-acc-usage">
         <div class="tr-acc-cell">
           <b class="tr-acc-num" data-test="tr-acc-calls">{{ callsText }}</b>
@@ -234,6 +265,82 @@ const temporaryNearestText = computed(() => {
   return withCurrency(amount);
 });
 
+function creditAmountText(num: number): string {
+  if (!Number.isFinite(num) || num <= 0) return PLACEHOLDER;
+  if (num >= 0.01) return withCurrency(num.toFixed(2));
+  const small = num.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+  if (small === '0' || small === '0.0000') {
+    return currency.value === 'CNY' ? '<¥0.0001' : `<0.0001 ${currency.value}`;
+  }
+  return withCurrency(small);
+}
+
+function formatShortExpireDate(iso: unknown): string {
+  const raw = String(iso ?? '').trim();
+  if (!raw) return '';
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return '';
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  if (date.getFullYear() !== new Date().getFullYear()) {
+    return `${date.getFullYear()}-${month}-${day}`;
+  }
+  return `${month}-${day}`;
+}
+
+interface ModelCreditRow {
+  key: string;
+  name: string;
+  amountText: string;
+  expireShort: string;
+  tip: string;
+  remainingUnits: number;
+}
+
+const activeModelCredits = computed<ModelCreditRow[]>(() => {
+  const rawList = overview.value?.model_credits;
+  if (!Array.isArray(rawList)) return [];
+  const rows: ModelCreditRow[] = [];
+  for (let i = 0; i < rawList.length; i += 1) {
+    const item = rawList[i];
+    if (!item || typeof item !== 'object') continue;
+    const remaining = Number((item as Record<string, any>).remaining_cny);
+    if (!Number.isFinite(remaining) || remaining <= 0) continue;
+    const modelId = String((item as Record<string, any>).model_id || '').trim();
+    const modelName = String((item as Record<string, any>).model_name || modelId || '模型专属赠金').trim();
+    const grantedNum = Number((item as Record<string, any>).granted_cny);
+    const expiresAt = (item as Record<string, any>).expires_at;
+    const expireFull = formatExpireDate(expiresAt);
+    const expireShort = formatShortExpireDate(expiresAt);
+    const remainingDisplay = creditAmountText(remaining);
+    const tipParts = [
+      modelId && modelId !== modelName ? `${modelName} (${modelId})` : modelName,
+      `剩余 ${remainingDisplay}`,
+    ];
+    if (Number.isFinite(grantedNum) && grantedNum > 0) {
+      tipParts.push(`初始 ${creditAmountText(grantedNum)}`);
+    }
+    if (expireFull) {
+      tipParts.push(`到期 ${expireFull}`);
+    }
+    const id = String((item as Record<string, any>).id || '').trim();
+    rows.push({
+      key: id || `${modelId || modelName}-${i}`,
+      name: modelName,
+      amountText: remainingDisplay,
+      expireShort,
+      tip: tipParts.join(' · '),
+      remainingUnits: Math.round(remaining * 1e8),
+    });
+  }
+  return rows;
+});
+
+const modelCreditsTotalText = computed(() => {
+  const totalUnits = activeModelCredits.value.reduce((acc, item) => acc + item.remainingUnits, 0);
+  return creditAmountText(totalUnits / 1e8);
+});
+
 function maskPhone(phone: string): string {
   const digits = phone.replace(/\s+/g, '');
   if (digits.length < 7) return digits;
@@ -349,6 +456,8 @@ onBeforeUnmount(() => {
   position: fixed;
   z-index: 1200;
   box-sizing: border-box;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
   padding: 14px;
   background: #fff;
   color: #111;
@@ -500,6 +609,70 @@ onBeforeUnmount(() => {
   margin-left: auto;
   font-size: 10.5px;
   color: #a8a8a8;
+  white-space: nowrap;
+}
+.tr-acc-model-gifts {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fafafa;
+}
+.tr-acc-model-gifts-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.tr-acc-model-gifts-label {
+  font-size: 11px;
+  color: #8a8a8a;
+}
+.tr-acc-model-gifts-total {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #333;
+  font-variant-numeric: tabular-nums;
+}
+.tr-acc-model-gifts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.tr-acc-model-gift-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  line-height: 1.4;
+}
+.tr-acc-model-gift-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: #333;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tr-acc-model-gift-expire {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #a8a8a8;
+  white-space: nowrap;
+}
+.tr-acc-model-gift-amount {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  color: #111;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .tr-acc-usage {

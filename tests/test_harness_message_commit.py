@@ -281,6 +281,35 @@ def test_rename_session_keeps_turn_attached_by_session_id(tmp_path):
     ).fetchone() == ("renamed",)
 
 
+def test_commit_after_mid_turn_rename_uses_turn_session_id(tmp_path):
+    """回合运行中改名后，提交必须按 turn 绑定的 session_id 归属而不是旧名字。"""
+    manager, journal, turn_id, step_id = _started_step(tmp_path)
+
+    assert manager.rename_session("session", "renamed") == (True, "renamed")
+
+    ids = journal.commit_messages(
+        "session",
+        turn_id,
+        step_id,
+        [("assistant", "answer")],
+        [
+            _committed_event(
+                HarnessEventKind.ASSISTANT_COMMITTED,
+                step_id,
+                0,
+            )
+        ],
+    )
+
+    assert len(ids) == 1
+    assert manager.conn.execute(
+        "SELECT sessions.session_name FROM messages "
+        "JOIN sessions ON sessions.id = messages.session_id "
+        "WHERE messages.id = ?",
+        (ids[0],),
+    ).fetchone() == ("renamed",)
+
+
 def test_undo_keeps_event_but_nulls_deleted_message_reference(tmp_path):
     manager, journal, turn_id, step_id = _started_step(tmp_path)
     manager.add_message("session", "user", "question")

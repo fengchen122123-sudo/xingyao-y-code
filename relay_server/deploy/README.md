@@ -31,6 +31,11 @@ npx vite build                                                  # base 已是 /m
 
 ## 3. 运行环境
 
+> **Python 必须是 3.11 或更高。** 锁定的 `starlette==1.10.0` 的 `Requires-Python` 就是 `>=3.11`，
+> Ubuntu 22.04 自带的 3.10、20.04 自带的 3.8 都不够，需先 `sudo apt install python3.11 python3.11-venv`
+> 再用它创建 venv。`requirements-relay.txt` 已把所有传递依赖锁到生产实测版本，
+> 升级其中任何一项都要整套重测（fastapi / starlette / pydantic 互相牵制）。
+
 ```bash
 python3 -m venv /srv/relay/venv
 /srv/relay/venv/bin/pip install -r /srv/relay/requirements-relay.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -53,6 +58,10 @@ RELAY_MOBILE_DIR=/srv/relay/static/mobile、RELAY_SHIM_PATH=/srv/relay/static/mo
   - `sudo nginx -t` 通过才 reload。官网 root/SSL/其余 location 不动。
 
 ## 5. 设备与桌面配置
+
+> `create-device` 会用 `RELAY_DB_PATH` 指向的库写设备记录，**必须与服务端 `relay.env` 里
+> `RELAY_DB_PATH` 一字不差**；漏了它命令会落到当前目录的 `relay.db`，建出一份服务读不到的
+> 孤儿库，表现就是换票一直 `401 设备令牌无效`、手机连不上。库文件属 root，命令要走 `sudo`。
 
 ```bash
 sudo bash -c 'set -a; . /etc/relay/relay.env; set +a; cd /srv/relay && venv/bin/python -m relay_server create-device --name <名字>'

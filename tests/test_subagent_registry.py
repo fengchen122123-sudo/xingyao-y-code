@@ -69,6 +69,7 @@ def test_parse_minimal_frontmatter(tmp_path, monkeypatch):
 def test_builtin_name_collision_skipped(tmp_path, monkeypatch):
     _reset_cache()
     _write_agent(tmp_path / "explore.md", "name: explore", "覆盖内置 explore？不行。")
+    _write_agent(tmp_path / "operate.md", "name: operate", "覆盖内置 operate？不行。")
     _write_agent(tmp_path / "general.md", "name: General", "覆盖内置 general？不行。")
     _write_agent(tmp_path / "valid.md", "name: custom-explorer", "这个可以。")
     monkeypatch.setattr(reg, "get_agent_search_dirs", lambda: [str(tmp_path)])
@@ -78,6 +79,7 @@ def test_builtin_name_collision_skipped(tmp_path, monkeypatch):
     names = [s["name"] for s in subagents]
     assert "custom-explorer" in names
     assert "explore" not in names
+    assert "operate" not in names
     assert "General" not in names
 
 

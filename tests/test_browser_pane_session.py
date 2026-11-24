@@ -267,3 +267,23 @@ def test_tool_not_visible_error_is_chinese(monkeypatch):
 
     assert result["ok"] is False
     assert "不在前台" in result["error"]
+
+
+def test_set_active_session_does_not_clobber_already_visible_target_surface(monkeypatch):
+    d = _dummy(monkeypatch, "B")
+    d._embedded_browser._visible = True
+    d._browser_pane_owner_session = "B"
+    d._browser_pane_mark_content("B")
+
+    result = d.browser_pane_set_active_session("B")
+
+    assert result == {"ok": True, "session_name": "B", "activated": False}
+    assert d._embedded_browser.calls == []
+
+    d._browser_pane_owner_session = "A"
+    d._browser_pane_mark_content("A")
+    result2 = d.browser_pane_set_active_session("B")
+
+    assert result2 == {"ok": True, "session_name": "B", "activated": False}
+    assert d._embedded_browser.calls == [("hide",)]
+

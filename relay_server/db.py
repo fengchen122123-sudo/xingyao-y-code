@@ -23,6 +23,9 @@ def connect(path) -> sqlite3.Connection:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(devices)").fetchall()}
     if "device_code" not in cols:
         conn.execute("ALTER TABLE devices ADD COLUMN device_code TEXT")
+    if "active_jti" not in cols:
+        # 同一设备只保留一张有效远端票：刷新后旧链接立即作废（单活语义）
+        conn.execute("ALTER TABLE devices ADD COLUMN active_jti TEXT")
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_device_code

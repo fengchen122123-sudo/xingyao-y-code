@@ -296,6 +296,32 @@ def _tool_call_activity_kinds(tool_calls):
     return used_write_tools, used_command_tools
 
 
+# 成功完成的这些角色子代理视为「真实执行了命令」：test 跑测试、operate 跑技能
+# 脚本与内网取证。计划门禁下主 Agent 不能自己调 execute_command，这两类角色是
+# 主要执行者；只认 test 会让 operate 跑出来的结果被误判成「未执行命令」。
+_SUBAGENT_COMMAND_EVIDENCE_TYPES = frozenset({"test", "operate"})
+
+_SUBAGENT_STATUS_COMPLETED = "completed"
+
+
+def _subagent_counts_as_command_evidence(subagent_type, result_content):
+    """子代理结果能否作为「本回合真实执行过命令」的证据。
+
+    只认命令型角色（test/operate）且结果为 status=completed；解析失败、
+    非对象、非 completed 一律不算，绝不把模糊内容当成通过证据。
+    """
+    role = str(subagent_type or "").strip().lower()
+    if role not in _SUBAGENT_COMMAND_EVIDENCE_TYPES:
+        return False
+    try:
+        payload = json.loads(str(result_content if result_content is not None else "{}"))
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("status") == _SUBAGENT_STATUS_COMPLETED
+
+
 def _claims_verification_without_evidence(
     final_text, used_write_tools, used_command_tools
 ):
@@ -341,6 +367,12 @@ def _tool_result_ok(function_name, result):
             payload = None
         if isinstance(payload, dict) and payload.get("status"):
             return payload["status"] in {"running", "completed", "selected"}
+        if function_name == "run_subagent" and content.startswith((
+            "子代理执行失败（",
+            "子代理执行超时（",
+            "子代理执行已取消（",
+        )):
+            return False
     return not content.startswith((
         TOOL_ERROR_PREFIX,
         ASK_USER_ERROR_PREFIX,
@@ -875,3 +907,114 @@ def _refill_messages_after_compression(messages, manager, session):
         m for m in refreshed if not (isinstance(m, dict) and m.get("role") == "system")
     ]
     messages[:] = system_blocks + refreshed
+
+
+def _is_ephemeral_subagent_turn(persist, parent_session, cache_scope) -> bool:
+    """Return True for non-persisted subagent turns that must not touch main session history."""
+    return (
+        not bool(persist)
+        and not parent_session
+        and str(cache_scope or "").startswith("subagent:")
+    )
+
+
+def _compact_ephemeral_messages_in_place(messages) -> bool:
+    """Shrink an ephemeral subagent message list in memory while keeping tool pairing valid."""
+    if not isinstance(messages, list) or len(messages) <= 2:
+        return False
+
+    from core.tool_result_maintenance import elide_tool_result, snip_tool_result
+
+    def _total_chars(items) -> int:
+        return sum(len(str(item)) for item in items)
+
+    before_chars = _total_chars(messages)
+    head_end = 0
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            head_end = idx + 1
+            break
+    if head_end == 0 or head_end >= len(messages):
+        return False
+
+    # 保护最后一轮完整交互（含其 tool_calls 与对应的 tool 结果），避免截断当前推理现场
+    tail_start = max(head_end, len(messages) - 4)
+    while tail_start > head_end and isinstance(messages[tail_start], dict):
+        if messages[tail_start].get("role") == "tool":
+            tail_start -= 1
+            continue
+        break
+
+    # Pass 1：精简保护区之外的旧 tool 结果文本
+    for idx in range(head_end, tail_start):
+        msg = messages[idx]
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or len(content) <= 800:
+            continue
+        elided = elide_tool_result(str(msg.get("name") or "tool"), content)
+        if elided is not None:
+            msg["content"] = elided
+        else:
+            msg["content"] = content[:600] + "\n...[历史工具输出已精简]..."
+
+    if _total_chars(messages) <= int(before_chars * 0.75):
+        return True
+
+    # Pass 2：按完整轮次（assistant + 后续 tool 消息）丢弃最早的中间执行记录
+    middle = messages[head_end:tail_start]
+    if middle:
+        units = []
+        i = 0
+        while i < len(middle):
+            unit = [middle[i]]
+            if isinstance(middle[i], dict) and middle[i].get("role") == "assistant":
+                j = i + 1
+                while (
+                    j < len(middle)
+                    and isinstance(middle[j], dict)
+                    and middle[j].get("role") == "tool"
+                ):
+                    unit.append(middle[j])
+                    j += 1
+                i = j
+            else:
+                i += 1
+            units.append(unit)
+        # 优先仅保留最后 1 个中间单元（若不止 1 个单元，则丢掉较早单元并注入折叠提示）
+        kept_units = units[-1:] if len(units) > 1 else []
+        flattened_kept = [msg for unit in kept_units for msg in unit]
+        notice = {
+            "role": "user",
+            "content": (
+                "[系统提示：较早的中间工具调用记录已自动折叠以释放上下文窗口。"
+                "请直接基于保留的最近结果收敛并输出最终结论，避免继续大规模读取。]"
+            ),
+        }
+        messages[:] = (
+            messages[:head_end]
+            + [notice]
+            + flattened_kept
+            + messages[tail_start:]
+        )
+
+    if _total_chars(messages) >= before_chars:
+        # Pass 3：若仅靠最新一轮的超大工具输出就撑爆上下文，用 snip 保留首尾关键信息
+        for msg in messages[head_end:]:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or len(content) <= 4000:
+                continue
+            snipped = snip_tool_result(str(msg.get("name") or "tool"), content)
+            if snipped is not None and len(snipped) < len(content):
+                msg["content"] = snipped
+            elif len(content) > 6000:
+                msg["content"] = (
+                    content[:3000]
+                    + "\n...[单步工具输出过长，中段已精简以适配上下文窗口]...\n"
+                    + content[-2000:]
+                )
+
+    return _total_chars(messages) < before_chars

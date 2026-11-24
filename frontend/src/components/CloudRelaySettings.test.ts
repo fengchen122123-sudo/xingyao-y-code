@@ -32,6 +32,15 @@ describe('CloudRelaySettings', () => {
     expect(prompt).toContain('relay_server');
     expect(prompt).toContain('nginx-standalone.conf');
     expect(prompt).toContain('--ycode-relay-configure');
+    // 部署提示词必须带上真实踩过的坑：库路径错位会建出孤儿库让换票 401，
+    // Windows 的 SSH_ASKPASS 在 posix_spawnp 下用 .bat 会直接失败
+    expect(prompt).toContain('RELAY_DB_PATH=/srv/relay/data/relay.db');
+    // relay.env 与 create-device 两处必须给出同一个库路径，否则换票必然 401
+    expect(prompt.split('RELAY_DB_PATH=/srv/relay/data/relay.db').length - 1)
+      .toBeGreaterThanOrEqual(2);
+    expect(prompt).toContain('Python >= 3.11');
+    expect(prompt).toContain('paramiko');
+    expect(prompt).toContain('active_jti');
     expect(prompt).toContain('129.204.50.227');
     expect(prompt).toContain('ubuntu');
     expect(prompt).toContain('xingyaocode.cn');
@@ -60,19 +69,26 @@ describe('CloudRelaySettings', () => {
     await new Promise((r) => setTimeout(r, 0));
 
     const toggle = wrapper.find('[data-test="cloud-relay-enabled"]');
-    await toggle.setValue(true);
+    expect(toggle.attributes('role')).toBe('switch');
+    expect(toggle.attributes('aria-checked')).toBe('false');
+    expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
+    expect(wrapper.findAll('input[type="radio"]')).toHaveLength(0);
+
+    await toggle.trigger('click');
     await new Promise((r) => setTimeout(r, 0));
 
     expect(save_cloud_relay_settings).not.toHaveBeenCalled();
+    expect(toggle.attributes('aria-checked')).toBe('false');
     expect(wrapper.find('[data-test="cloud-relay-message"]').text()).toContain('星瑶自动部署');
 
     await wrapper.find('[data-test="cloud-relay-url"]').setValue('wss://xingyaocode.cn/xy/bot/relay/device');
     await wrapper.find('[data-test="cloud-relay-device-id"]').setValue('dev-1');
     await wrapper.find('[data-test="cloud-relay-token"]').setValue('tok-1');
-    await toggle.setValue(true);
+    await toggle.trigger('click');
     await new Promise((r) => setTimeout(r, 0));
 
     expect(save_cloud_relay_settings).toHaveBeenCalledTimes(1);
+    expect(toggle.attributes('aria-checked')).toBe('true');
     expect(save_cloud_relay_settings).toHaveBeenCalledWith({
       enabled: true,
       url: 'wss://xingyaocode.cn/xy/bot/relay/device',

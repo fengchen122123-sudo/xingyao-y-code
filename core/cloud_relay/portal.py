@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -94,8 +95,58 @@ def mobile_page_available(base: str, device_id: str) -> bool:
         return False
 
 
+def _persisted_ticket(device_id: str) -> dict | None:
+    """读回上一次签发的远端票。
+
+    网关已改成「一设备只认最新一张票」，桌面重建内存缓存后如果直接换票，
+    会把用户手机里正在用的链接当场作废；把票持久化才能让重启不打扰在用设备。
+    """
+    try:
+        raw = str(config._load().get(config.CLOUD_RELAY_REMOTE_TICKET_KEY) or "")
+    except Exception:
+        logger.debug("读取云中转远端票缓存失败", exc_info=True)
+        return None
+    if not raw:
+        return None
+    try:
+        from core.credentials import unprotect_secret
+
+        data = json.loads(unprotect_secret(raw))
+    except Exception:
+        logger.debug("云中转远端票缓存解码失败", exc_info=True)
+        return None
+    if not isinstance(data, dict) or str(data.get("device_id") or "") != device_id:
+        return None
+    if not str(data.get("token") or ""):
+        return None
+    if int(data.get("expires_at") or 0) <= int(time.time()):
+        return None
+    return data
+
+
+def _persist_ticket(device_id: str, payload: dict) -> None:
+    try:
+        from core.credentials import protect_secret
+
+        blob = json.dumps(
+            {
+                "device_id": device_id,
+                "token": str(payload.get("token") or ""),
+                "expires_at": int(payload.get("expires_at") or 0),
+            }
+        )
+        config.save_config_value(config.CLOUD_RELAY_REMOTE_TICKET_KEY, protect_secret(blob))
+    except Exception:
+        logger.warning("云中转远端票缓存写入失败", exc_info=True)
+
+
 def build_pair_url(
-    bridge, *, mobile: bool, ttl_seconds: int = 0, reason: dict | None = None
+    bridge,
+    *,
+    mobile: bool,
+    ttl_seconds: int = 0,
+    reason: dict | None = None,
+    force_new: bool = False,
 ) -> dict | None:
 
     def fail(code: str, message: str) -> None:
@@ -120,14 +171,35 @@ def build_pair_url(
         # 换票结果在本地缓存：二维码是「打开就生成」的高频动作，而网关对换票限流
         # （10 分钟 6 次），反复打开不能每次都去打网关。临近过期才重新换。
         payload = None
+        refresh_notice = ""
         cached = _TICKET_CACHE.get(device_id)
+        if cached is None:
+            cached = _persisted_ticket(device_id)
+            if cached is not None:
+                _TICKET_CACHE[device_id] = cached
         now = int(time.time())
-        if cached is not None and int(cached.get("expires_at") or 0) - now > _CACHE_MARGIN_SECONDS:
+        cache_fresh = (
+            cached is not None
+            and int(cached.get("expires_at") or 0) - now > _CACHE_MARGIN_SECONDS
+        )
+        # force_new 来自用户点「刷新」：必须真去网关换新票。缓存只服务
+        # 「打开面板就出码」的高频路径，若它吞掉显式刷新，二维码和有效期
+        # 就永远纹丝不动——用户看到的就是「刷新无效」。
+        if cache_fresh and not force_new:
             payload = cached
         if payload is None:
             payload = request_ticket(base, device_id, device_token())
             if payload is not None:
                 _TICKET_CACHE[device_id] = payload
+                _persist_ticket(device_id, payload)
+                if force_new:
+                    # 网关换票即换代：旧 jti 作废，已连着的远端页面也会被踢
+                    refresh_notice = "旧链接已失效，请用新二维码重新扫码"
+            elif cache_fresh:
+                # 换票被拒（多数是网关限流 6 次/10 分钟）：刷新失败不能把手头
+                # 仍可用的链接换成兜底提示，否则用户扫到的二维码直接失效。
+                payload = cached
+                refresh_notice = "刷新过于频繁，已保留当前链接（稍后再试）"
         if payload is None:
             return fail("ticket", f"云中转换票失败，{hint}")
         jwt_token = str(payload.get("token") or "")
@@ -141,11 +213,14 @@ def build_pair_url(
         remaining = max(0, expires_at - int(time.time())) if expires_at else 0
         if ttl_seconds and ttl_seconds > 0 and remaining > ttl_seconds:
             remaining = int(ttl_seconds)
-        return {
+        result = {
             "url": f"{base}{page}?token={jwt_token}",
             "token": jwt_token,
             "expires_in": remaining,
         }
+        if refresh_notice:
+            result["refresh_notice"] = refresh_notice
+        return result
     except Exception:
         logger.exception("云中转公网二维码生成失败")
         return fail("error", f"云中转公网入口不可用，{hint}")

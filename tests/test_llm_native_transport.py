@@ -1,4 +1,6 @@
 import json
+
+import httpcore
 import pytest
 
 import core.llm_native_transport as nt
@@ -21,6 +23,7 @@ from core.llm_native_transport import (
     ContextWindowExceededError,
     AuthenticationError,
     APIConnectionError,
+    ContentFilteredError,
 )
 
 
@@ -115,6 +118,85 @@ def test_chunk_normalizer_reasoning_and_tools():
     assert chunk.usage.prompt_cache_hit_tokens == 64
 
 
+def test_would_block_read_retries_until_data():
+    calls = {"n": 0}
+
+    def operation(timeout):
+        calls["n"] += 1
+        assert timeout is None or timeout > 0
+        if calls["n"] < 3:
+            err = BlockingIOError(10035, "would block")
+            raise httpcore.ReadError(err) from err
+        return b"ok"
+
+    result = nt._call_retrying_would_block(operation, timeout=5, sleeper=lambda _s: None)
+    assert result == b"ok"
+    assert calls["n"] == 3
+
+
+def test_would_block_does_not_retry_other_socket_errors():
+    calls = {"n": 0}
+
+    def operation(timeout):
+        calls["n"] += 1
+        reset = OSError(10054, "connection reset")
+        reset.winerror = 10054
+        raise httpcore.ReadError(reset) from reset
+
+    with pytest.raises(httpcore.ReadError):
+        nt._call_retrying_would_block(operation, timeout=5, sleeper=lambda _s: None)
+    assert calls["n"] == 1
+
+
+def test_would_block_stops_at_deadline():
+    clock = {"t": 0.0}
+
+    def operation(timeout):
+        err = BlockingIOError(10035, "would block")
+        raise httpcore.ReadError(err) from err
+
+    def sleeper(seconds):
+        clock["t"] += seconds
+
+    with pytest.raises(httpcore.ReadError):
+        nt._call_retrying_would_block(
+            operation,
+            timeout=0.05,
+            sleeper=sleeper,
+            clock=lambda: clock["t"],
+            pause_start=0.04,
+        )
+
+
+def test_retry_stream_survives_one_would_block():
+    class Sock:
+        def __init__(self):
+            self.n = 0
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def recv(self, _n):
+            self.n += 1
+            if self.n == 1:
+                raise BlockingIOError(10035, "would block")
+            return b"hello"
+
+    stream = nt._WouldBlockRetryStream(Sock())
+    assert stream.read(16, timeout=5) == b"hello"
+
+
+def test_shared_client_uses_would_block_retry_backend(monkeypatch):
+    monkeypatch.setattr(nt, "_client_instance", None)
+    client = nt._get_shared_client()
+    try:
+        backend = client._transport._pool._network_backend
+        assert isinstance(backend, nt._WouldBlockRetryBackend)
+    finally:
+        client.close()
+        monkeypatch.setattr(nt, "_client_instance", None)
+
+
 def test_native_stream_close():
     class FakeResponse:
         def __init__(self):
@@ -159,6 +241,28 @@ def test_map_http_errors():
 
     err_500 = _map_http_error(FakeHTTPResponse(502, "Bad Gateway"))
     assert isinstance(err_500, APIConnectionError)
+
+
+def test_gateway_content_filter_maps_to_dedicated_error():
+    # 中转网关（new-api 系）命中后台关键词后的真实报文。触发词拼接构造，
+    # 避免测试源码本身成为下一次请求的触发源。
+    hit_word = "test_" + "sensitive"
+    body = (
+        '{"error":{"message":"user sensitive words detected: ' + hit_word + '",'
+        '"type":"new_api_error","param":"","code":"sensitive_words_detected"}}'
+    )
+
+    class FakeHTTPResponse:
+        def __init__(self, status_code, text):
+            self.status_code = status_code
+            self.text = text
+
+    err = _map_http_error(FakeHTTPResponse(500, body))
+    assert isinstance(err, ContentFilteredError)
+    assert not isinstance(err, APIConnectionError)
+    assert "内容过滤" in str(err)
+    assert hit_word not in str(err)
+    assert "***" in str(err)
 
 
 def test_fast_token_counter():

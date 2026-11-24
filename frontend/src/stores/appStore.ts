@@ -58,6 +58,7 @@ import type {
   GoalStateInfo,
   GitSnapshotDto,
   WorkspacePromptSuggestion,
+  EmbeddedBrowserSurfacePhase,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
 import { isDocxFilePath, isMarkdownFilePath, isOfficeFilePath, isPdfFilePath, toFileUrl } from '../utils/localPath';
@@ -552,7 +553,7 @@ export function isLoopbackHostName(host: unknown): boolean {
   return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
 }
 
-function isLoopbackPageHost(): boolean {
+export function isLoopbackPageHost(): boolean {
   try {
     return isLoopbackHostName(window.location.hostname);
   } catch {
@@ -808,9 +809,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
       loading: false,
       ready: false,
       visible: false,
+      phase: 'idle' as EmbeddedBrowserSurfacePhase,
+      surface_generation: 0,
       supported: true,
       automationViewport: null as [number, number] | null,
     },
+    browserSurfaceResyncNonce: 0,
+    browserSessionSyncing: false,
     browserNavRequest: null as null | { url: string; path: string; session?: string },
     browserNavNonce: 0,
     // 右栏「文档」页签的外部打开请求（对话正文 / 文件树点击 PDF、Office 文档）：
@@ -1201,6 +1206,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       runtime.automationViewport = this.embeddedBrowser.automationViewport
         ? ([...this.embeddedBrowser.automationViewport] as [number, number])
         : null;
+      runtime.embeddedBrowserUrl = this.embeddedBrowser.url || '';
+      runtime.embeddedBrowserTitle = this.embeddedBrowser.title || '';
       runtime.bgTaskDetailId = this.bgTaskDetailId;
       runtime.subagentDetailId = this.subagentDetailId;
       }
@@ -1283,6 +1290,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.embeddedBrowser.automationViewport = runtime.automationViewport
         ? ([...runtime.automationViewport] as [number, number])
         : null;
+      this.embeddedBrowser.url = runtime.embeddedBrowserUrl || '';
+      this.embeddedBrowser.title = runtime.embeddedBrowserTitle || '';
+      this.embeddedBrowser.can_go_back = false;
+      this.embeddedBrowser.can_go_forward = false;
+      this.embeddedBrowser.loading = false;
       this.rightPanelPicker = this.rightPanelTabs.length === 0;
       this.bgTaskDetailId = runtime.bgTaskDetailId || '';
       // 子代理详情查看对象同口径恢复：切会话不残留上一个会话的查看 id，
@@ -3967,18 +3979,22 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this._applyAgentName(localName);
         return;
       }
-      // 通知宿主把内嵌浏览器归属切到目标会话：该会话若有后台积压的
-      // 「打开浏览器」意图，后端回放 embedded_browser_activation；没有则
-      // 收起仍挂着旧会话内容的原生控件（跨端兜底）。
-      try {
-        void api.browser_pane_set_active_session?.(sessionName);
-      } catch {
-      }
+      // 通知宿主把内嵌浏览器归属切到目标会话：先等 switch_session 更新后端
+      // _current_session，再同步活跃会话与重同步表面，避免 open 抢跑命中
+      // 后端旧会话被误判为后台会话而静默延迟，或 set_active_session 迟到误隐藏。
+      const switchSeq = ((this as any)._browserSwitchSeq || 0) + 1;
+      (this as any)._browserSwitchSeq = switchSeq;
+      this.browserSessionSyncing = true;
       const modelVersion = this._sessionModelVersion[sessionName] || 0;
       try {
       const res = await api.switch_session(sessionName, targetWorkdir);
         // 竞态防护：快速连点不同会话时响应可能乱序返回，过期响应直接丢弃，
         // 避免高亮停在 B 会话却渲染出 A 会话的内容
+        if (this.currentSessionName !== sessionName) return;
+        try {
+          await api.browser_pane_set_active_session?.(sessionName);
+        } catch {
+        }
         if (this.currentSessionName !== sessionName) return;
         const fetchedMessages = Array.isArray(res.messages) ? res.messages : [];
         if (!runtime.running && (runtime.messages.length === 0 || (runtime.needsHistoryHydration && fetchedMessages.length > 0))) {
@@ -4077,10 +4093,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
       } finally {
+        if ((this as any)._browserSwitchSeq === switchSeq) {
+          this.browserSessionSyncing = false;
+        }
         // 加载态复位：仅在仍是当前会话时清除——快速连点不同会话时，
         // 过期响应返回不得清掉当前会话的加载态
         if (this.currentSessionName === sessionName) {
           this.sessionSwitching = false;
+          this.browserSurfaceResyncNonce += 1;
           void this.refreshHooks();
         }
       }
@@ -5233,6 +5253,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
       s.loading = !!src.loading;
       s.ready = !!src.ready;
       s.visible = !!src.visible;
+      if (typeof src.phase === 'string' && src.phase) {
+        s.phase = src.phase as EmbeddedBrowserSurfacePhase;
+      }
+      const gen = Number(src.surface_generation);
+      if (Number.isFinite(gen) && gen >= 0) {
+        s.surface_generation = gen;
+      }
     },
 
     async _handleOpenSessionEvent(event: BridgeEvent) {
@@ -7192,7 +7219,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       try {
         const res = await api.export_session(fmt);
         if (res && res.ok) {
-          this.notifyChat('导出成功: ' + (res.path || ''));
+          const exportPath = String(res.path || '').trim();
+          this.notifyChat(exportPath ? `导出成功: ${exportPath}` : '导出成功');
         } else {
           this.notifyChat('导出失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }

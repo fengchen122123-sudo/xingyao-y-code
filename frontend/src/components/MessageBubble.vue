@@ -272,13 +272,25 @@
         <span class="notice-title">提示</span>
         <span class="notice-text">{{ msg.content }}</span>
       </div>
+      <button
+        v-if="exportNoticePath"
+        type="button"
+        class="notice-action-btn"
+        data-test="notice-open-export-dir"
+        title="打开导出目录并定位文件"
+        :disabled="openingExportDir"
+        @click="onOpenExportDir"
+      >
+        <AppIcon name="folder-open" :size="12" />
+        <span>打开目录</span>
+      </button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
-import { useAppStore, type ChatMessage } from '../stores/appStore';
+import { isLoopbackPageHost, useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdownDetailed, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
 import { splitStableBlocks } from '../utils/markdownBlocks';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
@@ -286,6 +298,7 @@ import { canOpenInRightPanel, toAbsoluteLocalPath } from '../utils/localPath';
 import { useIsMobile } from '../composables/useViewport';
 import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
 import { isLoginExpiredError } from '../utils/loginExpired';
+import { extractExportSuccessPath } from '../utils/exportNotice';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
@@ -311,6 +324,23 @@ const store = useAppStore();
 function onLoginAgain() {
   store.openTrLoginModal();
   void store.refreshTrAuth();
+}
+
+const openingExportDir = ref(false);
+const exportNoticePath = computed(() => {
+  if (props.msg.role !== 'notice' || !isLoopbackPageHost()) return '';
+  return extractExportSuccessPath(props.msg.content);
+});
+
+async function onOpenExportDir() {
+  const target = exportNoticePath.value;
+  if (!target || openingExportDir.value) return;
+  openingExportDir.value = true;
+  try {
+    await store.revealInExplorer(target);
+  } finally {
+    openingExportDir.value = false;
+  }
 }
 // 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
 const isMobile = useIsMobile();
@@ -1744,5 +1774,38 @@ function onEditKeydown(e: KeyboardEvent) {
   color: var(--xy-text-2, var(--text-dim));
   white-space: pre-wrap;
   word-break: break-word;
+}
+.notice-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  align-self: center;
+  height: 24px;
+  margin: -2px 0;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--xy-border-strong, var(--border));
+  background: var(--xy-card, var(--bg1));
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--xy-text-2, var(--text));
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.14s, border-color 0.14s, background 0.14s;
+}
+.notice-action-btn:hover:not(:disabled) {
+  border-color: var(--xy-accent, var(--accent));
+  color: var(--xy-accent, var(--accent));
+  background: var(--xy-hover, var(--bg3));
+}
+.notice-action-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.notice-action-btn:focus-visible {
+  outline: 2px solid var(--xy-accent, var(--accent));
+  outline-offset: 1px;
 }
 </style>

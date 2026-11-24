@@ -1043,6 +1043,27 @@ def test_nudge_skips_zero_size_bounds_inside_callback(monkeypatch):
     assert form.queue == []
 
 
+def test_open_shows_existing_control_before_applying_bounds():
+    """定位失败也不能把已经建好的控件继续藏着：先显示再摆矩形。"""
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: ctrl._form
+    ctrl._ready = True
+    seen = {}
+
+    def _bounds(*_args, **_kwargs):
+        seen["visible_during_bounds"] = ctrl._webview.Visible
+
+    ctrl._apply_bounds = _bounds
+    ctrl._webview.BringToFront = lambda: seen.setdefault("front", ctrl._webview.Visible)
+
+    opened = ctrl.open({"x": 1, "y": 2, "width": 300, "height": 200})
+    assert opened["ok"] is True
+    assert opened["phase"] == "ready"
+    assert ctrl._webview.Visible is True
+    assert seen["visible_during_bounds"] is True
+    assert seen["front"] is True
+
+
 def test_surface_generation_rejects_stale_bounds_after_hide_and_requires_ready_ack():
     ctrl, _core = _fake_ready_controller()
     ctrl._get_form = lambda: ctrl._form
@@ -1077,3 +1098,21 @@ def test_surface_generation_rejects_stale_bounds_after_hide_and_requires_ready_a
     bounds_after_hide = ctrl.set_bounds({"x": 0, "y": 0, "width": 500, "height": 600}, surface_generation=3)
     assert bounds_after_hide["ok"] is True
     assert ctrl._webview.Visible is False
+
+
+def test_init_failure_emits_error_phase():
+    emitted = []
+    ctrl = eb.EmbeddedBrowserController(on_state=emitted.append, get_form=lambda: None)
+    core = _FakeCore()
+    ctrl._webview = SimpleNamespace(CoreWebView2=core, Visible=True)
+    ctrl._form = _FakeForm()
+
+    ctrl._on_init_completed(
+        ctrl._webview,
+        SimpleNamespace(IsSuccess=False, InitializationException="boom (0x8007139F)"),
+    )
+
+    assert len(emitted) >= 1
+    assert emitted[-1]["phase"] == "error"
+    assert emitted[-1]["ready"] is False
+

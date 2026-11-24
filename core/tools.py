@@ -13,7 +13,7 @@ import warnings
 import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -80,6 +80,11 @@ _SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
         "novel_status", "novel_wordcount", "novel_audit",
     }),
     "review": _SUBAGENT_READ_ONLY_TOOLS,
+    # 本机取证：只读集合 ∪ execute_command。不给 write_file / edit_file / multi_edit，
+    # 避免「查数据」变成改仓库（只读集合里的 fetch_image 会落盘到 AI 输出目录，
+    # 属既有只读工具行为）。
+    # fetch_url 仍在集合里，但私网会被 SSRF 拒绝，内网要走 execute_command。
+    "operate": _SUBAGENT_READ_ONLY_TOOLS | frozenset({"execute_command"}),
     "general": None,
 }
 
@@ -87,6 +92,80 @@ _SUBAGENT_DEFAULT_ALLOWED_TOOLS = {
 def default_subagent_allowed_tools(role: str):
     """内置角色默认工具白名单；未知角色按 general 处理（不限定）。"""
     return _SUBAGENT_DEFAULT_ALLOWED_TOOLS.get(role, None)
+
+
+# run_subagent 的 schema 默认值是 general。计划项没写具体角色时，general 和空值
+# 都表示「请按 stage 代选」，不能把分析项降成没有命令的 explore。
+_PLAN_STAGE_SUBAGENT_TYPES = {
+    "plan": "operate",
+    "build": "implement",
+    "review": "review",
+}
+
+# 内置角色名做小写归一：模型偶尔传 "Operate"/"Explore"，不能因为大小写
+# 掉进「自定义名字查不到 → 静默回退 general」的降级路径。
+_BUILTIN_SUBAGENT_ROLE_NAMES = frozenset(
+    {"explore", "operate", "implement", "test", "review", "general"}
+)
+
+# 可用次模型（便宜快）的角色：纯检索与跑测试。operate 要按技能脚本取实时数据、
+# 跟主模型节奏，不能落到次模型上。
+_SUBAGENT_SECONDARY_MODEL_ROLES = frozenset({"explore", "test"})
+
+
+def normalize_builtin_subagent_type(subagent_type: str) -> str:
+    """内置角色名转小写，自定义名字原样返回（注册中心的 name 区分大小写）。"""
+    raw = str(subagent_type or "").strip()
+    lowered = raw.lower()
+    return lowered if lowered in _BUILTIN_SUBAGENT_ROLE_NAMES else raw
+
+
+def resolve_plan_subagent_type(
+    subagent_type: str, stage: str, *, force_general: bool = False
+) -> str:
+    """计划项未指定具体角色时按 stage 选择子代理。
+
+    显式的 explore / operate / implement / test / review 以及自定义名字保持不变。
+    force_general=True 是显式出口：计划项合法 stage 只有 plan/build/review，
+    没有它的话 general（唯一含 MCP 工具的角色）在计划内永远不可达。
+    """
+    if force_general:
+        return "general"
+    chosen = normalize_builtin_subagent_type(subagent_type)
+    if chosen and chosen != "general":
+        return chosen
+    return _PLAN_STAGE_SUBAGENT_TYPES.get(str(stage or "").strip().lower(), "general")
+
+
+def _plan_stage_permission_mode(stage: str) -> str | None:
+    """plan 阶段子代理的权限档封顶：宽档降为 confirm，None 表示沿用父档位。
+
+    plan 阶段语义是「只读取证分析」。accept_edits/full 档下 execute_command 的
+    普通写命令（Set-Content / Copy-Item / Out-File）只判 NORMAL_MUTATION 直接放行，
+    会让子代理绕过「build 阶段才能改文件」的计划门禁，且命令改动的副作用不在
+    撤销范围内（execute_command 会登记 uncovered effects）。confirm 档下只读查询
+    仍自动放行，写操作必须由用户当场批准。
+    """
+    if str(stage or "").strip().lower() != "plan":
+        return None
+    from core import app_context as _app_context
+
+    parent_mode = str(_app_context.get_permission_mode() or "").strip()
+    if parent_mode in {"accept_edits", "full"}:
+        return "confirm"
+    return None
+
+
+def _subagent_skill_catalog() -> str:
+    try:
+        from core.skills import get_active_skills_catalog
+
+        return str(get_active_skills_catalog() or "").strip()
+    except Exception as error:
+        # 只降级为「本次没有技能目录」，但必须留痕：operate 的工作方式依赖
+        # 先读 SKILL.md，静默失效会让它退化成盲跑命令。
+        _logger.warning("子代理技能目录扫描失败，本次省略技能目录: %s", error)
+        return ""
 
 
 def _agent_display_name() -> str:
@@ -3180,6 +3259,38 @@ def _with_tool_error_footer(result: str, tool_errors: dict, turn_error: str = ""
     return result + "\n".join(lines)
 
 
+def _is_diagnostic_command_exit_only(task: "SubagentTask") -> bool:
+    """Allow test role to report root-cause analysis when tests exit non-zero."""
+    if str(task.subagent_type or "").strip().lower() != "test":
+        return False
+    if set(task.tool_errors.keys()) != {"execute_command"}:
+        return False
+    detail = str(task.tool_errors.get("execute_command") or "")
+    return "命令执行失败（退出码" in detail
+
+
+def _build_subagent_continuation_messages(
+    messages: list[dict[str, Any]],
+    result_text: str,
+    continuation_prompt: str,
+) -> list[dict[str, Any]]:
+    """Build continuation messages while preserving prior tool-call history."""
+    cont_messages = list(messages)
+    fallback_reply = result_text.strip() or "（未输出最终结论）"
+    if cont_messages and cont_messages[-1].get("role") == "assistant":
+        last_msg = dict(cont_messages[-1])
+        if last_msg.get("tool_calls"):
+            cont_messages.append({"role": "assistant", "content": fallback_reply})
+        else:
+            if not last_msg.get("content"):
+                last_msg["content"] = fallback_reply
+            cont_messages[-1] = last_msg
+    else:
+        cont_messages.append({"role": "assistant", "content": fallback_reply})
+    cont_messages.append({"role": "user", "content": continuation_prompt})
+    return cont_messages
+
+
 def _truncate_subagent_result(result: str, max_len: int, trailer: str) -> str:
     if len(result) <= max_len:
         return result
@@ -3228,6 +3339,12 @@ class SubagentStage:
     detail: str = ""
 
 
+_MAX_SUBAGENT_TOOL_RECORDS = 200
+_MAX_SUBAGENT_ROUND_NOTES = 64
+_MAX_SUBAGENT_ROUND_TEXT = 6000
+_MAX_SUBAGENT_DIFF_CHARS = 24000
+
+
 @dataclass(frozen=True)
 class SubagentTaskSnapshot:
     task_id: str
@@ -3248,6 +3365,17 @@ class SubagentTaskSnapshot:
     approval_wait_elapsed: float
     partial_result: str = ""
     tool_call_id: str = ""
+    timeout_seconds: int = 600
+    handoff: str = ""
+    model_name: str = ""
+    rounds: int = 0
+    tool_success_count: int = 0
+    tool_error_count: int = 0
+    approval_summary: str = ""
+    tool_records: tuple[dict[str, Any], ...] = ()
+    changed_files: tuple[str, ...] = ()
+    round_notes: tuple[dict[str, Any], ...] = ()
+    file_diffs: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -3272,6 +3400,14 @@ class SubagentTask:
     # 不 yield 正文；不单独记录就会退化成"子代理无公开结论"）
     turn_error: str = ""
     tool_success_count: int = 0
+    tool_error_count: int = 0
+    rounds: int = 0
+    model_name: str = ""
+    approval_summary: str = ""
+    tool_records: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    changed_files: list[str] = field(default_factory=list, repr=False)
+    round_notes: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    file_diffs: list[dict[str, Any]] = field(default_factory=list, repr=False)
     stage: str = "queued"
     stages: list[SubagentStage] = field(default_factory=list)
     execution_elapsed: float = 0.0
@@ -3396,6 +3532,28 @@ def _unpack_model_config(model_config: tuple | None):
     raise ValueError("model_config 必须是 (model, key, base_url[, model_id])")
 
 
+def _resolve_subagent_model_name(
+    litellm_model: str | None,
+    model_id: str | None = None,
+) -> str:
+    """提取子代理页面展示用的简短模型名称，失败时静默回退模型串尾部。"""
+    if model_id:
+        try:
+            from core.model_manager import _find_config_model, load_config
+
+            found = _find_config_model(load_config(), str(model_id))
+            if isinstance(found, dict):
+                name = str(found.get("name") or "").strip()
+                if name:
+                    return name
+        except Exception:
+            pass
+    raw = str(litellm_model or "").strip()
+    if "/" in raw:
+        raw = raw.rsplit("/", 1)[-1]
+    return raw
+
+
 def _format_tool_stage_duration(duration_ms) -> str:
     """tool_finished 阶段详情里的耗时片段：≥1s 显示秒，否则毫秒。"""
     try:
@@ -3485,26 +3643,30 @@ class SubagentManager:
         event_callback: Callable | None = None,
         task_id: str | None = None,
         tool_call_id: str = "",
+        permission_mode: str | None = None,
     ) -> str:
         if not 30 <= timeout_seconds <= 3600:
             raise ValueError("timeout_seconds must be between 30 and 3600")
         description = str(task_description or "").strip()
         if not description:
             raise ValueError("task_description must not be empty")
-        normalized_type = str(subagent_type or "general")
+        normalized_type = normalize_builtin_subagent_type(subagent_type or "general")
+        if not normalized_type:
+            normalized_type = "general"
         if model_config is None and self._uses_default_runner:
-            prefer_secondary = normalized_type in {"explore", "test"}
+            # explore/test 偏检索和跑测试，可用次模型。
+            # operate 要按技能脚本取实时数据，跟主模型。
+            prefer_secondary = normalized_type in _SUBAGENT_SECONDARY_MODEL_ROLES
             model_config = _snapshot_model_config(
                 prefer_secondary=prefer_secondary,
                 session_name=parent_session,
             )
 
-        # 加载自定义子 agent 配置：subagent_type 非内置 5 种时尝试从注册中心获取
+        # 加载自定义子 agent 配置：subagent_type 非内置角色时尝试从注册中心获取
         # 容错：加载失败回退到 None（_run_default_subagent 会按内置 general 处理）
         custom_config = None
-        if normalized_type and normalized_type not in {
-            "explore", "implement", "test", "review", "general"
-        }:
+        from core.subagent_registry import BUILTIN_SUBAGENT_TYPES
+        if normalized_type and normalized_type not in BUILTIN_SUBAGENT_TYPES:
             try:
                 from core.subagent_registry import get_custom_subagent
                 custom_config = get_custom_subagent(normalized_type)
@@ -3515,7 +3677,12 @@ class SubagentManager:
         # 权限档位随任务快照：子代理线程不继承调用线程的线程本地档位，
         # 必须在创建时（仍处于父回合线程）取值，_run_task 内再用 scope 恢复。
         from core import app_context as _app_context
-        _parent_permission_mode = _app_context.get_permission_mode()
+        # 调用方可显式指定更严的档位（见 run_subagent 的 plan 阶段封顶）；
+        # 未指定时沿用父回合快照。
+        _parent_permission_mode = (
+            str(permission_mode or "").strip() or _app_context.get_permission_mode()
+        )
+        _init_model, _, _, _init_model_id = _unpack_model_config(model_config)
         task = SubagentTask(
             task_id=str(task_id or _new_subagent_task_id()),
             parent_session=str(parent_session or ""),
@@ -3529,6 +3696,7 @@ class SubagentManager:
             timeout_seconds=int(timeout_seconds),
             terminal_callback=terminal_callback,
             model_config=model_config,
+            model_name=_resolve_subagent_model_name(_init_model, _init_model_id),
             custom_config=custom_config,
             event_callback=event_callback,
             permission_mode=_parent_permission_mode,
@@ -3785,8 +3953,13 @@ class SubagentManager:
                             for name, detail in task.tool_errors.items()
                         )
                     self._terminate(task.task_id, "failed", reason)
-                elif task.tool_errors and task.tool_success_count == 0:
+                elif (
+                    task.tool_errors
+                    and task.tool_success_count == 0
+                    and not _is_diagnostic_command_exit_only(task)
+                ):
                     # 所有工具调用都失败：结论只是错误复述，不能当成功
+                    # （test 角色执行测试命令非零退出且产出了有效诊断结论时，保留告警尾注并交付结果）
                     details = "; ".join(
                         f"{name}: {detail}" for name, detail in task.tool_errors.items()
                     )
@@ -3887,6 +4060,7 @@ class SubagentManager:
             task.status = "completed"
             task.result = result
             task.finished_at = time.time()
+            task.approval_summary = ""
             self._record_stage_locked(task, "completed")
         self._fire_terminal_notification(task)
         # done_event 是整个终态提交（计划回写 + 通知）的唯一完成屏障。
@@ -3927,6 +4101,16 @@ class SubagentManager:
                 task.status = status
                 task.error = str(error)
                 task.finished_at = time.time()
+                task.approval_summary = ""
+                for rec in task.tool_records:
+                    if rec.get("status") == "running":
+                        rec["status"] = "cancelled" if status == "cancelled" else "err"
+                        rec["finished_at"] = task.finished_at
+                        if not rec.get("error_summary"):
+                            rec["error_summary"] = (
+                                "已中止" if status == "cancelled"
+                                else ("已超时" if status == "timed_out" else "任务已结束")
+                            )
                 self._record_stage_locked(task, status, str(error))
                 task.cancel_event.set()
             # 锁内原子认领终态与回调：先写终态事实（status/error/finished_at）
@@ -4281,7 +4465,303 @@ class SubagentManager:
             approval_wait_elapsed=task.approval_wait_elapsed,
             partial_result=task.partial_result,
             tool_call_id=task.tool_call_id,
+            timeout_seconds=task.timeout_seconds,
+            handoff=task.handoff,
+            model_name=task.model_name,
+            rounds=task.rounds,
+            tool_success_count=task.tool_success_count,
+            tool_error_count=task.tool_error_count,
+            approval_summary=task.approval_summary,
+            tool_records=tuple(
+                {
+                    **rec,
+                    **({"diff": dict(rec["diff"])} if isinstance(rec.get("diff"), dict) else {}),
+                }
+                for rec in task.tool_records
+            ),
+            changed_files=tuple(task.changed_files),
+            round_notes=tuple(dict(note) for note in task.round_notes),
+            file_diffs=tuple(dict(diff) for diff in task.file_diffs),
         )
+
+    def _set_task_model_name(self, task_id: str, model_name: str) -> None:
+        name = str(model_name or "").strip()
+        if not name:
+            return
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.model_name = name
+
+    def _set_task_rounds(self, task_id: str, rounds: int) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.status not in _SUBAGENT_TERMINAL_STATUSES:
+                task.rounds = max(task.rounds, int(rounds))
+
+    def _set_approval_summary(self, task_id: str, summary: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.status not in _SUBAGENT_TERMINAL_STATUSES:
+                task.approval_summary = str(summary or "")
+
+    def _record_round_note(
+        self,
+        task_id: str,
+        round_no: int,
+        *,
+        thinking: str | None = None,
+        text: str | None = None,
+    ) -> None:
+        clean_thinking = str(thinking or "").strip() if thinking is not None else None
+        clean_text = str(text or "").strip() if text is not None else None
+        if not clean_thinking and not clean_text:
+            return
+        now = time.time()
+        rno = max(1, int(round_no))
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            entry = None
+            for note in reversed(task.round_notes):
+                if note.get("round") == rno:
+                    entry = note
+                    break
+            if entry is None:
+                entry = {
+                    "round": rno,
+                    "started_at": now,
+                    "thinking": "",
+                    "text": "",
+                }
+                task.round_notes.append(entry)
+                if len(task.round_notes) > _MAX_SUBAGENT_ROUND_NOTES:
+                    del task.round_notes[:-_MAX_SUBAGENT_ROUND_NOTES]
+            if clean_thinking:
+                entry["thinking"] = clean_thinking[:_MAX_SUBAGENT_ROUND_TEXT]
+            if clean_text:
+                prev = str(entry.get("text") or "")
+                combined = f"{prev}\n\n{clean_text}" if prev and clean_text != prev else clean_text
+                entry["text"] = combined[:_MAX_SUBAGENT_ROUND_TEXT]
+
+    def _record_changed_file(self, task_id: str, file_path: str) -> None:
+        fp = str(file_path or "").strip()
+        if not fp:
+            return
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            if fp not in task.changed_files:
+                task.changed_files.append(fp)
+
+    def _record_file_diff(self, task_id: str, payload: dict[str, Any]) -> None:
+        fp = str(payload.get("file_path") or "").strip()
+        if not fp:
+            return
+        diff_text = str(payload.get("diff_text") or "")
+        if len(diff_text) > _MAX_SUBAGENT_DIFF_CHARS:
+            diff_text = diff_text[:_MAX_SUBAGENT_DIFF_CHARS] + "\n…（diff 过长已截断）"
+        added = payload.get("added")
+        removed = payload.get("removed")
+        added_int = int(added) if isinstance(added, int) and not isinstance(added, bool) else None
+        removed_int = int(removed) if isinstance(removed, int) and not isinstance(removed, bool) else None
+        call_id = str(payload.get("tool_call_id") or "")
+        diff_obj: dict[str, Any] = {
+            "file_path": fp,
+            "diff_text": diff_text,
+        }
+        if added_int is not None:
+            diff_obj["added"] = added_int
+        if removed_int is not None:
+            diff_obj["removed"] = removed_int
+
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            if fp not in task.changed_files:
+                task.changed_files.append(fp)
+
+            existing = next((d for d in task.file_diffs if d.get("file_path") == fp), None)
+            if existing is None:
+                task.file_diffs.append(dict(diff_obj))
+            else:
+                if diff_text:
+                    prev_text = str(existing.get("diff_text") or "")
+                    merged_text = f"{prev_text}\n{diff_text}" if prev_text else diff_text
+                    existing["diff_text"] = merged_text[:_MAX_SUBAGENT_DIFF_CHARS]
+                if added_int is not None:
+                    existing["added"] = int(existing.get("added") or 0) + added_int
+                if removed_int is not None:
+                    existing["removed"] = int(existing.get("removed") or 0) + removed_int
+
+            target_rec = None
+            if call_id:
+                for rec in reversed(task.tool_records):
+                    if rec.get("id") == call_id:
+                        target_rec = rec
+                        break
+            if target_rec is None:
+                for rec in reversed(task.tool_records):
+                    if rec.get("category") == "mutation" and rec.get("status") == "running":
+                        target_rec = rec
+                        break
+            if target_rec is not None and diff_text:
+                target_rec["diff"] = dict(diff_obj)
+
+    def _record_tool_started(
+        self,
+        task_id: str,
+        call_id: str,
+        round_no: int,
+        payload: dict[str, Any],
+    ) -> None:
+        from core.tool_presenter import (
+            format_tool_arguments_preview,
+            sanitize_tool_display_text,
+        )
+
+        name = str(payload.get("name") or "tool")
+        display = payload.get("display") if isinstance(payload.get("display"), dict) else {}
+        category = str(display.get("category") or "other")
+        action = str(display.get("action") or name)
+        target = str(
+            display.get("command")
+            or display.get("target")
+            or payload.get("preview")
+            or ""
+        )
+        target = sanitize_tool_display_text(target, 180)
+        args_preview = format_tool_arguments_preview(
+            name, payload.get("arguments"), limit=800
+        )
+        now = time.time()
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            seq = (task.tool_records[-1]["seq"] + 1) if task.tool_records else 1
+            record = {
+                "id": str(call_id or f"tool-{seq}"),
+                "seq": seq,
+                "round": max(1, int(round_no)),
+                "name": name,
+                "category": category,
+                "action": action,
+                "target": target,
+                "args_preview": args_preview,
+                "status": "running",
+                "started_at": now,
+                "finished_at": None,
+                "duration_ms": None,
+                "duration_text": "",
+                "error_summary": "",
+                "result_preview": "",
+            }
+            task.tool_records.append(record)
+            if len(task.tool_records) > _MAX_SUBAGENT_TOOL_RECORDS:
+                del task.tool_records[:-_MAX_SUBAGENT_TOOL_RECORDS]
+
+    def _record_tool_finished(
+        self,
+        task_id: str,
+        call_id: str,
+        round_no: int,
+        payload: dict[str, Any],
+    ) -> None:
+        from core.tool_presenter import (
+            format_tool_arguments_preview,
+            sanitize_tool_display_text,
+            sanitize_tool_multiline_text,
+        )
+
+        name = str(payload.get("name") or "tool")
+        ok = payload.get("ok") is not False
+        display = payload.get("display") if isinstance(payload.get("display"), dict) else {}
+        duration_ms = payload.get("duration_ms")
+        try:
+            dur_int = max(0, int(duration_ms)) if duration_ms is not None else 0
+        except (TypeError, ValueError):
+            dur_int = 0
+        duration_text = _format_tool_stage_duration(dur_int) or ("0ms" if ok else "")
+        error_summary = ""
+        if not ok:
+            raw_err = str(
+                display.get("error_summary")
+                or payload.get("summary")
+                or payload.get("error")
+                or "工具执行失败"
+            ).lstrip("🚨").strip()
+            error_summary = sanitize_tool_display_text(raw_err, 180)
+        raw_result = str(
+            payload.get("result") or payload.get("summary") or ""
+        ).lstrip("🚨").strip()
+        result_preview = sanitize_tool_multiline_text(raw_result, limit=1500)
+        now = time.time()
+
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            if ok:
+                task.tool_success_count += 1
+            else:
+                task.tool_error_count += 1
+
+            target_rec = None
+            cid = str(call_id or "")
+            if cid:
+                for rec in reversed(task.tool_records):
+                    if rec.get("id") == cid:
+                        target_rec = rec
+                        break
+            if target_rec is None:
+                for rec in reversed(task.tool_records):
+                    if rec.get("status") == "running" and rec.get("name") == name:
+                        target_rec = rec
+                        break
+            if target_rec is None:
+                category = str(display.get("category") or "other")
+                action = str(display.get("action") or name)
+                target = sanitize_tool_display_text(
+                    display.get("command") or display.get("target") or payload.get("preview") or "",
+                    180,
+                )
+                seq = (task.tool_records[-1]["seq"] + 1) if task.tool_records else 1
+                target_rec = {
+                    "id": cid or f"tool-{seq}",
+                    "seq": seq,
+                    "round": max(1, int(round_no)),
+                    "name": name,
+                    "category": category,
+                    "action": action,
+                    "target": target,
+                    "args_preview": format_tool_arguments_preview(
+                        name, payload.get("arguments"), limit=800
+                    ),
+                    "started_at": now,
+                }
+                task.tool_records.append(target_rec)
+                if len(task.tool_records) > _MAX_SUBAGENT_TOOL_RECORDS:
+                    del task.tool_records[:-_MAX_SUBAGENT_TOOL_RECORDS]
+
+            if display:
+                if display.get("category"):
+                    target_rec["category"] = str(display["category"])
+                if display.get("action"):
+                    target_rec["action"] = str(display["action"])
+                better_target = str(display.get("command") or display.get("target") or "")
+                if better_target and not target_rec.get("target"):
+                    target_rec["target"] = sanitize_tool_display_text(better_target, 180)
+
+            target_rec["status"] = "ok" if ok else "err"
+            target_rec["finished_at"] = now
+            target_rec["duration_ms"] = dur_int
+            target_rec["duration_text"] = duration_text
+            target_rec["error_summary"] = error_summary
+            target_rec["result_preview"] = result_preview
 
     def _record_partial(self, task_id: str, text: str) -> None:
         cleaned = str(text or "").strip()
@@ -4375,17 +4855,18 @@ class SubagentManager:
 
         role_instructions = {
             "explore": (
-                "只读探索代码和资料，不修改文件，不执行有副作用命令。"
+                "只读探索代码和资料，不修改文件，不执行命令。"
                 "尽可能并行发起多个 search_code/glob_files/read_file 调用以最大化速度："
                 "用 glob_files 按模式定位文件，用 search_code 搜索内容，用 read_file 读取已知路径。"
                 "【工具失败降级】任一工具失败时优先尝试同类替代工具，不要直接返回失败："
                 "  · get_weather 失败（403/超时/SSRF）→ search_news 搜'城市名 天气'或 fetch_url 抓天气网页"
-                "  · fetch_url 失败 → 检查 URL 拼写，或改用 search_news 搜索相同关键词"
+                "  · fetch_url 失败 → 检查 URL 拼写，或改用 search_news 搜索相同关键词。"
+                "    私网地址被 SSRF 拒绝是预期结果，不要重试。"
                 "  · search_news 失败 → 可能网络受限，明确告知主 Agent 当前环境无法联网"
                 "  · search_code 无结果 → 改用 glob_files 按文件名模式查找，或扩大搜索范围"
                 "  · read_file 路径不存在 → 先用 list_directory 或 glob_files 定位正确路径"
-                "【本地优先】获取系统时间/日期/主机信息等本地可完成的任务，优先用 execute_command "
-                "执行本地命令（如 PowerShell 的 Get-Date），不要依赖联网工具。"
+                "本角色没有 execute_command。任务需要本机命令、技能脚本或内网接口时，"
+                "立即结束并说明应改派 operate，不要把本机缓存文件写成实时结果。"
                 "所有替代尝试都失败后，明确说明失败原因和已尝试的替代方案，由主 Agent 决策下一步。"
             ),
             "implement": (
@@ -4399,21 +4880,25 @@ class SubagentManager:
                 "改用更细粒度的命令（如单测）重试，避免一次跑全量测试。"
             ),
             "review": (
-                "只读审查实现和测试结果，列出风险和未覆盖项，不修改文件。"
+                "只读审查实现和测试结果，列出风险和未覆盖项，不修改文件，不执行命令。"
+                "需要 git diff、跑测试或访问内网时，结束并说明应改派 operate 或 test。"
                 "【工具失败降级】read_file/search_code 失败时参考 explore 角色的降级策略。"
+            ),
+            "operate": (
+                "负责本机取证和实时数据：执行命令、运行技能脚本、访问内网接口。"
+                "不修改项目源代码；没有 write_file/edit_file。需要改代码时结束并说明应交 implement。"
+                "先对照可用技能目录，相关技能必须先 read_file 读取 SKILL.md，再按其中的命令执行。"
+                "私网地址不要用 fetch_url，SSRF 会拒绝；改用 execute_command 调用本机脚本或 pwsh/curl。"
+                "磁盘上的缓存 JSON、快照、上次导出的结果不是实时数据；技能要求调接口时必须真的执行命令。"
+                "命令只用于读取和取证，不要用命令改文件、安装依赖、提交或删除。"
+                "【工具失败降级】命令失败时先读错误输出，修正参数后最多重试 1 次；"
+                "仍失败就说明命令、退出码和错误，不要改用缓存蒙混。"
             ),
             "general": (
                 "独立完成任务，按需使用可用工具。"
                 "【工具失败降级】任一工具失败时优先尝试同类替代工具，"
                 "所有替代都失败后明确说明原因，由主 Agent 决策下一步。"
             ),
-        }
-        role_when_to_use = {
-            "explore": "只读探索代码库、查找文件、搜索内容、回答代码相关问题时使用，预期会超过 3 次工具调用的探索任务优先用此类型。",
-            "implement": "需要修改代码、实现功能、修复 bug 时使用，会读写文件和执行命令。",
-            "test": "需要运行测试、定位失败根因、验证实现时使用，可执行命令但不修改业务代码。",
-            "review": "需要审查代码质量、安全性、可维护性时使用，只读不修改。",
-            "general": "独立完成综合性任务时使用，按需调用所有可用工具。",
         }
         if custom:
             role = custom.get("base_type", "general")
@@ -4433,10 +4918,15 @@ class SubagentManager:
             else default_subagent_allowed_tools(role)
         )
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
+        # 技能目录与主代理同源。子代理要先读到 SKILL.md 才知道该跑哪条命令；
+        # 扫描失败时省略目录，不阻断子任务。
+        skill_catalog = _subagent_skill_catalog()
+        if skill_catalog:
+            instruction_text = instruction_text + "\n" + skill_catalog
         # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪 / 信源分级五条对内置与自定义子代理
         # 一律生效。拼进 instruction_text 而非仅在首请求拼接——后续「续写总结」请求
         # （cont_messages）同样复用 instruction_text，两处请求自动带上同一份约束。
-        # 顺序：身份正文在前、公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
+        # 顺序：身份正文、技能目录在前，公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
         instruction_text = instruction_text + "\n" + build_subagent_common_block(allowed_tools)
         messages = [
             {
@@ -4480,6 +4970,12 @@ class SubagentManager:
             )
             return text
 
+        self._set_task_model_name(
+            task.task_id,
+            _resolve_subagent_model_name(current_model, current_model_id),
+        )
+        current_round = 1
+        self._set_task_rounds(task.task_id, current_round)
         self._record_stage(task.task_id, "model")
         # 子代理执行具体计划项时，不应继承父会话的计划锁约束；
         # 否则子代理会被剥夺 write_file/edit_file/execute_command 等必要工具，
@@ -4511,7 +5007,37 @@ class SubagentManager:
         partial_parts: list[str] = []
         partial_len = 0
         partial_flushed = 0
+        last_partial_flush = self._monotonic()
+        round_thinking_parts: list[str] = []
+        thinking_len = 0
+        thinking_flushed = 0
+        last_thinking_flush = self._monotonic()
+        saw_tool_finished = False
         turn_error_message = ""
+
+        def _flush_round_thinking() -> None:
+            nonlocal thinking_flushed
+            if round_thinking_parts and thinking_len > thinking_flushed:
+                self._record_round_note(
+                    task.task_id,
+                    current_round,
+                    thinking="".join(round_thinking_parts),
+                )
+                thinking_flushed = thinking_len
+
+        def _advance_round_if_needed() -> None:
+            nonlocal current_round, saw_tool_finished, thinking_len, thinking_flushed, last_thinking_flush
+            if not saw_tool_finished:
+                return
+            _flush_round_thinking()
+            round_thinking_parts.clear()
+            thinking_len = 0
+            thinking_flushed = 0
+            last_thinking_flush = self._monotonic()
+            current_round += 1
+            saw_tool_finished = False
+            self._set_task_rounds(task.task_id, current_round)
+
         # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度。
         # 必须把事件消费循环包在作用域内，因为生成器创建时并不执行子代理逻辑；
         # 若只包生成器创建语句，深度会在真正执行前复位，嵌套深度限制将永久失效。
@@ -4519,29 +5045,83 @@ class SubagentManager:
             with _subagent_depth_scope():
                 for event in events:
                     if event.kind == "thinking_started":
+                        _advance_round_if_needed()
                         self._record_stage(task.task_id, "thinking")
+                    elif event.kind == "thinking_delta":
+                        _advance_round_if_needed()
+                        self._record_stage(task.task_id, "thinking")
+                        chunk = str(event.payload.get("text", ""))
+                        if chunk and thinking_len < _MAX_SUBAGENT_ROUND_TEXT:
+                            take = chunk[: _MAX_SUBAGENT_ROUND_TEXT - thinking_len]
+                            round_thinking_parts.append(take)
+                            thinking_len += len(take)
+                            now_mono = self._monotonic()
+                            if thinking_len - thinking_flushed >= 80 or now_mono - last_thinking_flush >= 0.35:
+                                _flush_round_thinking()
+                                last_thinking_flush = now_mono
                     elif event.kind == "tool_started":
+                        _advance_round_if_needed()
+                        _flush_round_thinking()
+                        if answer:
+                            intro_text = "".join(answer).strip()
+                            if intro_text:
+                                self._record_round_note(
+                                    task.task_id,
+                                    current_round,
+                                    text=intro_text,
+                                )
+                            answer.clear()
+                        self._record_tool_started(
+                            task.task_id,
+                            str(event.payload.get("id") or ""),
+                            current_round,
+                            dict(event.payload),
+                        )
                         self._record_stage(
                             task.task_id,
                             "tool",
                             str(event.payload.get("name", "")),
                         )
-                        answer.clear()
                     elif event.kind == "permission_requested":
+                        try:
+                            from core.tool_presenter import describe_permission_request
+
+                            approval_text = describe_permission_request(
+                                str(event.payload.get("function_name") or ""),
+                                dict(event.payload.get("arguments") or {}),
+                            )
+                        except Exception:
+                            approval_text = str(event.payload.get("function_name") or "")
+                        self._set_approval_summary(task.task_id, approval_text[:240])
                         self._record_stage(task.task_id, "waiting_approval")
                     elif event.kind == "permission_resolved":
+                        self._set_approval_summary(task.task_id, "")
                         self._record_stage(task.task_id, "running", "approval resolved")
                     elif event.kind == "assistant_delta":
+                        _advance_round_if_needed()
+                        _flush_round_thinking()
                         self._record_stage(task.task_id, "composing")
                         text = str(event.payload.get("text", ""))
                         answer.append(text)
                         partial_parts.append(text)
                         partial_len += len(text)
-                        if partial_len - partial_flushed >= 2000:
+                        now_mono = self._monotonic()
+                        if partial_len > partial_flushed and (
+                            partial_len - partial_flushed >= 200
+                            or now_mono - last_partial_flush >= 0.6
+                        ):
                             self._record_partial(task.task_id, "".join(partial_parts))
                             partial_flushed = partial_len
+                            last_partial_flush = now_mono
                     elif event.kind == "tool_finished":
+                        saw_tool_finished = True
                         name = str(event.payload.get("name", "tool"))
+                        self._record_tool_finished(
+                            task.task_id,
+                            str(event.payload.get("id") or ""),
+                            current_round,
+                            dict(event.payload),
+                        )
                         if event.payload.get("ok") is False:
                             err = str(
                                 event.payload.get("summary")
@@ -4567,6 +5147,10 @@ class SubagentManager:
                             event.payload.get("message") or turn_error_message
                         )
                     elif event.kind == "diff_ready":
+                        self._record_file_diff(
+                            task.task_id,
+                            dict(event.payload),
+                        )
                         # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
                         # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
                         # 内部的调用 id，父端匹配不到会归入 legacy_diffs 兜底，
@@ -4579,11 +5163,12 @@ class SubagentManager:
                                 _logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
         finally:
             # 现场打捞兜底：与循环内的周期 flush 幂等（_record_partial 只在更长时覆盖）。
-            # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到最后一个
-            # 2000 字符边界，靠这里把尾部不足 2000 的正文也捞住，不改变异常传播。
+            # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到上一个刷新边界，
+            # 靠这里把尾部正文与思考也捞住，不改变异常传播。
+            _flush_round_thinking()
             self._record_partial(task.task_id, "".join(partial_parts))
         task.tool_errors.update(tool_errors)
-        task.tool_success_count = success_count
+        task.tool_success_count = max(task.tool_success_count, success_count)
         task.turn_error = turn_error_message
         result_text = "".join(answer)
 
@@ -4593,27 +5178,15 @@ class SubagentManager:
             and not turn_error_message
         ):
             continuation_prompt = (
-                "你之前的回答过于简短。请提供更完整的总结，包含：\n"
+                "你之前的回答过于简短。请直接基于上面已经获取的工具结果和信息提供更完整的中文总结，包含：\n"
                 "1. 具体的技术细节和实现要点\n"
                 "2. 关键发现与分析结论\n"
                 "3. 主 Agent 需要知晓的所有重要信息\n"
-                "请直接输出完整内容，不要重复之前的简短回答。"
+                "请直接输出完整内容，不要重复之前的简短回答，也不要重新调用已经完成的读写或命令工具。"
             )
-            cont_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        f"你是{_agent_display_name()}子代理({task.task_id})，角色是 {role}。"
-                        f"{instruction_text}"
-                        "你只执行主 Agent 已分配的单一子任务；"
-                        "结束时只输出供主 Agent 汇总的公开结论。"
-                        "所有输出必须使用中文。"
-                    ),
-                },
-                {"role": "user", "content": f"请完成以下子任务：\n{task.description}"},
-                {"role": "assistant", "content": result_text or "（未输出最终结论）"},
-                {"role": "user", "content": continuation_prompt},
-            ]
+            cont_messages = _build_subagent_continuation_messages(
+                messages, result_text, continuation_prompt
+            )
             self._record_stage(task.task_id, "summarizing")
             try:
                 cont_events = chat_with_model_events(
@@ -4625,23 +5198,71 @@ class SubagentManager:
                     turn_id=task.task_id,
                     cancel_event=task.cancel_event,
                     allow_subagents=False,
-                    allowed_tools=None,
+                    allowed_tools=allowed_tools,
                     consume_background_notifications=False,
                     parent_session=None,
                     parent_turn_id=None,
                     permission_owner=task.task_id,
                     permission_source=f"子代理总结：{task.description[:40]}",
+                    cache_scope=f"subagent:{role}",
+                    cache_session_id=task.parent_session,
                     model_id=current_model_id,
+                    budget_notice_provider=_budget_notice_provider,
                 )
                 cont_answer = []
+                cont_turn_error = ""
                 with _subagent_depth_scope():
                     for event in cont_events:
                         if event.kind == "assistant_delta":
                             cont_answer.append(str(event.payload.get("text", "")))
+                        elif event.kind == "tool_started":
+                            _advance_round_if_needed()
+                            self._record_tool_started(
+                                task.task_id,
+                                str(event.payload.get("id") or ""),
+                                current_round,
+                                dict(event.payload),
+                            )
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                str(event.payload.get("name", "")),
+                            )
+                        elif event.kind == "tool_finished":
+                            saw_tool_finished = True
+                            name = str(event.payload.get("name", "tool"))
+                            self._record_tool_finished(
+                                task.task_id,
+                                str(event.payload.get("id") or ""),
+                                current_round,
+                                dict(event.payload),
+                            )
+                            if event.payload.get("ok") is False:
+                                err = str(
+                                    event.payload.get("summary")
+                                    or event.payload.get("error")
+                                    or "工具执行失败"
+                                )
+                                task.tool_errors[name] = err
+                            else:
+                                task.tool_errors.pop(name, None)
+                                task.tool_success_count += 1
+                        elif event.kind == "diff_ready":
+                            self._record_file_diff(task.task_id, dict(event.payload))
+                            if task.event_callback is not None:
+                                try:
+                                    task.event_callback("diff_ready", dict(event.payload))
+                                except Exception:
+                                    _logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+                        elif event.kind == "turn_error":
+                            cont_turn_error = str(
+                                event.payload.get("message") or cont_turn_error
+                            )
                 continued = "".join(cont_answer).strip()
-                # 只有重试结果更长时才采用，避免重试反而更差
-                if len(continued) > len(result_text.strip()):
+                # 只有在未触发续写异常且结果更完整时才替换，避免报错/截断覆盖原有结论
+                if not cont_turn_error and len(continued) > len(result_text.strip()):
                     result_text = continued
+                    self._record_partial(task.task_id, result_text)
             except Exception:
                 # 总结续写失败不影响主流程，返回原始结果
                 pass
@@ -4657,6 +5278,7 @@ subagent_manager = SubagentManager()
 _SUBAGENT_DEFAULT_TIMEOUTS = {
     "explore": 300,
     "review": 420,
+    "operate": 900,
     "test": 900,
     "implement": 900,
     "general": 900,
@@ -4666,6 +5288,10 @@ _SUBAGENT_DEFAULT_TIMEOUTS = {
 # 超过该预算的大任务应转后台（后台默认预算按系数放宽）。
 SUBAGENT_FOREGROUND_MAX_TIMEOUT = 900
 SUBAGENT_BACKGROUND_TIMEOUT_FACTOR = 1.5
+
+# plan 阶段子代理的默认预算上限：该阶段是取证与分析，不是长任务执行；
+# 一个分析项拖满 900s 会把整个计划回合卡住 15 分钟。显式传入的预算不受影响。
+PLAN_STAGE_SUBAGENT_TIMEOUT = 600
 
 
 def make_authorized_verification_runner(
@@ -4730,6 +5356,7 @@ def run_subagent(
     subagent_type="general",
     plan_item_id="",
     event_callback=None,
+    force_general=False,
 ):
     # 子代理深度硬限制：防止无限递归（参考 OpenCode limit subagent nesting depth）
     # 主代理线程 depth=0，子代理 depth=1，孙代理 depth=2，重孙 depth=3 → 超限拒绝
@@ -4805,6 +5432,10 @@ def run_subagent(
         parent_session = parent_session or app_context.get_current_session()
         parent_turn_id = parent_turn_id or f"standalone-{uuid.uuid4().hex[:8]}"
     scheduler = None
+    plan_item = None
+    plan_stage = ""
+    # plan 阶段权限封顶值（None = 沿用父档位），见 _plan_stage_permission_mode
+    subagent_permission_mode = None
     if plan_item_id:
         from core.task_scheduler import get_default_scheduler
 
@@ -4813,6 +5444,8 @@ def run_subagent(
             (item for item in scheduler.plan.snapshot() if item["id"] == str(plan_item_id)),
             None,
         )
+        if plan_item is not None:
+            plan_stage = str(plan_item.get("stage") or "").strip().lower()
         if plan_item is None:
             # 计划项查无此项时必须区分两种根因，否则会把平台侧路由缺陷
             # 谎报成“计划项不存在”，误导模型放弃或改写计划：
@@ -4849,12 +5482,11 @@ def run_subagent(
                 "plan_item_id": str(plan_item_id),
                 "error": "用户输入准备项必须由 ask_user 执行，不能分配给子代理。",
             }, ensure_ascii=False)
-        if plan_item is not None and (not subagent_type or subagent_type == "general"):
-            subagent_type = {
-                "plan": "explore",
-                "build": "implement",
-                "review": "review",
-            }.get(plan_item.get("stage"), "general")
+        if plan_item is not None:
+            subagent_type = resolve_plan_subagent_type(
+                subagent_type, plan_stage, force_general=bool(force_general)
+            )
+            subagent_permission_mode = _plan_stage_permission_mode(plan_stage)
         if plan_item is not None and bool(plan_item.get("takeover_required", False)):
             # 首次超时后主 Agent 已接管（或排队等待接管）：同一计划项禁止再次
             # 派发子代理（timed_out → takeover ≠ retry → 新子代理）。
@@ -5010,6 +5642,8 @@ def run_subagent(
     # 后台任务不阻塞用户，默认预算再放宽 1.5 倍；显式传入的预算不做放大。
     if timeout_seconds is None:
         timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 900)
+        if plan_stage == "plan":
+            timeout_seconds = min(timeout_seconds, PLAN_STAGE_SUBAGENT_TIMEOUT)
         if run_in_background:
             timeout_seconds = min(
                 3600,
@@ -5030,6 +5664,7 @@ def run_subagent(
             event_callback=event_callback,
             task_id=delegated_task_id if scheduler is not None else None,
             tool_call_id=_current_tool_call_id(),
+            permission_mode=subagent_permission_mode,
         )
     except Exception as error:
         if scheduler is not None and plan_item_id:

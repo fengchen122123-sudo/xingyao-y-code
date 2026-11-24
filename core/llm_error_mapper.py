@@ -73,6 +73,19 @@ def _extract_status_code(exc: Any, text: str) -> int | None:
     return None
 
 
+def _looks_like_socket_would_block(text: str) -> bool:
+    """Windows WSAEWOULDBLOCK：套接字这一下没有数据，不是连接被拒绝。"""
+    lowered = (text or "").lower()
+    return (
+        "10035" in (text or "")
+        or "非阻止性套接字" in (text or "")
+        or "非阻塞套接字" in (text or "")
+        or "non-blocking socket" in lowered
+        or "ewouldblock" in lowered
+        or "wsaewouldblock" in lowered
+    )
+
+
 def _is_mostly_chinese(text: str) -> bool:
     if not text:
         return False
@@ -102,12 +115,92 @@ def _looks_like_unsupported_model(text: str) -> bool:
     return bool(_RE_MODEL_UNSUPPORTED.search(text or ""))
 
 
+# 中转网关（new-api / one-api 系）的内容过滤拦截。网关在把请求转发给上游之前
+# 检查请求文本，命中后台配置的关键词规则就直接回 HTTP 500，报文形如
+#   {"error":{"message":"user sensitive words detected: <词>",
+#             "type":"new_api_error","code":"sensitive_words_detected"}}
+# 新版请求过滤插件则回 {"code":"request_filtered","ruleId":"..."}。
+# 这类 500 与“服务商内部崩溃”无关，且上下文不变就必然复现，必须单独分类，
+# 否则会被引向“等几分钟重试 / 看 status.openai.com”的死路。
+_GATEWAY_FILTER_MARKERS = (
+    "sensitive_words_detected",
+    "sensitive words detected",
+    "request_filtered",
+    # 网关汉化版提示：同样属于确定性拒绝，不能按“临时故障”放行。
+    "命中敏感词",
+    "敏感词拦截",
+)
+
+_RE_GATEWAY_FILTER_HIT = re.compile(
+    r"(?:sensitive words detected|敏感词)[:：]\s*([^\s\"',;)\]}\n]+)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_gateway_content_filter(text: Any) -> bool:
+    """报文是否来自中转网关的内容过滤拦截（而不是上游模型故障）。"""
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _GATEWAY_FILTER_MARKERS)
+
+
+def gateway_filter_hit_words(text: Any) -> list[str]:
+    """网关回显的命中词，按出现顺序去重。"""
+    words: list[str] = []
+    for match in _RE_GATEWAY_FILTER_HIT.finditer(str(text or "")):
+        word = match.group(1).strip()
+        if word and word not in words:
+            words.append(word)
+    return words
+
+
+def mask_gateway_filter_words(text: Any, words: list[str]) -> str:
+    """把命中词在原报文里打码。
+
+    错误卡片本身会被写回会话历史，若原样保留触发词，下一轮请求又会命中同一条
+    规则（自锁：越诊断越报错，整个会话废掉）。保留首尾各两个字符，既能认出是
+    哪个词，又不再构成完整匹配。
+    """
+    masked = str(text or "")
+    for word in words:
+        if not word:
+            continue
+        keep = 2 if len(word) >= 6 else 1
+        token = f"{word[:keep]}***{word[-keep:]}" if len(word) > keep * 2 else "***"
+        masked = re.sub(re.escape(word), token, masked, flags=re.IGNORECASE)
+    return masked
+
+
 def map_llm_error(exc: Any) -> LLMErrorInfo:
     """将大模型报错或异常分类映射为结构化的中文错误信息。"""
     raw_str = sanitize_error_text(str(exc or ""))
     exc_type = type(exc).__name__.lower() if isinstance(exc, Exception) else ""
     text_lower = f"{exc_type} {raw_str}".lower()
     status_code = _extract_status_code(exc, raw_str)
+
+    # 网关内容过滤必须先于 500 判定：它是确定性的拒绝，不是服务商临时故障。
+    if looks_like_gateway_content_filter(raw_str):
+        hit_words = gateway_filter_hit_words(raw_str)
+        hit_hint = ""
+        if hit_words:
+            hit_hint = "命中词：" + "、".join(
+                mask_gateway_filter_words(word, [word]) for word in hit_words
+            ) + "。"
+        return LLMErrorInfo(
+            category="gateway_content_filtered",
+            title="请求被中转网关内容过滤拦截",
+            reason=(
+                "中转网关（new-api / one-api 系）在把请求转发给模型之前检查了请求文本，"
+                "命中后台配置的关键词规则后直接拒绝并回了 HTTP 500；上游模型从未收到这次请求。"
+                + hit_hint
+            ),
+            suggestion=(
+                "这不是服务商故障，等待重试不会恢复：报错回显的触发词已经留在会话上下文里，"
+                "每轮请求都会重新带上它，越问越拦。请清空当前会话或新开会话重新提问，"
+                "不要把这整段报错原文再贴回输入框；若网关是自建的，到后台「请求过滤 / 敏感词」"
+                "里删掉对应词条即可根治。"
+            ),
+            raw_message=mask_gateway_filter_words(raw_str, hit_words),
+        )
 
     if status_code == 402 or any(
         kw in text_lower
@@ -313,6 +406,15 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             raw_message=raw_str,
         )
 
+    if _looks_like_socket_would_block(text_lower) or _looks_like_socket_would_block(raw_str):
+        return LLMErrorInfo(
+            category="socket_would_block",
+            title="模型流暂时没有数据",
+            reason="读取模型流式输出时，连接这一下还没有新数据。Windows 把这次等待报成了套接字错误，模型并没有拒绝请求。",
+            suggestion="点「继续任务」即可接着做。若同一会话仍反复中断，检查到模型接口的网络是否稳定。",
+            raw_message=raw_str,
+        )
+
     if any(
         kw in exc_type
         for kw in (
@@ -422,8 +524,14 @@ def format_user_facing_error(exc: Any) -> str:
     if not raw_str:
         return "未知错误"
 
-    if _is_mostly_chinese(raw_str) and not any(
-        p in raw_str for p in ("litellm", "OpenAIException", "AnthropicError", "Error code:", "status_code")
+    if (
+        _is_mostly_chinese(raw_str)
+        and not _looks_like_socket_would_block(raw_str)
+        # 网关过滤提示必须进 map 打码，否则中文报文会原样透出触发词。
+        and not looks_like_gateway_content_filter(raw_str)
+        and not any(
+            p in raw_str for p in ("litellm", "OpenAIException", "AnthropicError", "Error code:", "status_code")
+        )
     ):
         return raw_str
 

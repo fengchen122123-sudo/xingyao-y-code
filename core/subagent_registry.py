@@ -6,7 +6,7 @@ import threading
 
 from core.workspace_context import get_workdir
 
-BUILTIN_SUBAGENT_TYPES = {"explore", "implement", "test", "review", "general"}
+BUILTIN_SUBAGENT_TYPES = {"explore", "implement", "test", "review", "operate", "general"}
 
 _FINGERPRINT_HASH_MAX_BYTES = 256 * 1024
 
@@ -84,16 +84,25 @@ def _parse_frontmatter(content):
     body = match.group(2).strip()
 
     frontmatter = {}
-    for line in yaml_content.split('\n'):
-        line = line.strip()
+    current_list_key = None
+    for raw_line in yaml_content.split('\n'):
+        line = raw_line.strip()
         if not line or line.startswith('#'):
             continue
+        if current_list_key and line.startswith('- '):
+            item = line[2:].strip().strip('"\'')
+            if item:
+                existing = frontmatter.get(current_list_key, "")
+                frontmatter[current_list_key] = f"{existing}, {item}" if existing else item
+            continue
         if ':' not in line:
+            current_list_key = None
             continue
         key, _, value = line.partition(':')
         key = key.strip().lower()
         value = value.strip().strip('"\'')
         frontmatter[key] = value
+        current_list_key = key if not value else None
 
     return frontmatter, body
 
@@ -101,9 +110,12 @@ def _parse_frontmatter(content):
 def _parse_allowed_tools(value):
     if not value:
         return None
+    text = str(value).strip()
+    if text.startswith('[') and text.endswith(']'):
+        text = text[1:-1]
     tools = set()
-    for part in value.split(','):
-        tool = part.strip().lower()
+    for part in text.split(','):
+        tool = part.strip().strip('"\'').strip().lower()
         if tool:
             tools.add(tool)
     return tools if tools else None

@@ -666,6 +666,39 @@ it('宿主串行代次门控：hide 后迟到 resolve 的 open ack 不得复活 
   wrapper.unmount();
 });
 
+it('open 回执仍是 opening 时，内核随后报就绪就收起准备中占位', async () => {
+  const api = mockApi();
+  api.browser_pane_open.mockResolvedValue({
+    ok: true,
+    ack: true,
+    phase: 'opening',
+    state: { phase: 'opening', ready: false, visible: true, url: 'https://www.baidu.com/' },
+  });
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.embeddedBrowser.url = 'https://www.baidu.com/';
+
+  const wrapper = await mountPane(true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalled());
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('opening');
+  expect(wrapper.find('[data-test="bp-surface-pending"]').exists()).toBe(true);
+
+  store.handleBridgeEvent({
+    type: 'embedded_browser',
+    data: {
+      url: 'https://www.baidu.com/',
+      ready: true,
+      visible: true,
+      phase: 'ready',
+    },
+  } as any);
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('ready');
+  expect(wrapper.find('[data-test="bp-surface-pending"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
 it('330px 窄面板遇 1440×900 视口时不篡改右栏宽度、隐藏被裁的原生视图并显示缩略图/展开提示，拖宽至 >=392px 后恢复', async () => {
   const api = mockApi();
   (window as any).pywebview = { api };
@@ -709,3 +742,102 @@ it('330px 窄面板遇 1440×900 视口时不篡改右栏宽度、隐藏被裁�
     if (chDesc) Object.defineProperty(HTMLElement.prototype, 'clientHeight', chDesc);
   }
 });
+
+it('open 返回 opening 后，收到内核 ready 状态事件时立即推进为 ready，不再卡在准备视图转圈', async () => {
+  const api = mockApi();
+  api.browser_pane_open.mockResolvedValue({
+    ok: true,
+    ack: true,
+    surface_generation: 1,
+    phase: 'opening',
+  });
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.embeddedBrowser.url = 'file:///C:/Users/test/.ycode/exports/preview/preview_123.html';
+
+  const wrapper = await mountPane(true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalled());
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('opening');
+  expect(wrapper.find('[data-test="bp-surface-pending"]').exists()).toBe(true);
+
+  store.handleBridgeEvent({
+    type: 'embedded_browser',
+    data: {
+      url: 'file:///C:/Users/test/.ycode/exports/preview/preview_123.html',
+      title: 'CHANGELOG.md',
+      ready: true,
+      visible: true,
+      phase: 'ready',
+      surface_generation: 1,
+    },
+  } as any);
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('ready');
+  expect(wrapper.find('[data-test="bp-surface-pending"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('后端代次领先返回 stale_surface_generation 时同步代次并自动重试 open，不永久卡死在 opening', async () => {
+  const api = mockApi();
+  let calls = 0;
+  api.browser_pane_open.mockImplementation(async (_rect, _url, _zoom, _session, gen) => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        stale: true,
+        error: 'stale_surface_generation',
+        surface_generation: 5,
+      };
+    }
+    return {
+      ok: true,
+      ack: true,
+      surface_generation: gen,
+      phase: 'ready',
+    };
+  });
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.embeddedBrowser.url = 'file:///C:/Users/test/.ycode/exports/preview/preview_123.html';
+
+  const wrapper = await mountPane(true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalledTimes(2));
+  expect(api.browser_pane_open.mock.calls[0][4]).toBe(1);
+  expect(api.browser_pane_open.mock.calls[1][4]).toBe(6);
+  await nextTick();
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('ready');
+  wrapper.unmount();
+});
+
+it('set_bounds 命中后端已隐藏的代次冲突时同步代次并重新 open 恢复显示', async () => {
+  const api = mockApi();
+  api.browser_pane_open
+    .mockResolvedValueOnce({ ok: true, ack: true, surface_generation: 1, phase: 'ready' })
+    .mockResolvedValueOnce({ ok: true, ack: true, surface_generation: 5, phase: 'ready' });
+  api.browser_pane_set_bounds.mockResolvedValueOnce({
+    ok: false,
+    stale: true,
+    error: 'stale_surface_generation',
+    surface_generation: 4,
+    state: { visible: false, phase: 'hidden', surface_generation: 4 },
+  });
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.embeddedBrowser.url = 'https://example.com';
+
+  const wrapper = await mountPane(true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalledTimes(1));
+
+  // 触发尺寸变化引发 set_bounds，模拟后端切会话时曾隐蔽 hide 推进了代次
+  vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(() => domRect(0, 0, 360, 420));
+  window.dispatchEvent(new Event('resize'));
+
+  await vi.waitFor(() => expect(api.browser_pane_set_bounds).toHaveBeenCalledTimes(1));
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalledTimes(2));
+  expect(api.browser_pane_open.mock.calls[1][4]).toBe(5);
+  expect(wrapper.find('[data-test="bp-surface-phase"]').attributes('data-phase')).toBe('ready');
+  wrapper.unmount();
+});
+

@@ -254,3 +254,34 @@ it('子代理开关关闭：会话内外的子代理页签一并收掉，重新�
   await store.switchSession('C');
   expect(store.rightPanelTabs).not.toContain('subagent');
 });
+
+it('switchSession 先完成 switch_session 再调 browser_pane_set_active_session 并按会话隔离浏览器 URL', async () => {
+  const order: string[] = [];
+  (window as any).pywebview = {
+    api: {
+      switch_session: vi.fn().mockImplementation(async (name: string) => {
+        order.push(`switch_session:${name}`);
+        return { messages: [], is_global: true };
+      }),
+      browser_pane_set_active_session: vi.fn().mockImplementation(async (name: string) => {
+        order.push(`set_active_session:${name}`);
+        return { ok: true, session_name: name, activated: false };
+      }),
+    },
+  };
+
+  const store = useAppStore();
+  await store.switchSession('A');
+  store.embeddedBrowser.url = 'https://a.example.com';
+  order.length = 0;
+
+  await store.switchSession('B');
+  expect(order).toEqual(['switch_session:B', 'set_active_session:B']);
+  expect(store.embeddedBrowser.url).toBe('');
+  expect(store.browserSessionSyncing).toBe(false);
+  expect(store.browserSurfaceResyncNonce).toBeGreaterThanOrEqual(2);
+
+  await store.switchSession('A');
+  expect(store.embeddedBrowser.url).toBe('https://a.example.com');
+});
+

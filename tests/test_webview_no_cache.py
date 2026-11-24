@@ -1,3 +1,4 @@
+import mimetypes
 import threading
 import time
 import urllib.request
@@ -75,5 +76,21 @@ def test_apply_is_idempotent(dist_root):
     try:
         _, headers, _ = _get_headers(server, "/index.html")
         assert headers["Cache-Control"] == "no-cache, no-store, must-revalidate"
+    finally:
+        server.shutdown()
+
+
+def test_patched_server_overrides_windows_js_mime(dist_root, monkeypatch):
+    apply()
+    # Windows 注册表 HKCR\.js\Content Type=text/plain 会进入 mimetypes 映射。
+    monkeypatch.setitem(mimetypes.types_map, ".js", "text/plain")
+    apply()
+
+    server = _serve_once(_make_pywebview_like_app(dist_root))
+    try:
+        status, headers, body = _get_headers(server, "/assets/index-ABC123.js")
+        assert status == 200
+        assert headers["Content-Type"] == "text/javascript; charset=UTF-8"
+        assert body == b"console.log(1)"
     finally:
         server.shutdown()

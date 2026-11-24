@@ -145,7 +145,7 @@ from core.llm_transport import (
 
 from core.llm_error_mapper import map_llm_error
 
-# 这几类失败重试没用（额度用完 / 密钥无效 / 权限不够 / 模型不存在），
+# 这几类失败重试没用（额度用完 / 密钥无效 / 权限不够 / 模型不存在 / 网关内容过滤），
 # 命中即直接报错收尾；限流等临时性错误继续重试
 _DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
     "insufficient_quota",
@@ -154,6 +154,8 @@ _DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
     "model_not_found",
     "model_unavailable",
     "policy_refusal",
+    # 网关内容过滤是确定性的：上下文里带着触发词，重试多少次都会命中同一条规则。
+    "gateway_content_filtered",
 })
 
 
@@ -162,6 +164,51 @@ def _is_deterministic_api_failure(exc):
         return map_llm_error(exc).category in _DETERMINISTIC_API_FAILURE_CATEGORIES
     except Exception:
         return False
+
+
+_RETRYABLE_STREAM_EXC_TYPE_MARKERS = (
+    "remoteprotocolerror",
+    "readerror",
+    "writeerror",
+    "networkerror",
+    "connecterror",
+    "connectionerror",
+    "connectionreseterror",
+    "connectionabortederror",
+    "brokenpipeerror",
+    "incompleteread",
+    "apiconnectionerror",
+)
+
+_RETRYABLE_STREAM_TEXT_MARKERS = (
+    "connectionterminated",
+    "server disconnected",
+    "connection reset",
+    "connection aborted",
+    "remote end closed",
+    "goaway",
+)
+
+
+def _is_retryable_stream_interruption(exc):
+    """流式阶段「对端主动断开连接」类异常，零产出时可换连接重发。
+
+    httpcore 收到 HTTP/2 GOAWAY 会把整条连接判死，并对当前流抛
+    RemoteProtocolError("<ConnectionTerminated ...>")——与请求内容无关，
+    换新连接重发完全等价。读超时、等待首字节超时、协议违规、用户取消
+    都不在此列。
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
+        return False
+    name = type(exc).__name__.lower()
+    if "localprotocolerror" in name:
+        return False
+    if any(marker in name for marker in _RETRYABLE_STREAM_EXC_TYPE_MARKERS):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _RETRYABLE_STREAM_TEXT_MARKERS)
 
 
 _KEY_RELATED_FAILURE_CATEGORIES = frozenset({
@@ -1214,12 +1261,15 @@ from core.llm_execution import (
     _TOOL_RESULT_TAIL_TOOLS,
     _build_tool_pipeline_and_context,
     _call_vision_model_for_content,
+    _SUBAGENT_COMMAND_EVIDENCE_TYPES,
     _canonical_arguments_signature,
     _claims_verification_without_evidence,
+    _compact_ephemeral_messages_in_place,
     _describe_images_with_secondary,
     _escape_control_chars_in_json_strings,
     _execute_single_tool_call,
     _get_imom_active_publish_root,
+    _is_ephemeral_subagent_turn,
     _persisted_tool_calls,
     _raw_tool_call_arguments,
     _read_file_result_limit,
@@ -1229,6 +1279,7 @@ from core.llm_execution import (
     _sandbox_outside_guard,
     _show_file_diff,
     _step_progress_observation,
+    _subagent_counts_as_command_evidence,
     _tool_call_activity_kinds,
     _tool_call_arguments,
     _tool_call_name,
@@ -2071,6 +2122,7 @@ def _chat_with_model_generator(
             cache_control_downgraded = False
             affinity_downgraded = False
             wait_started_at = None
+            prepared_request = None
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -2293,6 +2345,20 @@ def _chat_with_model_generator(
                                 "建议 /new 开新会话，或移除超大附件/图片后重试。"
                             ) from api_err
                         overflow_compress_attempts += 1
+                        if _is_ephemeral_subagent_turn(stream, parent_session, cache_scope):
+                            if event_callback is not None:
+                                _notify_event(event_callback, "status", {
+                                    "message": "子代理上下文窗口超限，正在精简内部执行历史后重试。",
+                                })
+                            if not _compact_ephemeral_messages_in_place(messages):
+                                raise RuntimeError(
+                                    "子代理单步载荷已超出模型上下文窗口且无法继续精简，"
+                                    "请缩小子任务范围或拆分为多个子代理后重试。"
+                                ) from api_err
+                            turn_snapshot = deepcopy(messages)
+                            if attempt < max_api_retries - 1:
+                                continue
+                            raise api_err
                         try:
                             if event_callback is None:
                                 print("\n[⚠️ 检测到上下文窗口超限，正在尝试压缩历史记录以缩减 Prompt 长度...]")
@@ -2431,31 +2497,61 @@ def _chat_with_model_generator(
                     else:
                         raise api_err
 
-            stream_assembler = StreamAssembler(
-                keep_reasoning_fields=_supports_reasoning_fields(
-                    model_name, api_base
-                ),
-                keep_thinking_blocks=(
-                    str(model_name or "").split("/")[0].lower() == "anthropic"
-                ),
-                require_tool_call_reasoning=_requires_tool_call_reasoning(
-                    model_name, api_base
-                ),
-            )
-            first_token_time = None
-            for chunk in _stream_chunks_with_idle_notice(
-                response_stream, event_callback, raise_if_cancelled,
-                inflight_holder=inflight_holder, cancel_event=cancel_event,
-            ):
-                raise_if_cancelled()
-                if chunk is None:
-                    yield ""
-                    continue
-                if first_token_time is None:
-                    first_token_time = time.monotonic()
-                update = stream_assembler.consume(chunk)
-                if update.public_text:
-                    yield update.public_text
+            # 流式阶段「零产出 + 连接被对端回收」允许换连接重发一次：此时
+            # 用户还没看到任何内容，重发与首次请求字节完全等价；一旦已产出
+            # 可见内容，重发会造成重复，必须放弃并把异常交回上层兜底。
+            stream_reconnect_used = False
+            while True:
+                stream_assembler = StreamAssembler(
+                    keep_reasoning_fields=_supports_reasoning_fields(
+                        model_name, api_base
+                    ),
+                    keep_thinking_blocks=(
+                        str(model_name or "").split("/")[0].lower() == "anthropic"
+                    ),
+                    require_tool_call_reasoning=_requires_tool_call_reasoning(
+                        model_name, api_base
+                    ),
+                )
+                first_token_time = None
+                try:
+                    for chunk in _stream_chunks_with_idle_notice(
+                        response_stream, event_callback, raise_if_cancelled,
+                        inflight_holder=inflight_holder, cancel_event=cancel_event,
+                    ):
+                        raise_if_cancelled()
+                        if chunk is None:
+                            yield ""
+                            continue
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        update = stream_assembler.consume(chunk)
+                        if update.public_text:
+                            yield update.public_text
+                    break
+                except Exception as stream_err:
+                    if (
+                        stream_reconnect_used
+                        or prepared_request is None
+                        or stream_assembler.has_visible_output
+                        or not _is_retryable_stream_interruption(stream_err)
+                    ):
+                        raise
+                    stream_reconnect_used = True
+                    logger.warning(
+                        "模型流式连接被对端回收且本轮零产出，换新连接重发一次：%s",
+                        _sanitize_error_text(str(stream_err)),
+                    )
+                    _notify_event(event_callback, "status", {
+                        "message": "模型流式连接被服务端回收（本轮尚未产出内容），正在换新连接重发一次。",
+                    })
+                    try:
+                        response_stream.close()
+                    except Exception:
+                        pass
+                    response_stream, inflight_holder = _request_stream(
+                        prepared_request, cancel_event=cancel_event
+                    )
 
             _tail_chunks = getattr(response_stream, "chunks", None)
             if _tail_chunks:
@@ -3345,8 +3441,8 @@ def _chat_with_model_generator(
 
             substantive_op_count += _count_substantive_ops(tool_calls_list)
 
-            # 已成功完成（status == "completed"）的 test 子代理等同真实测试验证证据，
-            # 避免主代理把测试派发给 subagent_type="test" 后仍触发验证声明误报。
+            # 已成功完成（status == "completed"）的 test/operate 子代理等同真实命令
+            # 验证证据，避免主代理把测试或取证派发出去后仍触发验证声明误报。
             if not used_command_tools:
                 _tc_by_id = {
                     tc.get("id"): tc for tc in tool_calls_list if isinstance(tc, dict) and tc.get("id")
@@ -3360,14 +3456,18 @@ def _chat_with_model_generator(
                         _sub_args = json.loads((_tc.get("function") or {}).get("arguments") or "{}")
                     except (TypeError, ValueError):
                         _sub_args = {}
-                    if str((_sub_args or {}).get("subagent_type") or "").strip().lower() == "test":
-                        try:
-                            _sub_res = json.loads(str(_msg.get("content") or "{}"))
-                        except (TypeError, ValueError):
-                            _sub_res = {}
-                        if isinstance(_sub_res, dict) and _sub_res.get("status") == "completed":
-                            used_command_tools = True
-                            break
+                    _sub_type = str((_sub_args or {}).get("subagent_type") or "").strip().lower()
+                    _sub_content = str(_msg.get("content") or "")
+                    _is_foreground_completed = (
+                        _sub_type in _SUBAGENT_COMMAND_EVIDENCE_TYPES
+                        and not bool((_sub_args or {}).get("run_in_background"))
+                        and not _sub_content.lstrip().startswith("{")
+                    )
+                    if _is_foreground_completed or _subagent_counts_as_command_evidence(
+                        _sub_type, _sub_content
+                    ):
+                        used_command_tools = True
+                        break
 
             results = [record.message for record in records]
             followup_messages = [
@@ -3598,6 +3698,15 @@ def _chat_with_model_generator(
         if e is persistence_failure:
             raise
         if event_callback is not None:
+            # 这条兜底只发事件、不 raise，上层不会再有 logger.exception，等于异常来源
+            # 彻底丢失（WinError 10035 这类瞬时报错就是这样查不到是谁抛的）。此处落一条
+            # 带堆栈的 warning：堆栈只含调用链与异常文本，不含请求头或凭证。
+            logger.warning(
+                "回合异常兜底（%s）：%s",
+                type(e).__name__,
+                _sanitize_error_text(str(e)),
+                exc_info=True,
+            )
             user_facing_msg = _format_user_facing_error(e)
             _notify_event(event_callback, "error", {
                 "message": user_facing_msg,

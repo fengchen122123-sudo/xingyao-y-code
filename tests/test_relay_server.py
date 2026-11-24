@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from relay_server import create_app
-from relay_server.auth import issue_remote_token, read_remote_token
+from relay_server.auth import issue_device_token, issue_remote_token, read_remote_token
 from relay_server.db import connect
 from relay_server.registry import (
     MAX_APPS,
@@ -288,14 +288,18 @@ class TestRegistry:
         assert plan["type"] == "resync_required"
         assert plan["data"]["reason"] == "boot"
 
-    def test_attach_app_same_id_no_double_count(self, reg, device):
+    def test_attach_app_same_jti_independent_keys(self, reg, device):
         dev, _ = device
         a = reg.attach_app(dev, "jti-1")
         assert a["ok"] is True
         b = reg.attach_app(dev, "jti-1")
         assert b["ok"] is True
-        assert reg.app_count(dev) == 1
+        # 同票多开必须各自持有独立 key（否则 RPC 回程会串连接）
+        assert a["key"] != b["key"]
+        assert reg.app_count(dev) == 2
         reg.detach_app(dev, a["key"])
+        assert reg.app_count(dev) == 1
+        reg.detach_app(dev, b["key"])
         assert reg.app_count(dev) == 0
 
     def test_attach_app_limit_and_release(self, reg, device):
@@ -557,9 +561,9 @@ class TestDeviceWS:
 
     def test_dual_app_rpc_ids_not_crossed(self, client, device):
         dev, token = device
-        jwt_a = issue_remote_token(SECRET, dev)["token"]
-        jwt_b = issue_remote_token(SECRET, dev)["token"]
-        with app_ws(client, dev, jwt_a) as app_a, app_ws(client, dev, jwt_b) as app_b:
+        # 单活后同一设备只有一张票：两个页面扫同一个二维码即可并行
+        jwt_token = issue_remote_token(SECRET, dev)["token"]
+        with app_ws(client, dev, jwt_token) as app_a, app_ws(client, dev, jwt_token) as app_b:
             assert app_a.receive_json()["type"] == "replay"
             assert app_b.receive_json()["type"] == "replay"
             with device_ws(client, dev, token) as dws:
@@ -579,10 +583,9 @@ class TestDeviceWS:
 
     def test_dual_app_rpc_stress(self, client, device):
         dev, token = device
-        jwt_a = issue_remote_token(SECRET, dev)["token"]
-        jwt_b = issue_remote_token(SECRET, dev)["token"]
+        jwt_token = issue_remote_token(SECRET, dev)["token"]
         rounds = 20
-        with app_ws(client, dev, jwt_a) as app_a, app_ws(client, dev, jwt_b) as app_b:
+        with app_ws(client, dev, jwt_token) as app_a, app_ws(client, dev, jwt_token) as app_b:
             assert app_a.receive_json()["type"] == "replay"
             assert app_b.receive_json()["type"] == "replay"
             with device_ws(client, dev, token) as dws:
@@ -696,16 +699,15 @@ class TestAppWS:
             with app_ws(client, dev, jwt_token) as app:
                 assert app.receive_json()["type"] == "replay"
 
-    def test_four_apps_then_close_4401(self, client, device):
+    def test_five_apps_on_same_token_then_4401(self, client, device):
         dev, _ = device
+        # 单活下一台设备只有一张票，4 个并发页面就到顶，第 5 个直接 4401
+        jwt_token = issue_remote_token(SECRET, dev)["token"]
         with ExitStack() as stack:
             for _ in range(MAX_APPS):
-                jwt_token = issue_remote_token(SECRET, dev)["token"]
                 ws = stack.enter_context(app_ws(client, dev, jwt_token))
                 assert ws.receive_json()["type"] == "replay"
-            extra = issue_remote_token(SECRET, dev)["token"]
-            with client.websocket_connect(f"/relay/client?device_id={dev}") as ws:
-                ws.send_json({"token": extra, "device_id": dev, "jwt": extra})
+            with app_ws(client, dev, jwt_token) as ws:
                 with pytest.raises(WebSocketDisconnect) as exc:
                     ws.receive_json()
                 assert exc.value.code == 4401
@@ -857,3 +859,71 @@ def test_device_enroll_enforces_enroll_key_when_configured(tmp_path):
         )
         assert ok.status_code == 200
         assert ok.json()["token"]
+
+
+class TestSingleActiveRemoteToken:
+    """刷新即旧链接作废：同一设备只认最新签发的那张远端票。"""
+
+    def test_new_issue_invalidates_previous(self, conn, device):
+        dev, _ = device
+        first = issue_device_token(conn, SECRET, dev)
+        assert read_remote_token(conn, first["token"], SECRET, dev) is not None
+        second = issue_device_token(conn, SECRET, dev)
+        assert read_remote_token(conn, first["token"], SECRET, dev) is None
+        assert read_remote_token(conn, second["token"], SECRET, dev) is not None
+
+    def test_legacy_token_binds_on_first_use(self, conn, device):
+        # 升级前签发的票没有独占标记：第一次使用时就地绑定，
+        # 此后任何新签发都让它立刻失效（不让升级把手机里正在用的链接一次性打死）
+        dev, _ = device
+        legacy = issue_remote_token(SECRET, dev)
+        assert read_remote_token(conn, legacy["token"], SECRET, dev) is not None
+        issue_device_token(conn, SECRET, dev)
+        assert read_remote_token(conn, legacy["token"], SECRET, dev) is None
+
+    def test_active_jti_column_migrated_on_old_db(self, tmp_path):
+        path = str(tmp_path / "old.db")
+        raw_conn = sqlite3.connect(path)
+        raw_conn.execute(
+            """
+            CREATE TABLE devices (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                last_seen INTEGER
+            )
+            """
+        )
+        raw_conn.commit()
+        raw_conn.close()
+        migrated = connect(path)
+        try:
+            cols = {r["name"] for r in migrated.execute("PRAGMA table_info(devices)")}
+            assert "active_jti" in cols
+        finally:
+            migrated.close()
+
+
+class TestRefreshKicksRemoteConnections:
+    def test_refresh_closes_established_app_ws(self, client, conn, device):
+        dev, token = device
+        first = ticket(client, dev, token).json()
+        with app_ws(client, dev, first["token"]) as ws:
+            assert ws.receive_json()["type"] in {"replay", "resync_required"}
+            second = ticket(client, dev, token).json()
+            assert second["token"] != first["token"]
+            with pytest.raises(WebSocketDisconnect):
+                for _ in range(6):
+                    ws.receive_json()
+
+    def test_refresh_cycles_do_not_exhaust_app_slots(self, client, conn, device):
+        # 每次刷新都换 jti：旧 App 名额若不回收，第 5 次连接会被 too_many_apps 拒绝
+        dev, token = device
+        current = ticket(client, dev, token).json()["token"]
+        for _ in range(MAX_APPS):
+            with app_ws(client, dev, current) as ws:
+                assert ws.receive_json()["type"] in {"replay", "resync_required"}
+            resp = ticket(client, dev, token)
+            assert resp.status_code == 200
+            current = resp.json()["token"]
+        with app_ws(client, dev, current) as ws:
+            assert ws.receive_json()["type"] in {"replay", "resync_required"}

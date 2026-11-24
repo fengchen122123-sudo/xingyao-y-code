@@ -103,3 +103,219 @@ it('气泡可悬停：鼠标进入气泡不收起，移出后收起', async () =
   });
   wrapper.unmount();
 });
+
+it('主代理同款过程视图：展示思考折叠、点状工具流、改动文件卡、仅看失败筛选与停止操作', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const cancelTask = vi.fn().mockResolvedValue({ ok: true, status: 'cancelled', msg: '已停止该子代理' });
+  const getDetail = vi.fn().mockResolvedValue({
+    ok: true,
+    task: {
+      id: 'sub-rich',
+      description: '工作目录 E:\\repo，分支 dev。目标：发布校验并上传',
+      type: 'implement',
+      status: 'running',
+      stage: 'waiting_approval',
+      elapsed: 132,
+      execution_elapsed: 90,
+      approval_wait_elapsed: 42,
+      timeout_seconds: 600,
+      background: true,
+      model_name: 'gpt-4.1-mini',
+      approval_summary: '执行命令：git tag v1.4.2',
+      rounds: 2,
+      tool_ok: 1,
+      tool_err: 1,
+      started_at: 1758000000,
+      stages: [],
+      changed_files: ['dist/manifest.json'],
+      file_diffs: [
+        { file_path: 'dist/manifest.json', diff_text: '--- a/dist/manifest.json\n+++ b/dist/manifest.json\n-old\n+new', added: 1, removed: 1 },
+      ],
+      round_notes: [
+        { round: 1, started_at: 1758000001, thinking: '先检索 release_parts 引用位置', text: '正在定位发布清单。' },
+      ],
+      tool_records: [
+        {
+          id: 'c1', seq: 1, round: 1, name: 'search_code', category: 'search',
+          action: '搜索代码', target: 'release_parts', args_preview: 'query: release_parts',
+          status: 'ok', started_at: 1758000002, duration_ms: 31, duration_text: '31ms', result_preview: '命中 3 处',
+        },
+        {
+          id: 'c2', seq: 2, round: 2, name: 'execute_command', category: 'command',
+          action: '运行命令', target: 'pytest', args_preview: 'command: pytest',
+          status: 'err', started_at: 1758000010, error_summary: 'KeyError: TOKEN',
+          result_preview: 'Traceback: KeyError TOKEN',
+        },
+      ],
+      result: '',
+      error: '',
+      partial: '已核对前 6 个分卷。',
+    },
+    tasks: [
+      { id: 'sub-rich', description: '发布校验并上传', type: 'implement', status: 'running', stage: 'waiting_approval', elapsed: 132, background: true },
+    ],
+  });
+  (window as any).pywebview = {
+    api: { get_subagent_task_detail: getDetail, cancel_subagent_task: cancelTask },
+  };
+  const store = useAppStore();
+  store.workdir = 'E:\\repo';
+  store.subagentDetailId = 'sub-rich';
+
+  const wrapper = mount(SubagentPane, {
+    props: { active: true },
+    global: { plugins: [pinia] },
+  });
+
+  await vi.waitFor(() => {
+    expect(wrapper.find('[data-test="subagent-tool-c1"]').exists()).toBe(true);
+  });
+
+  // 不再出现机械 Round 1 标题，改为展示思考摘要、过渡正文与点状工具流
+  expect(wrapper.find('[data-test="subagent-wait-banner"]').text()).toContain('git tag v1.4.2');
+  expect(wrapper.text()).not.toContain('Round 1');
+  expect(wrapper.text()).toContain('先检索 release_parts 引用位置');
+  expect(wrapper.text()).toContain('正在定位发布清单');
+  expect(wrapper.text()).toContain('pytest');
+  expect(wrapper.text()).toContain('KeyError: TOKEN');
+  expect(wrapper.find('[data-test="subagent-files"]').text()).toContain('1 个文件已更改');
+
+  // 点击工具展开调用参数与错误详情
+  await wrapper.get('[data-test="subagent-tool-c2"] [data-row-toggle]').trigger('click');
+  expect(wrapper.text()).toContain('command: pytest');
+  expect(wrapper.text()).toContain('Traceback: KeyError TOKEN');
+
+  // 仅看失败筛选隐藏成功调用
+  await wrapper.get('[data-test="subagent-filter-failed"]').trigger('click');
+  expect(wrapper.find('[data-test="subagent-tool-c1"]').exists()).toBe(false);
+  expect(wrapper.find('[data-test="subagent-tool-c2"]').exists()).toBe(true);
+
+  // 点击停止按钮触发协作取消
+  await wrapper.get('[data-test="subagent-stop"]').trigger('click');
+  expect(cancelTask).toHaveBeenCalledWith('sub-rich', store.currentSessionName);
+  wrapper.unmount();
+});
+
+it('完成后自动收起执行过程，并将连续读取与同类命令合并为单行', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const getDetail = vi.fn().mockResolvedValue({
+    ok: true,
+    task: {
+      id: 'sub-merged',
+      description: '核对历史文档',
+      type: 'explore',
+      status: 'completed',
+      stage: 'completed',
+      elapsed: 70,
+      execution_elapsed: 70,
+      background: false,
+      rounds: 4,
+      tool_ok: 4,
+      tool_err: 0,
+      stages: [],
+      tool_records: [
+        { id: 'r1', seq: 1, round: 1, name: 'read_file', category: 'read', action: '读取文件', target: 'README.md', status: 'ok', started_at: 100, duration_ms: 20 },
+        { id: 'r2', seq: 2, round: 1, name: 'read_file', category: 'read', action: '读取文件', target: 'AGENTS.md', status: 'ok', started_at: 101, duration_ms: 25 },
+        { id: 'g1', seq: 3, round: 2, name: 'execute_command', category: 'command', action: '运行命令', target: 'git show a:README.md', status: 'ok', started_at: 110, duration_ms: 1200 },
+        { id: 'g2', seq: 4, round: 3, name: 'execute_command', category: 'command', action: '运行命令', target: 'git show a:AGENTS.md', status: 'ok', started_at: 120, duration_ms: 800 },
+      ],
+      result: '已完成历史提交比对。',
+      error: '',
+      partial: '',
+    },
+    tasks: [],
+  });
+  (window as any).pywebview = { api: { get_subagent_task_detail: getDetail } };
+  const store = useAppStore();
+  store.subagentDetailId = 'sub-merged';
+
+  const wrapper = mount(SubagentPane, {
+    props: { active: true },
+    global: { plugins: [pinia] },
+  });
+
+  await vi.waitFor(() => {
+    expect(wrapper.find('[data-test="subagent-result"]').exists()).toBe(true);
+  });
+
+  // 有最终结论时默认收起过程（与主代理 TurnGroup 一致），点击标题展开后显示合并行
+  const fold = wrapper.get('[data-test="subagent-flow"] .turn-fold');
+  expect(fold.classes()).not.toContain('is-open');
+  expect(fold.text()).toContain('星舰执行过程 · 4 个工具调用 · 已完成');
+
+  await fold.get('.fold-head').trigger('click');
+  expect(fold.classes()).toContain('is-open');
+  expect(fold.text()).toContain('2 个文件');
+  expect(fold.text()).toContain('git show · 2 次');
+  wrapper.unmount();
+});
+
+it('未指定任务打开总览清单，点选任务进入详情且终态停止轮询', async () => {
+  vi.useFakeTimers();
+  try {
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const getDetail = vi.fn().mockImplementation(async (taskId: string) => {
+      if (!taskId) {
+        return {
+          ok: true,
+          task: null,
+          tasks: [
+            { id: 'sub-done', description: '构建产物', type: 'explore', status: 'completed', stage: 'completed', elapsed: 40, background: false, rounds: 2, tool_ok: 3, tool_err: 0 },
+          ],
+        };
+      }
+      return {
+        ok: true,
+        task: {
+          id: 'sub-done',
+          description: '构建产物',
+          type: 'explore',
+          status: 'completed',
+          stage: 'completed',
+          elapsed: 40,
+          background: false,
+          stages: [],
+          tool_records: [],
+          result: '### 完成\n- 产出 **v1.4.2**',
+          error: '',
+          partial: '',
+        },
+        tasks: [
+          { id: 'sub-done', description: '构建产物', type: 'explore', status: 'completed', stage: 'completed', elapsed: 40, background: false },
+        ],
+      };
+    });
+    (window as any).pywebview = { api: { get_subagent_task_detail: getDetail } };
+    const store = useAppStore();
+    store.subagentDetailId = '';
+
+    const wrapper = mount(SubagentPane, {
+      props: { active: true },
+      global: { plugins: [pinia] },
+    });
+
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-test="subagent-hub-item-sub-done"]').exists()).toBe(true);
+    });
+
+    await wrapper.get('[data-test="subagent-hub-item-sub-done"]').trigger('click');
+    await vi.waitFor(() => {
+      expect(wrapper.find('[data-test="subagent-result"]').exists()).toBe(true);
+    });
+    expect(wrapper.find('[data-test="subagent-result"] h4').text()).toBe('完成');
+    expect(wrapper.find('[data-test="subagent-result"] strong').text()).toBe('v1.4.2');
+
+    const callsAtTerminal = getDetail.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(3500);
+    expect(getDetail.mock.calls.length).toBe(callsAtTerminal);
+
+    await wrapper.get('[data-test="subagent-full-result"]').trigger('click');
+    expect(document.body.querySelector('[data-test="subagent-full-modal"]')).not.toBeNull();
+    wrapper.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});

@@ -1835,7 +1835,7 @@ def _invalidate_ui():
         app_instance.invalidate()
 
 def trigger_session_auto_rename(session_name, user_query, api_model, api_key, api_url):
-    """异步后台根据用户首个提问智能为会话重命名"""
+    """首轮对话结束后异步用 AI 总结为会话命名（每个会话只自动改一次）。"""
     def _apply_rename(final_title):
         """在 UI 线程上应用重命名结果。
 
@@ -1856,60 +1856,58 @@ def trigger_session_auto_rename(session_name, user_query, api_model, api_key, ap
 
     def _rename_job():
         try:
-            query_text = ""
-            if isinstance(user_query, str):
-                query_text = user_query
-            elif isinstance(user_query, list):
-                for item in user_query:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        query_text += item.get("text", "")
-
-            query_text = query_text[:200].strip()
-            if not query_text:
+            # 已 AI 命名或用户手动改名过的会话不再变动
+            try:
+                source = manager.get_session_title_source(session_name)
+            except Exception:
+                source = None
+            if source not in (None, "", "default"):
                 return
 
-            prompt = (
-                "你是一个会话起名助手。请根据以下用户的提问，提炼出一个非常简短、概括性强、通俗易懂的中文会话标题。\n"
-                "要求：\n"
-                "1. 必须在 2 到 6 个汉字以内，千万不要带标点符号，不要带任何解释说明文字，也不要带任何 Markdown 格式或引号。\n"
-                "2. 必须直接返回会话标题本身。\n"
-                "例如，用户问“帮我写个冒泡排序”，你应该返回“冒泡排序”；用户问“运行报错怎么办”，你应该返回“错误调试”。\n\n"
-                f"用户提问：\"{query_text}\"\n"
-                "会话标题："
+            from core.session_title import (
+                generate_session_title,
+                message_text,
             )
-            from core.llm_native_transport import native_completion
-            response = native_completion(
-                model=api_model,
-                api_key=api_key,
-                api_base=api_url,
-                messages=[{"role": "user", "content": prompt}],
-                timeout=10
+
+            try:
+                history = manager.get_history(session_name)
+            except Exception:
+                history = []
+
+            user_msgs = [m for m in history if m.get("role") == "user"]
+            assistant_msgs = [m for m in history if m.get("role") == "assistant"]
+            user_text = (
+                message_text(user_msgs[0].get("content", "")) if user_msgs else ""
             )
-            title = response.choices[0].message.content.strip()
-            title = re.sub(r'["\'“”‘’，。！、]', '', title)
-            title = title[:8].strip()
+            if not user_text:
+                user_text = message_text(user_query)
+            assistant_text = (
+                message_text(assistant_msgs[0].get("content", ""))
+                if assistant_msgs
+                else ""
+            )
+
+            title = None
+            if api_model:
+                title = generate_session_title(
+                    api_model, api_key, api_url, user_text, assistant_text
+                )
+            if not title:
+                # 备用防线：大模型起名失败时截取用户提问前 12 个有效字符
+                clean_query = re.sub(r'[^\w\u4e00-\u9fa5]', '', user_text).strip()
+                clean_query = "".join(clean_query.split())
+                title = clean_query[:12] or "新对话"
 
             if title and not re.match(r"^session_[a-f0-9]{6}$", title):
-                success, final_title = manager.rename_session(session_name, title)
+                success, final_title = manager.rename_session_if_untitled(
+                    session_name, title
+                )
                 if success:
                     _apply_rename(final_title)
         except Exception as exc:
-            # 备用防线：如果大模型起名由于网络/超时失败，直接截取用户提问前 6 个有效字符作为会话名称
-            logging.getLogger("py.warnings").warning("session auto-rename failed: %s", exc)
-            try:
-                clean_query = re.sub(r'[^\w\u4e00-\u9fa5]', '', query_text).strip()
-                clean_query = "".join(clean_query.split())
-                fallback_title = clean_query[:6]
-                if not fallback_title:
-                    fallback_title = "新对话"
-
-                success, final_title = manager.rename_session(session_name, fallback_title)
-                if success:
-                    _apply_rename(final_title)
-            except Exception as fallback_exc:
-                logging.getLogger("py.warnings").warning(
-                    "session auto-rename fallback failed: %s", fallback_exc
-                )
+            logging.getLogger("py.warnings").warning(
+                "session auto-rename failed: %s", exc
+            )
 
     threading.Thread(target=_rename_job, daemon=True).start()
 
@@ -4286,7 +4284,9 @@ def handle_slash_command(command_text):
             elif sub == "rename" and len(parts) > 2:
                 new_name = " ".join(parts[2:]).strip('"\'<>')
                 if new_name:
-                    success, final_name = manager.rename_session(current_session, new_name)
+                    success, final_name = manager.rename_session(
+                        current_session, new_name, title_source="manual"
+                    )
                     if success:
                         current_session = final_name
                         sync_plan_session(current_session)
@@ -6466,19 +6466,22 @@ def _background_worker():
 
             if not turn_interrupted:
                 _report_task_result(task_data, True)
-                if re.match(r"^session_[a-f0-9]{6}$", task_session):
+                try:
                     history = manager.get_history(task_session)
                     user_msgs = [m for m in history if m.get("role") == "user"]
-                    if user_msgs:
-                        first_user_query = user_msgs[0].get("content", "")
-                        if first_user_query:
-                            trigger_session_auto_rename(
-                                task_session,
-                                first_user_query,
-                                task_model,
-                                task_key,
-                                task_url
-                            )
+                    first_user_query = (
+                        user_msgs[0].get("content", "") if user_msgs else ""
+                    )
+                except Exception:
+                    first_user_query = ""
+                # 是否触发由内部按 title_source + 首轮判断，不再依赖占位名
+                trigger_session_auto_rename(
+                    task_session,
+                    first_user_query,
+                    task_model,
+                    task_key,
+                    task_url,
+                )
             else:
                 _report_task_result(task_data, False, turn_error or "任务被取消或回复生成失败")
         except Exception as e:
@@ -6958,7 +6961,9 @@ def run_cli():
                 try:
                     new_name = input(f"请输入会话「{target}」的新名称: ").strip()
                     if new_name:
-                        success, final_name = manager.rename_session(target, new_name)
+                        success, final_name = manager.rename_session(
+                            target, new_name, title_source="manual"
+                        )
                         if success:
                             if current_session == target:
                                 current_session = final_name

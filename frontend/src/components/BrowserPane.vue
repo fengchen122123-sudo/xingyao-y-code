@@ -380,6 +380,7 @@ const frameH = computed(() => Math.round(freeSize.value.h * fitScale.value));
 const surface = useEmbeddedBrowserSurface({
   isActive: () => props.active,
   shouldShowSurface: () =>
+    !store.browserSessionSyncing &&
     !store.rightPanelSnipActive &&
     !store.embeddedBrowserOverlayBlocking &&
     !viewportConstrained.value &&
@@ -392,6 +393,10 @@ const surface = useEmbeddedBrowserSurface({
   getSurfaceEl: () => frameRef.value || surfaceRef.value,
   getZoom: () => (frameRenderable.value && freeSize.value.on ? fitScale.value : 1),
   getSessionName: () => store.currentSessionName,
+  isHostReady: () => store.embeddedBrowser.ready,
+  getHostPhase: () => store.embeddedBrowser.phase,
+  getHostSurfaceGeneration: () => store.embeddedBrowser.surface_generation,
+  getResyncKey: () => store.browserSurfaceResyncNonce,
   // 原生控件永远绘制在 DOM 之上且不受 overflow:hidden 裁剪：上报矩形一旦
   // 越出占位区就会盖住会话区（自由尺寸框在占位区不可测量时兜底缩放=1，
   // 曾按原始 1440×900 铺满整个主区）。所有上报矩形一律夹紧回占位区内。
@@ -400,6 +405,13 @@ const surface = useEmbeddedBrowserSurface({
   onUnsupported: () => { store.embeddedBrowser.supported = false; },
 });
 const surfaceVisible = surface.surfaceVisible;
+
+watch(
+  () => [store.embeddedBrowser.ready, store.embeddedBrowser.visible] as const,
+  ([ready, visible]) => {
+    if (ready && visible) surface.noteHostState({ ready: true, visible: true, phase: 'ready' });
+  },
+);
 
 const addrInputRef = ref<HTMLInputElement | null>(null);
 const editing = ref(false);

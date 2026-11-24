@@ -35,6 +35,18 @@ def test_both_prompts_carry_the_same_clauses():
     assert only_in_cli == [] and only_in_gui == []
 
 
+def test_subagent_routing_sends_commands_to_operate():
+    for prompt_path in (CLI_PROMPT, GUI_PROMPT):
+        text = prompt_path.read_text(encoding="utf-8")
+        assert "operate 本机命令、技能脚本与内网取证" in text
+        assert "不要派 explore" in text
+        assert "stage=plan 派 operate" in text
+        # 计划内 general（含 MCP）的唯一出口，缺了这条规则就没法在计划里用 MCP
+        assert "force_general=true" in text
+        # plan 阶段权限封顶：写命令/删除/提交必须当场批准
+        assert "必须用户当场批准" in text
+
+
 def test_clauses_land_in_expected_sections():
     text = CLI_PROMPT.read_text(encoding="utf-8")
 

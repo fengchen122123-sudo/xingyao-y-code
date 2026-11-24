@@ -35,6 +35,8 @@ class RelayRegistry:
         self.overflowed = {}
         self.rpc_routes = {}
         self.listeners = []
+        # (device_id, app_key) -> closer：签发新票时要能主动断开已建立的远端连接
+        self.app_closers = {}
 
     def create_device(self, database, name: str) -> tuple[str, str]:
         device_id = str(uuid.uuid4())
@@ -86,7 +88,31 @@ class RelayRegistry:
         self.holes.pop(device_id, None)
         self.overflowed.pop(device_id, None)
         self.rpc_routes.pop(device_id, None)
+        self._close_apps(device_id)
         return current
+
+    def _close_apps(self, device_id: str) -> int:
+        keys = [key for (dev, key) in list(self.app_closers) if dev == device_id]
+        for key in keys:
+            closer = self.app_closers.pop((device_id, key), None)
+            if callable(closer):
+                closer()
+        return len(keys)
+
+    def kick_apps(self, device_id: str) -> int:
+        """踢掉该设备所有已建立的远端连接，并回收 App 名额。
+
+        刷新会换新 jti，旧 jti 占的名额若不回收，连刷几次就会把 MAX_APPS 占满，
+        新二维码反而连不上。
+        """
+        self.apps.pop(device_id, None)
+        return self._close_apps(device_id)
+
+    def bind_app_closer(self, device_id: str, app_key: str, closer) -> None:
+        self.app_closers[(device_id, app_key)] = closer
+
+    def unbind_app_closer(self, device_id: str, app_key: str) -> None:
+        self.app_closers.pop((device_id, app_key), None)
 
     @staticmethod
     def _close(current: dict | None) -> None:
@@ -233,20 +259,17 @@ class RelayRegistry:
         return events
 
     def attach_app(self, device_id: str, app_id: str) -> dict:
-        """占一个 App 名额。同一 jti 重连只换连接键，不重复计数。"""
+        """占一个 App 名额，每个连接拿独立 key。
+
+        单活 token 下同一张票可能同时开多个页面（手机 + 平板），它们共享
+        app_id 但必须各自持有自己的 key，否则 RPC 回程会串到另一个连接上。
+        """
         bucket = self.apps.setdefault(device_id, [])
-        key = uuid.uuid4().hex
-        for item in bucket:
-            if item["app_id"] == app_id:
-                retired = item.setdefault("retired_keys", [])
-                retired.append(item["key"])
-                del retired[:-8]
-                item["key"] = key
-                return {"ok": True, "key": key}
         if len(bucket) >= MAX_APPS:
             if not bucket:
                 self.apps.pop(device_id, None)
             return {"ok": False, "error": "too_many_apps"}
+        key = uuid.uuid4().hex
         bucket.append({"app_id": app_id, "key": key})
         return {"ok": True, "key": key}
 

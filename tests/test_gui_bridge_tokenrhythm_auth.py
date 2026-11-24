@@ -501,6 +501,16 @@ _OVERVIEW = {
         "nearest_expires_at": "2026-11-01T10:20:30+08:00",
         "nearest_amount_cny": "5.00000000",
     },
+    "model_credits": [
+        {
+            "id": "mg-1",
+            "model_id": "glm-5.3",
+            "model_name": "GLM-5.3",
+            "remaining_cny": "17.00000000",
+            "granted_cny": "17.00000000",
+            "expires_at": "2026-11-30T15:59:00.000Z",
+        }
+    ],
 }
 
 
@@ -536,6 +546,20 @@ def test_account_overview_temporary_credits_missing_default(monkeypatch):
     }
 
 
+def test_account_overview_model_credits_missing_and_broken_default(monkeypatch):
+    bridge, _ = _make_bridge()
+    legacy = {k: v for k, v in _OVERVIEW.items() if k != "model_credits"}
+    monkeypatch.setattr(tr_auth, "account_overview", lambda: dict(legacy))
+    assert bridge.tr_account_overview()["model_credits"] == []
+
+    broken = dict(_OVERVIEW)
+    broken["model_credits"] = ["bad", {"id": "mg-1", "remaining_cny": "1.0"}]
+    monkeypatch.setattr(tr_auth, "account_overview", lambda: dict(broken))
+    assert bridge.tr_account_overview()["model_credits"] == [
+        {"id": "mg-1", "remaining_cny": "1.0"}
+    ]
+
+
 @pytest.mark.parametrize("broken", [None, "", [], "12.3"])
 def test_account_overview_temporary_credits_not_dict_default(monkeypatch, broken):
     bridge, _ = _make_bridge()
@@ -551,6 +575,20 @@ def test_account_overview_temporary_credits_not_dict_default(monkeypatch, broken
         "nearest_expires_at": "",
         "nearest_amount_cny": "0",
     }
+
+
+def test_account_overview_model_credits_missing_and_broken_default(monkeypatch):
+    bridge, _ = _make_bridge()
+    legacy = {k: v for k, v in _OVERVIEW.items() if k != "model_credits"}
+    monkeypatch.setattr(tr_auth, "account_overview", lambda: dict(legacy))
+    assert bridge.tr_account_overview()["model_credits"] == []
+
+    broken = dict(_OVERVIEW)
+    broken["model_credits"] = ["bad", {"id": "mg-1", "remaining_cny": "1.0"}]
+    monkeypatch.setattr(tr_auth, "account_overview", lambda: dict(broken))
+    assert bridge.tr_account_overview()["model_credits"] == [
+        {"id": "mg-1", "remaining_cny": "1.0"}
+    ]
 
 
 def test_account_overview_partial_passthrough(monkeypatch):
