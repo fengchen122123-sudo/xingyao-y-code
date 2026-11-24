@@ -291,3 +291,67 @@ def test_subagent_records_structured_tools_rounds_files_approval_and_fast_partia
     assert "secret123" not in first["result_preview"]
     assert first["error_summary"] == "401 Unauthorized"
     assert second["round"] == 2 and second["status"] == "ok" and second["duration_text"] == "18ms"
+
+
+def test_subagent_records_round_thinking_intro_text_and_file_diffs(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    def fake_events(*args, **kwargs):
+        yield TurnEvent("t1", 1, "thinking_started", {})
+        yield TurnEvent("t1", 2, "thinking_delta", {"text": "先查旧提交差异，"})
+        yield TurnEvent("t1", 3, "thinking_delta", {"text": "再修改对应文件。"})
+        yield TurnEvent("t1", 4, "assistant_delta", {"text": "开始检查 AgentCore 差异。"})
+        yield TurnEvent("t1", 5, "tool_started", {
+            "id": "call-edit",
+            "name": "edit_file",
+            "arguments": {"file_path": "src/AgentCore.java"},
+            "display": {"category": "mutation", "action": "修改文件", "target": "src/AgentCore.java"},
+        })
+        yield TurnEvent("t1", 6, "diff_ready", {
+            "tool_call_id": "call-edit",
+            "file_path": "src/AgentCore.java",
+            "diff_text": "--- a/src/AgentCore.java\n+++ b/src/AgentCore.java\n-old\n+new\n+more",
+            "added": 2,
+            "removed": 1,
+        })
+        yield TurnEvent("t1", 7, "tool_finished", {
+            "id": "call-edit",
+            "name": "edit_file",
+            "ok": True,
+            "duration_ms": 24,
+            "result": "updated",
+            "display": {"category": "mutation", "action": "修改文件", "target": "src/AgentCore.java"},
+        })
+        yield TurnEvent("t1", 8, "thinking_delta", {"text": "已确认修改完成，可以输出结论。"})
+        yield TurnEvent("t1", 9, "assistant_delta", {"text": "已完成 AgentCore 恢复并验证所有用例通过。" * 8})
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+    monkeypatch.setattr(
+        "core.task_decision_hooks.decide_subagent_review",
+        lambda **kwargs: None,
+    )
+
+    manager = SubagentManager()
+    bridge = _bare_bridge(monkeypatch, manager)
+    manager.run("记录思考与Diff", "s1", "t1", timeout_seconds=120)
+    snap = manager.snapshot()[0]
+    detail = bridge.get_subagent_task_detail(snap.task_id, "s1")["task"]
+
+    assert len(detail["round_notes"]) == 2
+    assert detail["round_notes"][0]["round"] == 1
+    assert "先查旧提交差异" in detail["round_notes"][0]["thinking"]
+    assert detail["round_notes"][0]["text"] == "开始检查 AgentCore 差异。"
+    assert detail["round_notes"][1]["round"] == 2
+    assert "输出结论" in detail["round_notes"][1]["thinking"]
+    # 最终轮结论只进 result，不重复塞入 round_notes["text"]
+    assert detail["round_notes"][1]["text"] == ""
+    assert detail["file_diffs"] == [{
+        "file_path": "src/AgentCore.java",
+        "diff_text": "--- a/src/AgentCore.java\n+++ b/src/AgentCore.java\n-old\n+new\n+more",
+        "added": 2,
+        "removed": 1,
+    }]
+    assert detail["tool_records"][0]["diff"]["added"] == 2
+    assert detail["tool_records"][0]["diff"]["removed"] == 1
+

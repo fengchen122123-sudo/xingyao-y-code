@@ -6,6 +6,8 @@
       :key="row.id"
       :row="row"
       :elapsed-ms="activeElapsedMs"
+      :show-inline-error="showInlineError"
+      :tool-test-prefix="toolTestPrefix"
       :class="{
         'trace-first': index === 0,
         'trace-last': index === rows.length - 1,
@@ -28,6 +30,9 @@ const props = defineProps<{
   calls: ToolExecutionCall[];
   legacyDiffs: LegacyDiff[];
   state: ExecutionState;
+  groupCommands?: boolean;
+  showInlineError?: boolean;
+  toolTestPrefix?: string;
 }>();
 
 const STATE_LABELS: Record<ExecutionState, string> = {
@@ -41,7 +46,11 @@ const title = computed(
   () => `执行过程 · ${props.calls.length} 项 · ${STATE_LABELS[props.state] ?? props.state}`,
 );
 
-const rows = computed(() => buildToolTraceRows(props.calls, props.legacyDiffs, props.state));
+const rows = computed(() =>
+  buildToolTraceRows(props.calls, props.legacyDiffs, props.state, {
+    groupCommands: props.groupCommands,
+  }),
+);
 
 const now = ref(Date.now());
 let timer: number | undefined;

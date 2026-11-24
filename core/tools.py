@@ -3229,6 +3229,9 @@ class SubagentStage:
 
 
 _MAX_SUBAGENT_TOOL_RECORDS = 200
+_MAX_SUBAGENT_ROUND_NOTES = 64
+_MAX_SUBAGENT_ROUND_TEXT = 6000
+_MAX_SUBAGENT_DIFF_CHARS = 24000
 
 
 @dataclass(frozen=True)
@@ -3260,6 +3263,8 @@ class SubagentTaskSnapshot:
     approval_summary: str = ""
     tool_records: tuple[dict[str, Any], ...] = ()
     changed_files: tuple[str, ...] = ()
+    round_notes: tuple[dict[str, Any], ...] = ()
+    file_diffs: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -3290,6 +3295,8 @@ class SubagentTask:
     approval_summary: str = ""
     tool_records: list[dict[str, Any]] = field(default_factory=list, repr=False)
     changed_files: list[str] = field(default_factory=list, repr=False)
+    round_notes: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    file_diffs: list[dict[str, Any]] = field(default_factory=list, repr=False)
     stage: str = "queued"
     stages: list[SubagentStage] = field(default_factory=list)
     execution_elapsed: float = 0.0
@@ -4341,8 +4348,16 @@ class SubagentManager:
             tool_success_count=task.tool_success_count,
             tool_error_count=task.tool_error_count,
             approval_summary=task.approval_summary,
-            tool_records=tuple(dict(rec) for rec in task.tool_records),
+            tool_records=tuple(
+                {
+                    **rec,
+                    **({"diff": dict(rec["diff"])} if isinstance(rec.get("diff"), dict) else {}),
+                }
+                for rec in task.tool_records
+            ),
             changed_files=tuple(task.changed_files),
+            round_notes=tuple(dict(note) for note in task.round_notes),
+            file_diffs=tuple(dict(diff) for diff in task.file_diffs),
         )
 
     def _set_task_model_name(self, task_id: str, model_name: str) -> None:
@@ -4366,6 +4381,46 @@ class SubagentManager:
             if task is not None and task.status not in _SUBAGENT_TERMINAL_STATUSES:
                 task.approval_summary = str(summary or "")
 
+    def _record_round_note(
+        self,
+        task_id: str,
+        round_no: int,
+        *,
+        thinking: str | None = None,
+        text: str | None = None,
+    ) -> None:
+        clean_thinking = str(thinking or "").strip() if thinking is not None else None
+        clean_text = str(text or "").strip() if text is not None else None
+        if not clean_thinking and not clean_text:
+            return
+        now = time.time()
+        rno = max(1, int(round_no))
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            entry = None
+            for note in reversed(task.round_notes):
+                if note.get("round") == rno:
+                    entry = note
+                    break
+            if entry is None:
+                entry = {
+                    "round": rno,
+                    "started_at": now,
+                    "thinking": "",
+                    "text": "",
+                }
+                task.round_notes.append(entry)
+                if len(task.round_notes) > _MAX_SUBAGENT_ROUND_NOTES:
+                    del task.round_notes[:-_MAX_SUBAGENT_ROUND_NOTES]
+            if clean_thinking:
+                entry["thinking"] = clean_thinking[:_MAX_SUBAGENT_ROUND_TEXT]
+            if clean_text:
+                prev = str(entry.get("text") or "")
+                combined = f"{prev}\n\n{clean_text}" if prev and clean_text != prev else clean_text
+                entry["text"] = combined[:_MAX_SUBAGENT_ROUND_TEXT]
+
     def _record_changed_file(self, task_id: str, file_path: str) -> None:
         fp = str(file_path or "").strip()
         if not fp:
@@ -4376,6 +4431,61 @@ class SubagentManager:
                 return
             if fp not in task.changed_files:
                 task.changed_files.append(fp)
+
+    def _record_file_diff(self, task_id: str, payload: dict[str, Any]) -> None:
+        fp = str(payload.get("file_path") or "").strip()
+        if not fp:
+            return
+        diff_text = str(payload.get("diff_text") or "")
+        if len(diff_text) > _MAX_SUBAGENT_DIFF_CHARS:
+            diff_text = diff_text[:_MAX_SUBAGENT_DIFF_CHARS] + "\n…（diff 过长已截断）"
+        added = payload.get("added")
+        removed = payload.get("removed")
+        added_int = int(added) if isinstance(added, int) and not isinstance(added, bool) else None
+        removed_int = int(removed) if isinstance(removed, int) and not isinstance(removed, bool) else None
+        call_id = str(payload.get("tool_call_id") or "")
+        diff_obj: dict[str, Any] = {
+            "file_path": fp,
+            "diff_text": diff_text,
+        }
+        if added_int is not None:
+            diff_obj["added"] = added_int
+        if removed_int is not None:
+            diff_obj["removed"] = removed_int
+
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return
+            if fp not in task.changed_files:
+                task.changed_files.append(fp)
+
+            existing = next((d for d in task.file_diffs if d.get("file_path") == fp), None)
+            if existing is None:
+                task.file_diffs.append(dict(diff_obj))
+            else:
+                if diff_text:
+                    prev_text = str(existing.get("diff_text") or "")
+                    merged_text = f"{prev_text}\n{diff_text}" if prev_text else diff_text
+                    existing["diff_text"] = merged_text[:_MAX_SUBAGENT_DIFF_CHARS]
+                if added_int is not None:
+                    existing["added"] = int(existing.get("added") or 0) + added_int
+                if removed_int is not None:
+                    existing["removed"] = int(existing.get("removed") or 0) + removed_int
+
+            target_rec = None
+            if call_id:
+                for rec in reversed(task.tool_records):
+                    if rec.get("id") == call_id:
+                        target_rec = rec
+                        break
+            if target_rec is None:
+                for rec in reversed(task.tool_records):
+                    if rec.get("category") == "mutation" and rec.get("status") == "running":
+                        target_rec = rec
+                        break
+            if target_rec is not None and diff_text:
+                target_rec["diff"] = dict(diff_obj)
 
     def _record_tool_started(
         self,
@@ -4764,8 +4874,36 @@ class SubagentManager:
         partial_len = 0
         partial_flushed = 0
         last_partial_flush = self._monotonic()
+        round_thinking_parts: list[str] = []
+        thinking_len = 0
+        thinking_flushed = 0
+        last_thinking_flush = self._monotonic()
         saw_tool_finished = False
         turn_error_message = ""
+
+        def _flush_round_thinking() -> None:
+            nonlocal thinking_flushed
+            if round_thinking_parts and thinking_len > thinking_flushed:
+                self._record_round_note(
+                    task.task_id,
+                    current_round,
+                    thinking="".join(round_thinking_parts),
+                )
+                thinking_flushed = thinking_len
+
+        def _advance_round_if_needed() -> None:
+            nonlocal current_round, saw_tool_finished, thinking_len, thinking_flushed, last_thinking_flush
+            if not saw_tool_finished:
+                return
+            _flush_round_thinking()
+            round_thinking_parts.clear()
+            thinking_len = 0
+            thinking_flushed = 0
+            last_thinking_flush = self._monotonic()
+            current_round += 1
+            saw_tool_finished = False
+            self._set_task_rounds(task.task_id, current_round)
+
         # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度。
         # 必须把事件消费循环包在作用域内，因为生成器创建时并不执行子代理逻辑；
         # 若只包生成器创建语句，深度会在真正执行前复位，嵌套深度限制将永久失效。
@@ -4773,16 +4911,32 @@ class SubagentManager:
             with _subagent_depth_scope():
                 for event in events:
                     if event.kind == "thinking_started":
-                        if saw_tool_finished:
-                            current_round += 1
-                            saw_tool_finished = False
-                            self._set_task_rounds(task.task_id, current_round)
+                        _advance_round_if_needed()
                         self._record_stage(task.task_id, "thinking")
+                    elif event.kind == "thinking_delta":
+                        _advance_round_if_needed()
+                        self._record_stage(task.task_id, "thinking")
+                        chunk = str(event.payload.get("text", ""))
+                        if chunk and thinking_len < _MAX_SUBAGENT_ROUND_TEXT:
+                            take = chunk[: _MAX_SUBAGENT_ROUND_TEXT - thinking_len]
+                            round_thinking_parts.append(take)
+                            thinking_len += len(take)
+                            now_mono = self._monotonic()
+                            if thinking_len - thinking_flushed >= 80 or now_mono - last_thinking_flush >= 0.35:
+                                _flush_round_thinking()
+                                last_thinking_flush = now_mono
                     elif event.kind == "tool_started":
-                        if saw_tool_finished:
-                            current_round += 1
-                            saw_tool_finished = False
-                            self._set_task_rounds(task.task_id, current_round)
+                        _advance_round_if_needed()
+                        _flush_round_thinking()
+                        if answer:
+                            intro_text = "".join(answer).strip()
+                            if intro_text:
+                                self._record_round_note(
+                                    task.task_id,
+                                    current_round,
+                                    text=intro_text,
+                                )
+                            answer.clear()
                         self._record_tool_started(
                             task.task_id,
                             str(event.payload.get("id") or ""),
@@ -4794,7 +4948,6 @@ class SubagentManager:
                             "tool",
                             str(event.payload.get("name", "")),
                         )
-                        answer.clear()
                     elif event.kind == "permission_requested":
                         try:
                             from core.tool_presenter import describe_permission_request
@@ -4811,10 +4964,8 @@ class SubagentManager:
                         self._set_approval_summary(task.task_id, "")
                         self._record_stage(task.task_id, "running", "approval resolved")
                     elif event.kind == "assistant_delta":
-                        if saw_tool_finished:
-                            current_round += 1
-                            saw_tool_finished = False
-                            self._set_task_rounds(task.task_id, current_round)
+                        _advance_round_if_needed()
+                        _flush_round_thinking()
                         self._record_stage(task.task_id, "composing")
                         text = str(event.payload.get("text", ""))
                         answer.append(text)
@@ -4862,9 +5013,9 @@ class SubagentManager:
                             event.payload.get("message") or turn_error_message
                         )
                     elif event.kind == "diff_ready":
-                        self._record_changed_file(
+                        self._record_file_diff(
                             task.task_id,
-                            str(event.payload.get("file_path") or ""),
+                            dict(event.payload),
                         )
                         # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
                         # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
@@ -4879,7 +5030,8 @@ class SubagentManager:
         finally:
             # 现场打捞兜底：与循环内的周期 flush 幂等（_record_partial 只在更长时覆盖）。
             # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到上一个刷新边界，
-            # 靠这里把尾部正文也捞住，不改变异常传播。
+            # 靠这里把尾部正文与思考也捞住，不改变异常传播。
+            _flush_round_thinking()
             self._record_partial(task.task_id, "".join(partial_parts))
         task.tool_errors.update(tool_errors)
         task.tool_success_count = max(task.tool_success_count, success_count)

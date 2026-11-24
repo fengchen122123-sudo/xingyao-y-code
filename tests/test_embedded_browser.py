@@ -1098,3 +1098,21 @@ def test_surface_generation_rejects_stale_bounds_after_hide_and_requires_ready_a
     bounds_after_hide = ctrl.set_bounds({"x": 0, "y": 0, "width": 500, "height": 600}, surface_generation=3)
     assert bounds_after_hide["ok"] is True
     assert ctrl._webview.Visible is False
+
+
+def test_init_failure_emits_error_phase():
+    emitted = []
+    ctrl = eb.EmbeddedBrowserController(on_state=emitted.append, get_form=lambda: None)
+    core = _FakeCore()
+    ctrl._webview = SimpleNamespace(CoreWebView2=core, Visible=True)
+    ctrl._form = _FakeForm()
+
+    ctrl._on_init_completed(
+        ctrl._webview,
+        SimpleNamespace(IsSuccess=False, InitializationException="boom (0x8007139F)"),
+    )
+
+    assert len(emitted) >= 1
+    assert emitted[-1]["phase"] == "error"
+    assert emitted[-1]["ready"] is False
+

@@ -417,3 +417,77 @@ describe('computer action row', () => {
     wFallback.unmount();
   });
 });
+
+describe('command-group, args_preview and cleaned subagent titles', () => {
+  it('renders command-group count and expands individual commands', async () => {
+    const row: ToolTraceRow = {
+      id: 'command:g1',
+      kind: 'command-group',
+      status: 'completed',
+      action: '运行命令',
+      detail: 'git show',
+      command: 'git show a:README.md',
+      errorSummary: '',
+      count: 2,
+      durationMs: 1500,
+      metrics: {},
+      calls: [
+        {
+          id: 'g1',
+          name: 'execute_command',
+          label: '运行命令',
+          display: { category: 'command', action: '运行命令', target: 'git show a:README.md', command: 'git show a:README.md', metrics: {}, error_summary: '', is_skill: false },
+          result: { ok: true, summary: '完成', result: '', duration_ms: 800 },
+        },
+        {
+          id: 'g2',
+          name: 'execute_command',
+          label: '运行命令',
+          display: { category: 'command', action: '运行命令', target: 'git show a:AGENTS.md', command: 'git show a:AGENTS.md', metrics: {}, error_summary: '', is_skill: false },
+          result: { ok: true, summary: '完成', result: '', duration_ms: 700 },
+        },
+      ],
+    };
+    const wrapper = mount(ToolExecutionRow, { props: { row } });
+    expect(wrapper.get('.trace-kind').text()).toBe('运行');
+    expect(wrapper.get('.trace-target').text()).toBe('git show · 2 次');
+    expect(wrapper.get('.trace-meta').text()).toBe('1.5s');
+    await wrapper.get('[data-row-toggle]').trigger('click');
+    const items = wrapper.findAll('.trace-files li');
+    expect(items).toHaveLength(2);
+    expect(items[0].text()).toContain('git show a:README.md');
+    expect(items[1].text()).toContain('git show a:AGENTS.md');
+  });
+
+  it('cleans repetitive workdir prefix on subagent rows and renders args_preview', async () => {
+    const row: ToolTraceRow = {
+      id: 'subagent:s1',
+      kind: 'subagent',
+      status: 'running',
+      action: '运行子代理',
+      detail: '工作目录 E:\\repo，分支 dev。目标：核对文档恢复口径',
+      command: '',
+      errorSummary: '',
+      count: 1,
+      metrics: {},
+      calls: [{
+        id: 's1',
+        name: 'run_subagent',
+        label: '运行子代理',
+        args_preview: 'type: explore',
+        subagent_tasks: [{
+          id: 't1',
+          description: '工作目录 E:\\repo，分支 dev。目标：核对文档恢复口径',
+          status: 'running',
+          stage: 'tool',
+          elapsed: 12,
+        }],
+      }],
+    };
+    const wrapper = mount(ToolExecutionRow, { props: { row } });
+    expect(wrapper.get('.trace-target').text()).toBe('核对文档恢复口径');
+    await wrapper.get('[data-row-toggle]').trigger('click');
+    expect(wrapper.get('.subagent-desc').text()).toBe('核对文档恢复口径');
+    expect(wrapper.get('.trace-args').text()).toContain('type: explore');
+  });
+});

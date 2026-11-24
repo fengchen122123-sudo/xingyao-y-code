@@ -20,9 +20,19 @@ const snapshot = {
 };
 
 function mockApi(overrides: Record<string, any> = {}) {
+  let current = { ...snapshot };
   const api = {
-    get_feishu_settings: vi.fn(async () => ({ ok: true, settings: { ...snapshot } })),
-    set_feishu_settings: vi.fn(async () => ({ ok: true, settings: { ...snapshot } })),
+    get_feishu_settings: vi.fn(async () => ({ ok: true, settings: { ...current } })),
+    set_feishu_settings: vi.fn(async (payload: Record<string, any> = {}) => {
+      current = {
+        ...current,
+        enabled: payload.enabled ?? current.enabled,
+        app_id: payload.app_id ?? current.app_id,
+        approvers: payload.approvers ?? current.approvers,
+        notify_chat_id: payload.notify_chat_id ?? current.notify_chat_id,
+      };
+      return { ok: true, settings: { ...current } };
+    }),
     get_feishu_secret: vi.fn(async () => ({ ok: true, app_secret: 'super_secret' })),
     test_feishu_connection: vi.fn(async () => ({ ok: true, msg: '凭据有效' })),
     ...overrides,
@@ -47,12 +57,47 @@ describe('FeishuSettings', () => {
     const wrapper = mountPage();
     await flushPromises();
 
+    expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0);
+    expect(wrapper.findAll('input[type="radio"]')).toHaveLength(0);
     expect((wrapper.find('[data-test="feishu-app-id"]').element as HTMLInputElement).value).toBe('cli_demo');
     expect((wrapper.find('[data-test="feishu-approvers"]').element as HTMLInputElement).value).toBe('ou_a, ou_b');
     expect((wrapper.find('[data-test="feishu-notify-chat"]').element as HTMLInputElement).value).toBe('oc_x');
-    expect((wrapper.find('[data-test="feishu-enabled"]').element as HTMLInputElement).checked).toBe(true);
+    const toggle = wrapper.find('[data-test="feishu-enabled"]');
+    expect(toggle.attributes('role')).toBe('switch');
+    expect(toggle.attributes('aria-checked')).toBe('true');
     expect(wrapper.find('[data-test="feishu-status"]').text()).toContain('已连接');
     expect(wrapper.find('[data-test="feishu-status"]').text()).toContain('已收事件 7');
+  });
+
+  it('开关按钮：凭据已配置时点击立即切换保存；未配置时仅解锁草稿并提示填写', async () => {
+    const api = mockApi();
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const toggle = wrapper.find('[data-test="feishu-enabled"]');
+    await toggle.trigger('click');
+    await flushPromises();
+
+    expect(api.set_feishu_settings).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: false, app_id: 'cli_demo' }),
+    );
+    expect(toggle.attributes('aria-checked')).toBe('false');
+
+    // 未配置凭据时开启：仅更新草稿不直接报错落盘
+    const emptyApi = mockApi({
+      get_feishu_settings: vi.fn(async () => ({
+        ok: true,
+        settings: { ...snapshot, enabled: false, app_id: '', has_secret: false },
+      })),
+    });
+    const emptyWrapper = mountPage();
+    await flushPromises();
+    const emptyToggle = emptyWrapper.find('[data-test="feishu-enabled"]');
+    await emptyToggle.trigger('click');
+    await flushPromises();
+    expect(emptyApi.set_feishu_settings).not.toHaveBeenCalled();
+    expect(emptyToggle.attributes('aria-checked')).toBe('true');
+    expect(emptyWrapper.find('[data-test="feishu-message"]').text()).toContain('App ID');
   });
 
   it('密钥默认掩码，点显示才按需取明文', async () => {

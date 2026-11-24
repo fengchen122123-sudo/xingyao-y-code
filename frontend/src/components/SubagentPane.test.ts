@@ -104,7 +104,7 @@ it('气泡可悬停：鼠标进入气泡不收起，移出后收起', async () =
   wrapper.unmount();
 });
 
-it('结构化轮次视图：展示动作目标、展开工具参数与错误详情、仅看失败筛选与停止操作', async () => {
+it('主代理同款过程视图：展示思考折叠、点状工具流、改动文件卡、仅看失败筛选与停止操作', async () => {
   const pinia = createPinia();
   setActivePinia(pinia);
   const cancelTask = vi.fn().mockResolvedValue({ ok: true, status: 'cancelled', msg: '已停止该子代理' });
@@ -129,11 +129,17 @@ it('结构化轮次视图：展示动作目标、展开工具参数与错误详�
       started_at: 1758000000,
       stages: [],
       changed_files: ['dist/manifest.json'],
+      file_diffs: [
+        { file_path: 'dist/manifest.json', diff_text: '--- a/dist/manifest.json\n+++ b/dist/manifest.json\n-old\n+new', added: 1, removed: 1 },
+      ],
+      round_notes: [
+        { round: 1, started_at: 1758000001, thinking: '先检索 release_parts 引用位置', text: '正在定位发布清单。' },
+      ],
       tool_records: [
         {
           id: 'c1', seq: 1, round: 1, name: 'search_code', category: 'search',
           action: '搜索代码', target: 'release_parts', args_preview: 'query: release_parts',
-          status: 'ok', started_at: 1758000002, duration_text: '31ms', result_preview: '命中 3 处',
+          status: 'ok', started_at: 1758000002, duration_ms: 31, duration_text: '31ms', result_preview: '命中 3 处',
         },
         {
           id: 'c2', seq: 2, round: 2, name: 'execute_command', category: 'command',
@@ -166,28 +172,83 @@ it('结构化轮次视图：展示动作目标、展开工具参数与错误详�
     expect(wrapper.find('[data-test="subagent-tool-c1"]').exists()).toBe(true);
   });
 
+  // 不再出现机械 Round 1 标题，改为展示思考摘要、过渡正文与点状工具流
   expect(wrapper.find('[data-test="subagent-wait-banner"]').text()).toContain('git tag v1.4.2');
-  expect(wrapper.text()).toContain('Round 1');
-  expect(wrapper.text()).toContain('搜索代码');
-  expect(wrapper.text()).toContain('release_parts');
+  expect(wrapper.text()).not.toContain('Round 1');
+  expect(wrapper.text()).toContain('先检索 release_parts 引用位置');
+  expect(wrapper.text()).toContain('正在定位发布清单');
+  expect(wrapper.text()).toContain('pytest');
   expect(wrapper.text()).toContain('KeyError: TOKEN');
+  expect(wrapper.find('[data-test="subagent-files"]').text()).toContain('1 个文件已更改');
 
   // 点击工具展开调用参数与错误详情
-  await wrapper.get('[data-test="subagent-tool-c2"] .suba-tool-btn').trigger('click');
+  await wrapper.get('[data-test="subagent-tool-c2"] [data-row-toggle]').trigger('click');
+  expect(wrapper.text()).toContain('command: pytest');
   expect(wrapper.text()).toContain('Traceback: KeyError TOKEN');
 
-  // 仅看失败筛选隐藏 Round 1 的成功调用
+  // 仅看失败筛选隐藏成功调用
   await wrapper.get('[data-test="subagent-filter-failed"]').trigger('click');
   expect(wrapper.find('[data-test="subagent-tool-c1"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="subagent-tool-c2"]').exists()).toBe(true);
 
-  // 切换到改动文件列表并预览文件
-  await wrapper.get('[data-test="subagent-filter-files"]').trigger('click');
-  expect(wrapper.find('[data-test="subagent-files"]').text()).toContain('dist/manifest.json');
-
   // 点击停止按钮触发协作取消
   await wrapper.get('[data-test="subagent-stop"]').trigger('click');
   expect(cancelTask).toHaveBeenCalledWith('sub-rich', store.currentSessionName);
+  wrapper.unmount();
+});
+
+it('完成后自动收起执行过程，并将连续读取与同类命令合并为单行', async () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const getDetail = vi.fn().mockResolvedValue({
+    ok: true,
+    task: {
+      id: 'sub-merged',
+      description: '核对历史文档',
+      type: 'explore',
+      status: 'completed',
+      stage: 'completed',
+      elapsed: 70,
+      execution_elapsed: 70,
+      background: false,
+      rounds: 4,
+      tool_ok: 4,
+      tool_err: 0,
+      stages: [],
+      tool_records: [
+        { id: 'r1', seq: 1, round: 1, name: 'read_file', category: 'read', action: '读取文件', target: 'README.md', status: 'ok', started_at: 100, duration_ms: 20 },
+        { id: 'r2', seq: 2, round: 1, name: 'read_file', category: 'read', action: '读取文件', target: 'AGENTS.md', status: 'ok', started_at: 101, duration_ms: 25 },
+        { id: 'g1', seq: 3, round: 2, name: 'execute_command', category: 'command', action: '运行命令', target: 'git show a:README.md', status: 'ok', started_at: 110, duration_ms: 1200 },
+        { id: 'g2', seq: 4, round: 3, name: 'execute_command', category: 'command', action: '运行命令', target: 'git show a:AGENTS.md', status: 'ok', started_at: 120, duration_ms: 800 },
+      ],
+      result: '已完成历史提交比对。',
+      error: '',
+      partial: '',
+    },
+    tasks: [],
+  });
+  (window as any).pywebview = { api: { get_subagent_task_detail: getDetail } };
+  const store = useAppStore();
+  store.subagentDetailId = 'sub-merged';
+
+  const wrapper = mount(SubagentPane, {
+    props: { active: true },
+    global: { plugins: [pinia] },
+  });
+
+  await vi.waitFor(() => {
+    expect(wrapper.find('[data-test="subagent-result"]').exists()).toBe(true);
+  });
+
+  // 有最终结论时默认收起过程（与主代理 TurnGroup 一致），点击标题展开后显示合并行
+  const fold = wrapper.get('[data-test="subagent-flow"] .turn-fold');
+  expect(fold.classes()).not.toContain('is-open');
+  expect(fold.text()).toContain('星舰执行过程 · 4 个工具调用 · 已完成');
+
+  await fold.get('.fold-head').trigger('click');
+  expect(fold.classes()).toContain('is-open');
+  expect(fold.text()).toContain('2 个文件');
+  expect(fold.text()).toContain('git show · 2 次');
   wrapper.unmount();
 });
 

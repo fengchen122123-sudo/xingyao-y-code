@@ -21,6 +21,14 @@ export interface UseEmbeddedBrowserSurfaceOptions {
   getClampEl?: () => HTMLElement | null;
   getZoom?: () => number;
   getSessionName?: () => string;
+  /** 后端内核就绪状态（如 store.embeddedBrowser.ready）：用于把 opening 推进到 ready */
+  isHostReady?: () => boolean;
+  /** 后端当前表面阶段（'idle' | 'opening' | 'ready' | 'hidden' | 'error'） */
+  getHostPhase?: () => string;
+  /** 后端当前最新表面代次（calibrate / 事件同步用） */
+  getHostSurfaceGeneration?: () => number;
+  /** 外部重同步信号（如切会话完成后端更新后自增） */
+  getResyncKey?: () => number;
   /** 平台不支持时返回 true：完全不发桥调用，避免无谓报错 */
   isUnsupported: () => boolean;
   onUnsupported?: () => void;
@@ -36,8 +44,6 @@ export interface UseEmbeddedBrowserSurfaceApi {
   syncNow: () => Promise<any> | null;
   navigate: (url: string) => void;
   request: (method: string, ...args: unknown[]) => void;
-  /** 宿主稍后推送的就绪状态。open 回执可能停在 opening，不能据此一直盖住页面。 */
-  noteHostState: (state: { ready?: boolean; visible?: boolean; phase?: string }) => void;
 }
 
 const MIN_SIDE = 2;
@@ -88,7 +94,15 @@ export function useEmbeddedBrowserSurface(
   let lastVisible = false;
   let lastRectKey = '';
   let desiredGeneration = 0;
+  let openAckedGeneration = 0;
   let hostChain: Promise<unknown> = Promise.resolve();
+
+  function syncBackendGeneration(raw: unknown): void {
+    const num = Number(raw);
+    if (Number.isFinite(num) && num > desiredGeneration) {
+      desiredGeneration = num;
+    }
+  }
 
   function enqueueHost<T>(fn: () => Promise<T>): Promise<T> {
     const next = hostChain.then(fn, fn);
@@ -197,12 +211,13 @@ export function useEmbeddedBrowserSurface(
     const session = currentSession();
     const hidePromise = callApi('browser_pane_hide', session, gen).then((res) => {
       if (res && res.ok === false && res.error === 'unsupported_platform') markUnsupported();
+      else if (res?.stale) syncBackendGeneration(res?.surface_generation ?? res?.state?.surface_generation);
     });
     // hide 必须立刻到达宿主（不得被阻塞的 open 卡死），同时让后续 show/set_bounds 串行等待 hide 落地
     hostChain = Promise.all([hostChain, hidePromise]).then(() => undefined, () => undefined);
   }
 
-  function show(rect: BrowserRect, url = ''): Promise<any> {
+  function show(rect: BrowserRect, url = '', retryCount = 0): Promise<any> {
     lastVisible = true;
     surfaceVisible.value = true;
     lastRectKey = rectKey(rect);
@@ -212,12 +227,29 @@ export function useEmbeddedBrowserSurface(
     surfacePhase.value = 'opening';
     const zoom = currentZoom(opts);
     const session = currentSession();
-    return enqueueHost(() => {
+    let retryArgs: { url: string; nextRetry: number; syncedGen: number } | null = null;
+    const hostResult = enqueueHost(() => {
       if (disposed || !lastVisible || gen !== desiredGeneration) {
         return Promise.resolve({ ok: false, stale: true });
       }
       return callApi('browser_pane_open', rect, url, zoom, session, gen).then((res) => {
-        if (disposed || !lastVisible || gen !== desiredGeneration || res?.stale) {
+        if (disposed || !lastVisible || gen !== desiredGeneration) {
+          return res;
+        }
+        if (res && res.deferred) {
+          lastVisible = false;
+          surfaceVisible.value = false;
+          lastRectKey = '';
+          surfacePhase.value = 'idle';
+          return res;
+        }
+        if (res?.stale) {
+          syncBackendGeneration(res?.surface_generation ?? res?.state?.surface_generation);
+          if (retryCount < 2) {
+            retryArgs = { url, nextRetry: retryCount + 1, syncedGen: desiredGeneration };
+            return res;
+          }
+          surfacePhase.value = 'error';
           return res;
         }
         if (res && res.ok === false) {
@@ -226,51 +258,97 @@ export function useEmbeddedBrowserSurface(
           } else {
             surfacePhase.value = 'error';
           }
+          return res;
+        }
+        openAckedGeneration = gen;
+        syncBackendGeneration(res?.surface_generation ?? res?.state?.surface_generation);
+        const hostPhase = opts.getHostPhase?.() ?? '';
+        const hostReady = Boolean(opts.isHostReady?.());
+        if (res?.phase === 'error' || hostPhase === 'error') {
+          surfacePhase.value = 'error';
+        } else if (res?.phase === 'opening' && !hostReady && hostPhase !== 'ready') {
+          surfacePhase.value = 'opening';
         } else {
-          const next = res?.phase === 'opening' ? 'opening' : 'ready';
-          // 就绪事件可能先于这条回执到达。迟到的 opening 不能把占位层再盖回去。
-          if (!(surfacePhase.value === 'ready' && next === 'opening')) {
-            surfacePhase.value = next;
-          }
+          surfacePhase.value = 'ready';
         }
         return res;
       });
     });
+    return hostResult.then((res) => {
+      if (!retryArgs) return res;
+      const { syncedGen, nextRetry } = retryArgs;
+      if (disposed || !lastVisible || desiredGeneration !== syncedGen) return res;
+      const latestEl = opts.getSurfaceEl();
+      if (!latestEl) { hide(); return res; }
+      const latestRect = measure(latestEl);
+      occluded.value = detectOccluded(latestEl, latestRect);
+      if (!canShow(latestRect) || occluded.value) { hide(); return res; }
+      return show(latestRect, retryArgs.url, nextRetry);
+    });
   }
 
-  function noteHostState(state: { ready?: boolean; visible?: boolean; phase?: string }): void {
-    if (disposed || !lastVisible || surfacePhase.value !== 'opening') return;
-    if (state?.phase === 'error') {
-      surfacePhase.value = 'error';
-      return;
-    }
-    if (state?.phase === 'ready' || (state?.ready && state?.visible)) {
-      surfacePhase.value = 'ready';
-    }
-  }
-
-  function move(rect: BrowserRect): void {
+  function move(rect: BrowserRect, retryCount = 0): void {
     const gen = desiredGeneration;
     const zoom = currentZoom(opts);
     const session = currentSession();
+    let recoverAction: { kind: 'open' | 'move'; nextRetry: number; syncedGen: number } | null = null;
     void enqueueHost(() => {
       if (disposed || !lastVisible || gen !== desiredGeneration) {
         return Promise.resolve();
       }
       return callApi('browser_pane_set_bounds', rect, zoom, session, gen).then((res) => {
-        if (disposed || !lastVisible || gen !== desiredGeneration || res?.stale) {
+        if (disposed || !lastVisible || gen !== desiredGeneration) {
+          return;
+        }
+        if (res?.stale) {
+          syncBackendGeneration(res?.surface_generation ?? res?.state?.surface_generation);
+          if (retryCount < 2) {
+            const needOpen =
+              res?.state?.visible === false
+              || res?.state?.phase === 'hidden'
+              || res?.state?.phase === 'idle';
+            recoverAction = {
+              kind: needOpen ? 'open' : 'move',
+              nextRetry: retryCount + 1,
+              syncedGen: desiredGeneration,
+            };
+          }
           return;
         }
         if (res && res.ok === false) {
           if (res.error === 'unsupported_platform') {
             markUnsupported();
-          } else if (res.error !== 'not_open') {
+          } else if (res.error === 'not_open') {
+            if (retryCount < 1) {
+              recoverAction = {
+                kind: 'open',
+                nextRetry: retryCount + 1,
+                syncedGen: desiredGeneration,
+              };
+            }
+          } else {
             surfacePhase.value = 'error';
           }
-        } else if (res?.phase === 'ready' && surfacePhase.value === 'opening') {
-          surfacePhase.value = 'ready';
+        } else if (res && res.ok !== false && surfacePhase.value === 'opening') {
+          if (res?.phase === 'ready' || opts.isHostReady?.() || opts.getHostPhase?.() === 'ready') {
+            surfacePhase.value = 'ready';
+          }
         }
       });
+    }).then(() => {
+      if (!recoverAction) return;
+      const { kind, nextRetry, syncedGen } = recoverAction;
+      if (disposed || !lastVisible || desiredGeneration !== syncedGen) return;
+      const latestEl = opts.getSurfaceEl();
+      if (!latestEl) { hide(); return; }
+      const latestRect = measure(latestEl);
+      occluded.value = detectOccluded(latestEl, latestRect);
+      if (!canShow(latestRect) || occluded.value) { hide(); return; }
+      if (kind === 'open') {
+        void show(latestRect, '', nextRetry);
+      } else {
+        move(latestRect, nextRetry);
+      }
     });
   }
 
@@ -356,6 +434,76 @@ export function useEmbeddedBrowserSurface(
   watch(() => opts.isActive(), () => syncNow(), { flush: 'post' });
   watch(() => opts.shouldShowSurface(), () => syncNow(), { flush: 'post' });
 
+  if (opts.isHostReady || opts.getHostPhase) {
+    watch(
+      () => [opts.isHostReady?.() ?? false, opts.getHostPhase?.() ?? ''] as const,
+      ([ready, phase]) => {
+        if (disposed || !lastVisible) return;
+        if (surfacePhase.value !== 'opening') return;
+        if (openAckedGeneration !== desiredGeneration) return;
+        if (phase === 'error') {
+          surfacePhase.value = 'error';
+        } else if (ready || phase === 'ready') {
+          surfacePhase.value = 'ready';
+        }
+      },
+    );
+  }
+
+  if (opts.getHostSurfaceGeneration) {
+    watch(
+      () => opts.getHostSurfaceGeneration?.() ?? 0,
+      (hostGen) => {
+        if (disposed) return;
+        if (!lastVisible) {
+          syncBackendGeneration(hostGen);
+          return;
+        }
+        const hostPhase = opts.getHostPhase?.() ?? '';
+        if (
+          openAckedGeneration === desiredGeneration
+          && hostGen > desiredGeneration
+          && (hostPhase === 'hidden' || hostPhase === 'idle')
+        ) {
+          syncBackendGeneration(hostGen);
+          lastVisible = false;
+          surfaceVisible.value = false;
+          lastRectKey = '';
+          void nextTick(() => syncNow());
+        }
+      },
+    );
+  }
+
+  if (opts.getSessionName) {
+    watch(
+      () => opts.getSessionName?.() ?? '',
+      () => {
+        if (disposed) return;
+        if (lastVisible) {
+          lastVisible = false;
+          surfaceVisible.value = false;
+          lastRectKey = '';
+        }
+        syncNow();
+      },
+      { flush: 'post' },
+    );
+  }
+
+  if (opts.getResyncKey) {
+    watch(
+      () => opts.getResyncKey?.() ?? 0,
+      () => {
+        if (disposed) return;
+        if (!lastVisible && opts.isActive()) {
+          syncNow();
+        }
+      },
+      { flush: 'post' },
+    );
+  }
+
   return {
     surfaceVisible,
     occluded,
@@ -364,6 +512,5 @@ export function useEmbeddedBrowserSurface(
     syncNow,
     navigate,
     request,
-    noteHostState,
   };
 }
