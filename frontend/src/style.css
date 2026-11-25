@@ -910,6 +910,12 @@ html:not([data-gui-theme-id]) .kimi-footer-workdir {
   padding: 0;
   color: var(--text);
 }
+/* 浅色外观下代码块不铺主题 code_background 的实色（浅色主题为近白的 #f0f0ec，
+   在白色对话底上显得像突兀的白块），改成一缕与主题同源的中性冷调薄底：
+   既有颜色标识能区分代码区域，也不刺眼；深色外观保留原有暗色底。 */
+:root.light .md-body pre {
+  background: color-mix(in srgb, var(--theme-accent) 4%, var(--theme-text-primary) 5%, transparent) !important;
+}
 .md-body .code-block {
   position: relative;
   margin: 10px 0;
