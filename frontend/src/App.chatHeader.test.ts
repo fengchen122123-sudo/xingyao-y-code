@@ -107,21 +107,42 @@ it('对话标题栏渲染「决策」入口，点击展开/收起决策记录面
   wrapper.unmount();
 });
 
-it('决策未读徽章：decision_recorded 事件累计，打开面板后清零', async () => {
+it('决策未读数字徽章已移除：本会话决策只点亮入口，不再挂数字', async () => {
   const store = useAppStore();
   store.initialized = true;
+  store.currentSessionName = 'sess-A';
   const wrapper = mount(App, { global: { stubs } });
 
+  expect(wrapper.find('[data-test="decision-entry"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="decision-entry-badge"]').exists()).toBe(false);
 
-  store.handleBridgeEvent({ type: 'decision_recorded', data: {} } as any);
-  store.handleBridgeEvent({ type: 'decision_recorded', data: {} } as any);
+  store.handleBridgeEvent({ type: 'decision_recorded', data: { scene: 'router', session_id: 'sess-A' } } as any);
+  store.handleBridgeEvent({ type: 'decision_recorded', data: { scene: 'router', session_id: 'sess-A' } } as any);
   await wrapper.vm.$nextTick();
-  expect(wrapper.get('[data-test="decision-entry-badge"]').text()).toBe('2');
+
+  // 入口出现，但数字徽章不再渲染
+  expect(wrapper.find('[data-test="decision-entry"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="decision-entry-badge"]').exists()).toBe(false);
 
   await wrapper.find('[data-test="decision-entry"]').trigger('click');
   await flushPromises();
   expect(store.decisionUnread).toBe(0);
+  wrapper.unmount();
+});
+
+it('空白新会话不渲染「决策」入口：会话还没开始就不能被上一个会话的决策点亮', async () => {
+  const store = useAppStore();
+  store.initialized = true;
+  store.currentSessionName = 'sess-A';
+  store.decisionHasRecords = true;
+  store.decisionUnread = 5;
+
+  await store.createGlobalSession();
+  const wrapper = mount(App, { global: { stubs } });
+
+  expect(store.decisionHasRecords).toBe(false);
+  expect(store.decisionUnread).toBe(0);
+  expect(wrapper.find('[data-test="decision-entry"]').exists()).toBe(false);
   wrapper.unmount();
 });
 

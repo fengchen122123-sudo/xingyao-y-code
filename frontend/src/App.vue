@@ -112,7 +112,7 @@
               data-test="decision-entry"
               title="查看 JEV 决策记录"
               @click.stop="toggleDecisionPanel"
-            ><AppIcon name="brain" :size="12" :stroke-width="2" /><span class="chip-label">决策</span><span v-if="store.decisionUnread > 0" class="decision-entry-badge" data-test="decision-entry-badge">{{ store.decisionUnread > 99 ? '99+' : store.decisionUnread }}</span></button>
+            ><AppIcon name="brain" :size="12" :stroke-width="2" /><span class="chip-label">决策</span></button>
             <DecisionRecordPopup v-if="decisionPanelOpen" @close="decisionPanelOpen = false" />
           </div>
 
@@ -1480,20 +1480,6 @@ onUnmounted(() => {
 .decision-entry-wrap {
   position: relative;
 }
-.decision-entry-badge {
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  margin-left: 4px;
-  border-radius: 99px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 10.5px;
-  font-weight: 700;
-  line-height: 16px;
-  text-align: center;
-  display: inline-block;
-}
 .task-entry {
   display: inline-flex;
   align-items: center;
@@ -1610,7 +1596,6 @@ onUnmounted(() => {
     max-width: none;
   }
   #chat-header .task-entry-badge,
-  #chat-header .decision-entry-badge,
   #chat-header :deep(.bg-entry-badge) {
     position: absolute;
     top: -4px;

@@ -56,6 +56,20 @@ describe('decision_recorded 事件', () => {
     expect(store.decisionHasRecords).toBe(false);
   });
 
+  it('缺 session_id 的决策：无法证明属于本会话，只刷面板不点亮入口', () => {
+    const store = useAppStore();
+    store.currentSessionName = 'sess-A';
+
+    store.handleBridgeEvent({
+      type: 'decision_recorded',
+      data: { scene: 'router' },
+    } as any);
+
+    expect(store.decisionEventTick).toBe(1);
+    expect(store.decisionUnread).toBe(0);
+    expect(store.decisionHasRecords).toBe(false);
+  });
+
   it('旧后端缺省 scene：按业务决策处理（不能因为缺字段就不提示）', () => {
     const store = useAppStore();
     store.currentSessionName = 'sess-A';

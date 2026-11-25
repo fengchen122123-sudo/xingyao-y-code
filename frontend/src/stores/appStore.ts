@@ -4271,6 +4271,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.pendingWorkdir = 'GLOBAL';
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新对话';
+      // 决策入口只属于具体会话：草稿会话还没开始，必须复位上一个会话的点亮态，
+      // 否则空白新对话上会挂着上一个会话遗留的「决策」按钮
+      this.decisionHasRecords = false;
+      this.decisionUnread = 0;
       // 草稿会话没有目标：清掉上一个会话的状态条，避免新对话里挂着旧目标
       this.goalState = null;
       this._bindSessionRuntime('');
@@ -4315,6 +4319,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.pendingWorkdir = targetWorkdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
+      // 同上：分组里的草稿会话也未开始，入口随会话切换一并复位
+      this.decisionHasRecords = false;
+      this.decisionUnread = 0;
       this.goalState = null;
       this._bindSessionRuntime('');
       const runtime = this._getSessionRuntime('');
@@ -4383,6 +4390,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.pendingWorkdir = null;
         this.permRequest.show = false;
         this.currentSessionName = res.session_name;
+        // 新建的秘书会话尚无任何决策：入口初始必须是熄灭状态
+        this.decisionHasRecords = false;
+        this.decisionUnread = 0;
         this.currentSessionDisplayName = String(res.secretary_name || res.display_name || normalized);
         this._bindSessionRuntime(res.session_name);
         this.messages = [];
@@ -5597,11 +5607,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 入口与徽章口径是「当前会话」：其他会话的决策只让面板按 tick 重拉，
         // 既不累加未读、也不点亮当前会话入口（否则切到 A 会话会看到 B 的决策）
         const decisionSession = String(data.session_id || '').trim();
-        if (decisionSession && decisionSession !== this.currentSessionName) {
-          this.decisionEventTick += 1;
+        this.decisionEventTick += 1;
+        // 归属不明（缺 session_id）的决策证明不了属于当前会话：后台线程与无会话
+        // 上下文里的决策都会落到空串，一律不点亮入口，避免空白新对话被别人的
+        // 决策挂出一个「决策」按钮
+        if (!decisionSession || decisionSession !== this.currentSessionName) {
           return;
         }
-        this.decisionEventTick += 1;
         // 探针（scene="probe"）只证明链路通了，不算真实决策：与后端
         // has_business_records 的口径保持一致。否则跑一次探针就会点亮入口，
         // 而下次启动探测又按 has_business_records=false 把它熄灭（入口闪烁）。
