@@ -424,6 +424,13 @@ def _element_lines(observation) -> list[str]:
     return lines
 
 
+def _ui_note_block(observation) -> list[dict]:
+    note = str(getattr(observation, "ui_note", "") or "").strip()
+    if not note:
+        return []
+    return [{"type": "text", "text": note}]
+
+
 def _elements_content_blocks(element_lines: list[str]) -> list[dict]:
     if not element_lines:
         return []
@@ -486,7 +493,7 @@ def _observation_followup_message(
         getattr(observation, "screen_unchanged", False)
         and observation.action not in ("observe", "observe_region")
     ):
-        unchanged_blocks = list_blocks + [
+        unchanged_blocks = list_blocks + _ui_note_block(observation) + [
             {"type": "text", "text": f"{_OBSERVATION_UNCHANGED_TEXT}\n{frame_line}"}
         ]
         return {
@@ -517,7 +524,7 @@ def _observation_followup_message(
         )
         return {
             "role": "user",
-            "content": list_blocks + [
+            "content": list_blocks + _ui_note_block(observation) + [
                 {"type": "text", "text": no_screenshot_observation_text(observation)},
                 {"type": "text", "text": frame_line},
             ],
@@ -545,7 +552,7 @@ def _observation_followup_message(
             "_computer_v1": {**meta, "image_omitted": omitted_reason or "too_large"},
         }
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
-    content = list_blocks
+    content = list_blocks + _ui_note_block(observation)
     content.append({"type": "text", "text": OBSERVATION_FOLLOWUP_TEXT})
     if not element_lines:
         if getattr(observation, "action", "") == "observe_region":

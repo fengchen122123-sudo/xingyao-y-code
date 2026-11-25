@@ -197,6 +197,39 @@ def test_explicit_observe_with_elements_attaches_image_and_position(tmp_path):
     assert "位置=画面右下角" in text
 
 
+def test_self_drawn_ui_note_is_shown_with_the_screenshot(tmp_path):
+    from PIL import Image
+
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    png = tmp_path / "frame.png"
+    Image.new("RGB", (16, 16), (255, 255, 255)).save(png, format="PNG")
+    note = "此窗口是自绘界面，控件树只有标题栏按钮。"
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        png_path=str(png),
+        width=16,
+        height=16,
+        original_width=16,
+        original_height=16,
+        ui_note=note,
+        elements=(
+            {"ref": "el-2", "kind": "button", "name": "系统",
+             "bounds": (0, 0, 10, 10), "enabled": True},
+        ),
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    text = "\n".join(
+        block["text"] for block in message["content"] if block["type"] == "text"
+    )
+    assert note in text
+    assert "el-2" in text
+    assert "image_url" in [block["type"] for block in message["content"]]
+
+
 def _dense_unnamed_elements(count=80):
     return tuple(
         {

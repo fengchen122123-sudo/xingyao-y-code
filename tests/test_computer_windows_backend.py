@@ -1260,7 +1260,8 @@ def test_observe_returns_stale_observation_when_hwnd_changes_during_capture():
     adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
 
     def switching_grab():
-        adapter.foreground_id = 2002
+        # 两次抓取都换前台：内部重试一次后仍然不稳定，观察必须失败。
+        adapter.foreground_id += 1000
         return FakeImage(1280, 720)
 
     backend = WindowsComputerBackend(
@@ -1413,34 +1414,209 @@ def test_drag_samples_only_caller_path_and_scroll_does_not_activate_foreground()
         backend.close()
 
 
-def test_ctypes_set_foreground_window_skips_vk_menu_and_attach_thread_input(monkeypatch):
-    import core.computer.win32_adapter as wa
-
-    keybd_calls = []
+def _foreground_user32(*, become_foreground_on_call):
+    """become_foreground_on_call: 第几次 SetForegroundWindow 之后前台变成目标。0 表示始终拒绝。"""
+    state = {"fg": 1001, "sets": 0}
     attach_calls = []
-    fg_calls = []
+    bring_calls = []
+    keybd_calls = []
 
     class _SetFgFn:
         def __call__(self, hwnd):
-            fg_calls.append(hwnd)
+            state["sets"] += 1
+            if become_foreground_on_call and state["sets"] >= become_foreground_on_call:
+                state["fg"] = int(hwnd)
             return False
 
     class _GetFgFn:
         def __call__(self):
-            return 1001
+            return state["fg"]
 
     class _FakeUser32:
         SetForegroundWindow = _SetFgFn()
         GetForegroundWindow = _GetFgFn()
 
+        def GetWindowThreadProcessId(self, hwnd, pid):
+            return 42
+
+        def AttachThreadInput(self, src, dst, attach):
+            attach_calls.append((int(src), int(dst), bool(attach)))
+            return True
+
+        def BringWindowToTop(self, hwnd):
+            bring_calls.append(int(hwnd))
+            return True
+
         def keybd_event(self, *args):
             keybd_calls.append(args)
 
-        def AttachThreadInput(self, *args):
-            attach_calls.append(args)
+    class _FakeKernel32:
+        def GetCurrentThreadId(self):
+            return 7
 
-    monkeypatch.setattr(wa.ctypes, "windll", type("_W", (), {"user32": _FakeUser32()})())
-    assert wa._ctypes_set_foreground_window(2002) is False
-    assert fg_calls == [2002]
+    windll = type("_W", (), {"user32": _FakeUser32(), "kernel32": _FakeKernel32()})()
+    return windll, state, attach_calls, bring_calls, keybd_calls
+
+
+def test_ctypes_set_foreground_window_attaches_thread_then_verifies(monkeypatch):
+    import core.computer.win32_adapter as wa
+
+    windll, _state, attach_calls, bring_calls, keybd_calls = _foreground_user32(
+        become_foreground_on_call=2
+    )
+    monkeypatch.setattr(wa.ctypes, "windll", windll)
+    assert wa._ctypes_set_foreground_window(2002) is True
+    assert attach_calls == [(7, 42, True), (7, 42, False)]
+    assert bring_calls == [2002]
     assert keybd_calls == []
+
+
+def test_ctypes_set_foreground_window_detaches_when_still_rejected(monkeypatch):
+    import core.computer.win32_adapter as wa
+
+    windll, _state, attach_calls, _bring_calls, keybd_calls = _foreground_user32(
+        become_foreground_on_call=0
+    )
+    monkeypatch.setattr(wa.ctypes, "windll", windll)
+    assert wa._ctypes_set_foreground_window(2002) is False
+    assert attach_calls == [(7, 42, True), (7, 42, False)]
+    assert keybd_calls == []
+
+
+def test_ctypes_set_foreground_window_skips_attach_when_already_foreground(monkeypatch):
+    import core.computer.win32_adapter as wa
+
+    windll, _state, attach_calls, bring_calls, keybd_calls = _foreground_user32(
+        become_foreground_on_call=1
+    )
+    monkeypatch.setattr(wa.ctypes, "windll", windll)
+    assert wa._ctypes_set_foreground_window(2002) is True
     assert attach_calls == []
+    assert bring_calls == []
+    assert keybd_calls == []
+
+
+def test_observe_retries_once_when_foreground_changes_during_capture():
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    grabs = {"n": 0}
+
+    def grab():
+        grabs["n"] += 1
+        if grabs["n"] == 1:
+            adapter.foreground_id = 2002
+        return FakeImage(1280, 720)
+
+    backend = WindowsComputerBackend(image_grab=grab, win32_adapter=adapter)
+    backend._started = True
+    try:
+        observation = backend.observe("run-retry")
+        assert observation.ok is True
+        assert observation.surface_id == "hwnd:2002"
+        assert grabs["n"] == 2
+    finally:
+        backend.close()
+
+
+def test_observe_retries_once_when_foreground_changes_during_element_collect():
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+
+    class _DriftLocator:
+        def __init__(self):
+            self.calls = 0
+
+        def collect(self, hwnd):
+            self.calls += 1
+            if self.calls == 1:
+                adapter.foreground_id = 2002
+            return []
+
+        def invalidate(self):
+            return None
+
+        def close(self):
+            return None
+
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720),
+        win32_adapter=adapter,
+        element_locator=_DriftLocator(),
+    )
+    backend._started = True
+    try:
+        observation = backend.observe("run-retry-collect")
+        assert observation.ok is True
+        assert observation.surface_id == "hwnd:2002"
+    finally:
+        backend.close()
+
+
+def test_observe_crops_secondary_monitor_foreground_window():
+    from core.computer.windows_backend import screenshot_to_physical
+
+    adapter = FakeWin32Adapter(
+        foreground_id=1001, virtual_rect=(0, -1080, 1920, 2280)
+    )
+    adapter.foreground_window_rect = lambda: (-8, -1088, 1928, 8)
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1920, 2280), win32_adapter=adapter
+    )
+    backend._started = True
+    try:
+        observation = backend.observe("run-crop")
+        assert observation.ok is True
+        assert observation.origin_x == 0
+        assert observation.origin_y == -1080
+        assert observation.original_width == 1920
+        assert observation.original_height == 1088
+        assert screenshot_to_physical(0, 0, observation) == (0, -1080)
+    finally:
+        backend.close()
+
+
+def test_observe_drops_fullscreen_caption_button_and_notes_self_drawn_ui():
+    adapter = FakeWin32Adapter(
+        foreground_id=1001,
+        virtual_rect=(0, -1080, 1920, 2280),
+        foreground_title="iMOM Agent",
+    )
+    adapter.foreground_window_rect = lambda: (-8, -1088, 1928, 8)
+
+    class _ChromeLocator:
+        def collect(self, hwnd):
+            return [
+                {
+                    "ref": "el-1",
+                    "kind": "button",
+                    "name": "关闭",
+                    "bounds": (0, -1080, 1920, 0),
+                    "enabled": True,
+                },
+                {
+                    "ref": "el-2",
+                    "kind": "button",
+                    "name": "系统",
+                    "bounds": (0, -1080, 22, -1058),
+                    "enabled": True,
+                },
+            ]
+
+        def invalidate(self):
+            return None
+
+        def close(self):
+            return None
+
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1920, 2280),
+        win32_adapter=adapter,
+        element_locator=_ChromeLocator(),
+    )
+    backend._started = True
+    try:
+        observation = backend.observe("run-chrome")
+        names = [element["name"] for element in observation.elements]
+        assert names == ["系统"]
+        assert "自绘界面" in observation.ui_note
+        assert "截图坐标" in observation.ui_note
+    finally:
+        backend.close()

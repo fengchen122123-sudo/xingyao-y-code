@@ -109,6 +109,107 @@ def _scaled_dimensions(width: int, height: int) -> tuple[int, int]:
     return max(1, round(width * ratio)), max(1, round(height * ratio))
 
 
+_CAPTION_NAMES = frozenset(
+    {
+        "关闭",
+        "系统",
+        "最小化",
+        "最大化",
+        "还原",
+        "向下还原",
+        "close",
+        "system",
+        "minimize",
+        "maximize",
+        "restore",
+    }
+)
+_SELF_DRAWN_NOTE = (
+    "此窗口是自绘界面，控件树只有标题栏按钮。请依据截图坐标点击，"
+    "坐标以这张截图左上角为 (0,0)。铺满窗口的标题栏按钮已从可点击列表移除。"
+)
+_MIN_CROP_EDGE = 64
+
+
+def _is_caption_name(name: str) -> bool:
+    return str(name or "").strip().casefold() in _CAPTION_NAMES
+
+
+def _present_desktop_elements(elements, left: int, top: int, width: int, height: int):
+    """去掉铺满窗口的标题栏按钮，以及中心落在裁剪画面外的控件。"""
+    area = max(0, int(width)) * max(0, int(height))
+    right = int(left) + int(width)
+    bottom = int(top) + int(height)
+    kept = []
+    for element in elements or ():
+        if not isinstance(element, dict):
+            kept.append(element)
+            continue
+        bounds = tuple(element.get("bounds") or ())
+        if len(bounds) == 4:
+            try:
+                el, et, er, eb = (int(value) for value in bounds)
+            except (TypeError, ValueError):
+                kept.append(element)
+                continue
+            element_width, element_height = er - el, eb - et
+            if (
+                element_width > 0
+                and element_height > 0
+                and area > 0
+                and _is_caption_name(str(element.get("name") or ""))
+                and element_width * element_height >= int(area * 0.4)
+            ):
+                continue
+            center_x = (el + er) / 2
+            center_y = (et + eb) / 2
+            if not (int(left) <= center_x < right and int(top) <= center_y < bottom):
+                continue
+        kept.append(element)
+    only_caption = bool(elements) and all(
+        isinstance(item, dict) and _is_caption_name(str(item.get("name") or ""))
+        for item in elements
+    )
+    return tuple(kept), (_SELF_DRAWN_NOTE if only_caption else "")
+
+
+def _crop_image_to_window(image, virtual, window_bounds):
+    """把整张虚拟桌面裁到前台窗口与虚拟桌面的交集。铺满虚拟桌面时不裁。"""
+    origin_x, origin_y, width, height = (int(value) for value in virtual)
+    left, top, right, bottom = (int(value) for value in window_bounds)
+    crop_left = max(left, origin_x)
+    crop_top = max(top, origin_y)
+    crop_right = min(right, origin_x + width)
+    crop_bottom = min(bottom, origin_y + height)
+    if (
+        crop_right - crop_left < _MIN_CROP_EDGE
+        or crop_bottom - crop_top < _MIN_CROP_EDGE
+    ):
+        return None
+    if (
+        crop_left == origin_x
+        and crop_top == origin_y
+        and crop_right == origin_x + width
+        and crop_bottom == origin_y + height
+    ):
+        return None
+    crop = getattr(image, "crop", None)
+    if not callable(crop):
+        return None
+    box = (
+        crop_left - origin_x,
+        crop_top - origin_y,
+        crop_right - origin_x,
+        crop_bottom - origin_y,
+    )
+    return crop(box), (
+        crop_left,
+        crop_top,
+        crop_right - crop_left,
+        crop_bottom - crop_top,
+    )
+
+
 class WindowsComputerBackend:
     """Windows 桌面 backend（target="desktop"）；线程安全，关闭幂等。"""
 
@@ -207,145 +308,183 @@ class WindowsComputerBackend:
             elements=(),
         )
 
+    def _try_crop_foreground_locked(self, image, virtual_rect):
+        """前台窗口没铺满虚拟桌面时，把截图裁到该窗口。失败则保持整屏。"""
+        getter = getattr(self._adapter, "foreground_window_rect", None)
+        if not callable(getter):
+            return None
+        try:
+            bounds = getter()
+        except Exception:
+            _LOGGER.exception("读取前台窗口矩形失败")
+            return None
+        if not bounds or len(tuple(bounds)) != 4:
+            return None
+        try:
+            return _crop_image_to_window(image, virtual_rect, bounds)
+        except Exception:
+            _LOGGER.exception("裁剪前台窗口失败，观察退回整张虚拟桌面")
+            return None
+
     def observe(self, run_id: str) -> ComputerObservation:
         with self._lock:
             self._ensure_started_locked()
             self._adapter.ensure_interactive()
-            before_hwnd = int(self._adapter.foreground_window_id() or 0)
-            (origin_x, origin_y, original_width, original_height), image = (
-                self._grab_checked_locked()
+            observation = self._capture_desktop_observation_locked(run_id)
+            if observation.ok or observation.error_code != "computer_surface_changed":
+                return observation
+            return self._capture_desktop_observation_locked(run_id)
+
+    def _capture_desktop_observation_locked(self, run_id: str) -> ComputerObservation:
+        """调用方持有锁。抓取期间前台或虚拟桌面变化时返回失效观察，不在这里重试。"""
+        before_hwnd = int(self._adapter.foreground_window_id() or 0)
+        (origin_x, origin_y, original_width, original_height), image = (
+            self._grab_checked_locked()
+        )
+        virtual_rect = (origin_x, origin_y, original_width, original_height)
+        after_grab_hwnd = int(self._adapter.foreground_window_id() or 0)
+        after_grab_rect = self._adapter.virtual_screen_rect()
+        if (after_grab_hwnd, after_grab_rect) != (before_hwnd, virtual_rect):
+            return self._stale_capture_observation_locked(run_id)
+        pending_candidates = self._pending_surface_candidates
+        self._pending_surface_candidates = ()
+        pending_elements = self._pending_elements
+        self._pending_elements = ()
+        pending_region = self._pending_region
+        self._pending_region = None
+        effective_elements = pending_elements
+        signature = (before_hwnd, *virtual_rect)
+        if signature != self._surface_signature:
+            self._surface_generation += 1
+            self._surface_signature = signature
+        # 观察重建焦点基线：清空 pointer 目标参照，键盘护栏回落到本次前台，
+        # 避免「先点 B、再观察 C」时拿旧点击目标误判焦点丢失。
+        self._last_pointer_target_hwnd = None
+        if pending_region is not None:
+            observation = self._build_region_observation_locked(
+                run_id, image, (origin_x, origin_y), pending_region
             )
-            capture_rect = (origin_x, origin_y, original_width, original_height)
-            after_grab_hwnd = int(self._adapter.foreground_window_id() or 0)
-            after_grab_rect = self._adapter.virtual_screen_rect()
-            if (after_grab_hwnd, after_grab_rect) != (before_hwnd, capture_rect):
-                return self._stale_capture_observation_locked(run_id)
-            pending_candidates = self._pending_surface_candidates
-            self._pending_surface_candidates = ()
-            pending_elements = self._pending_elements
-            self._pending_elements = ()
-            pending_region = self._pending_region
-            self._pending_region = None
-            effective_elements = pending_elements
-            signature = (before_hwnd, origin_x, origin_y, original_width, original_height)
-            if signature != self._surface_signature:
-                self._surface_generation += 1
-                self._surface_signature = signature
-            # 观察重建焦点基线：清空 pointer 目标参照，键盘护栏回落到本次前台，
-            # 避免「先点 B、再观察 C」时拿旧点击目标误判焦点丢失。
-            self._last_pointer_target_hwnd = None
-            if pending_region is not None:
-                observation = self._build_region_observation_locked(
-                    run_id, image, (origin_x, origin_y), pending_region
-                )
-                if pending_elements:
-                    self._last_elements = pending_elements
-                    self._elements_surface_generation = self._surface_generation
+            if pending_elements:
+                self._last_elements = pending_elements
+                self._elements_surface_generation = self._surface_generation
+        else:
+            cropped = self._try_crop_foreground_locked(image, virtual_rect)
+            if cropped is not None:
+                image, (origin_x, origin_y, original_width, original_height) = cropped
+            model_width, model_height = _scaled_dimensions(
+                original_width, original_height
+            )
+            if (model_width, model_height) != (original_width, original_height):
+                image = image.resize((model_width, model_height), _RESAMPLE)
+            png = self._encode_png(image)
+            elements = pending_elements
+            if elements:
+                self._last_elements = elements
+                self._elements_surface_generation = self._surface_generation
+            elif (
+                self._last_elements
+                and self._elements_surface_generation == self._surface_generation
+            ):
+                elements = self._last_elements
             else:
-                model_width, model_height = _scaled_dimensions(
-                    original_width, original_height
-                )
-                if (model_width, model_height) != (original_width, original_height):
-                    image = image.resize((model_width, model_height), _RESAMPLE)
-                png = self._encode_png(image)
-                elements = pending_elements
+                elements = ()
+                if self._last_elements:
+                    self._last_elements = ()
+                    self._elements_surface_generation = -1
+                    if self._element_locator is not None:
+                        try:
+                            self._element_locator.invalidate()
+                        except Exception:
+                            _LOGGER.exception("失效旧元素引用失败")
+                elements = self._collect_elements_locked(before_hwnd)
+                after_collect_hwnd = int(self._adapter.foreground_window_id() or 0)
+                after_collect_rect = self._adapter.virtual_screen_rect()
+                if (after_collect_hwnd, after_collect_rect) != (before_hwnd, virtual_rect):
+                    self._pending_surface_candidates = pending_candidates
+                    self._pending_elements = pending_elements
+                    self._pending_region = pending_region
+                    return self._stale_capture_observation_locked(run_id)
                 if elements:
                     self._last_elements = elements
                     self._elements_surface_generation = self._surface_generation
-                elif (
-                    self._last_elements
-                    and self._elements_surface_generation == self._surface_generation
-                ):
-                    elements = self._last_elements
-                else:
-                    elements = ()
-                    if self._last_elements:
-                        self._last_elements = ()
-                        self._elements_surface_generation = -1
-                        if self._element_locator is not None:
-                            try:
-                                self._element_locator.invalidate()
-                            except Exception:
-                                _LOGGER.exception("失效旧元素引用失败")
-                    elements = self._collect_elements_locked(before_hwnd)
-                    after_collect_hwnd = int(self._adapter.foreground_window_id() or 0)
-                    after_collect_rect = self._adapter.virtual_screen_rect()
-                    if (after_collect_hwnd, after_collect_rect) != (before_hwnd, capture_rect):
-                        return self._stale_capture_observation_locked(run_id)
-                    if elements:
-                        self._last_elements = elements
-                        self._elements_surface_generation = self._surface_generation
-                effective_elements = elements
-                if elements:
-                    png = self._annotate_elements_locked(
-                        png,
-                        elements,
-                        original_width / model_width,
-                        original_height / model_height,
-                        origin_x,
-                        origin_y,
-                    )
-                path = self._store_screenshot_locked(png)
-                observation = ComputerObservation(
-                    run_id=run_id,
-                    target="desktop",
-                    action="observe",
-                    ok=True,
-                    screen_sha256=hashlib.sha256(png).hexdigest(),
-                    png_path=str(path),
-                    width=model_width,
-                    height=model_height,
-                    original_width=original_width,
-                    original_height=original_height,
-                    origin_x=origin_x,
-                    origin_y=origin_y,
-                    scale_x=original_width / model_width,
-                    scale_y=original_height / model_height,
-                    window_title=self._window_title_summary(),
+            elements, ui_note = _present_desktop_elements(
+                elements, origin_x, origin_y, original_width, original_height
+            )
+            self._last_elements = elements
+            if elements:
+                self._elements_surface_generation = self._surface_generation
+            effective_elements = elements
+            if elements:
+                png = self._annotate_elements_locked(
+                    png,
+                    elements,
+                    original_width / model_width,
+                    original_height / model_height,
+                    origin_x,
+                    origin_y,
                 )
-                self._region_baseline = None
-            observation = replace(
-                observation,
-                surface_id=f"hwnd:{signature[0]}",
-                surface_generation=self._surface_generation,
-                surface_candidates=pending_candidates,
-                elements=effective_elements,
-            )
-            if pending_region is not None:
-                self._region_baseline = pending_region
-            self._frame_seq += 1
-            frame_id = f"desktop-{self._surface_generation}-{self._frame_seq}"
-            observation = replace(
-                observation,
-                frame_id=frame_id,
-                viewport_generation=self._surface_generation,
-                input_activated=self._last_activation_changed,
-            )
-            frame = ObservationFrame(
-                frame_id=frame_id,
+            path = self._store_screenshot_locked(png)
+            observation = ComputerObservation(
                 run_id=run_id,
                 target="desktop",
-                surface_id=observation.surface_id,
-                surface_generation=observation.surface_generation,
-                viewport_generation=observation.viewport_generation,
-                origin_x=observation.origin_x,
-                origin_y=observation.origin_y,
-                crop_width=observation.original_width or observation.width,
-                crop_height=observation.original_height or observation.height,
-                image_width=observation.width,
-                image_height=observation.height,
-                model_to_css_x=float(observation.scale_x or 1.0),
-                model_to_css_y=float(observation.scale_y or 1.0),
-                coordinate_input_enabled=True,
-                disabled_reason="",
+                action="observe",
+                ok=True,
+                screen_sha256=hashlib.sha256(png).hexdigest(),
+                png_path=str(path),
+                width=model_width,
+                height=model_height,
+                original_width=original_width,
+                original_height=original_height,
+                origin_x=origin_x,
+                origin_y=origin_y,
+                scale_x=original_width / model_width,
+                scale_y=original_height / model_height,
+                window_title=self._window_title_summary(),
+                ui_note=ui_note,
             )
-            self._frames[frame_id] = frame
-            while len(self._frames) > 32:
-                self._frames.pop(next(iter(self._frames)))
-            self._active_frame = frame
-            self._last_activation_changed = False
-            self._last_observation = observation
-            return observation
+            self._region_baseline = None
+        observation = replace(
+            observation,
+            surface_id=f"hwnd:{signature[0]}",
+            surface_generation=self._surface_generation,
+            surface_candidates=pending_candidates,
+            elements=effective_elements,
+        )
+        if pending_region is not None:
+            self._region_baseline = pending_region
+        self._frame_seq += 1
+        frame_id = f"desktop-{self._surface_generation}-{self._frame_seq}"
+        observation = replace(
+            observation,
+            frame_id=frame_id,
+            viewport_generation=self._surface_generation,
+            input_activated=self._last_activation_changed,
+        )
+        frame = ObservationFrame(
+            frame_id=frame_id,
+            run_id=run_id,
+            target="desktop",
+            surface_id=observation.surface_id,
+            surface_generation=observation.surface_generation,
+            viewport_generation=observation.viewport_generation,
+            origin_x=observation.origin_x,
+            origin_y=observation.origin_y,
+            crop_width=observation.original_width or observation.width,
+            crop_height=observation.original_height or observation.height,
+            image_width=observation.width,
+            image_height=observation.height,
+            model_to_css_x=float(observation.scale_x or 1.0),
+            model_to_css_y=float(observation.scale_y or 1.0),
+            coordinate_input_enabled=True,
+            disabled_reason="",
+        )
+        self._frames[frame_id] = frame
+        while len(self._frames) > 32:
+            self._frames.pop(next(iter(self._frames)))
+        self._active_frame = frame
+        self._last_activation_changed = False
+        self._last_observation = observation
+        return observation
 
     def sync_observation_frame(self, frame: ObservationFrame) -> None:
         """同步 Provider 重缩放逆变换或超限禁用状态到桌面当前帧。"""

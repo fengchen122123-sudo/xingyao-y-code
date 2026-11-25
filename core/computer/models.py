@@ -175,6 +175,8 @@ class ComputerObservation:
     # 自愈判定使用；绝不加入 observation_provider_projection 投影（投影字节不变）。
     input_activated: bool = False
     screen_unchanged: bool = False
+    # 桌面观察给模型的补充说明（自绘窗口等）。不进入 9 键投影。
+    ui_note: str = ""
 
 
 @dataclass(frozen=True)

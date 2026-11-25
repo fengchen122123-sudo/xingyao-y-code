@@ -282,16 +282,17 @@ class _DefaultSurfaceHost:
         return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
 
     def activate_window(self, hwnd: int) -> None:
-        """ShowWindow 恢复 + SetForegroundWindow，随后验证实际前台身份。
+        """ShowWindow 恢复后置前，并以实际前台句柄核对。
 
-        SetForegroundWindow 受系统限制；返回/验证失败显式报错，绝不通过
-        后台盲输假装已激活。
+        第一次被系统拒绝时会短暂附着前台线程再试。核对失败显式报错，
+        绝不通过后台盲输假装已激活。
         """
+        from core.computer.win32_adapter import _ctypes_set_foreground_window
+
         handle = int(hwnd)
         if _user32.IsIconic(handle):
             _user32.ShowWindow(handle, _SW_RESTORE)
-        _user32.SetForegroundWindow(handle)
-        if int(_user32.GetForegroundWindow() or 0) != handle:
+        if not _ctypes_set_foreground_window(handle):
             raise ComputerControlError(
                 "computer_action_failed",
                 "激活窗口失败：系统拒绝将目标窗口置前台（SetForegroundWindow 受限）",

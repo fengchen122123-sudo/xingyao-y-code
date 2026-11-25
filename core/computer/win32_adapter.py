@@ -43,7 +43,6 @@ _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 _DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
 _ABSOLUTE_RANGE = 65535
 _GA_ROOT = 2
-_VK_MENU = 0x12
 
 KEY_NAME_TO_VK = {
     "CTRL": 0x11,
@@ -277,13 +276,79 @@ def _ctypes_window_from_point(x: int, y: int) -> int:
     return root or hwnd
 
 
-def _ctypes_set_foreground_window(hwnd: int) -> bool:
-    """调用 SetForegroundWindow 并验证实际前台句柄（不使用 VK_MENU 或 AttachThreadInput）。"""
+def _ctypes_window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     user32 = ctypes.windll.user32
-    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-    if not user32.SetForegroundWindow(int(hwnd)):
-        return False
-    return _ctypes_foreground_window() == int(hwnd)
+    user32.GetWindowRect.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.RECT))
+    user32.GetWindowRect.restype = wintypes.BOOL
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
+        return None
+    return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+
+def _prototype(fn, argtypes, restype) -> None:
+    """ctypes 函数需要原型；测试桩是普通方法，设不上就跳过。"""
+    if argtypes is not None:
+        try:
+            fn.argtypes = argtypes
+        except (AttributeError, TypeError):
+            pass
+    try:
+        fn.restype = restype
+    except (AttributeError, TypeError):
+        pass
+
+
+def _ctypes_set_foreground_window(hwnd: int) -> bool:
+    """把目标窗口置前，并以 GetForegroundWindow 作为唯一成功标准。
+
+    第一次 SetForegroundWindow 被系统拒绝时，短暂把当前线程挂到前台线程上，
+    BringWindowToTop 后再置前，并在 finally 里解开。不发送 Alt 键。
+    核对失败返回 False，绝不把 API 的返回值当成已经置前。
+    """
+    user32 = ctypes.windll.user32
+    target = int(hwnd)
+    _prototype(user32.SetForegroundWindow, (wintypes.HWND,), wintypes.BOOL)
+    user32.SetForegroundWindow(target)
+    if _ctypes_foreground_window() == target:
+        return True
+    kernel32 = ctypes.windll.kernel32
+    _prototype(
+        user32.GetWindowThreadProcessId,
+        (wintypes.HWND, ctypes.c_void_p),
+        wintypes.DWORD,
+    )
+    _prototype(
+        user32.AttachThreadInput,
+        (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL),
+        wintypes.BOOL,
+    )
+    _prototype(user32.BringWindowToTop, (wintypes.HWND,), wintypes.BOOL)
+    _prototype(kernel32.GetCurrentThreadId, None, wintypes.DWORD)
+    foreground = _ctypes_foreground_window()
+    our_thread = int(kernel32.GetCurrentThreadId() or 0)
+    foreground_thread = (
+        int(user32.GetWindowThreadProcessId(int(foreground), None) or 0)
+        if foreground
+        else 0
+    )
+    attached = False
+    try:
+        if foreground_thread and our_thread and foreground_thread != our_thread:
+            attached = bool(
+                user32.AttachThreadInput(our_thread, foreground_thread, True)
+            )
+        user32.BringWindowToTop(target)
+        user32.SetForegroundWindow(target)
+    except Exception:
+        _LOGGER.exception("前台二次获取失败")
+    finally:
+        if attached:
+            try:
+                user32.AttachThreadInput(our_thread, foreground_thread, False)
+            except Exception:
+                _LOGGER.exception("解除前台线程附着失败")
+    return _ctypes_foreground_window() == target
 
 
 def _ctypes_window_title(hwnd: int) -> str:
@@ -366,6 +431,7 @@ class Win32InputAdapter:
         window_from_point: Callable[[int, int], int] | None = None,
         set_foreground_window: Callable[[int], bool] | None = None,
         list_top_window_titles: Callable[[], tuple[str, ...]] | None = None,
+        window_rect: Callable[[int], tuple[int, int, int, int] | None] | None = None,
     ) -> None:
         self._send_input = send_input if send_input is not None else _ctypes_send_input
         if platform is None:
@@ -410,6 +476,7 @@ class Win32InputAdapter:
             if list_top_window_titles is not None
             else _ctypes_top_window_titles
         )
+        self._window_rect = window_rect if window_rect is not None else _ctypes_window_rect
         self._pressed_keys: list[str] = []
         self._pressed_buttons: set[str] = set()
         self._input_gate = threading.Lock()
@@ -487,6 +554,23 @@ class Win32InputAdapter:
         hwnd = self._get_foreground_window()
         return int(hwnd) if hwnd else 0
 
+    def foreground_window_rect(self) -> tuple[int, int, int, int] | None:
+        """前台窗口屏幕矩形 (left, top, right, bottom)；读不到时返回 None。"""
+        hwnd = self.foreground_window_id()
+        if not hwnd:
+            return None
+        try:
+            rect = self._window_rect(int(hwnd))
+        except Exception:
+            _LOGGER.exception("读取前台窗口矩形失败")
+            return None
+        if not rect or len(tuple(rect)) != 4:
+            return None
+        left, top, right, bottom = (int(value) for value in rect)
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
+
     def list_top_window_titles(self) -> tuple[str, ...]:
         """枚举可见且有标题的顶层窗口标题（wait_for window_active 只读探测）。
 
@@ -516,8 +600,8 @@ class Win32InputAdapter:
     def set_foreground_window(self, hwnd: int) -> bool:
         """把目标窗口提到前台（通用化重构 Task C 输入前置激活）。
 
-        best-effort：失败（含 Alt 键技巧重试后仍失败）归一为 False 并留痕，
-        绝不抛错阻断输入。
+        best-effort：SetForegroundWindow 被拒绝时会短暂附着前台线程再试一次。
+        仍对不上实际前台句柄则返回 False 并留痕，绝不抛错阻断调用方。
         """
         try:
             return bool(self._set_foreground(int(hwnd)))
