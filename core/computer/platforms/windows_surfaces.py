@@ -290,9 +290,16 @@ class _DefaultSurfaceHost:
         from core.computer.win32_adapter import _ctypes_set_foreground_window
 
         handle = int(hwnd)
-        if _user32.IsIconic(handle):
+        was_iconic = bool(_user32.IsIconic(handle))
+        if was_iconic:
             _user32.ShowWindow(handle, _SW_RESTORE)
+            # 最小化窗口异步恢复，稍作等待再置前避免抢在还原前核对失败
+            time.sleep(0.05)
         if not _ctypes_set_foreground_window(handle):
+            if was_iconic:
+                time.sleep(0.08)
+                if _ctypes_set_foreground_window(handle):
+                    return
             raise ComputerControlError(
                 "computer_action_failed",
                 "激活窗口失败：系统拒绝将目标窗口置前台（SetForegroundWindow 受限）",

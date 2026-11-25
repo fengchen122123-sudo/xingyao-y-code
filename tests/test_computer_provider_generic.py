@@ -609,3 +609,109 @@ def test_text_only_element_lines_observation_does_not_modify_coord_frame(tmp_pat
         if snap is not None:
             service.stop(snap.run_id, "test")
         backend.close()
+
+
+def test_desktop_no_screenshot_observation_omits_browser_throttling_text():
+    from core.computer.models import ComputerObservation
+    from core.computer.provider_generic import _observation_followup_message
+
+    observation = ComputerObservation(
+        run_id="run-1",
+        target="desktop",
+        action="observe",
+        ok=False,
+        error_code="computer_surface_changed",
+        error_message="截屏或控件采集期间前景窗口或桌面几何变化，当前观察不可用于坐标输入，请重新 observe",
+    )
+    message = _observation_followup_message(observation, run_id="run-1", ordinal=1)
+    assert message["_computer_v1"]["image_omitted"] == "no_screenshot"
+    text = "\n".join(block["text"] for block in message["content"])
+    assert "本次没有截图" in text
+    assert "截屏或控件采集期间前景窗口或桌面几何变化" in text
+    assert "浏览器窗口不可见" not in text
+    assert "【页面正文】" not in text
+
+
+def test_element_bounds_projected_to_cropped_and_downscaled_image(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+    from PIL import Image
+    from core.computer import provider_generic
+    from core.computer.models import (
+        ComputerCapability,
+        ComputerObservation,
+        ComputerOwner,
+    )
+    from core.computer.tool_adapter import ComputerTurnLease
+    import threading
+
+    png = tmp_path / "big.png"
+    buf = io.BytesIO()
+    Image.new("RGB", (2560, 1440), (30, 60, 90)).save(buf, format="PNG")
+    png.write_bytes(buf.getvalue() + b"\x00" * 128)
+
+    obs = ComputerObservation(
+        run_id="run-proj",
+        target="desktop",
+        action="observe",
+        png_path=str(png),
+        width=2560,
+        height=1440,
+        original_width=2560,
+        original_height=1440,
+        origin_x=100,
+        origin_y=-1000,
+        scale_x=1.0,
+        scale_y=1.0,
+        frame_id="desktop-1-1",
+        elements=(
+            {
+                "ref": "el-1",
+                "kind": "ButtonControl",
+                "name": "确定",
+                "bounds": (100 + 200, -1000 + 400, 100 + 400, -1000 + 500),
+                "enabled": True,
+            },
+        ),
+    )
+
+    class _FakeController:
+        def __init__(self):
+            self.frames = {}
+
+        def execute(self, run_id, owner, action):
+            return obs
+
+        def snapshot(self):
+            return SimpleNamespace(action_count=1)
+
+        def sync_observation_frame(self, run_id, frame):
+            self.frames[frame.frame_id] = frame
+
+        def get_observation_frame(self, run_id, frame_id):
+            return self.frames.get(frame_id)
+
+    monkeypatch.setattr(provider_generic, "_OBSERVATION_IMAGE_MAX_BYTES", 5000)
+    cap = ComputerCapability(enabled=True, protocol="generic", targets=("desktop",))
+    lease = ComputerTurnLease(
+        capability=cap,
+        owner=ComputerOwner("s1", "t1", "测试", threading.Event()),
+        controller=_FakeController(),
+        run_id="run-proj",
+    )
+    decoded = SimpleNamespace(
+        name="computer_action",
+        arguments={"kind": "observe", "target": "desktop"},
+    )
+    result = provider_generic.execute_reserved_computer_tool(
+        decoded, SimpleNamespace(computer_lease=lease)
+    )
+    payload = json.loads(result.content)
+    # 2560x1440 -> 1280x720 (2x downscale): projection JSON & element bounds must match!
+    assert (payload["width"], payload["height"]) == (1280, 720)
+    followup_text = "\n".join(
+        block["text"]
+        for block in result.followup_messages[0]["content"]
+        if block["type"] == "text"
+    )
+    assert "bounds=(100, 200, 200, 250)" in followup_text

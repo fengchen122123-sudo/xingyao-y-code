@@ -764,6 +764,15 @@ def _audit_config_keys() -> None:
 
 def main():
     _configure_runtime_logging()
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            # 必须在 pywebview 调用 SetProcessDPIAware()（锁定为 SYSTEM_AWARE）之前
+            # 启用 Per-Monitor V2，否则多显示器不同 DPI 缩放下桌面操控坐标会整体偏移。
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except Exception:
+            logger.debug("设置 Per-Monitor V2 DPI awareness 失败（保持默认）", exc_info=True)
     # 内嵌 WebView2 的默认内存参数：进程级环境变量注入（pywebview 的
     # edgechromium 后端以及 core.embedded_browser 直接 new 的控件都会读到它）。
     # 必须用 setdefault——用户系统里已有的 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS

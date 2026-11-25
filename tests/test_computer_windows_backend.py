@@ -1620,3 +1620,302 @@ def test_observe_drops_fullscreen_caption_button_and_notes_self_drawn_ui():
         assert "截图坐标" in observation.ui_note
     finally:
         backend.close()
+
+
+def test_sequence_click_other_window_then_type_text_succeeds():
+    from core.computer.actions import parse_computer_action
+    from core.computer.controller import ComputerControlService
+    from core.computer.models import ComputerCapability, ComputerOwner
+
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    adapter.window_at_point_id = 2002
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720), win32_adapter=adapter
+    )
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
+    owner = ComputerOwner("s1", "t1", "测试", threading.Event())
+    cap = ComputerCapability(
+        enabled=True, protocol="generic", targets=("desktop",), settings_generation=0
+    )
+    snap = service.start_run(owner, cap, target="desktop")
+    try:
+        service.execute(
+            snap.run_id, owner, ComputerAction(kind="observe", target="desktop")
+        )
+        seq = parse_computer_action(
+            {
+                "kind": "sequence",
+                "target": "desktop",
+                "steps": [
+                    {"kind": "click", "target": "desktop", "x": 100, "y": 100},
+                    {"kind": "type_text", "target": "desktop", "text": "hello"},
+                    {"kind": "keypress", "target": "desktop", "keys": ["ENTER"]},
+                ],
+            }
+        )
+        obs = service.execute(snap.run_id, owner, seq)
+        assert obs.ok is True
+        assert obs.surface_id == "hwnd:2002"
+        assert adapter.set_foreground_calls == [2002]
+        assert adapter.texts == ["hello"]
+        assert adapter.keys_sent == [("ENTER",)]
+    finally:
+        service.stop(snap.run_id, "test")
+
+
+def test_sequence_alt_tab_allows_later_keypress_but_rejects_stale_click():
+    from core.computer.actions import parse_computer_action
+    from core.computer.controller import ComputerControlService
+    from core.computer.models import ComputerCapability, ComputerOwner
+
+    class _SwitchAdapter(FakeWin32Adapter):
+        def send_keys(self, keys):
+            super().send_keys(keys)
+            if tuple(keys) == ("ALT", "TAB"):
+                self.foreground_id = 2002
+                self.foreground_title = "IDEA"
+
+    adapter = _SwitchAdapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720), win32_adapter=adapter
+    )
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
+    owner = ComputerOwner("s1", "t1", "测试", threading.Event())
+    cap = ComputerCapability(
+        enabled=True, protocol="generic", targets=("desktop",), settings_generation=0
+    )
+    snap = service.start_run(owner, cap, target="desktop")
+    try:
+        service.execute(
+            snap.run_id, owner, ComputerAction(kind="observe", target="desktop")
+        )
+        seq_keys = parse_computer_action(
+            {
+                "kind": "sequence",
+                "target": "desktop",
+                "steps": [
+                    {"kind": "keypress", "target": "desktop", "keys": ["ALT", "TAB"]},
+                    {"kind": "wait", "target": "desktop", "duration_ms": 100},
+                    {
+                        "kind": "keypress",
+                        "target": "desktop",
+                        "keys": ["CTRL", "SHIFT", "A"],
+                    },
+                ],
+            }
+        )
+        obs = service.execute(snap.run_id, owner, seq_keys)
+        assert obs.ok is True
+        assert adapter.keys_sent == [("ALT", "TAB"), ("CTRL", "SHIFT", "A")]
+
+        adapter.foreground_id = 2002
+        seq_click = parse_computer_action(
+            {
+                "kind": "sequence",
+                "target": "desktop",
+                "steps": [
+                    {"kind": "keypress", "target": "desktop", "keys": ["ALT", "TAB"]},
+                    {"kind": "click", "target": "desktop", "x": 10, "y": 10},
+                ],
+            }
+        )
+        # Re-establish baseline on 2002, then switch on ALT+TAB -> click must reject
+        adapter.send_keys = lambda keys: (
+            FakeWin32Adapter.send_keys(adapter, keys),
+            setattr(adapter, "foreground_id", 3003)
+            if tuple(keys) == ("ALT", "TAB")
+            else None,
+        )[0]
+        with pytest.raises(ComputerControlError) as raised:
+            service.execute(snap.run_id, owner, seq_click)
+        assert raised.value.code == "computer_surface_changed"
+        assert raised.value.details["failed_step_index"] == 1
+    finally:
+        service.stop(snap.run_id, "test")
+
+
+def test_observe_region_clips_maximized_window_dwm_border():
+    from core.computer.actions import parse_computer_action
+    from tests.test_computer_surfaces import FakeSurfaceLocator
+
+    locator = FakeSurfaceLocator(
+        windows=[{"label": "IDEA", "bounds": (-8, -1088, 1936, 1096)}]
+    )
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, -1080, 1920, 2280))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1920, 2280),
+        win32_adapter=adapter,
+        surface_locator=locator,
+    )
+    backend.start()
+    try:
+        backend.execute("run-r", ComputerAction(kind="list_surfaces", target="desktop"))
+        candidate = backend.observe("run-r").surface_candidates[0]
+        backend.execute(
+            "run-r",
+            parse_computer_action(
+                {
+                    "kind": "observe_region",
+                    "target": "desktop",
+                    "surface_ref": candidate["ref"],
+                    "surface_generation": candidate["surface_generation"],
+                }
+            ),
+        )
+        region_obs = backend.observe("run-r")
+        assert region_obs.ok is True
+        assert (region_obs.origin_x, region_obs.origin_y) == (0, -1080)
+        assert (region_obs.original_width, region_obs.original_height) == (1920, 1088)
+    finally:
+        backend.close()
+
+
+def test_observe_passes_bounded_deadline_to_collect():
+    seen = {}
+
+    class _DeadlineLocator:
+        def collect(self, hwnd, *, deadline=None, cancel_event=None):
+            seen["deadline"] = deadline
+            seen["cancel_event"] = cancel_event
+            return []
+
+        def invalidate(self):
+            return None
+
+        def close(self):
+            return None
+
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720),
+        win32_adapter=adapter,
+        element_locator=_DeadlineLocator(),
+    )
+    backend._started = True
+    try:
+        obs = backend.observe("run-dl")
+        assert obs.ok is True
+        assert seen["deadline"] is not None
+        assert seen["cancel_event"] is backend._stop_event
+    finally:
+        backend.close()
+
+
+def test_wait_for_probes_live_foreground_hwnd_when_window_activates():
+    adapter = FakeWin32Adapter(
+        foreground_id=1001, foreground_title="StarYao", virtual_rect=(0, 0, 1280, 720)
+    )
+    probed_hwnds = []
+
+    class _ProbeLocator:
+        def probe(self, hwnd, matcher, deadline=None, cancel_event=None):
+            probed_hwnds.append(hwnd)
+            return {"condition": "text_exists", "name": "Ready"} if hwnd == 2002 else None
+
+        def close(self):
+            return None
+
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720),
+        win32_adapter=adapter,
+        element_locator=_ProbeLocator(),
+    )
+    backend._started = True
+
+    def _switch():
+        import time
+
+        time.sleep(0.1)
+        adapter.foreground_id = 2002
+        adapter.foreground_title = "IDEA Target"
+
+    worker = threading.Thread(target=_switch, daemon=True)
+    worker.start()
+    try:
+        backend.execute(
+            "run-w",
+            ComputerAction(
+                kind="wait_for",
+                target="desktop",
+                condition="text_exists",
+                text="Ready",
+                window_name="IDEA",
+                timeout_ms=2000,
+                interval_ms=50,
+            ),
+        )
+        assert 2002 in probed_hwnds
+    finally:
+        worker.join(timeout=2)
+        backend.close()
+
+
+def test_ctypes_set_foreground_window_attaches_distinct_foreground_and_target_threads(
+    monkeypatch,
+):
+    import core.computer.win32_adapter as wa
+
+    windll, _state, attach_calls, bring_calls, _keybd_calls = _foreground_user32(
+        become_foreground_on_call=2
+    )
+    windll.user32.GetWindowThreadProcessId = lambda hwnd, pid: (
+        101 if int(hwnd) == 1001 else 202
+    )
+    monkeypatch.setattr(wa.ctypes, "windll", windll)
+    assert wa._ctypes_set_foreground_window(2002) is True
+    assert attach_calls == [
+        (7, 101, True),
+        (7, 202, True),
+        (7, 202, False),
+        (7, 101, False),
+    ]
+    assert bring_calls == [2002]
+
+
+def test_observe_recollects_fresh_elements_on_same_surface():
+    calls = {"n": 0}
+
+    class _DynamicLocator:
+        def collect(self, hwnd, *, deadline=None, cancel_event=None):
+            calls["n"] += 1
+            label = "旧按钮" if calls["n"] == 1 else "新按钮"
+            return [
+                {
+                    "ref": "el-1",
+                    "kind": "ButtonControl",
+                    "name": label,
+                    "bounds": (10, 10, 80, 40),
+                    "enabled": True,
+                }
+            ]
+
+        def invalidate(self):
+            return None
+
+        def close(self):
+            return None
+
+    adapter = FakeWin32Adapter(foreground_id=1001, virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720),
+        win32_adapter=adapter,
+        element_locator=_DynamicLocator(),
+    )
+    backend._started = True
+    try:
+        obs1 = backend.observe("run-dyn")
+        backend.execute(
+            "run-dyn", ComputerAction(kind="click", target="desktop", x=20, y=20)
+        )
+        obs2 = backend.observe("run-dyn")
+        assert calls["n"] == 2
+        assert obs1.elements[0]["name"] == "旧按钮"
+        assert obs2.elements[0]["name"] == "新按钮"
+    finally:
+        backend.close()

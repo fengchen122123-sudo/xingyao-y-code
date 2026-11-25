@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+from dataclasses import replace
 import json
 import logging
 
@@ -312,10 +313,24 @@ _OBSERVATION_NO_SCREENSHOT_TEXT = (
     "不要假设画面为空；需要图片时先让窗口重新可见（切回窗口或取消最小化）再 observe。"
 )
 
+_OBSERVATION_DESKTOP_NO_SCREENSHOT_TEXT = (
+    "【电脑观察】本次没有截图（桌面截图或控件采集期间窗口可能正在切换或被占用）。"
+    "请重新 observe 建立稳定的桌面观察基线后再操作。"
+)
+
 _OBSERVATION_PAGE_TEXT_HEADING = "【页面正文】"
 
 
 def no_screenshot_observation_text(observation) -> str:
+    if getattr(observation, "target", "") == "desktop":
+        lines = [_OBSERVATION_DESKTOP_NO_SCREENSHOT_TEXT]
+        error_message = str(getattr(observation, "error_message", "") or "")
+        if error_message and not getattr(observation, "ok", True):
+            lines.append(error_message)
+        reason = str(getattr(observation, "screenshot_error", "") or "")
+        if reason and reason != error_message:
+            lines.append(reason)
+        return "\n".join(lines)
     lines = [_OBSERVATION_NO_SCREENSHOT_TEXT]
     reason = str(getattr(observation, "screenshot_error", "") or "")
     if reason:
@@ -381,20 +396,34 @@ def _downscale_png(png_bytes: bytes) -> bytes | None:
         return None
 
 
-def _element_position_label(element, observation) -> str:
+def _element_position_label(element, observation, frame=None) -> str:
     bounds = tuple(element.get("bounds", ()) or ())
     if len(bounds) != 4:
         return ""
     try:
         left, top, right, bottom = (float(v) for v in bounds)
-        vw = float(getattr(observation, "width", 0) or 0)
-        vh = float(getattr(observation, "height", 0) or 0)
-        ow = float(getattr(observation, "original_width", 0) or 0)
-        oh = float(getattr(observation, "original_height", 0) or 0)
+        vw = float(
+            getattr(frame, "image_width", 0) or getattr(observation, "width", 0) or 0
+        )
+        vh = float(
+            getattr(frame, "image_height", 0) or getattr(observation, "height", 0) or 0
+        )
+        ow = float(
+            getattr(frame, "crop_width", 0)
+            or getattr(observation, "original_width", 0)
+            or 0
+        )
+        oh = float(
+            getattr(frame, "crop_height", 0)
+            or getattr(observation, "original_height", 0)
+            or 0
+        )
         if vw <= 0 or vh <= 0 or ow <= 0 or oh <= 0:
             return ""
-        mx = (((left + right) / 2.0) - float(getattr(observation, "origin_x", 0) or 0)) * vw / ow
-        my = (((top + bottom) / 2.0) - float(getattr(observation, "origin_y", 0) or 0)) * vh / oh
+        ox = float(getattr(observation, "origin_x", 0) or 0)
+        oy = float(getattr(observation, "origin_y", 0) or 0)
+        mx = (((left + right) / 2.0) - ox) * vw / ow
+        my = (((top + bottom) / 2.0) - oy) * vh / oh
     except (TypeError, ValueError):
         return ""
     if not (0.0 <= mx <= vw and 0.0 <= my <= vh):
@@ -410,15 +439,58 @@ def _element_position_label(element, observation) -> str:
     return "画面" + col + row + "角"
 
 
-def _element_lines(observation) -> list[str]:
+def _project_bounds_to_image(bounds, observation, frame=None) -> tuple:
+    raw = tuple(bounds or ())
+    if len(raw) != 4:
+        return raw
+    try:
+        left, top, right, bottom = (float(v) for v in raw)
+    except (TypeError, ValueError):
+        return raw
+    ox = float(getattr(observation, "origin_x", 0) or 0)
+    oy = float(getattr(observation, "origin_y", 0) or 0)
+    sx = float(
+        getattr(frame, "model_to_css_x", 0.0)
+        or getattr(observation, "scale_x", 1.0)
+        or 1.0
+    )
+    sy = float(
+        getattr(frame, "model_to_css_y", 0.0)
+        or getattr(observation, "scale_y", 1.0)
+        or 1.0
+    )
+    if sx <= 0:
+        sx = 1.0
+    if sy <= 0:
+        sy = 1.0
+    if ox == 0.0 and oy == 0.0 and abs(sx - 1.0) < 1e-6 and abs(sy - 1.0) < 1e-6:
+        return raw
+    img_w = int(getattr(frame, "image_width", 0) or getattr(observation, "width", 0) or 0)
+    img_h = int(getattr(frame, "image_height", 0) or getattr(observation, "height", 0) or 0)
+    x0 = round((left - ox) / sx)
+    y0 = round((top - oy) / sy)
+    x1 = round((right - ox) / sx)
+    y1 = round((bottom - oy) / sy)
+    if img_w > 0 and img_h > 0:
+        x0 = min(max(x0, 0), img_w)
+        x1 = min(max(x1, 0), img_w)
+        y0 = min(max(y0, 0), img_h)
+        y1 = min(max(y1, 0), img_h)
+    return (x0, y0, x1, y1)
+
+
+def _element_lines(observation, frame=None) -> list[str]:
     lines = []
     for element in getattr(observation, "elements", ()) or ():
-        position = _element_position_label(element, observation)
+        position = _element_position_label(element, observation, frame=frame)
         suffix = (" 位置=" + position) if position else ""
+        bounds = _project_bounds_to_image(
+            element.get("bounds", ()), observation, frame=frame
+        )
         lines.append(
             f"- {element.get('ref', '')} {element.get('kind', '')} "
             f"name={element.get('name', '')!r} "
-            f"bounds={tuple(element.get('bounds', ()))} "
+            f"bounds={bounds} "
             f"enabled={bool(element.get('enabled', True))}{suffix}"
         )
     return lines
@@ -476,23 +548,21 @@ def _observation_followup_message(
         meta["frame_id"] = str(observation.frame_id)
     frame_line = _frame_reference_line(observation)
     elements = getattr(observation, "elements", ()) or ()
-    element_lines = _element_lines(observation)
-    dense_unnamed = _is_dense_unnamed_elements(elements)
-    # 密集无名列表在「动作后的自动观察」里不逐行输出（每步几百行会吞掉大量
-    # 上下文），但显式 observe 是模型主动要看，必须给全，否则它永远拿不到
-    # el-N 引用、只能靠目测坐标点 16px 格子。
-    if dense_unnamed and getattr(observation, "action", "") != "observe":
-        list_blocks = [
-            {"type": "text", "text": _dense_elements_note(len(element_lines))}
-        ]
-    else:
-        list_blocks = _elements_content_blocks(element_lines)
+    has_png = bool(str(getattr(observation, "png_path", "") or ""))
     # 显式 observe 永远附图：模型主动要看画面时省略图片等于没回答它。
     # 局部观察同理——模型点名要看这块区域，画面没变也必须给。
     if (
         getattr(observation, "screen_unchanged", False)
         and observation.action not in ("observe", "observe_region")
     ):
+        element_lines = _element_lines(observation)
+        dense_unnamed = _is_dense_unnamed_elements(elements)
+        if dense_unnamed and getattr(observation, "action", "") != "observe":
+            list_blocks = [
+                {"type": "text", "text": _dense_elements_note(len(element_lines))}
+            ]
+        else:
+            list_blocks = _elements_content_blocks(element_lines)
         unchanged_blocks = list_blocks + _ui_note_block(observation) + [
             {"type": "text", "text": f"{_OBSERVATION_UNCHANGED_TEXT}\n{frame_line}"}
         ]
@@ -504,7 +574,15 @@ def _observation_followup_message(
     # B 方案降级 / 纯文本控件清单：
     # - png_path 为空且无截图失败、非显式 observe、有控件列表时，保持纯文本观察，且不修改后端 _coord_frame；
     # - 真正截图失败 / 显式 observe 无图时，禁用本帧坐标输入并显式说明无图原因。
-    if not str(getattr(observation, "png_path", "") or ""):
+    if not has_png:
+        element_lines = _element_lines(observation)
+        dense_unnamed = _is_dense_unnamed_elements(elements)
+        if dense_unnamed and getattr(observation, "action", "") != "observe":
+            list_blocks = [
+                {"type": "text", "text": _dense_elements_note(len(element_lines))}
+            ]
+        else:
+            list_blocks = _elements_content_blocks(element_lines)
         if (
             element_lines
             and not str(getattr(observation, "screenshot_error", "") or "")
@@ -539,6 +617,17 @@ def _observation_followup_message(
         controller=controller,
         run_id=run_id,
     )
+    element_lines = _element_lines(observation, frame=frame)
+    dense_unnamed = _is_dense_unnamed_elements(elements)
+    # 密集无名列表在「动作后的自动观察」里不逐行输出（每步几百行会吞掉大量
+    # 上下文），但显式 observe 是模型主动要看，必须给全，否则它永远拿不到
+    # el-N 引用、只能靠目测坐标点 16px 格子。
+    if dense_unnamed and getattr(observation, "action", "") != "observe":
+        list_blocks = [
+            {"type": "text", "text": _dense_elements_note(len(element_lines))}
+        ]
+    else:
+        list_blocks = _elements_content_blocks(element_lines)
     if png_bytes is None:
         return {
             "role": "user",
@@ -599,6 +688,21 @@ def execute_reserved_computer_tool(decoded, context) -> ToolResult | None:
             ordinal=ordinal,
             controller=lease.controller,
         )
+        frame_id = str(getattr(observation, "frame_id", "") or "")
+        if frame_id:
+            synced = lease.controller.get_observation_frame(lease.run_id, frame_id)
+            if (
+                synced is not None
+                and synced.image_width > 0
+                and synced.image_height > 0
+            ):
+                observation = replace(
+                    observation,
+                    width=synced.image_width,
+                    height=synced.image_height,
+                    scale_x=synced.model_to_css_x,
+                    scale_y=synced.model_to_css_y,
+                )
     except ComputerControlError as domain_error:
         return _error_result(action.target, action.kind, domain_error)
     content = json.dumps(

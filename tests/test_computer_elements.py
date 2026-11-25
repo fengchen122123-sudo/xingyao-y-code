@@ -649,3 +649,90 @@ def test_real_uia_collect_filters_offscreen_and_zero_area_and_reverifies_identit
     with pytest.raises(ComputerControlError) as raised_dl:
         host.collect(1001, deadline=time.monotonic() - 0.1)
     assert raised_dl.value.code in ("computer_wait_timeout", "computer_surfaces_unavailable")
+
+
+def test_real_uia_click_falls_back_to_selection_and_toggle_patterns():
+    import sys
+    import types
+    from core.computer.platforms import windows_elements_uia as uia_module
+
+    class _Rect:
+        left, top, right, bottom = 10, 10, 80, 40
+
+    class _Pattern:
+        def __init__(self, log, label):
+            self._log = log
+            self._label = label
+
+        def QueryInterface(self, _iface):
+            return self
+
+        def Select(self):
+            self._log.append(("select", self._label))
+
+        def Toggle(self):
+            self._log.append(("toggle", self._label))
+
+    class _Element:
+        CurrentControlType = 50019
+        CurrentBoundingRectangle = _Rect()
+        CurrentIsEnabled = True
+        CurrentIsOffscreen = False
+
+        def __init__(self, supported_pattern_id, log, label):
+            self._supported = supported_pattern_id
+            self._log = log
+            self._label = label
+
+        def GetRuntimeId(self):
+            return (1, 2)
+
+        def GetCurrentPattern(self, pid):
+            if pid == self._supported:
+                return _Pattern(self._log, self._label)
+            return None
+
+    class _InlineCom:
+        def call(self, fn, **kwargs):
+            return fn(None)
+
+    calls = []
+    host = uia_module.RealUIAHost.__new__(uia_module.RealUIAHost)
+    host._com = _InlineCom()
+    host._elements = {
+        "el-tab": _Element(uia_module._UIA_SELECTION_ITEM_PATTERN_ID, calls, "tab"),
+        "el-chk": _Element(uia_module._UIA_TOGGLE_PATTERN_ID, calls, "chk"),
+    }
+    host._element_meta = {
+        "el-tab": {"hwnd": 1, "control_type": 50019, "bounds": (10, 10, 80, 40), "runtime_id": (1, 2)},
+        "el-chk": {"hwnd": 1, "control_type": 50019, "bounds": (10, 10, 80, 40), "runtime_id": (1, 2)},
+    }
+
+    comtypes = types.ModuleType("comtypes")
+    client = types.ModuleType("comtypes.client")
+    gen = types.ModuleType("comtypes.gen")
+    uia_client = types.ModuleType("comtypes.gen.UIAutomationClient")
+    uia_client.IUIAutomationInvokePattern = object
+    uia_client.IUIAutomationSelectionItemPattern = object
+    uia_client.IUIAutomationTogglePattern = object
+    uia_client.IUIAutomationExpandCollapsePattern = object
+    gen.UIAutomationClient = uia_client
+    comtypes.client = client
+    comtypes.gen = gen
+    old = {k: sys.modules.get(k) for k in ("comtypes", "comtypes.client", "comtypes.gen", "comtypes.gen.UIAutomationClient")}
+    sys.modules.update({
+        "comtypes": comtypes,
+        "comtypes.client": client,
+        "comtypes.gen": gen,
+        "comtypes.gen.UIAutomationClient": uia_client,
+    })
+    try:
+        host.click("el-tab")
+        host.click("el-chk")
+        assert calls == [("select", "tab"), ("toggle", "chk")]
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v

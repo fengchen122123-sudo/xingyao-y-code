@@ -251,6 +251,7 @@ class WindowsComputerBackend:
         self._pending_elements: tuple = ()
         self._last_elements: tuple = ()
         self._elements_surface_generation: int = -1
+        self._elements_dirty: bool = False
         self._pending_region: tuple | None = None
         self._region_baseline: tuple | None = None
         self._surface_signature: tuple | None = None
@@ -260,6 +261,8 @@ class WindowsComputerBackend:
         self._active_frame: ObservationFrame | None = None
         self._last_activation_changed = False
         self._last_pointer_target_hwnd: int | None = None
+        self._in_sequence = False
+        self._sequence_keyboard_may_switch = False
 
     @classmethod
     def create_default(cls) -> "WindowsComputerBackend":
@@ -333,6 +336,8 @@ class WindowsComputerBackend:
             observation = self._capture_desktop_observation_locked(run_id)
             if observation.ok or observation.error_code != "computer_surface_changed":
                 return observation
+            # 窗口切换（如 Alt+Tab / Alt+Esc）动画尚未落稳时短暂让出时间再复拍
+            self._stop_event.wait(0.08)
             return self._capture_desktop_observation_locked(run_id)
 
     def _capture_desktop_observation_locked(self, run_id: str) -> ComputerObservation:
@@ -381,8 +386,10 @@ class WindowsComputerBackend:
             if elements:
                 self._last_elements = elements
                 self._elements_surface_generation = self._surface_generation
+                self._elements_dirty = False
             elif (
-                self._last_elements
+                not self._elements_dirty
+                and self._last_elements
                 and self._elements_surface_generation == self._surface_generation
             ):
                 elements = self._last_elements
@@ -404,6 +411,7 @@ class WindowsComputerBackend:
                     self._pending_elements = pending_elements
                     self._pending_region = pending_region
                     return self._stale_capture_observation_locked(run_id)
+                self._elements_dirty = False
                 if elements:
                     self._last_elements = elements
                     self._elements_surface_generation = self._surface_generation
@@ -510,6 +518,16 @@ class WindowsComputerBackend:
                         scale_y=frame.model_to_css_y,
                     )
 
+    def begin_sequence(self, run_id: str) -> None:
+        with self._lock:
+            self._in_sequence = True
+            self._sequence_keyboard_may_switch = False
+
+    def end_sequence(self, run_id: str) -> None:
+        with self._lock:
+            self._in_sequence = False
+            self._sequence_keyboard_may_switch = False
+
     def execute(self, run_id: str, action: ComputerAction) -> None:
         wait_duration: int | None = None
         wait_for_action: ComputerAction | None = None
@@ -543,10 +561,12 @@ class WindowsComputerBackend:
                         "computer_invalid_action",
                         f"duration_ms 必须在 {MIN_WAIT_MS}-{MAX_WAIT_MS} 毫秒之间",
                     )
+                self._elements_dirty = True
                 wait_duration = duration
             elif kind == "wait_for":
                 # 只读条件等待：不改变界面状态，不需要画面基线（不要求先 observe），
                 # 但每次动作前的 interactive desktop 检查已在上面做过。
+                self._elements_dirty = True
                 wait_for_action = action
             elif kind in _ELEMENT_KINDS:
                 self._dispatch_element_locked(action)
@@ -554,11 +574,19 @@ class WindowsComputerBackend:
             elif kind in _SEMANTIC_DESKTOP_KINDS:
                 self._dispatch_semantic_locked(action)
                 return
+            elif kind in _KEYBOARD_KINDS:
+                self._require_keyboard_surface_and_focus_locked()
+                self._dispatch_locked(action)
+                self._elements_dirty = True
+                if self._in_sequence and kind == "keypress":
+                    self._sequence_keyboard_may_switch = True
+                    if any(k in ("ALT", "META") for k in (action.keys or ())):
+                        self._last_pointer_target_hwnd = None
+                return
             else:
                 self._require_current_surface_locked()
-                if kind in _KEYBOARD_KINDS:
-                    self._require_keyboard_focus_locked()
                 self._dispatch_locked(action)
+                self._elements_dirty = True
                 return
         if wait_for_action is not None:
             self._wait_for_interruptible(
@@ -591,6 +619,7 @@ class WindowsComputerBackend:
                 )
             self._pending_elements = collected
             self._elements_surface_generation = self._surface_generation
+            self._elements_dirty = False
             return
         self._require_current_surface_locked()
         self._raise_if_stopped_locked()
@@ -603,6 +632,7 @@ class WindowsComputerBackend:
             _call_with_supported_kwargs(
                 locator.click, action.element_ref, expected_hwnd=expected_hwnd
             )
+            self._elements_dirty = True
             return
         if not isinstance(action.text, str) or not action.text:
             raise ComputerControlError(
@@ -614,6 +644,7 @@ class WindowsComputerBackend:
             action.text,
             expected_hwnd=expected_hwnd,
         )
+        self._elements_dirty = True
 
     def _collect_elements_locked(self, hwnd: int | None = None) -> tuple:
         locator = self._element_locator
@@ -625,7 +656,14 @@ class WindowsComputerBackend:
                 if hwnd is not None
                 else int(self._adapter.foreground_window_id() or 0)
             )
-            listing = tuple(locator.collect(target_hwnd))
+            listing = tuple(
+                _call_with_supported_kwargs(
+                    locator.collect,
+                    target_hwnd,
+                    deadline=time.monotonic() + 3.0,
+                    cancel_event=self._stop_event,
+                )
+            )
         except Exception:
             _LOGGER.exception("自动提取前台窗口元素失败，观察退回普通截图")
             return ()
@@ -788,26 +826,27 @@ class WindowsComputerBackend:
         ref, generation, (region_x, region_y, region_w, region_h) = region_info
         virtual_x, virtual_y = virtual_origin
         desktop_w, desktop_h = image.size
-        if not (
-            virtual_x <= region_x
-            and virtual_y <= region_y
-            and region_x + region_w <= virtual_x + desktop_w
-            and region_y + region_h <= virtual_y + desktop_h
-        ):
+        crop_left = max(region_x, virtual_x)
+        crop_top = max(region_y, virtual_y)
+        crop_right = min(region_x + region_w, virtual_x + desktop_w)
+        crop_bottom = min(region_y + region_h, virtual_y + desktop_h)
+        if crop_right <= crop_left or crop_bottom <= crop_top:
             raise ComputerControlError(
                 "computer_coordinate_out_of_bounds",
                 "语义定位区域超出虚拟桌面半开区间，拒绝裁剪（不 clamp 越界坐标）",
             )
+        crop_w = crop_right - crop_left
+        crop_h = crop_bottom - crop_top
         cropped = image.crop(
             (
-                region_x - virtual_x,
-                region_y - virtual_y,
-                region_x - virtual_x + region_w,
-                region_y - virtual_y + region_h,
+                crop_left - virtual_x,
+                crop_top - virtual_y,
+                crop_right - virtual_x,
+                crop_bottom - virtual_y,
             )
         )
-        model_width, model_height = _scaled_dimensions(region_w, region_h)
-        if (model_width, model_height) != (region_w, region_h):
+        model_width, model_height = _scaled_dimensions(crop_w, crop_h)
+        if (model_width, model_height) != (crop_w, crop_h):
             cropped = cropped.resize((model_width, model_height), _RESAMPLE)
         png = self._encode_png(cropped)
         path = self._store_screenshot_locked(png)
@@ -820,12 +859,12 @@ class WindowsComputerBackend:
             png_path=str(path),
             width=model_width,
             height=model_height,
-            original_width=region_w,
-            original_height=region_h,
-            origin_x=region_x,
-            origin_y=region_y,
-            scale_x=region_w / model_width,
-            scale_y=region_h / model_height,
+            original_width=crop_w,
+            original_height=crop_h,
+            origin_x=crop_left,
+            origin_y=crop_top,
+            scale_x=crop_w / model_width,
+            scale_y=crop_h / model_height,
             window_title=self._window_title_summary(),
         )
 
@@ -913,9 +952,10 @@ class WindowsComputerBackend:
                 "computer_elements_unavailable",
                 "当前桌面 backend 未提供 UIA 元素探测能力，无法执行该等待条件",
             )
+        live_hwnd = int(self._adapter.foreground_window_id() or 0) or int(hwnd)
         return _call_with_supported_kwargs(
             locator.probe,
-            int(hwnd),
+            live_hwnd,
             matcher,
             deadline=deadline,
             cancel_event=self._stop_event,
@@ -931,6 +971,40 @@ class WindowsComputerBackend:
             width,
             height,
         )
+
+    def _require_virtual_rect_unchanged_locked(self) -> tuple[int, tuple]:
+        origin_x, origin_y, width, height = self._adapter.virtual_screen_rect()
+        current = self._surface_signature_current_locked(
+            origin_x, origin_y, width, height
+        )
+        if (
+            self._surface_signature is not None
+            and current[1:] != self._surface_signature[1:]
+        ):
+            raise ComputerControlError(
+                "computer_surface_changed",
+                "前台窗口或桌面几何已变化，旧坐标已失效，"
+                "必须重新观察（observe）后再操作",
+            )
+        return current[0], current
+
+    def _require_keyboard_surface_and_focus_locked(self) -> None:
+        if self._last_pointer_target_hwnd is not None:
+            if self._last_observation is not None and self._surface_signature is not None:
+                self._require_virtual_rect_unchanged_locked()
+            self._require_keyboard_focus_locked()
+            return
+        if self._in_sequence and self._sequence_keyboard_may_switch:
+            if self._last_observation is not None and self._surface_signature is not None:
+                fg_hwnd, _ = self._require_virtual_rect_unchanged_locked()
+                if fg_hwnd <= 0:
+                    raise ComputerControlError(
+                        "computer_surface_changed",
+                        "当前没有活动前台窗口，必须重新观察（observe）后再操作",
+                    )
+            return
+        self._require_current_surface_locked()
+        self._require_keyboard_focus_locked()
 
     def _require_current_surface_locked(self) -> None:
         if self._last_observation is None or self._surface_signature is None:

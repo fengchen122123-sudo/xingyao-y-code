@@ -16,6 +16,9 @@ _LOGGER = logging.getLogger(__name__)
 _UIA_CONTROL_TYPE_PROPERTY_ID = 30003
 _UIA_INVOKE_PATTERN_ID = 10000
 _UIA_VALUE_PATTERN_ID = 10002
+_UIA_EXPAND_COLLAPSE_PATTERN_ID = 10005
+_UIA_SELECTION_ITEM_PATTERN_ID = 10010
+_UIA_TOGGLE_PATTERN_ID = 10015
 _CUIAUTOMATION_CLSID = "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
 
 _MAX_NAME_CHARS = 80
@@ -285,16 +288,41 @@ class RealUIAHost:
             try:
                 import comtypes.client
 
+                ui_client = comtypes.gen.UIAutomationClient
                 pattern = element.GetCurrentPattern(_UIA_INVOKE_PATTERN_ID)
-                if pattern is None:
-                    raise ComputerControlError(
-                        "computer_element_unsupported",
-                        f"元素 {ref} 不支持 Invoke（请改用坐标点击）",
-                    )
-                invoke = pattern.QueryInterface(
-                    comtypes.gen.UIAutomationClient.IUIAutomationInvokePattern
+                if pattern is not None:
+                    pattern.QueryInterface(
+                        ui_client.IUIAutomationInvokePattern
+                    ).Invoke()
+                    return
+                sel_pattern = element.GetCurrentPattern(_UIA_SELECTION_ITEM_PATTERN_ID)
+                if sel_pattern is not None:
+                    sel_pattern.QueryInterface(
+                        ui_client.IUIAutomationSelectionItemPattern
+                    ).Select()
+                    return
+                toggle_pattern = element.GetCurrentPattern(_UIA_TOGGLE_PATTERN_ID)
+                if toggle_pattern is not None:
+                    toggle_pattern.QueryInterface(
+                        ui_client.IUIAutomationTogglePattern
+                    ).Toggle()
+                    return
+                expand_pattern = element.GetCurrentPattern(
+                    _UIA_EXPAND_COLLAPSE_PATTERN_ID
                 )
-                invoke.Invoke()
+                if expand_pattern is not None:
+                    ec = expand_pattern.QueryInterface(
+                        ui_client.IUIAutomationExpandCollapsePattern
+                    )
+                    if int(getattr(ec, "CurrentExpandCollapseState", 0) or 0) == 1:
+                        ec.Collapse()
+                    else:
+                        ec.Expand()
+                    return
+                raise ComputerControlError(
+                    "computer_element_unsupported",
+                    f"元素 {ref} 不支持 Invoke/Select/Toggle（请改用坐标点击）",
+                )
             except ComputerControlError:
                 raise
             except Exception as error:
@@ -441,11 +469,23 @@ class RealUIAHost:
         return element
 
 
+_VALUE_PATTERN_CONTROL_TYPE_IDS = frozenset(
+    {
+        50003,  # ComboBox
+        50004,  # Edit
+        50016,  # Spinner
+        50025,  # Custom
+        50030,  # Document
+    }
+)
+
+
 def _probe_node_texts(node) -> tuple[str, str]:
     """单节点的 (CurrentName, ValuePattern 当前值)；任一读取失败按空串处理。
 
     单节点 COM 异常绝不上抛：个别控件在树变化瞬间读属性会抛，跳过即可，
-    不能因为一个坏节点让整次等待失败。
+    不能因为一个坏节点让整次等待失败。只在可能承载 ValuePattern 的控件类型上
+    查询，避免在大量容器/按钮节点上做无谓的跨进程 COM 调用导致 wait_for 超时。
     """
     name = ""
     try:
@@ -454,14 +494,19 @@ def _probe_node_texts(node) -> tuple[str, str]:
         name = ""
     value = ""
     try:
-        import comtypes.client
-
-        pattern = node.GetCurrentPattern(_UIA_VALUE_PATTERN_ID)
-        if pattern is not None:
-            interface = comtypes.gen.UIAutomationClient.IUIAutomationValuePattern
-            value = str(pattern.QueryInterface(interface).CurrentValue or "")
+        type_id = int(node.CurrentControlType)
     except Exception:
-        value = ""
+        type_id = None
+    if type_id is None or type_id in _VALUE_PATTERN_CONTROL_TYPE_IDS:
+        try:
+            import comtypes.client
+
+            pattern = node.GetCurrentPattern(_UIA_VALUE_PATTERN_ID)
+            if pattern is not None:
+                interface = comtypes.gen.UIAutomationClient.IUIAutomationValuePattern
+                value = str(pattern.QueryInterface(interface).CurrentValue or "")
+        except Exception:
+            value = ""
     return name, value
 
 

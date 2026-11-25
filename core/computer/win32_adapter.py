@@ -302,16 +302,23 @@ def _prototype(fn, argtypes, restype) -> None:
 def _ctypes_set_foreground_window(hwnd: int) -> bool:
     """把目标窗口置前，并以 GetForegroundWindow 作为唯一成功标准。
 
-    第一次 SetForegroundWindow 被系统拒绝时，短暂把当前线程挂到前台线程上，
-    BringWindowToTop 后再置前，并在 finally 里解开。不发送 Alt 键。
-    核对失败返回 False，绝不把 API 的返回值当成已经置前。
+    第一次 SetForegroundWindow 被系统拒绝时，短暂把当前线程挂到前台线程
+    （及目标窗口线程，若不同于前台线程）上，BringWindowToTop 后再置前，并在
+    finally 里解开。不发送 Alt 键。核对失败返回 False，绝不把 API 返回值当成功。
     """
+    import time as _time
+
     user32 = ctypes.windll.user32
     target = int(hwnd)
     _prototype(user32.SetForegroundWindow, (wintypes.HWND,), wintypes.BOOL)
-    user32.SetForegroundWindow(target)
+    first_ok = bool(user32.SetForegroundWindow(target))
     if _ctypes_foreground_window() == target:
         return True
+    if first_ok:
+        for _ in range(5):
+            _time.sleep(0.02)
+            if _ctypes_foreground_window() == target:
+                return True
     kernel32 = ctypes.windll.kernel32
     _prototype(
         user32.GetWindowThreadProcessId,
@@ -332,20 +339,33 @@ def _ctypes_set_foreground_window(hwnd: int) -> bool:
         if foreground
         else 0
     )
-    attached = False
+    target_thread = int(user32.GetWindowThreadProcessId(target, None) or 0)
+    attached_threads: list[int] = []
     try:
-        if foreground_thread and our_thread and foreground_thread != our_thread:
-            attached = bool(
-                user32.AttachThreadInput(our_thread, foreground_thread, True)
-            )
+        for peer_thread in (foreground_thread, target_thread):
+            if (
+                peer_thread
+                and our_thread
+                and peer_thread != our_thread
+                and peer_thread not in attached_threads
+            ):
+                if bool(user32.AttachThreadInput(our_thread, peer_thread, True)):
+                    attached_threads.append(peer_thread)
         user32.BringWindowToTop(target)
-        user32.SetForegroundWindow(target)
+        second_ok = bool(user32.SetForegroundWindow(target))
+        if _ctypes_foreground_window() == target:
+            return True
+        if second_ok:
+            for _ in range(5):
+                _time.sleep(0.02)
+                if _ctypes_foreground_window() == target:
+                    return True
     except Exception:
         _LOGGER.exception("前台二次获取失败")
     finally:
-        if attached:
+        for peer_thread in reversed(attached_threads):
             try:
-                user32.AttachThreadInput(our_thread, foreground_thread, False)
+                user32.AttachThreadInput(our_thread, peer_thread, False)
             except Exception:
                 _LOGGER.exception("解除前台线程附着失败")
     return _ctypes_foreground_window() == target

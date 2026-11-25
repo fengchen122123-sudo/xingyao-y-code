@@ -702,3 +702,56 @@ def test_win32_adapter_list_top_window_titles_only_returns_non_empty_titles():
 
     # 枚举失败 best-effort 归一为空元组（等待会继续轮询到超时），绝不抛出。
     assert Win32InputAdapter(list_top_window_titles=_boom).list_top_window_titles() == ()
+
+
+def test_probe_node_texts_skips_value_pattern_on_non_value_controls():
+    from core.computer.platforms.windows_elements_uia import _probe_node_texts
+
+    class _StrictButton:
+        CurrentName = "Build"
+        CurrentControlType = 50000  # Button
+
+        def GetCurrentPattern(self, pattern_id):
+            raise AssertionError("Button 不应查询 ValuePattern")
+
+    assert _probe_node_texts(_StrictButton()) == ("Build", "")
+
+    class _ValuePattern:
+        CurrentValue = "server"
+
+        def QueryInterface(self, iface):
+            return self
+
+    class _EditNode:
+        CurrentName = ""
+        CurrentControlType = 50004  # Edit
+
+        def GetCurrentPattern(self, pattern_id):
+            return _ValuePattern()
+
+    import sys
+    import types
+
+    comtypes = types.ModuleType("comtypes")
+    client = types.ModuleType("comtypes.client")
+    gen = types.ModuleType("comtypes.gen")
+    uia_client = types.ModuleType("comtypes.gen.UIAutomationClient")
+    uia_client.IUIAutomationValuePattern = object
+    gen.UIAutomationClient = uia_client
+    comtypes.client = client
+    comtypes.gen = gen
+    old = {k: sys.modules.get(k) for k in ("comtypes", "comtypes.client", "comtypes.gen", "comtypes.gen.UIAutomationClient")}
+    sys.modules.update({
+        "comtypes": comtypes,
+        "comtypes.client": client,
+        "comtypes.gen": gen,
+        "comtypes.gen.UIAutomationClient": uia_client,
+    })
+    try:
+        assert _probe_node_texts(_EditNode()) == ("", "server")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v

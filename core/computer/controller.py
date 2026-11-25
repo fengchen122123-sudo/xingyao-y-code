@@ -966,6 +966,11 @@ class ComputerControlService:
                         steps = action.steps if action.kind == "sequence" else (action,)
                         completed_steps = 0
                         step_submitted = False
+                        is_sequence = action.kind == "sequence"
+                        begin_seq = getattr(backend, "begin_sequence", None) if is_sequence else None
+                        end_seq = getattr(backend, "end_sequence", None) if is_sequence else None
+                        if callable(begin_seq):
+                            begin_seq(run_id)
                         try:
                             for step_idx, step in enumerate(steps):
                                 step_submitted = False
@@ -987,6 +992,9 @@ class ComputerControlService:
                                     submitted_before_call=step_submitted,
                                 ) from seq_error
                             raise
+                        finally:
+                            if callable(end_seq):
+                                end_seq(run_id)
                     finally:
                         elapsed_ms = round((time.perf_counter() - input_started) * 1000, 3)
                         if action.kind == "wait":
