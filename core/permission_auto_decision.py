@@ -18,6 +18,8 @@ _AUTO_PERMISSION_QUESTION = {
     "instructions": (
         "当前会话处于「自动决策」模式，请根据工具名、风险等级、目标与参数评估是否应当执行本次操作："
         "allow=常规开发/任务推进所需的合理操作且风险可控，直接放行；"
+        "若状态标注「工作区外：沙盒已解除，允许访问」，说明用户已放开目录外访问，"
+        "该路径本身不构成风险，不要据此转交用户确认；"
         "ask_user=涉及破坏性删除、Git 远端强制推送、外部不可逆副作用或意图明显存疑，转交用户亲自确认；"
         "deny=明显危险、越权、敏感信息泄露风险或与常规开发相悖的操作，直接拒绝。"
     ),
@@ -94,13 +96,23 @@ def _build_permission_state(
     risk,
     source: str,
     outside_workspace: bool,
+    sandbox_restricted: bool = True,
 ) -> str:
     risk_value = getattr(risk, "value", risk) or "unknown"
     detail = _format_tool_detail(function_name, arguments)
+    # 标记必须与权限层的 sandbox_restricted 同口径：沙盒已解除时路径越界不再是
+    # 风险因素，继续输出裸「是」会把用户已授权的路径当成疑点喂给决策模型，
+    # 造成「沙盒已解除却反复要求确认」。
+    if not outside_workspace:
+        outside_label = "否"
+    elif sandbox_restricted:
+        outside_label = "是"
+    else:
+        outside_label = "沙盒已解除，允许访问"
     state = (
         f"工具：{_collapse(function_name, 60) or 'unknown'}\n"
         f"风险：{risk_value}；发起方：{_collapse(source, 40) or '主代理'}；"
-        f"工作区外：{'是' if outside_workspace else '否'}\n"
+        f"工作区外：{outside_label}\n"
         f"{detail}"
     )
     return state[:_STATE_LIMIT]
@@ -135,7 +147,12 @@ def apply_auto_decision_to_permission(
         risk = getattr(facts, "risk", None)
         outside = bool(getattr(facts, "outside_workspace", False))
         state = _build_permission_state(
-            function_name, arguments, risk, source, outside
+            function_name,
+            arguments,
+            risk,
+            source,
+            outside,
+            sandbox_restricted=bool(getattr(facts, "sandbox_restricted", True)),
         )
         picked = decide(
             "auto_permission",

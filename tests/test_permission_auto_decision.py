@@ -480,3 +480,44 @@ def test_automation_validate_task_accepts_auto_decision():
         "trigger_config": {},
     })
     assert errors == []
+
+
+def test_sandbox_released_marks_outside_path_as_allowed_for_jev(isolated_env, monkeypatch):
+    """沙盒已解除时，交给 JEV 的状态不能再把「工作区外」当作风险信号。"""
+    ycode_dir, workdir = isolated_env
+    _write_user_config(ycode_dir, allow_outside_workspace=True)
+    _enable_jev()
+    app_context.set_permission_mode("auto_decision")
+
+    calls = _mock_post(
+        monkeypatch,
+        lambda _idx, _req: httpx.Response(200, json={"answers": {"q": {"choice": "allow"}}}),
+    )
+    _patch_prompt_handler(
+        monkeypatch,
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("沙盒已解除时不应再弹窗确认")
+        ),
+    )
+
+    write_spec = ToolSpec(
+        name="write_file",
+        description="write",
+        input_schema={"type": "object", "properties": {"file_path": {"type": "string"}}},
+        execute=lambda **_kw: "ok",
+        read_only=False,
+        mutates_files=True,
+    )
+    res = terminal.authorize_tool_call(
+        "write_file",
+        {"file_path": str(workdir.parent / "outside.txt"), "content": "hi"},
+        tool_spec=write_spec,
+        outside_workspace=True,
+    )
+
+    assert res.allowed is True
+    assert res.reason == "jev_auto_allow"
+    state = calls[0]["payload"]["state"]
+    assert "工作区外：沙盒已解除，允许访问" in state
+    assert "工作区外：是" not in state
+    assert "沙盒已解除" in calls[0]["payload"]["questions"]["q"]["instructions"]
