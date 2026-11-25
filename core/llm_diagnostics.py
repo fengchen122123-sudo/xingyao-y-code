@@ -48,6 +48,57 @@ def set_token_usage_listener(callback):
 
 _cache_request_states = {}
 _cache_usage_states = {}
+_session_window_usage = {}
+
+
+def set_session_window_usage(
+    session_id,
+    *,
+    latest_total=None,
+    latest_prompt=None,
+    latest_cached=None,
+    update_global=True,
+):
+    """更新指定会话的窗口占用快照；必要时同步全局兼容字典。"""
+    sid = str(session_id or "").strip()
+    with token_usage_lock:
+        if sid:
+            entry = _session_window_usage.setdefault(
+                sid,
+                {"latest_total": 0, "latest_prompt": 0, "latest_cached": 0},
+            )
+            if latest_total is not None:
+                entry["latest_total"] = int(latest_total or 0)
+            if latest_prompt is not None:
+                entry["latest_prompt"] = int(latest_prompt or 0)
+            if latest_cached is not None:
+                entry["latest_cached"] = int(latest_cached or 0)
+        if update_global:
+            if latest_total is not None:
+                session_token_usage["latest_total"] = int(latest_total or 0)
+            if latest_prompt is not None:
+                session_token_usage["latest_prompt"] = int(latest_prompt or 0)
+            if latest_cached is not None:
+                session_token_usage["latest_cached"] = int(latest_cached or 0)
+
+
+def get_session_window_usage(session_id):
+    """只读读取指定会话的窗口占用快照；未登记时返回 None。"""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    with token_usage_lock:
+        entry = _session_window_usage.get(sid)
+        return dict(entry) if entry is not None else None
+
+
+def clear_session_window_usage(session_id):
+    """清理指定会话的窗口占用快照。"""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    with token_usage_lock:
+        _session_window_usage.pop(sid, None)
 
 
 def _cache_usage_key(session_id, model_name, api_base, cache_scope="main"):
@@ -193,6 +244,19 @@ def _classify_cache_request_details(
             reason = "模型或接口变化"
         elif previous["tool_contract"] != current["tool_contract"]:
             reason = "工具契约变化"
+        elif (
+            str(cache_scope or "").startswith("subagent:")
+            and (
+                len(current["messages"]) < len(previous["messages"])
+                or (
+                    len(previous["messages"]) >= 2
+                    and len(current["messages"]) >= 2
+                    and previous["messages"][0] == current["messages"][0]
+                    and previous["messages"][1] != current["messages"][1]
+                )
+            )
+        ):
+            reason = "冷启动"
         elif common_prefix != len(previous["messages"]):
             reason = "上下文压缩或历史重写"
         else:
@@ -416,12 +480,15 @@ def get_token_usage_snapshot(
     state_key = _cache_usage_key(
         session_id, model_name, api_base, cache_scope
     )
+    sid = str(session_id or "").strip()
     with token_usage_lock:
         state = _cache_usage_states.get(state_key)
+        win_state = _session_window_usage.get(sid) if sid else None
+        win_source = win_state if win_state is not None else session_token_usage
         window = {
-            "latest_total": int(session_token_usage.get("latest_total", 0) or 0),
-            "latest_prompt": int(session_token_usage.get("latest_prompt", 0) or 0),
-            "latest_cached": int(session_token_usage.get("latest_cached", 0) or 0),
+            "latest_total": int(win_source.get("latest_total", 0) or 0),
+            "latest_prompt": int(win_source.get("latest_prompt", 0) or 0),
+            "latest_cached": int(win_source.get("latest_cached", 0) or 0),
             "max_window": int(session_token_usage.get("max_window", 0) or 0),
         }
         process = {
@@ -596,6 +663,8 @@ def rename_cache_usage_session(old_name, new_name):
     if old_key == new_key:
         return
     with token_usage_lock:
+        if old_key in _session_window_usage:
+            _session_window_usage[new_key] = _session_window_usage.pop(old_key)
         for mapping in (_cache_request_states, _cache_usage_states):
             moves = [
                 (key, (new_key, *key[1:]), value)
@@ -605,6 +674,12 @@ def rename_cache_usage_session(old_name, new_name):
             for source, target, value in moves:
                 mapping[target] = value
                 del mapping[source]
+    try:
+        from core.context_breakdown import rename_breakdown_session
+
+        rename_breakdown_session(old_key, new_key)
+    except Exception:
+        logger.debug("上下文来源占比快照迁移失败（已忽略）", exc_info=True)
     try:
         from core.agent_service import rename_session_stable_sections
 
@@ -625,9 +700,16 @@ def clear_cache_usage_session(session_name):
     """清理指定会话的进程内缓存遥测，防止同名新会话继承旧状态。"""
     session_key = str(session_name)
     with token_usage_lock:
+        _session_window_usage.pop(session_key, None)
         for mapping in (_cache_request_states, _cache_usage_states):
             for key in [key for key in mapping if key and key[0] == session_key]:
                 del mapping[key]
+    try:
+        from core.context_breakdown import clear_breakdown
+
+        clear_breakdown(session_id=session_key, clear_global=False)
+    except Exception:
+        logger.debug("上下文来源占比快照清理失败（已忽略）", exc_info=True)
     try:
         from core.agent_service import clear_session_stable_sections
 
@@ -933,6 +1015,13 @@ def _account_server_usage(
             session_token_usage["latest_total"] = total_tokens
             session_token_usage["latest_prompt"] = prompt_tokens
             session_token_usage["latest_cached"] = cached_tokens or 0
+            sid = str(session_id or "").strip()
+            if sid:
+                _session_window_usage[sid] = {
+                    "latest_total": int(total_tokens or 0),
+                    "latest_prompt": int(prompt_tokens or 0),
+                    "latest_cached": int(cached_tokens or 0),
+                }
 
     if main_scope:
         if cache_reported:

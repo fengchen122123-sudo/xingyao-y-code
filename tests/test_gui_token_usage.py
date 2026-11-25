@@ -512,3 +512,151 @@ def test_ensure_fits_active_window_forwards_api_base(tmp_path, monkeypatch):
     assert captured["model"] == "openai/deepseek-v4.1-flash-1017"
     assert captured["api_base"] == "https://api.deepseek.com"
     assert captured["history"] == [{"role": "user", "content": "hello"}]
+
+
+def test_background_session_usage_and_recalc_do_not_overwrite_current_session(
+    tmp_path, monkeypatch
+):
+    from core import context_breakdown as cb
+
+    bridge = _bridge_without_init("session-a")
+    bridge._memory = MemoryManager(str(tmp_path / "iso.db"))
+    bridge._memory.create_session_explicit("session-a")
+    bridge._memory.create_session_explicit("session-b")
+    bridge._memory.add_message("session-a", "user", "hello a")
+    bridge._memory.add_message("session-b", "user", "hello b")
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/glm-5.3",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *a, **k: None)
+
+    saved = dict(llm.session_token_usage)
+    try:
+        llm._account_server_usage(
+            {"prompt_tokens": 160000, "completion_tokens": 200, "total_tokens": 160200},
+            model_name="openai/glm-5.3",
+            api_base="https://open.bigmodel.cn/api/paas/v4",
+            session_id="session-a",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        cb.set_breakdown([{"source": "messages", "chars": 5000}], session_id="session-a")
+
+        # 后台会话记账 + 重算不得覆盖当前 UI 会话 session-a 的上下文占用与占比
+        llm._account_server_usage(
+            {"prompt_tokens": 100000, "completion_tokens": 100, "total_tokens": 100100},
+            model_name="openai/glm-5.3",
+            api_base="https://open.bigmodel.cn/api/paas/v4",
+            session_id="session-b",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        cb.set_breakdown([{"source": "messages", "chars": 100}], session_id="session-b")
+        bridge._recalc_token_usage("session-b")
+
+        payload = bridge.get_token_usage()
+        assert payload["used"] == 160000
+        assert payload["context_breakdown"] == [{"source": "messages", "chars": 5000}]
+    finally:
+        llm.clear_cache_usage_session("session-a")
+        llm.clear_cache_usage_session("session-b")
+        cb.clear_breakdown()
+        with llm.token_usage_lock:
+            llm.session_token_usage.update(saved)
+
+
+def test_async_recalc_skips_emit_when_session_no_longer_current(tmp_path, monkeypatch):
+    bridge = _bridge_without_init("session-new")
+    bridge._memory = MemoryManager(str(tmp_path / "async-iso.db"))
+    bridge._memory.create_session_explicit("session-old")
+    bridge._memory.create_session_explicit("session-new")
+
+    emitted = []
+    bridge._emit_raw = lambda kind, data: emitted.append((kind, data))
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/glm-5.3",
+        "base_url": "",
+        "context_window": 1000000,
+    })
+
+    bridge._async_recalc_token_usage("session-old")
+    assert emitted == []
+    llm.clear_cache_usage_session("session-old")
+    llm.clear_cache_usage_session("session-new")
+
+
+def test_turn_worker_preserves_latest_prompt_unless_compressed(tmp_path, monkeypatch):
+    from tests.test_gui_message_final import _bare_turn_bridge
+
+    session = "turn-preserve-session"
+    bridge = _bare_turn_bridge()
+    bridge._current_session = session
+    bridge._memory = MemoryManager(str(tmp_path / "preserve.db"))
+    # _bare_turn_bridge 已把 turn_undo 默认 manager 绑在旧的 :memory: 库上，
+    # 换库后必须重绑：否则 _run_turn_worker 建检查点时 resolve_session_id
+    # 在新库里查不到会话，直接抛 TurnUndoError 让整个回合失败。
+    from core.turn_undo import service as _tu_service
+
+    _tu_service.configure_default_manager(
+        bridge._memory, blob_root=tmp_path / "undo-blobs"
+    )
+    bridge._memory.create_session_explicit(session)
+    bridge._memory.add_token_usage(
+        "openai", "glm-5.3", 160000, 200, 0, 160200,
+        session_id=session, cache_scope="main",
+    )
+
+    emitted = []
+    bridge.emit_event = lambda kind, data: emitted.append((kind, data))
+    bridge._session_workdir = lambda _name: str(tmp_path)
+    bridge._sync_active_model_context = lambda *_a: None
+    bridge._subagent_progress_poller = lambda *_a, **_k: None
+    bridge._maybe_auto_rename = lambda _name: None
+    bridge._consume_turn_events = lambda *_a, **_k: False
+    # _bare_turn_bridge 把 _emit_token_usage 换成了 no-op；本测试要观察推送的
+    # token_usage 事件，这里接回 ApiBridge 的真实实现。
+    bridge._emit_token_usage = gui_bridge.ApiBridge._emit_token_usage.__get__(bridge)
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_a, **_k: {
+        "litellm_model": "openai/glm-5.3",
+        "api_key": "key",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(
+        "core.input_parser.parse_user_input", lambda text, **_kwargs: (text, [])
+    )
+    monkeypatch.setattr(
+        "core.agent_service.estimate_history_tokens_with_system",
+        lambda *_a, **_k: 100000,
+    )
+
+    saved = dict(llm.session_token_usage)
+    try:
+        # 1) 未触发压缩：已有 latest_prompt=160000 应保留，不得在回合起始瞬间跌回 100000
+        llm.set_session_window_usage(session, latest_total=160200, latest_prompt=160000)
+        monkeypatch.setattr(
+            "core.agent_service.prepare_turn_messages", lambda *_a, **_k: []
+        )
+        bridge._run_turn_worker("下一轮", session)
+        usage_events = [d for kind, d in emitted if kind == "token_usage"]
+        assert usage_events and usage_events[0]["used"] == 160000
+
+        # 2) 实际触发压缩（notify("compress", ...)）：必须重算并回落到新基线
+        emitted.clear()
+
+        def _compressed_prepare(*_a, **kwargs):
+            kwargs["notify"]("compress", "已折叠")
+            return []
+
+        monkeypatch.setattr("core.agent_service.prepare_turn_messages", _compressed_prepare)
+        bridge._run_turn_worker("再来一轮", session)
+        usage_events = [d for kind, d in emitted if kind == "token_usage"]
+        assert usage_events and usage_events[0]["used"] == 100000
+    finally:
+        llm.clear_cache_usage_session(session)
+        with llm.token_usage_lock:
+            llm.session_token_usage.update(saved)

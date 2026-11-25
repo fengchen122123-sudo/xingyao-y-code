@@ -4577,6 +4577,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
     def _async_recalc_token_usage(self, session_name: str):
         try:
             self._recalc_token_usage(session_name)
+            if not self._is_current_ui_session(session_name):
+                return
             usage = self.get_token_usage()
             self._emit_raw("token_usage_updated", usage)
             logger.info("异步 token 用量重算完成: %s", session_name)
@@ -5388,14 +5390,22 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 }
             self._clear_session_last_error(target)
             deleted = self._memory.clear_session_messages(target)
-            from core.llm import session_token_usage, token_usage_lock
+            from core.llm import (
+                clear_session_window_usage,
+                session_token_usage,
+                token_usage_lock,
+            )
             from core.context_breakdown import clear_breakdown
-            with token_usage_lock:
-                session_token_usage["latest_total"] = 0
-                session_token_usage["latest_prompt"] = 0
-                session_token_usage["latest_cached"] = 0
-            clear_breakdown()
-            self._emit_token_usage()
+            is_current = self._is_current_ui_session(target)
+            clear_session_window_usage(target)
+            if is_current:
+                with token_usage_lock:
+                    session_token_usage["latest_total"] = 0
+                    session_token_usage["latest_prompt"] = 0
+                    session_token_usage["latest_cached"] = 0
+            clear_breakdown(session_id=target, clear_global=is_current)
+            if is_current:
+                self._emit_token_usage()
             return {"ok": True, "deleted": int(deleted), "msg": f"已清空 {deleted} 条历史记录"}
         except Exception as e:
             logger.exception("clear_session_history 失败")
@@ -5428,7 +5438,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             # latest_total 还是旧值（可能属于别的会话），必须先按当前会话
             # 历史重算 used，否则前端会算出 600K/256K=243% 这类虚假占比
             self._recalc_token_usage(session_name)
-            self._emit_token_usage()
+            if self._is_current_ui_session(session_name):
+                self._emit_token_usage()
             self._ensure_fits_active_window(session_name)
             # 广播模型变更到所有端（桌面 JS 桥 + 局域网手机）：任一端切换模型后，
             # 其他端的模型芯片/状态栏/轮次标签实时跟随，避免两端显示与真实不符
@@ -9844,6 +9855,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     })
 
             from core.agent_service import prepare_turn_messages
+            base_notify = self._notice_emitter(session_name)
+            did_compress = False
+
+            def _turn_prepare_notify(kind: str, message: str) -> None:
+                nonlocal did_compress
+                if kind == "compress":
+                    did_compress = True
+                if base_notify is not None:
+                    base_notify(kind, message)
+
             history = prepare_turn_messages(
                 self._memory,
                 session_name,
@@ -9851,7 +9872,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 ctx_win,
                 permission_mode=automation_permission_mode or self._effective_permission_mode(session_name),
                 cancel_event=cancel_event,
-                notify=self._notice_emitter(session_name),
+                notify=_turn_prepare_notify,
                 api_key=api_key,
                 api_base=api_base,
                 is_gui=True,
@@ -9860,11 +9881,16 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             )
 
             # 按回合撤销检查点已在用户消息落库前创建（undo_ctx）；
-            # 历史压缩后重算窗口占用并推送，让上下文圆圈及时回落。
-            # 组装刚写入的来源占比快照必须保留（那是本轮最新数据，不是旧会话
-            # 残留）——否则下方推送的面板数据永远为空（2026-09-23 修复）。
-            self._recalc_token_usage(session_name, clear_breakdown_snapshot=False)
-            self._emit_token_usage()
+            # 仅当本轮实际发生了压缩，或当前尚无真实 prompt 基线时才重算（会清零 latest_prompt），
+            # 否则保留上一轮 API 返回的真实 prompt_tokens，避免非账本路由在回合起始
+            # 瞬间从真实用量（如 16%）跌回不含工具定义的本地估算（如 10%）。
+            # 组装刚写入的来源占比快照必须保留（clear_breakdown_snapshot=False）。
+            from core.llm import get_session_window_usage
+            existing_win = get_session_window_usage(session_name) or {}
+            if did_compress or not int(existing_win.get("latest_prompt") or 0):
+                self._recalc_token_usage(session_name, clear_breakdown_snapshot=False)
+            if self._is_current_ui_session(session_name):
+                self._emit_token_usage()
 
             poller_stop = threading.Event()
             poller = threading.Thread(
@@ -10651,7 +10677,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 self._recalc_token_usage(session_name, clear_breakdown_snapshot=False)
             except Exception:
                 logger.debug("断点续跑 token 用量重算失败", exc_info=True)
-            self._emit_token_usage()
+            if self._is_current_ui_session(session_name):
+                self._emit_token_usage()
             self._clear_session_last_error(session_name)
 
         self._active_turns[session_name] = threading.current_thread()
@@ -11133,7 +11160,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 "cache_keepalive_session_pct": rounded(
                     (keepalive_usage.get("session_all") or {}).get("rate")
                 ),
-                "context_breakdown": get_breakdown(),
+                "context_breakdown": get_breakdown(session_id=getattr(self, "_current_session", None)),
             }
         except Exception:
             logger.debug("get_token_usage 失败", exc_info=True)
@@ -11184,6 +11211,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             logger.debug("get_token_usage_overview 失败", exc_info=True)
             return {"ok": False, "msg": str(exc), "current": "", "totals": {}, "sessions": []}
 
+    def _is_current_ui_session(self, session_name: Optional[str]) -> bool:
+        current = getattr(self, "_current_session", None)
+        return (not current) or (not session_name) or (session_name == current)
+
     def _emit_token_usage(self):
         try:
             self.emit_event("token_usage", self.get_token_usage())
@@ -11220,17 +11251,21 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         """
         try:
             from core.context_breakdown import clear_breakdown
-            from core.llm import session_token_usage, token_usage_lock
+            from core.llm import set_session_window_usage
             # 按会话取模型：切模型后重算必须用该会话新绑定模型的窗口
             active = get_active_model(session_name) or {}
             total = self._session_token_baseline(
                 session_name, active, empty_is_zero=True
             )
-            with token_usage_lock:
-                session_token_usage["latest_total"] = total
-                session_token_usage["latest_prompt"] = 0
+            is_current = self._is_current_ui_session(session_name)
+            set_session_window_usage(
+                session_name,
+                latest_total=total,
+                latest_prompt=0,
+                update_global=is_current,
+            )
             if clear_breakdown_snapshot:
-                clear_breakdown()
+                clear_breakdown(session_id=session_name, clear_global=is_current)
         except Exception:
             logger.debug("重算 token 用量失败", exc_info=True)
 
@@ -11280,7 +11315,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                         is_gui=True,
                     )
                     self._recalc_token_usage(session_name)
-                    self._emit_token_usage()
+                    if self._is_current_ui_session(session_name):
+                        self._emit_token_usage()
                 except Exception:
                     logger.exception("切换模型后后台自动压缩失败")
 

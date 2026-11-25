@@ -1249,6 +1249,33 @@ def test_append_context_suffix_reports_injection():
     ) is False
 
 
+def test_append_context_suffix_preserves_historical_user_after_assistant():
+    from core.agent_service import _append_context_suffix_to_last_user
+
+    class _RecordingMgr:
+        def __init__(self):
+            self.replaced = False
+
+        def replace_latest_user_message_content(self, *args, **kwargs):
+            self.replaced = True
+
+    mgr = _RecordingMgr()
+    history = [
+        {"role": "user", "content": "原始问题"},
+        {"role": "assistant", "content": "先查一下", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+    ]
+    assert _append_context_suffix_to_last_user(
+        history, "DYN_CTX", "", "TIME_CTX", mgr, "s"
+    ) is True
+    assert mgr.replaced is False
+    assert history[0]["content"] == "原始问题"
+    assert len(history) == 4
+    assert history[-1]["role"] == "user"
+    assert "DYN_CTX" in history[-1]["content"]
+
+
+
 
 def test_build_referenced_sessions_block_marks_media_only_session():
     from core.agent_service import build_referenced_sessions_block

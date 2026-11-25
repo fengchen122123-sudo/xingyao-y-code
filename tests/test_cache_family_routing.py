@@ -638,3 +638,56 @@ def test_mixed_kimi_qwen_name_on_affinity_lane_keeps_kimi_branch_only(monkeypatc
 
     assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
     assert "extra_headers" not in opts
+
+
+def test_mid_name_family_matching_across_vendors():
+    from core.llm_dialects import (
+        _builtin_default_max_tokens,
+        _is_deepseek_family,
+        _is_glm_family,
+        _is_kimi_family,
+        _is_qwen_family,
+        _supports_cache_control,
+        _supports_cache_keepalive,
+    )
+    from core.model_spec_table import lookup_model_spec
+    from core.reasoning_capabilities import get_reasoning_capability
+
+    # DeepSeek mid-name variants
+    for name in (
+        "global:deepseek-v4.1-flash",
+        "Pro/deepseek-ai/DeepSeek-V4",
+        "custom-deepseek-flash-08",
+    ):
+        assert _is_deepseek_family(name)
+        assert _supports_cache_keepalive(name, "https://relay.example.com/v1")
+        assert _builtin_default_max_tokens(name) == 384000
+
+    # Kimi / k3 / k3.1 mid-name variants (without stealing unrelated qwen/step models)
+    for name in (
+        "k3",
+        "k3.1",
+        "k3.1-pro",
+        "k3.1-pro-highspeed",
+        "anthropic/k3.1-pro",
+        "vendor-kimi-k3.1",
+        "Pro/moonshotai/K3-256k",
+    ):
+        assert _is_kimi_family(name)
+        assert _supports_cache_keepalive(name, "https://api.kimi.com/coding/v1")
+
+    assert not _is_kimi_family("qwen3-k30")
+    assert not _is_kimi_family("my-wk3-test")
+
+    cap_k31 = get_reasoning_capability("anthropic/k3.1-pro")
+    assert cap_k31 is not None and cap_k31.kind == "effort"
+
+    # GLM & Qwen mid-name variants + updated 2026 spec table entries
+    assert _is_glm_family("Pro/zai-org/GLM-5.3-FlashX")
+    assert _supports_cache_keepalive("Pro/zai-org/GLM-5.3-FlashX", "https://open.bigmodel.cn/api/paas/v4")
+    assert _is_qwen_family("ali-qwen3.8-flash")
+    assert _supports_cache_control("ali-qwen3.8-flash", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    assert lookup_model_spec("Pro/deepseek-v4.1-flash-1017") == (1048576, 384000)
+    assert lookup_model_spec("kimi-k3.1-pro") == (1048576, 131072)
+    assert lookup_model_spec("minimax-m3.1-flash") == (1000000, 131072)
+

@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 
 
@@ -64,7 +65,7 @@ _register(
     ),
 )
 _register(
-    ("minimax-m3", "longcat-2.0"),
+    ("minimax-m3", "minimax-m3.1-flash", "longcat-2.0", "longcat-2.5", "longcat-2.5-preview"),
     ReasoningCapability(
         "toggle", ("default", "off", "on"), "thinking_object_toggle"
     ),
@@ -177,6 +178,9 @@ _register(
 )
 
 
+_KIMI_NAME_RE = re.compile(r"(?:^|[^a-z0-9])k(?:2|3)(?:[._-]\d+)*(?=$|[^a-z0-9])")
+
+
 def _model_leaf_name(normalized: str) -> str:
     scheme, separator, suffix = normalized.partition("://")
     name = suffix if separator else normalized
@@ -187,7 +191,7 @@ def normalize_reasoning_model_name(model_name: str) -> str:
     """移除传输协议前缀并折叠已确认的同模型别名。"""
     normalized = str(model_name or "").strip().lower()
     prefix, separator, suffix = normalized.partition("/")
-    if separator and prefix in {"openai", "anthropic"}:
+    if separator and prefix in {"openai", "anthropic", "responses"}:
         normalized = suffix
     if normalized == "zai-org/glm-5.2":
         return "glm-5.2"
@@ -204,15 +208,26 @@ def get_reasoning_capability(model_name: str) -> ReasoningCapability:
     if registered is not None:
         return registered
     leaf = _model_leaf_name(normalized)
-    if leaf.startswith("deepseek"):
+    leaf_registered = REASONING_CAPABILITIES.get(leaf)
+    if leaf_registered is not None:
+        return leaf_registered
+    # 支持任意位置匹配（%deepseek%、%kimi%/%moonshot%/k2/k3/k3.1、%glm%、%qwen%、%agnes%），
+    # 兼容中转网关前缀（如 global:deepseek-v4.1-flash、Pro/deepseek-v4、k3.1-pro）。
+    target = leaf or normalized
+    if "deepseek" in normalized:
         return _DEEPSEEK_PREFIX_CAPABILITY
-    if leaf.startswith("agnes"):
+    if "agnes" in normalized:
         return _AGNES_PREFIX_CAPABILITY
-    if leaf.startswith("kimi"):
+    if (
+        "kimi" in normalized
+        or "moonshot" in normalized
+        or _KIMI_NAME_RE.search(target)
+        or _KIMI_NAME_RE.search(normalized)
+    ):
         return _KIMI_PREFIX_CAPABILITY
-    if leaf.startswith("glm"):
+    if "glm" in normalized:
         return _GLM_PREFIX_CAPABILITY
-    if leaf.startswith("qwen"):
+    if "qwen" in normalized or "dashscope" in normalized:
         return _QWEN_PREFIX_CAPABILITY
     # 未登记（厂商新增 / 网关自定义名）：没有可依据的厂商事实，给通用开关兜底，
     # 让 GUI 仍能显示可操作的思考开关；显式的 hidden 登记已在上面命中返回。

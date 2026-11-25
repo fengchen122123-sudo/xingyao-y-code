@@ -43,31 +43,37 @@ def test_glm53_variant_names_inherit_family_capability():
 
 
 def test_glm53_prefix_rule_does_not_spill_to_other_glm_generations():
-    for name in ("glm-5.4", "glm-5.2-plus"):
+    for name in ("glm-5.4", "glm-5.2-plus", "Pro/glm-5.3-flashx", "z-ai/glm-5.3"):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
         assert capability.options == ("default", "low", "high", "max"), name
         assert capability.request_strategy == "thinking_object_effort", name
 
-    clone = get_reasoning_capability("my-glm-5.3-clone")
-    assert clone.kind == "effort"
-    assert clone.options == ("default", "off", "low", "medium", "high", "xhigh", "max")
-    assert clone.request_strategy == "effort_switch"
 
-
-def test_prefix_rules_do_not_leak_to_lookalike_names():
+def test_substring_family_rules_match_gateway_prefixed_and_k3_models():
     for name in (
-        "some-future-model",
-        "my-deepseek-clone",
-        "my-agnes-clone",
-        "my-qwen-clone",
+        "global:deepseek-v4.1-flash",
+        "Pro/deepseek-ai/DeepSeek-V4",
+        "aws-deepseek-r1",
     ):
-        capability = get_reasoning_capability(name)
-        assert capability.kind == "effort", name
-        assert capability.options == (
-            "default", "off", "low", "medium", "high", "xhigh", "max"
-        ), name
-        assert capability.request_strategy == "effort_switch", name
+        cap = get_reasoning_capability(name)
+        assert cap.options == ("default", "off", "low", "high", "xhigh", "max"), name
+        assert cap.request_strategy == "thinking_object_effort", name
+
+    for name in ("k3", "k3.1", "k3.1-pro", "k3.1-pro-highspeed", "vendor-kimi-k3.1"):
+        cap = get_reasoning_capability(name)
+        assert cap.options == ("default", "low", "high", "max"), name
+        assert cap.request_strategy == "always_on_effort", name
+
+    for name in ("ali-qwen3.8-max", "Pro/qwen3.7-flash"):
+        cap = get_reasoning_capability(name)
+        assert cap.options == ("default", "off", "low", "medium", "xhigh"), name
+        assert cap.request_strategy == "enable_thinking_effort", name
+
+    for name in ("custom-agnes-3.0", "proxy/agnes-2.5-flash"):
+        cap = get_reasoning_capability(name)
+        assert cap.options == ("default", "off", "on"), name
+        assert cap.request_strategy == "agnes_enable_thinking", name
 
 
 def test_unregistered_models_fall_back_to_generic_effort():
@@ -77,7 +83,6 @@ def test_unregistered_models_fall_back_to_generic_effort():
         "muse-spark-1.3-contributor-free",
         "nemotron-3-ultra-free",
         "mimo-v2.5-free",
-        "LongCat-2.5-Preview",
         "intern-latest",
         "senseaudio-s2",
         "https://gateway.example/v1/some-custom-model",
@@ -150,7 +155,10 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "glm-5": ("default", "low", "high", "max"),
         "glm-5.1": ("default", "low", "high", "max"),
         "MiniMax-M3": ("default", "off", "on"),
+        "minimax-m3.1-flash": ("default", "off", "on"),
         "LongCat-2.0": ("default", "off", "on"),
+        "LongCat-2.5": ("default", "off", "on"),
+        "LongCat-2.5-Preview": ("default", "off", "on"),
         "step-3.7-flash": ("default", "low", "medium", "high"),
         "step-router-v1": ("default", "low", "medium", "high"),
         "agnes-2.5-flash": ("default", "off", "on"),
@@ -337,8 +345,8 @@ def test_bare_family_names_hit_family_rules():
         assert capability.default_choice == default, name
 
 
-def test_family_prefix_rules_do_not_match_lookalike_names():
-    for name in ("my-kimi-clone", "my-glm-clone", "my-qwen-clone"):
+def test_unrelated_model_names_do_not_match_family_rules():
+    for name in ("some-future-model", "rk3588-local", "ark-4k-vision"):
         capability = get_reasoning_capability(name)
         assert capability.kind == "effort", name
         assert capability.options == (

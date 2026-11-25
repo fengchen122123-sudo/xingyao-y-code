@@ -585,3 +585,42 @@ def test_online_byte_facts_record_zero_for_unmarked_request(monkeypatch):
     assert details["request_bytes_final"] == len(
         _canonical_diagnostic_json(online_messages).encode("utf-8")
     )
+
+
+def test_fresh_subagent_with_different_user_task_classifies_as_cold_start():
+    from core.llm_diagnostics import _classify_cache_request_details
+
+    session_id = "subagent-diag-test-session"
+    sub_sys = [{"role": "system", "content": "你是星瑶子代理，角色是 explore。"}]
+    first = sub_sys + [
+        {"role": "user", "content": "子任务 ID：sub-1\n请完成：查 A"},
+        {"role": "assistant", "content": "正在查 A"},
+        {"role": "tool", "tool_call_id": "1", "content": "result A"},
+    ]
+    second = sub_sys + [
+        {"role": "user", "content": "子任务 ID：sub-2\n请完成：查 B"},
+    ]
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+
+    d1 = _classify_cache_request_details(
+        session_id,
+        "subagent:explore",
+        "deepseek-v4.1-flash-1017",
+        "https://api.deepseek.com/v1",
+        "read_file",
+        first,
+        tools=tools,
+    )
+    assert d1["request_reason"] == "冷启动"
+
+    d2 = _classify_cache_request_details(
+        session_id,
+        "subagent:explore",
+        "deepseek-v4.1-flash-1017",
+        "https://api.deepseek.com/v1",
+        "read_file",
+        second,
+        tools=tools,
+    )
+    assert d2["request_reason"] == "冷启动"
+

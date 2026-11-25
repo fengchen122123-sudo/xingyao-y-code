@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import re
 from typing import Optional, Dict, Any
 from urllib.parse import quote
 
@@ -118,6 +119,9 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
 }
 
 
+_KIMI_POLICY_NAME_RE = re.compile(r"(?:^|[^a-z0-9])k(?:2|3)(?:[._-]\d+)*(?=$|[^a-z0-9])")
+
+
 def get_model_policy(
     model_name: Optional[str] = None,
     api_base: Optional[str] = None,
@@ -125,7 +129,7 @@ def get_model_policy(
 ) -> ModelPolicy:
     """根据给定的模型名、Base URL 或明确的 provider_id 获取对应的方言策略。
 
-    优先按显式 provider_id 匹配，其次按模型名前缀与 Base URL 启发式识别，兜底返回 standard 策略。
+    优先按显式 provider_id 匹配，其次按模型名子串与 Base URL 启发式识别，兜底返回 standard 策略。
     """
     if provider_id and provider_id in POLICY_REGISTRY:
         return POLICY_REGISTRY[provider_id]
@@ -142,7 +146,10 @@ def get_model_policy(
     if (
         "moonshot" in m_lower
         or "kimi" in m_lower
+        or _KIMI_POLICY_NAME_RE.search(m_lower)
         or "api.moonshot.cn" in base_lower
+        or "api.moonshot.ai" in base_lower
+        or "api.kimi.com" in base_lower
     ):
         return POLICY_REGISTRY["moonshot"]
 
@@ -150,6 +157,7 @@ def get_model_policy(
         "glm" in m_lower
         or "zhipu" in m_lower
         or "bigmodel.cn" in base_lower
+        or "api.z.ai" in base_lower
     ):
         return POLICY_REGISTRY["zhipu"]
 
@@ -165,6 +173,8 @@ def get_model_policy(
         "qwen" in m_lower
         or "dashscope" in m_lower
         or "dashscope.aliyuncs.com" in base_lower
+        or "dashscope-intl.aliyuncs.com" in base_lower
+        or "maas.aliyuncs.com" in base_lower
     ):
         return POLICY_REGISTRY["dashscope"]
 

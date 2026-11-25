@@ -326,9 +326,12 @@ from core.llm_diagnostics import (
     _strip_cache_control_markers,
     _usage_field,
     clear_cache_usage_session,
+    clear_session_window_usage,
+    get_session_window_usage,
     get_token_usage_snapshot,
     rename_cache_usage_session,
     session_token_usage,
+    set_session_window_usage,
     set_token_usage_listener,
     token_usage_lock,
 )
@@ -440,7 +443,7 @@ def _debug_dump_request_tools(model_name, api_base, request_tools):
         logger.debug("工具列表落盘失败（旁路，已忽略）", exc_info=True)
 
 
-def _snapshot_tool_breakdown(request_tools):
+def _snapshot_tool_breakdown(request_tools, *, session_id: str | None = None):
     """【纯旁路】按 MCP 工具名集合拆分统计工具定义字符量（设计规格 §3.3；
     2026-09-23 拆分系统/MCP）。失败仅记 debug，绝不改变 request_tools 与发送字节。"""
     try:
@@ -460,10 +463,12 @@ def _snapshot_tool_breakdown(request_tools):
         _update_ctx_source(
             "system_tools",
             len(json.dumps(system_tools, ensure_ascii=False)) if system_tools else 0,
+            session_id=session_id,
         )
         _update_ctx_source(
             "mcp_tools",
             len(json.dumps(mcp_tools, ensure_ascii=False)) if mcp_tools else 0,
+            session_id=session_id,
         )
     except Exception:
         logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
@@ -1882,9 +1887,11 @@ def _chat_with_model_generator(
     request_tools = _select_request_tools_for_route(
         model_name, api_base, request_tools
     )
+    telemetry_session_id = _resolve_cache_session_identity(cache_session_id)
     # 【纯旁路】工具定义字符量快照（设计规格 §3.3；2026-09-23 拆分系统/MCP）：
-    # 每步请求都会走到，重复更新无害；失败仅记 debug，绝不改变发送字节。
-    _snapshot_tool_breakdown(request_tools)
+    # 仅主对话作用域按当前会话写入，避免子代理/压缩/保活请求覆盖主会话面板占比。
+    if str(cache_scope or "main") == "main":
+        _snapshot_tool_breakdown(request_tools, session_id=telemetry_session_id)
     _debug_dump_request_tools(model_name, api_base, request_tools)
     native_computer_capability = (
         computer_capability
@@ -1921,7 +1928,6 @@ def _chat_with_model_generator(
     native_continuation_state = None
     native_continuation_output = None
     request_tool_contract = _tool_contract_fingerprint(request_tools)
-    telemetry_session_id = _resolve_cache_session_identity(cache_session_id)
     deepseek_ledger_enabled = _uses_deepseek_prompt_ledger(
         model_name, api_base, cache_scope, stream, parent_session
     )

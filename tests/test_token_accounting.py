@@ -567,3 +567,43 @@ def test_account_server_usage_swallows_listener_errors(monkeypatch, caplog):
     assert persisted and persisted[0]["prompt_tokens"] == 100
     with llm.token_usage_lock:
         assert llm.session_token_usage["latest_prompt"] == 100
+
+
+def test_window_usage_is_isolated_per_session(monkeypatch):
+    import core.llm as llm
+
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: None)
+    try:
+        llm._account_server_usage(
+            {"prompt_tokens": 160000, "completion_tokens": 500, "total_tokens": 160500},
+            model_name="openai/glm-5.3",
+            api_base="https://iso.example/v1",
+            session_id="win-iso-a",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        llm._account_server_usage(
+            {"prompt_tokens": 100000, "completion_tokens": 200, "total_tokens": 100200},
+            model_name="openai/glm-5.3",
+            api_base="https://iso.example/v1",
+            session_id="win-iso-b",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+
+        snap_a = llm.get_token_usage_snapshot("win-iso-a", "openai/glm-5.3", "https://iso.example/v1")
+        snap_b = llm.get_token_usage_snapshot("win-iso-b", "openai/glm-5.3", "https://iso.example/v1")
+        assert snap_a["window"]["latest_prompt"] == 160000
+        assert snap_b["window"]["latest_prompt"] == 100000
+
+        llm.rename_cache_usage_session("win-iso-a", "win-iso-a2")
+        snap_a2 = llm.get_token_usage_snapshot("win-iso-a2", "openai/glm-5.3", "https://iso.example/v1")
+        assert snap_a2["window"]["latest_prompt"] == 160000
+
+        llm.clear_cache_usage_session("win-iso-b")
+        assert llm.get_session_window_usage("win-iso-b") is None
+        assert llm.get_session_window_usage("win-iso-a2")["latest_prompt"] == 160000
+    finally:
+        llm.clear_cache_usage_session("win-iso-a")
+        llm.clear_cache_usage_session("win-iso-a2")
+        llm.clear_cache_usage_session("win-iso-b")

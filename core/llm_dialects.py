@@ -22,30 +22,58 @@ logger = logging.getLogger(__name__)
 
 _REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek", "moonshot")
 
-_KIMI_NAME_RE = re.compile(r"(?:^|[-_/])k(?:2|3)(?:[._-]\d+)?(?:$|[-_])")
+_KIMI_NAME_RE = re.compile(r"(?:^|[^a-z0-9])k(?:2|3)(?:[._-]\d+)*(?=$|[^a-z0-9])")
+_GPT_NAME_RE = re.compile(r"(?:^|[^a-z0-9])(?:gpt-[3456]|o[134](?:-|$)|codex)")
+_TRANSPORT_PREFIXES = ("openai/", "anthropic/", "responses/")
+
+
+def _strip_protocol_prefix(model_name):
+    text = str(model_name or "").strip().lower()
+    for prefix in _TRANSPORT_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
 
 
 def _family_names(model_name):
-    model = str(model_name or "").split("/")[-1].lower()
+    model = _strip_protocol_prefix(model_name)
     names = set()
     if "kimi" in model or "moonshot" in model or _KIMI_NAME_RE.search(model):
         names.add("kimi")
     if "deepseek" in model:
         names.add("deepseek")
-    if "glm" in model:
+    if "glm" in model or "zhipu" in model or "zai-org" in model or "z-ai" in model:
         names.add("glm")
     if "qwen" in model or "dashscope" in model:
         names.add("qwen")
+    if "minimax" in model or "abab" in model:
+        names.add("minimax")
+    if "claude" in model:
+        names.add("claude")
+    if "gemini" in model:
+        names.add("gemini")
+    if "step-" in model or "stepfun" in model:
+        names.add("stepfun")
+    if "seed-" in model or "doubao" in model:
+        names.add("seed")
+    if "mimo" in model:
+        names.add("mimo")
+    if "longcat" in model:
+        names.add("longcat")
+    if "sensenova" in model:
+        names.add("sensenova")
+    if "agnes" in model:
+        names.add("agnes")
+    if not names and _GPT_NAME_RE.search(model):
+        names.add("gpt")
     return frozenset(names)
 
 
 def _is_kimi_family(model_name, api_base=""):
-    m = str(model_name or "").split("/")[-1].lower()
-    if "kimi" in m or "moonshot" in m:
+    names = _family_names(model_name)
+    if "kimi" in names:
         return True
-    if _KIMI_NAME_RE.search(m):
-        return True
-    if _family_names(model_name):
+    if names:
         return False  # 名称已属其他已知族 → 域名兜底不生效
     b = str(api_base or "").lower()
     return "moonshot" in b or "kimi" in b
@@ -69,7 +97,7 @@ def _is_official_kimi_route(api_base=""):
     ):
         return False
     if host == "api.kimi.com":
-        return path in {"/coding", "/coding/v1"}
+        return path in {"/coding", "/coding/v1", "/v1"}
     return (
         host in {"api.moonshot.cn", "api.moonshot.ai"}
         and path in {"", "/v1"}
@@ -77,10 +105,10 @@ def _is_official_kimi_route(api_base=""):
 
 
 def _is_deepseek_family(model_name, api_base=""):
-    model = str(model_name or "").split("/")[-1].lower()
-    if "deepseek" in model:
+    names = _family_names(model_name)
+    if "deepseek" in names:
         return True
-    if _family_names(model_name):
+    if names:
         return False  # 名称已属其他已知族 → 域名兜底不生效
     return _is_official_deepseek_route(api_base)
 
@@ -111,7 +139,7 @@ def _is_official_zhipu_route(api_base=""):
         or parsed.fragment
     ):
         return False
-    return host == "open.bigmodel.cn" and path in {
+    return host in {"open.bigmodel.cn", "api.z.ai"} and path in {
         "",
         "/api/paas/v4",
         "/api/coding/paas/v4",
@@ -120,10 +148,10 @@ def _is_official_zhipu_route(api_base=""):
 
 
 def _is_glm_family(model_name, api_base=""):
-    model = str(model_name or "").split("/")[-1].lower()
-    if "glm" in model:
+    names = _family_names(model_name)
+    if "glm" in names:
         return True
-    if _family_names(model_name):
+    if names:
         return False  # 名称已属其他已知族 → 域名兜底不生效
     return _is_official_zhipu_route(api_base)
 
@@ -154,10 +182,10 @@ def _is_official_dashscope_route(api_base=""):
 
 
 def _is_qwen_family(model_name, api_base=""):
-    model = str(model_name or "").split("/")[-1].lower()
-    if "qwen" in model or "dashscope" in model:
+    names = _family_names(model_name)
+    if "qwen" in names:
         return True
-    if _family_names(model_name):
+    if names:
         return False  # 名称已属其他已知族 → 域名兜底不生效
     return _is_official_dashscope_route(api_base)
 
@@ -815,17 +843,11 @@ def _tool_contract_fingerprint(tools):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disabled=False):
-    if disabled:
-        return messages
-    if not _supports_cache_control(model_name, api_base, model_cfg):
-        return messages
-    if not messages:
-        return messages
+_CACHE_CONTROL_MAX_BREAKPOINTS = 4
+_CACHE_CONTROL_STRIDE = 6
 
-    is_qwen = _is_qwen_family(model_name, api_base)
 
-    # 清除已有标记，避免累积（_strip_media_and_merge 不传 cache_control，但兜底防御）
+def _strip_existing_cache_control(messages):
     for msg in messages:
         if isinstance(msg, dict):
             msg.pop("cache_control", None)
@@ -835,44 +857,154 @@ def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disa
                     if isinstance(item, dict):
                         item.pop("cache_control", None)
 
-    def _mark_message(msg):
-        if is_qwen:
-            content = msg.get("content")
-            if isinstance(content, str) and content:
-                msg["content"] = [
-                    {
-                        "type": "text",
-                        "text": content,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-                return True
-            if isinstance(content, list) and content:
-                for item in reversed(content):
-                    if isinstance(item, dict) and item.get("type") in ("text", "input_text"):
-                        item["cache_control"] = {"type": "ephemeral"}
-                        return True
-                return False
-            return False
-        msg["cache_control"] = {"type": "ephemeral"}
-        return True
 
+def _is_qwen_markable_message(msg):
+    if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content)
+    if isinstance(content, list) and content:
+        return any(
+            isinstance(item, dict) and item.get("type") in ("text", "input_text")
+            for item in content
+        )
+    return False
+
+
+def _is_anthropic_markable_message(msg):
+    return isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
+
+
+def _completed_stride_milestones(messages, end_exclusive, is_markable, max_count):
+    """在 [1, end_exclusive) 内按固定步长抽取已完成分桶的末尾稳定锚点。
+
+    分桶一旦封口（bucket_end < end_exclusive），其锚点下标就不再随后续追加而偏移，
+    从而在显式断点上限（4 个）内用重叠窗口接力历史缓存，避免每次步进都把断点移走
+    导致缓存退回 messages[0]。
+    """
+    if max_count <= 0 or end_exclusive <= _CACHE_CONTROL_STRIDE + 1:
+        return []
+    anchors = []
+    bucket_start = 1
+    while bucket_start + _CACHE_CONTROL_STRIDE <= end_exclusive:
+        bucket_end = bucket_start + _CACHE_CONTROL_STRIDE
+        for idx in range(bucket_end - 1, bucket_start - 1, -1):
+            if is_markable(messages[idx]):
+                anchors.append(idx)
+                break
+        bucket_start = bucket_end
+    return anchors[-max_count:]
+
+
+def _mark_qwen_message(msg, *, attach_cache_control):
+    content = msg.get("content")
+    if isinstance(content, str) and content:
+        block = {"type": "text", "text": content}
+        if attach_cache_control:
+            block["cache_control"] = {"type": "ephemeral"}
+        msg["content"] = [block]
+        return True
+    if isinstance(content, list) and content:
+        for item in reversed(content):
+            if isinstance(item, dict) and item.get("type") in ("text", "input_text"):
+                if attach_cache_control:
+                    item["cache_control"] = {"type": "ephemeral"}
+                return True
+        return False
+    return False
+
+
+def _apply_qwen_cache_control(messages):
+    marked_indices = set()
     if messages[0].get("role") == "system":
-        _mark_message(messages[0])
+        if _mark_qwen_message(messages[0], attach_cache_control=True):
+            marked_indices.add(0)
 
     last_assistant_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("role") == "assistant":
+    for i in range(len(messages) - 1, 0, -1):
+        if messages[i].get("role") == "assistant" and _is_qwen_markable_message(messages[i]):
             last_assistant_idx = i
-            if _mark_message(messages[i]):
-                break
+            marked_indices.add(i)
+            break
 
-    if is_qwen and len(messages) - 1 != last_assistant_idx:
+    if len(messages) - 1 != last_assistant_idx:
         tail = messages[-1]
-        if isinstance(tail, dict) and tail.get("role") == "user":
-            _mark_message(tail)
+        if isinstance(tail, dict) and tail.get("role") == "user" and _is_qwen_markable_message(tail):
+            marked_indices.add(len(messages) - 1)
+
+    # 长对话（>6 条）：补齐最多 (4 - len(marked_indices)) 个已完成步长分桶的历史锚点，
+    # 并保持锚点之前的所有 user / 非空 assistant 消息统一为 text block 列表形式，
+    # 彻底消除断点淘汰时 str <-> list 格式翻转引发的前缀缓存全量失效。
+    if len(messages) > _CACHE_CONTROL_STRIDE:
+        non_system_marked = [idx for idx in marked_indices if idx > 0]
+        end_exclusive = min(non_system_marked) if non_system_marked else len(messages)
+        slots_left = _CACHE_CONTROL_MAX_BREAKPOINTS - len(marked_indices)
+        for anchor in _completed_stride_milestones(
+            messages, end_exclusive, _is_qwen_markable_message, slots_left
+        ):
+            marked_indices.add(anchor)
+
+    max_non_system_idx = max((idx for idx in marked_indices if idx > 0), default=0)
+    if len(messages) > _CACHE_CONTROL_STRIDE and max_non_system_idx > 0:
+        for idx in range(1, max_non_system_idx + 1):
+            if _is_qwen_markable_message(messages[idx]):
+                _mark_qwen_message(messages[idx], attach_cache_control=(idx in marked_indices))
+    else:
+        for idx in sorted(marked_indices):
+            if idx > 0:
+                _mark_qwen_message(messages[idx], attach_cache_control=True)
 
     return messages
+
+
+def _apply_anthropic_cache_control(messages):
+    marked_indices = set()
+    if messages[0].get("role") == "system":
+        marked_indices.add(0)
+
+    # <=2 条消息保持仅标记 system（兼容 Anthropic 首轮黄金字节基线）
+    if len(messages) > 2:
+        last_assistant_idx = None
+        for i in range(len(messages) - 1, 0, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant_idx = i
+                marked_indices.add(i)
+                break
+
+        if len(messages) - 1 != last_assistant_idx:
+            tail = messages[-1]
+            if isinstance(tail, dict) and tail.get("role") == "user":
+                marked_indices.add(len(messages) - 1)
+
+        if len(messages) > _CACHE_CONTROL_STRIDE:
+            non_system_marked = [idx for idx in marked_indices if idx > 0]
+            end_exclusive = min(non_system_marked) if non_system_marked else len(messages)
+            slots_left = _CACHE_CONTROL_MAX_BREAKPOINTS - len(marked_indices)
+            for anchor in _completed_stride_milestones(
+                messages, end_exclusive, _is_anthropic_markable_message, slots_left
+            ):
+                marked_indices.add(anchor)
+
+    for idx in sorted(marked_indices):
+        messages[idx]["cache_control"] = {"type": "ephemeral"}
+    return messages
+
+
+def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disabled=False):
+    if disabled:
+        return messages
+    if not _supports_cache_control(model_name, api_base, model_cfg):
+        return messages
+    if not messages:
+        return messages
+
+    # 清除已有标记，避免累积（_strip_media_and_merge 不传 cache_control，但兜底防御）
+    _strip_existing_cache_control(messages)
+
+    if _is_qwen_family(model_name, api_base):
+        return _apply_qwen_cache_control(messages)
+    return _apply_anthropic_cache_control(messages)
 
 
 _vision_support_cache = {}
@@ -1108,7 +1240,18 @@ _REASONING_EFFORT_LEVELS = ("low", "high", "max")
 # Kimi Code / Moonshot Anthropic 兼容端点：档位翻译为原生 thinking.budget_tokens；
 # kimi-for-coding（K2.8 Preview）与 K3 同为 low/high/max 三档。
 _K3_REASONING_MODEL_NAMES = frozenset(
-    {"k3", "k3-256k", "kimi-k3", "kimi-k3-256k", "kimi-for-coding"}
+    {
+        "k3",
+        "k3-256k",
+        "k3.1",
+        "k3.1-pro",
+        "k3.1-pro-highspeed",
+        "kimi-k3",
+        "kimi-k3-256k",
+        "kimi-k3.1",
+        "kimi-k3.1-pro",
+        "kimi-for-coding",
+    }
 )
 # 阶跃星辰 Anthropic 兼容端点（/step_plan/v1/messages）不接受 Anthropic 原生
 # thinking/budget_tokens，推理深度由官方扩展字段 output_config.effort 控制
@@ -1252,7 +1395,7 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
                 return capability
             if (
                 normalized_model not in _K3_REASONING_MODEL_NAMES
-                and not normalized_model.split("/")[-1].startswith("kimi")
+                and not _is_kimi_family(model_name)
             ):
                 raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
             budget_tokens = _ANTHROPIC_REASONING_BUDGETS[choice]
@@ -1390,13 +1533,13 @@ _BUILTIN_DEFAULT_MAX_TOKENS = 32000
 
 
 def _builtin_default_max_tokens(model_name, api_base=""):
-    model = str(model_name or "").split("/")[-1].lower()
+    model = _strip_protocol_prefix(model_name)
     base = str(api_base or "").lower()
     if "kimi-k2.7-code" in model and "tokenrhythm.studio" in base:
         return 16000
-    if model.startswith("deepseek") or _is_deepseek_family(model_name, api_base):
+    if "deepseek" in model or _is_deepseek_family(model_name, api_base):
         return 384000
-    if model.startswith("agnes"):
+    if "agnes" in model:
         return 65535
     if _is_glm_family(model_name, api_base):
         if "glm-5.3" in model:
@@ -1418,9 +1561,9 @@ def _builtin_default_max_tokens(model_name, api_base=""):
         return 128000
     if "seed-2.1-pro" in model or "seed-2.1-turbo" in model:
         return 131000
-    if "mimo-v2.6" in model or model.startswith("mimo-v2.5"):
+    if "mimo-v2.6" in model or "mimo-v2.5" in model:
         return 131072
-    if "minimax-m2.5" in model:
+    if "minimax-m2.5" in model or "minimax-m3" in model:
         return 200000
     if "minimax-m2.7" in model:
         return 192000

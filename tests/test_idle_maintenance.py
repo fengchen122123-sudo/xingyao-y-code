@@ -28,19 +28,16 @@ def _env(monkeypatch, manager):
     monkeypatch.setattr("core.model_manager.get_active_model", lambda s: fake_active)
 
 
-def test_local_tiers_run_and_no_compression_below_watermark(manager, monkeypatch):
+def test_local_tiers_respect_watermarks_below_threshold(manager, monkeypatch):
     calls = []
-    done = threading.Event()
 
     def fake_maintain(session, tier):
         calls.append(tier)
-        if len(calls) >= 2:
-            done.set()
         return (0, 0)
 
     monkeypatch.setattr(manager, "maintain_tool_results", fake_maintain)
     monkeypatch.setattr(
-        "core.agent_service.get_session_token_baseline", lambda *a, **k: 1.0
+        "core.agent_service.get_session_token_baseline", lambda *a, **k: 10000.0
     )
     pre = []
     monkeypatch.setattr(
@@ -50,9 +47,53 @@ def test_local_tiers_run_and_no_compression_below_watermark(manager, monkeypatch
 
     svc = IdleMaintenanceService()
     svc.on_turn_finished("idle-session", notify=None)
-    assert done.wait(5)
-    assert sorted(calls) == [1, 2]
+    time.sleep(0.25)
+    assert calls == []
     assert pre == []
+    svc.shutdown()
+
+
+def test_local_tiers_run_only_matching_watermarks(manager, monkeypatch):
+    calls_tier1 = []
+    done_tier1 = threading.Event()
+
+    def fake_maintain_t1(session, tier):
+        calls_tier1.append(tier)
+        done_tier1.set()
+        return (0, 0)
+
+    monkeypatch.setattr(manager, "maintain_tool_results", fake_maintain_t1)
+    # 128000 * 0.60 = 76800 < 90000 < 128000 * 0.80 (102400) -> 仅跑 tier=1
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline", lambda *a, **k: 90000.0
+    )
+    monkeypatch.setattr(
+        "core.agent_service._trigger_background_precompress", lambda *a, **k: False
+    )
+
+    svc = IdleMaintenanceService()
+    svc.on_turn_finished("idle-session", notify=None)
+    assert done_tier1.wait(5)
+    time.sleep(0.1)
+    assert calls_tier1 == [1]
+
+    calls_both = []
+    done_both = threading.Event()
+
+    def fake_maintain_both(session, tier):
+        calls_both.append(tier)
+        if len(calls_both) >= 2:
+            done_both.set()
+        return (0, 0)
+
+    monkeypatch.setattr(manager, "maintain_tool_results", fake_maintain_both)
+    # 105000 > 128000 * 0.80 -> tier=1 与 tier=2 都运行
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline", lambda *a, **k: 105000.0
+    )
+    svc.on_turn_finished("idle-session", notify=None)
+    assert done_both.wait(5)
+    assert sorted(calls_both) == [1, 2]
     svc.shutdown()
 
 

@@ -4943,7 +4943,7 @@ class SubagentManager:
             {
                 "role": "system",
                 "content": (
-                    f"你是{_agent_display_name()}子代理({task.task_id})，角色是 {role}。"
+                    f"你是{_agent_display_name()}子代理，角色是 {role}。"
                     f"{instruction_text}"
                     "你只执行主 Agent 已分配的单一子任务，不得拆解、创建或修改主任务计划；"
                     "如实使用可用工具；结束时只输出供主 Agent 汇总的公开结论。"
@@ -4960,7 +4960,7 @@ class SubagentManager:
             },
             {
                 "role": "user",
-                "content": f"请完成以下子任务：\n{task.description}",
+                "content": f"子任务 ID：{task.task_id}\n请完成以下子任务：\n{task.description}",
             },
         ]
         def _budget_notice_provider():

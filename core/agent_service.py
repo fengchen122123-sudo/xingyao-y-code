@@ -518,13 +518,21 @@ def _append_context_suffix_to_last_user(
             break
     if last_user_idx is None:
         return False
+    suffix_parts = [p for p in (dynamic_prompt, ref_block, summary_msg, time_note) if p]
+    if not suffix_parts:
+        return False
+    # 若该 user 消息之后已存在 assistant / tool 回复，绝不能回头改写历史 user 消息——
+    # 回写会让之后整段对话前缀缓存失效；改为尾部追加运行上下文块，保持严格追加。
+    if any(
+        isinstance(m, dict) and m.get("role") in ("assistant", "tool")
+        for m in history[last_user_idx + 1:]
+    ):
+        history.append({"role": "user", "content": "\n\n".join(suffix_parts)})
+        return True
     original_content = history[last_user_idx].get("content", "")
     if not isinstance(original_content, str):
         return False
     cleaned = strip_context_suffix(original_content)
-    suffix_parts = [p for p in (dynamic_prompt, ref_block, summary_msg, time_note) if p]
-    if not suffix_parts:
-        return False
     new_content = cleaned + "\n\n" + "\n\n".join(suffix_parts)
     history[last_user_idx]["content"] = new_content
     try:
@@ -1116,9 +1124,14 @@ def prepare_turn_messages(
         if estimated_tokens > window and not _cancelled():
             _notify("compress", "<ansired>⚠️ 当前上下文单条消息本身已超过模型窗口，本轮请求可能被 provider 拒绝；建议精简输入或开启新会话。</ansired>")
 
-    # 更新最新 Token 数供界面显示（与 UI 线程并发读写，必须持锁）
-    with token_usage_lock:
-        session_token_usage["latest_total"] = estimated_tokens
+    # 更新最新 Token 数供界面显示（按会话隔离写入；同时同步全局字典以兼容 CLI/旧路径）
+    import sys as _sys
+    _set_win = getattr(_sys.modules.get("core.llm"), "set_session_window_usage", None)
+    if callable(_set_win):
+        _set_win(session_name, latest_total=estimated_tokens)
+    else:
+        with token_usage_lock:
+            session_token_usage["latest_total"] = estimated_tokens
 
     history = _drop_legacy_context_systems(history)
 
@@ -1236,7 +1249,7 @@ def prepare_turn_messages(
             {"source": "system_prompt", "chars": system_prompt_chars},
             {"source": "skills", "chars": skills_len},
             {"source": "runtime_context", "chars": runtime_context_chars},
-        ])
+        ], session_id=session_name)
     except Exception:
         logger.debug("上下文来源占比统计失败（旁路，已忽略）", exc_info=True)
 

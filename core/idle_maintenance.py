@@ -186,13 +186,68 @@ class IdleMaintenanceService:
         manager = get_manager()
         if manager is None:
             return
-        # 免费本地维护：旧工具结果折叠/占位（一次性、幂等、DB 层，语义照旧）。
-        # 顺带把改写后的新前缀在空闲窗口内预热。
+        # 先解析当前激活模型与水位线基线：低于 0.60 / 0.80 水位时绝不改写历史工具
+        # 结果，避免空闲 240s 后把 Kimi/GLM/Qwen/LongCat/Claude 等无账本模型的
+        # 前缀 KV 缓存全部打废。
         try:
-            manager.maintain_tool_results(session, tier=1)
-            manager.maintain_tool_results(session, tier=2)
+            from core.model_manager import get_active_model
+            active = get_active_model(session)
         except Exception:
-            _LOGGER.debug("会话 %s 闲时本地维护失败", session, exc_info=True)
+            active = None
+        window = int(active.get("context_window") or 0) if active else 0
+        baseline = None
+        watermark_window = 0
+        precompress_ratio = 0.0
+        summarize_ratio = 0.95
+        if active and window > 0:
+            try:
+                from core.agent_service import (
+                    ELIDE_RATIO,
+                    SNIP_RATIO,
+                    SUMMARIZE_RATIO,
+                    get_session_token_baseline,
+                )
+                from core.memory_compressor import (
+                    get_precompress_ratio,
+                    get_watermark_base_tokens,
+                )
+
+                summarize_ratio = SUMMARIZE_RATIO
+                history = manager.get_history_for_llm(session)
+                model_name = active.get("litellm_model") or ""
+                api_base = active.get("base_url") or ""
+                baseline = get_session_token_baseline(
+                    manager, session, model_name,
+                    history=history, api_base=api_base,
+                )
+                watermark_base = get_watermark_base_tokens(model_name)
+                watermark_window = min(window, watermark_base) if watermark_base else window
+                precompress_ratio = get_precompress_ratio()
+
+                if baseline > watermark_window * SNIP_RATIO:
+                    try:
+                        snipped, _ = manager.maintain_tool_results(session, tier=1)
+                        if snipped:
+                            history = manager.get_history_for_llm(session)
+                            baseline = get_session_token_baseline(
+                                manager, session, model_name,
+                                history=history, api_base=api_base,
+                            )
+                    except Exception:
+                        _LOGGER.debug("会话 %s 闲时 tier=1 维护失败", session, exc_info=True)
+                if baseline > watermark_window * ELIDE_RATIO:
+                    try:
+                        _, elided = manager.maintain_tool_results(session, tier=2)
+                        if elided:
+                            history = manager.get_history_for_llm(session)
+                            baseline = get_session_token_baseline(
+                                manager, session, model_name,
+                                history=history, api_base=api_base,
+                            )
+                    except Exception:
+                        _LOGGER.debug("会话 %s 闲时 tier=2 维护失败", session, exc_info=True)
+            except Exception:
+                _LOGGER.debug("会话 %s 闲时水位维护评估失败", session, exc_info=True)
 
         try:
             from core.media_store import prune_orphan_blobs, prune_orphan_tmp
@@ -229,22 +284,16 @@ class IdleMaintenanceService:
         # 维护线程里同步等待——否则会拖住闲时压缩的推进与后续会话的维护排期。
         # 取不到激活模型（含无 api_key）时直接跳过，不写日志噪声；线程内部
         # 再包一层 try/except 只记 debug，异常一律不外溢。
-        try:
-            from core.model_manager import get_active_model
-
-            learning_active = get_active_model(session)
-        except Exception:
-            learning_active = None
-        if learning_active:
+        if active:
             learning_model = (
-                learning_active.get("litellm_model") or learning_active.get("model") or ""
+                active.get("litellm_model") or active.get("model") or ""
             )
-            learning_key = learning_active.get("api_key") or ""
+            learning_key = active.get("api_key") or ""
             if learning_model and str(learning_key).strip():
                 model_cfg = (
                     learning_model,
                     learning_key,
-                    learning_active.get("base_url") or "",
+                    active.get("base_url") or "",
                 )
                 try:
                     threading.Thread(
@@ -260,36 +309,12 @@ class IdleMaintenanceService:
             return
 
         # LLM 压缩：水位达标才触发，复用预压缩入口的防抖/防重入/notify 管道
-        try:
-            from core.model_manager import get_active_model
-            active = get_active_model(session)
-        except Exception:
-            active = None
-        if not active:
-            return
-        window = int(active.get("context_window") or 0)
-        if window <= 0:
+        if not active or window <= 0 or baseline is None:
             return
         try:
-            from core.agent_service import (
-                SUMMARIZE_RATIO,
-                _trigger_background_precompress,
-                get_session_token_baseline,
-            )
-            from core.memory_compressor import (
-                get_precompress_ratio,
-                get_watermark_base_tokens,
-            )
+            from core.agent_service import _trigger_background_precompress
 
-            history = manager.get_history_for_llm(session)
-            baseline = get_session_token_baseline(
-                manager, session, active.get("litellm_model") or "",
-                history=history, api_base=active.get("base_url") or "",
-            )
-            watermark_base = get_watermark_base_tokens(active.get("litellm_model") or "")
-            watermark_window = min(window, watermark_base) if watermark_base else window
-            precompress_ratio = get_precompress_ratio()
-            threshold = precompress_ratio if precompress_ratio > 0 else SUMMARIZE_RATIO
+            threshold = precompress_ratio if precompress_ratio > 0 else summarize_ratio
             if baseline <= watermark_window * threshold:
                 return
             done = threading.Event()

@@ -585,3 +585,70 @@ def test_cache_control_blacklist_expires_after_ttl():
     assert not _supports_cache_control(_QWEN, _OFFICIAL)
     time.sleep(0.08)
     assert _supports_cache_control(_QWEN, _OFFICIAL)
+
+
+def test_qwen_multistep_rolling_milestone_anchors_keep_prefix_format_stable():
+    from core.llm_dialects import _apply_cache_control
+
+    turns = [{"role": "system", "content": "sys"}]
+    for i in range(1, 7):
+        turns.append({"role": "user", "content": f"q{i}"})
+        if i < 6:
+            turns.append({"role": "assistant", "content": f"a{i}"})
+
+    # Turn 6 (user q6 -> 12 messages: idx 0..11, marks {0, 6, 10, 11})
+    step_q6 = _apply_cache_control([dict(m) for m in turns], _QWEN, _OFFICIAL)
+    # Turn 7 (assistant a6 + user q7 -> 14 messages: idx 0..13, marks {0, 6, 12, 13})
+    turns_q7 = turns + [
+        {"role": "assistant", "content": "a6"},
+        {"role": "user", "content": "q7"},
+    ]
+    step_q7 = _apply_cache_control([dict(m) for m in turns_q7], _QWEN, _OFFICIAL)
+    # Turn 8 (assistant a7 + user q8 -> 16 messages: idx 0..15, rolls milestone to {0, 12, 14, 15})
+    turns_q8 = turns_q7 + [
+        {"role": "assistant", "content": "a7"},
+        {"role": "user", "content": "q8"},
+    ]
+    step_q8 = _apply_cache_control([dict(m) for m in turns_q8], _QWEN, _OFFICIAL)
+
+    assert _marker_count(step_q6) <= 4
+    assert _marker_count(step_q7) <= 4
+    assert _marker_count(step_q8) <= 4
+
+    # Milestone at index 6 and its entire prefix (0..6) remain byte-identical across turn 6 -> 7
+    assert step_q6[:7] == step_q7[:7]
+    # Historical messages stay list-formatted without str<->list flipping as tail moves forward
+    for idx in range(0, 12):
+        assert isinstance(step_q6[idx]["content"], list)
+        assert isinstance(step_q7[idx]["content"], list)
+        assert isinstance(step_q8[idx]["content"], list)
+
+
+def test_anthropic_multistep_marks_milestones_without_touching_tool_messages():
+    from core.llm_dialects import _apply_cache_control
+
+    def has_marker(msg):
+        if "cache_control" in msg:
+            return True
+        content = msg.get("content")
+        return isinstance(content, list) and any(
+            isinstance(b, dict) and "cache_control" in b for b in content
+        )
+
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(1, 5):
+        msgs.append({"role": "user", "content": f"u{i}"})
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": f"c{i}"}]})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": f"res{i}"})
+    msgs.append({"role": "assistant", "content": "done"})
+
+    out = _apply_cache_control(msgs, "anthropic/claude-sonnet-4-5", "https://api.anthropic.com")
+    assert 3 <= _marker_count(out) <= 4
+    # System + at least one non-system milestone/tail marked, and zero tool messages marked
+    assert has_marker(out[0])
+    assert has_marker(out[-1])
+    for msg in out:
+        if msg["role"] == "tool":
+            assert isinstance(msg["content"], str)
+            assert not has_marker(msg)
+
