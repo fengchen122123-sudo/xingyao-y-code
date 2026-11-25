@@ -26,6 +26,12 @@ NOT_FOUND_ERROR_TEXT = (
     "'type': 'invalid_request_error'}}"
 )
 RATE_LIMIT_ERROR_TEXT = "Error code: 429 - Rate limit reached for requests per minute (RPM)"
+# Kimi for Coding 额度耗尽：同样是 429，但属于账户确定性耗尽，必须换 Key 而不是退避重试
+KIMI_QUOTA_ERROR_TEXT = (
+    "Error code: 429 - {'error': {'message': \"Your organization's Extra Usage "
+    "balance has run out. Please contact your organization admin to add more "
+    "Extra Usage.\", 'type': 'exceeded_current_quota_error'}}"
+)
 
 PROVIDER_CONFIG = {
     "providers": [
@@ -219,5 +225,25 @@ def test_rate_limit_does_not_switch_key_and_keeps_retrying(mocker):
     events = _run_turn("turn-rate-limit-no-switch")
 
     assert keys_used == [KEY_1, KEY_1, KEY_1], "429 与 Key 无关，必须保持同一 Key 重试"
+    assert events[-1].kind == "turn_finished"
+    assert not any(event.kind in ("error", "turn_error") for event in events)
+
+
+def test_kimi_quota_429_switches_to_next_key(mocker):
+    """额度耗尽的 429 必须走多 Key 切换，而不是当成限流原地重试。"""
+    _make_fast_retry(mocker)
+    keys_used = []
+
+    def completion(**kwargs):
+        keys_used.append(kwargs.get("api_key"))
+        if len(keys_used) == 1:
+            raise _StubApiError(KIMI_QUOTA_ERROR_TEXT, status_code=429)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+
+    events = _run_turn("turn-kimi-quota-switch")
+
+    assert keys_used == [KEY_1, KEY_2]
     assert events[-1].kind == "turn_finished"
     assert not any(event.kind in ("error", "turn_error") for event in events)

@@ -214,8 +214,20 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             "quota exceeded",
             "balance not enough",
             "out of credits",
+            # 额度耗尽的 429 与 RPM 限流的 429 骨架相同，但前者是确定性失败：
+            # 只有归到本分类才会 fail-fast 并触发多 Key 故障转移，被误判成
+            # rate_limit 的结果是在同一个空 Key 上退避重试到失败。
+            # Kimi for Coding 订阅额度用尽：{"type":"exceeded_current_quota_error",
+            # "message":"Your organization's Extra Usage balance has run out..."}；
+            # "Insufficient Balance" 是 DeepSeek 等厂商的措辞。
+            "exceeded_current_quota",
+            "extra usage balance",
+            "balance has run out",
+            "insufficient balance",
             "账户额度不足",
             "余额不足",
+            "额度已耗尽",
+            "余额已耗尽",
             "欠费",
         )
     ):
@@ -223,7 +235,11 @@ def map_llm_error(exc: Any) -> LLMErrorInfo:
             category="insufficient_quota",
             title="账户额度耗尽 / 余额不足",
             reason="当前大模型服务商账户的 API 调用额度已耗尽，或已触达账户设置的消费硬上限。",
-            suggestion="请登录对应的模型服务商官网（如 OpenAI / DeepSeek / Moonshot 等）检查账户余额并充值，或更新为有可用额度的 API Key。",
+            suggestion=(
+                "请登录对应的模型服务商官网（如 OpenAI / DeepSeek / Moonshot 等）检查账户余额并充值，"
+                "或更新为有可用额度的 API Key；若该厂商已配置多个 Key，请确认有额度的 Key 也在列表里，"
+                "故障转移会自动切到它。"
+            ),
             raw_message=raw_str,
         )
 

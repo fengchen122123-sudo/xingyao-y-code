@@ -213,3 +213,36 @@ def test_already_chinese_message_passthrough():
 def test_none_or_empty_error():
     assert format_user_facing_error(None) == "未知错误"
     assert format_user_facing_error("") == "未知错误"
+
+
+def test_kimi_exceeded_current_quota_error_is_quota_not_rate_limit():
+    """Kimi for Coding 额度耗尽回 429 + exceeded_current_quota_error。
+
+    骨架与 RPM 限流完全相同（都是 429），但它是账户确定性耗尽：必须归为
+    insufficient_quota。若被当成临时限流，会退避重试同一个 Key，且不进
+    多 Key 故障转移分支（Key 类失败集合里没有 rate_limit）。
+    """
+    exc = DummyApiException(
+        "Error code: 429 - {'error': {'message': \"Your organization's Extra Usage "
+        "balance has run out. Please contact your organization admin to add more "
+        "Extra Usage.\", 'type': 'exceeded_current_quota_error'}}",
+        status_code=429,
+    )
+    info = map_llm_error(exc)
+    assert info.category == "insufficient_quota"
+    assert "额度" in info.title or "余额" in info.title
+
+    formatted = format_user_facing_error(exc)
+    assert "充值" in formatted or "Key" in formatted
+
+
+def test_insufficient_balance_variants_are_quota():
+    # 各厂商对“没钱了”的措辞差异很大，常见形态都要收敛到同一分类
+    for text in (
+        "Insufficient Balance",
+        '{"error":{"message":"insufficient balance","type":"invalid_request_error"}}',
+        "Your credit balance is too low to access the API.",
+        "Extra Usage balance has run out.",
+    ):
+        info = map_llm_error(DummyApiException(text, status_code=429))
+        assert info.category == "insufficient_quota", text
