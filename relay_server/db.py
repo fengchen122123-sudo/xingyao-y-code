@@ -32,5 +32,24 @@ def connect(path) -> sqlite3.Connection:
         ON devices(device_code) WHERE device_code IS NOT NULL
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mcp_tokens (
+            id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            last_used INTEGER
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_mcp_tokens_device_id
+        ON mcp_tokens(device_id)
+        """
+    )
     conn.commit()
     return conn

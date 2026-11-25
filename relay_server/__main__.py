@@ -107,6 +107,62 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_create_mcp_token(args: argparse.Namespace) -> int:
+    conn = connect(_db_path())
+    try:
+        token_id, token = RelayRegistry().create_mcp_token(
+            conn, args.device_id, name=args.name
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+    print(f"token_id: {token_id}")
+    print(f"device_id: {args.device_id}")
+    print(f"mcp_token: {token}")
+    return 0
+
+
+def cmd_list_mcp_tokens(args: argparse.Namespace) -> int:
+    conn = connect(_db_path())
+    try:
+        if args.device_id:
+            rows = conn.execute(
+                "SELECT id, device_id, name, revoked, created_at, last_used "
+                "FROM mcp_tokens WHERE device_id = ? ORDER BY created_at",
+                (args.device_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, device_id, name, revoked, created_at, last_used "
+                "FROM mcp_tokens ORDER BY created_at"
+            ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        print(
+            f'{row["id"]}  device_id={row["device_id"]}  name={row["name"]}  '
+            f'revoked={row["revoked"]}  created_at={row["created_at"]}  last_used={row["last_used"]}'
+        )
+    if not rows:
+        print("（无 MCP 令牌）")
+    return 0
+
+
+def cmd_revoke_mcp_token(args: argparse.Namespace) -> int:
+    conn = connect(_db_path())
+    try:
+        ok = RelayRegistry().revoke_mcp_token(conn, args.token_id)
+    finally:
+        conn.close()
+    if not ok:
+        print(f"MCP 令牌不存在：{args.token_id}", file=sys.stderr)
+        return 1
+    print(f"已吊销 MCP 令牌：{args.token_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relay_server", description="极简中转服务器")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -128,6 +184,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_rotate = sub.add_parser("rotate", help="轮换设备令牌，明文仅输出一次")
     p_rotate.add_argument("device_id")
     p_rotate.set_defaults(func=cmd_rotate)
+
+    p_mcp_create = sub.add_parser("create-mcp-token", help="为设备签发长期 MCP/Skill 访问令牌")
+    p_mcp_create.add_argument("--device-id", required=True, help="目标设备 ID")
+    p_mcp_create.add_argument("--name", default="amoo", help="令牌备注名（如 amoo）")
+    p_mcp_create.set_defaults(func=cmd_create_mcp_token)
+
+    p_mcp_list = sub.add_parser("list-mcp-tokens", help="列出 MCP/Skill 访问令牌")
+    p_mcp_list.add_argument("--device-id", default="", help="可选，按设备 ID 过滤")
+    p_mcp_list.set_defaults(func=cmd_list_mcp_tokens)
+
+    p_mcp_revoke = sub.add_parser("revoke-mcp-token", help="吊销指定的 MCP/Skill 访问令牌")
+    p_mcp_revoke.add_argument("token_id")
+    p_mcp_revoke.set_defaults(func=cmd_revoke_mcp_token)
     return parser
 
 

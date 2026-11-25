@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from .auth import issue_device_token, issue_remote_token, read_remote_token
 from .db import connect
+from .mcp_bridge import mount_mcp_and_skill_routes
 from .registry import (
     OUTBOUND_LIMIT,
     DeviceAlreadyEnrolledError,
@@ -485,6 +486,8 @@ def create_app(
             relay.unbind_app_closer(device_id, app_key)
             # 断开/登出都要释放名额，否则名额泄漏会把第 5 个 App 误判成超限。
             relay.detach_app(device_id, app_key)
+
+    mount_mcp_and_skill_routes(app, database, relay)
 
     shim = Path(shim_path) if shim_path is not None else None
     _mount_desktop(app, Path(desktop_dir) if desktop_dir is not None else None, shim)

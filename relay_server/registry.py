@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import secrets
 import sqlite3
+import threading
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -35,6 +36,8 @@ class RelayRegistry:
         self.overflowed = {}
         self.rpc_routes = {}
         self.listeners = []
+        self.observers = []
+        self._db_lock = threading.Lock()
         # (device_id, app_key) -> closer：签发新票时要能主动断开已建立的远端连接
         self.app_closers = {}
 
@@ -50,6 +53,73 @@ class RelayRegistry:
         )
         database.commit()
         return device_id, token
+
+    def create_mcp_token(
+        self, database, device_id: str, name: str = "default"
+    ) -> tuple[str, str]:
+        """为已注册设备签发长期有效的 MCP / Skill 访问令牌，明文只返回一次。"""
+        row = database.execute("SELECT id FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"设备不存在: {device_id}")
+        token_id = uuid.uuid4().hex[:16]
+        raw_token = "xym_" + secrets.token_urlsafe(32)
+        display_name = str(name or "").strip()[:64] or "default"
+        database.execute(
+            """
+            INSERT INTO mcp_tokens(id, device_id, name, token_hash, revoked, created_at)
+            VALUES (?, ?, ?, ?, 0, ?)
+            """,
+            (token_id, device_id, display_name, hash_token(raw_token), int(time.time())),
+        )
+        database.commit()
+        return token_id, raw_token
+
+    def revoke_mcp_token(self, database, token_id: str) -> bool:
+        cur = database.execute(
+            "UPDATE mcp_tokens SET revoked = 1 WHERE id = ?",
+            (str(token_id or "").strip(),),
+        )
+        database.commit()
+        return cur.rowcount > 0
+
+    def authenticate_mcp_token(
+        self, database, raw_token: str, expected_device_id: str | None = None
+    ) -> str | None:
+        """校验 MCP / Skill 访问令牌并解析归属 device_id（设备或令牌被吊销均拒绝）。"""
+        token = str(raw_token or "").strip()
+        if not token:
+            return None
+        digest = hash_token(token)
+        with self._db_lock:
+            row = database.execute(
+                """
+                SELECT m.id AS token_id, m.device_id AS device_id, m.token_hash AS token_hash,
+                       m.revoked AS token_revoked, m.last_used AS last_used,
+                       d.revoked AS device_revoked
+                FROM mcp_tokens m
+                JOIN devices d ON d.id = m.device_id
+                WHERE m.token_hash = ?
+                """,
+                (digest,),
+            ).fetchone()
+            if row is None:
+                return None
+            if int(row["token_revoked"]) or int(row["device_revoked"]):
+                return None
+            if not secrets.compare_digest(str(row["token_hash"]), digest):
+                return None
+            device_id = str(row["device_id"])
+            if expected_device_id is not None and device_id != expected_device_id:
+                return None
+            now = int(time.time())
+            last_used = int(row["last_used"] or 0)
+            if now - last_used >= 60:
+                database.execute(
+                    "UPDATE mcp_tokens SET last_used = ? WHERE id = ?",
+                    (now, str(row["token_id"])),
+                )
+                database.commit()
+            return device_id
 
     def enroll_device(
         self, database, device_code: str, name: str | None = None
@@ -385,8 +455,22 @@ class RelayRegistry:
         if item in self.listeners:
             self.listeners.remove(item)
 
+    def add_observer(self, fn) -> None:
+        if fn not in self.observers:
+            self.observers.append(fn)
+
+    def remove_observer(self, fn) -> None:
+        if fn in self.observers:
+            self.observers.remove(fn)
+
     def publish(self, device_id: str, frame: dict, app_key: str | None = None) -> None:
         """app_key 非空表示定向给某个 App（RPC 回程），否则广播给该设备的所有订阅者。"""
+        if app_key is None:
+            for obs in list(self.observers):
+                try:
+                    obs(device_id, frame)
+                except Exception:
+                    pass
         for listener_device, send, listener_key in list(self.listeners):
             if listener_device != device_id:
                 continue

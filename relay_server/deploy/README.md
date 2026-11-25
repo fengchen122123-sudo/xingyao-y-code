@@ -86,3 +86,19 @@ CLI 另有 list-devices / revoke / rotate（rotate 会解除吊销并踢旧连�
   入口 JS 221KB、CSS 212KB，窄带外网首屏要十几秒。
 - 升级代码：scp 覆盖 /srv/relay/relay_server 后 sudo systemctl restart relay；
   前端改动需按 §1 重新构建上传。
+
+## 7. 手机智能体（amoo）MCP 与 Skill 远程接入
+
+在已有设备的基础上，签发一条专用的长期 MCP / Skill 访问令牌（不会踢掉手机网页端会话）：
+
+```bash
+sudo bash -c 'set -a; . /etc/relay/relay.env; set +a; cd /srv/relay && venv/bin/python -m relay_server create-mcp-token --device-id <设备ID> --name amoo'
+```
+
+- **MCP 接入地址**（Streamable HTTP `POST /mcp`）：
+  - URL：`https://<你的域名>/mcp`（无域名仅 IP 时 `http://<服务器IP>/mcp`）
+  - 鉴权：`Authorization: Bearer <mcp_token>`（或 URL 参数 `?token=<mcp_token>`）
+  - 暴露工具：`send_message`、`get_reply`、`get_status`、`list_models`、`switch_model`、`list_workspaces`、`list_sessions`、`switch_session`、`create_session`、`stop_task`、`respond_permission`
+- **Skill 接入**：
+  - 将 `relay_server/skill_template/xingyao-remote/SKILL.md` 导入 `amoo`，使用 `/api/skill/send`、`/api/skill/reply`、`/api/skill/status`、`/api/skill/models`、`/api/skill/model`、`/api/skill/workspaces`、`/api/skill/sessions`、`/api/skill/switch-session`、`/api/skill/create-session`、`/api/skill/permission`、`/api/skill/stop`。
+- 令牌管理命令：`list-mcp-tokens`、`revoke-mcp-token <token_id>`。
