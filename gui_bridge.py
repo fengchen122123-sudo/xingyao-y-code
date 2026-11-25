@@ -109,6 +109,35 @@ def _force_finish_reason(idle_seconds: float, stop_requested: bool) -> Optional[
     return None
 
 
+def _stall_turn_error_message(
+    reason: str, idle_seconds: float, pending_permission: str = ""
+) -> str:
+    """看门狗强制收尾时给用户看的文案。
+
+    pending_permission 非空说明本回合其实卡在"等用户点授权"上（权限卡片/飞书卡片
+    挂着没人确认）：这不是程序故障，提示必须直说是审批没点，否则用户会以为代码坏了。
+    """
+    if reason == "stop":
+        return (
+            f"已请求停止，但回合 {int(_STOP_WATCHDOG_SECONDS)} 秒内没有任何进展，"
+            "判定为卡在不可中断的同步调用上，已强制结束并解锁会话。"
+            "完整线程栈已写入运行日志。"
+        )
+    minutes = max(1, int(idle_seconds // 60))
+    if pending_permission:
+        return (
+            f"本回合在等你审批「{pending_permission}」已经 {minutes} 分钟，"
+            "一直没有收到确认，已强制结束并解锁会话。"
+            "这不是程序故障：重新发起该操作，并在弹出的授权卡片里点确认即可。"
+        )
+    return (
+        f"本回合已连续 {int(_STALL_TIMEOUT_SECONDS // 60)} 分钟没有任何进展，"
+        "判定为卡死，已强制结束并解锁会话。"
+        "常见原因是工具阻塞在系统弹窗或不可中断的同步调用上，"
+        "完整线程栈已写入运行日志。"
+    )
+
+
 # CLI 的 prompt_toolkit 着色标记（<ansiyellow> 等）：GUI 不渲染，桥接层统一剥离，
 # 否则用户会在提示里看到 <ansiyellow> 原文。CLI 路径不经此处，不受影响。
 _ANSI_MARKUP_RE = re.compile(r"</?ansi\w*>")
@@ -3322,6 +3351,46 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         with lock:
             last = activity.get(session_name)
         return time.monotonic() - last if last else 0.0
+
+    def _pending_permission_summary(self, turn_id: str) -> str:
+        """本回合未决权限请求的单行可读摘要；无未决请求或不属于本回合时返回空串。
+
+        权限确认是无限等待的（见 _activate_permission_request），等待期间事件流静默、
+        活动时间戳不更新，看门狗光看 idle 分不清"真卡死"和"在等用户点确认"。
+        """
+        if not turn_id:
+            return ""
+        try:
+            from core.permission_broker import permission_broker
+
+            request = permission_broker.active_request()
+            if request is None:
+                return ""
+            owner = str(getattr(request, "owner_id", "") or "")
+            parent_turn = str(getattr(request, "parent_turn_id", "") or "")
+            if str(turn_id) not in (owner, parent_turn):
+                # 子代理发起的权限请求 owner 是子代理 task_id，按父回合归属再核对一次
+                from core.tools import subagent_manager
+
+                if not any(
+                    str(getattr(task, "task_id", "")) == owner
+                    and str(getattr(task, "parent_turn_id", "")) == str(turn_id)
+                    for task in subagent_manager.snapshot()
+                ):
+                    return ""
+            from core.tool_presenter import describe_permission_request
+
+            # 多行命令压成单行限长摘要：提示框里只留一眼能认出是哪条操作的量
+            summary = " ".join(
+                describe_permission_request(
+                    str(getattr(request, "function_name", "") or ""),
+                    dict(getattr(request, "arguments", {}) or {}),
+                ).split()
+            )
+            return summary[:120]
+        except Exception:
+            logger.debug("看门狗查询未决权限请求失败", exc_info=True)
+            return ""
 
     def _is_turn_active(self, session_name: str) -> bool:
         # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__
@@ -9455,11 +9524,23 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     reason = _force_finish_reason(idle, cancel_event.is_set())
                     if reason is None:
                         continue
-                    if reason == "stop":
+                    _stalled_by_stop = reason == "stop"
+                    # 探测必须早于取消动作：权限请求被取消后就查不到了，而"在等你审批"
+                    # 与"真卡死"的解释和给用户的文案完全不同
+                    _pending_permission = (
+                        "" if _stalled_by_stop else self._pending_permission_summary(turn_id)
+                    )
+                    if _stalled_by_stop:
                         # 用户已经点过停止：这条路径下更要快速收尾，不能再等 30 分钟
                         logger.warning(
                             "停止看门狗 [%s]：用户已请求停止，但 %.0f 秒无任何进展仍未退出，强制收尾",
                             session_name, idle,
+                        )
+                    elif _pending_permission:
+                        logger.warning(
+                            "回合无进展看门狗 [%s]：已 %.0f 秒无进展，但有未决权限请求「%s」，"
+                            "按等待用户审批超时收尾",
+                            session_name, idle, _pending_permission,
                         )
                     else:
                         logger.warning(
@@ -9485,18 +9566,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     except Exception:
                         logger.debug("看门狗取消在飞请求失败", exc_info=True)
                     try:
-                        _stalled_by_stop = reason == "stop"
                         self.emit_event("turn_error", {
-                            "message": (
-                                f"已请求停止，但回合 {int(_STOP_WATCHDOG_SECONDS)} 秒内没有任何进展，"
-                                "判定为卡在不可中断的同步调用上，已强制结束并解锁会话。"
-                                "完整线程栈已写入运行日志。"
-                                if _stalled_by_stop
-                                else
-                                f"本回合已连续 {int(_STALL_TIMEOUT_SECONDS // 60)} 分钟没有任何进展，"
-                                "判定为卡死，已强制结束并解锁会话。"
-                                "常见原因是工具阻塞在系统弹窗或不可中断的同步调用上，"
-                                "完整线程栈已写入运行日志。"
+                            "message": _stall_turn_error_message(
+                                reason, idle, _pending_permission
                             ),
                             "session_name": session_name,
                         })
@@ -9509,7 +9581,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                             _tu_service.finish_turn(
                                 undo_ctx,
                                 aborted=True,
-                                reason="回合长时间无进展，看门狗强制结束",
+                                reason=(
+                                    "回合在等待用户审批权限，看门狗按超时强制结束"
+                                    if _pending_permission
+                                    else "回合长时间无进展，看门狗强制结束"
+                                ),
                             )
                             undo_finished = True
                         except Exception:
@@ -9525,7 +9601,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                                     str(record.get("status")),
                                     "failed",
                                     int(time.time() * 1000),
-                                    error_code="TurnStalled",
+                                    error_code=(
+                                        "TurnAwaitingPermission"
+                                        if _pending_permission
+                                        else "TurnStalled"
+                                    ),
                                 )
                     except Exception:
                         logger.debug("看门狗回写 harness 回合终态失败", exc_info=True)
