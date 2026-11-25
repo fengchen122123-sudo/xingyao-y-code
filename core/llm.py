@@ -905,6 +905,10 @@ def chat_with_model_events(
     budget_notice_provider=None,
     request_reason: str = "",
     resume_turn: bool = False,
+    # 只读目标预算：None 走 TurnProgressGuard 默认（交互回合 48）。
+    # 一次性子代理（尤其只读审查）由调用方显式放宽，避免大批量逐章读取
+    # 在收敛出结论前被误判为“无进展”而熔断。
+    progress_read_budget: int | None = None,
 ):
     if computer_turn_source not in COMPUTER_TURN_SOURCES:
         raise ValueError(
@@ -1045,6 +1049,7 @@ def chat_with_model_events(
             computer_capability=computer_turn_capability,
             budget_notice_provider=budget_notice_provider,
             request_reason=request_reason,
+            progress_read_budget=progress_read_budget,
         )
         for chunk in generator:
             yield from drain_public_events()
@@ -1411,6 +1416,7 @@ def _chat_with_model_generator(
     computer_capability=None,
     budget_notice_provider=None,
     request_reason: str = "",
+    progress_read_budget: int | None = None,
 ):
     from core.model_manager import get_model_protocol
 
@@ -1520,7 +1526,7 @@ def _chat_with_model_generator(
     repeat_call_guard = RepeatCallGuard()
     from core.harness.progress_guard import TurnProgressGuard
 
-    progress_guard = TurnProgressGuard()
+    progress_guard = TurnProgressGuard(max_unique_reads=progress_read_budget)
     consecutive_error_steps = 0
     last_loop_guard_turn = -10
     loop_guard_count = 0

@@ -94,6 +94,17 @@ def default_subagent_allowed_tools(role: str):
     return _SUBAGENT_DEFAULT_ALLOWED_TOOLS.get(role, None)
 
 
+# 子代理的只读目标预算（TurnProgressGuard 的 max_unique_reads）。
+# 交互回合默认 48 是“防无限换路径绕过熔断”的早停线，但子代理是一次性完整
+# 子任务：只读角色（review / explore）根本没有写工具，永远不可能产生
+# mutation 进展，只能靠“读到新目标”续命；而审查类子任务天然要逐章读正文
+# 加设定/追踪文件（一次审查 100-300 个文件是常态）。沿用 48 会让合法审查在
+# 收敛出结论前必然熔断（NoProgressError）——实测已发生。
+# 放宽到 1024：足够覆盖“每章 1-2 次分页读取 × 几百章”，仍保留有限形制；
+# 子代理另有 timeout_seconds 与轮次上限约束，不会因放宽预算无限消耗。
+_SUBAGENT_PROGRESS_READ_BUDGET = 1024
+
+
 # run_subagent 的 schema 默认值是 general。计划项没写具体角色时，general 和空值
 # 都表示「请按 stage 代选」，不能把分析项降成没有命令的 explore。
 _PLAN_STAGE_SUBAGENT_TYPES = {
@@ -4999,6 +5010,7 @@ class SubagentManager:
             cache_session_id=task.parent_session,
             model_id=current_model_id,
             budget_notice_provider=_budget_notice_provider,
+            progress_read_budget=_SUBAGENT_PROGRESS_READ_BUDGET,
         )
 
         answer = []

@@ -23,10 +23,28 @@ class TurnProgressGuard:
     # 否则合法调查会在首次写入前被误杀。
     MAX_UNIQUE_READS = 48
 
-    def __init__(self) -> None:
+    def __init__(self, max_unique_reads: int | None = None) -> None:
+        self._max_unique_reads = self._resolve_read_budget(max_unique_reads)
         self._baseline: ProgressObservation | None = None
         self._stalled_steps = 0
         self._seen_reads: set[str] = set()
+
+    @classmethod
+    def _resolve_read_budget(cls, value: int | None) -> int:
+        """把调用方传入的只读预算归一为合法正整数，非法值回落默认。
+
+        交互回合（主 Agent）沿用 MAX_UNIQUE_READS；一次性子代理任务——尤其
+        只读审查（逐章读正文 + 设定 + 追踪文件，且没有写工具可产生 mutation）
+        ——读取目标数天然远超交互回合，必须由调用方显式放宽，否则合法审查会在
+        收敛出结论前被误判为停滞并熔断（NoProgressError）。
+        """
+        if value is None:
+            return cls.MAX_UNIQUE_READS
+        try:
+            budget = int(value)
+        except (TypeError, ValueError):
+            return cls.MAX_UNIQUE_READS
+        return budget if budget > 0 else cls.MAX_UNIQUE_READS
 
     def observe(self, observation: ProgressObservation) -> bool:
         hash_changed = (
@@ -45,7 +63,7 @@ class TurnProgressGuard:
             self._seen_reads.clear()
         if observation.read_signatures:
             for signature in observation.read_signatures:
-                if len(self._seen_reads) >= self.MAX_UNIQUE_READS:
+                if len(self._seen_reads) >= self._max_unique_reads:
                     break
                 if signature not in self._seen_reads:
                     self._seen_reads.add(signature)
