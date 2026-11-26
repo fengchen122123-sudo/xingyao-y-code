@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -92,6 +93,23 @@ _HEALTH_REASON_NO_LOGIN = "未登录基元律动账号"
 _HEALTH_REASON_EXPIRED = "登录已失效，请重新登录"
 _HEALTH_REASON_NETWORK = "会话校验失败（网络异常，可稍后重试）"
 
+# 会话 cookie 的指纹：只有相对上次落盘发生变化时才重新加密写文件。
+# 服务端会在请求之间轮换 tr_session，而旧实现只在登录那一刻存一次盘，
+# 重启后恢复的往往已是作废快照——这是登录态两三天就失效的主因。
+_COOKIE_DIGEST = ""
+
+# 会话保活：服务端没有 refresh 端点，客户端只能靠「定期活动」维持会话，
+# 并在服务端下发新 cookie 时回写。间隔默认 25 分钟，设为 0 可关闭。
+_KEEPALIVE_ENV = "YCODE_TR_KEEPALIVE_MINUTES"
+_KEEPALIVE_DEFAULT_MINUTES = 25.0
+_KEEPALIVE_MIN_SECONDS = 60.0
+_KEEPALIVE_THREAD: threading.Thread | None = None
+_KEEPALIVE_LOCK = threading.Lock()
+_KEEPALIVE_STOP = threading.Event()
+# 主线程与保活线程都可能触发回写：串行化文件写入，避免两个 write_text
+# 同时 truncate 写出半截密文（那会导致下次启动恢复失败）。
+_SESSION_WRITE_LOCK = threading.Lock()
+
 
 class TokenRhythmAuthError(RuntimeError):
     """登录 / 绑定失败。message 为可直接展示给用户的中文提示。"""
@@ -110,12 +128,12 @@ class TokenRhythmAuthError(RuntimeError):
         self.status = status
 
 
-def _save_session(client: httpx.Client) -> None:
+def _save_session(client: httpx.Client) -> bool:
     """把当前会话 cookie 加密写入本地，供下次启动恢复登录态。
 
     只保存 name/value/domain/path/expires；cookie 等同于账号凭证，整体经
     DPAPI 加密（绑定当前 Windows 用户）后再落盘。已过期的 cookie 不写。
-    保存失败只记日志，绝不影响本次登录结果。
+    保存失败只记日志，绝不影响本次登录结果；返回是否真的写了盘。
     """
     try:
         now = time.time()
@@ -138,20 +156,50 @@ def _save_session(client: httpx.Client) -> None:
                 }
             )
         if not cookies:
-            return
+            return False
         from core.credentials import protect_secret
 
         payload = json.dumps(
             {"v": 1, "saved_at": int(now), "cookies": cookies}, ensure_ascii=False
         )
+        encrypted = protect_secret(payload)
         _SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _SESSION_FILE.write_text(protect_secret(payload), encoding="utf-8")
-        try:
-            os.chmod(_SESSION_FILE, 0o600)
-        except OSError:
-            pass
+        with _SESSION_WRITE_LOCK:
+            _SESSION_FILE.write_text(encrypted, encoding="utf-8")
+            try:
+                os.chmod(_SESSION_FILE, 0o600)
+            except OSError:
+                pass
+        return True
     except Exception:  # noqa: BLE001 - 持久化失败不能影响登录主流程
         logger.warning("基元律动会话保存失败（不影响本次登录）", exc_info=True)
+        return False
+
+
+def _cookie_digest(client: httpx.Client) -> str:
+    """cookie jar 的稳定指纹：只用于判断是否需要回写，不落盘也不进日志。"""
+    parts = sorted(
+        f"{cookie.domain}\x00{cookie.path}\x00{cookie.name}\x00{cookie.value}"
+        for cookie in client.cookies.jar
+    )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _save_session_if_changed(client: httpx.Client) -> None:
+    """cookie jar 相对上次落盘有变化才重新加密写文件。
+
+    每个请求都做一次 DPAPI 加密代价过高，而服务端只在轮换会话时下发新
+    cookie，所以用指纹去重；写盘失败只记 debug 日志，绝不影响本次请求。
+    """
+    global _COOKIE_DIGEST
+    try:
+        digest = _cookie_digest(client)
+        if digest == _COOKIE_DIGEST:
+            return
+        if _save_session(client):
+            _COOKIE_DIGEST = digest
+    except Exception:  # noqa: BLE001 - 回写失败不能影响请求结果
+        logger.debug("基元律动会话回写失败", exc_info=True)
 
 
 def _load_session(client: httpx.Client) -> bool:
@@ -201,6 +249,71 @@ def _clear_session() -> None:
         logger.warning("基元律动会话清理失败", exc_info=True)
 
 
+def _keepalive_interval_seconds() -> float:
+    """保活间隔（秒）；0 表示关闭。低于 60 秒一律抬到 60 秒，避免配置手滑刷屏。"""
+    raw = os.environ.get(_KEEPALIVE_ENV, "").strip()
+    if raw:
+        try:
+            minutes = float(raw)
+        except ValueError:
+            minutes = _KEEPALIVE_DEFAULT_MINUTES
+    else:
+        minutes = _KEEPALIVE_DEFAULT_MINUTES
+    if minutes <= 0:
+        return 0.0
+    return max(_KEEPALIVE_MIN_SECONDS, minutes * 60.0)
+
+
+def _keepalive_loop(interval: float) -> None:
+    """低频探活：维持服务端会话活跃，并借响应把轮换后的 cookie 回写。
+
+    - 未登录 / 未恢复会话时直接跳过，空闲进程不会产生任何请求；
+    - 网络异常由 session_health 内部区分，绝不误清本地会话；
+    - 任何异常都在线程内吞掉，保活失败不能把主进程带崩。
+    """
+    while not _KEEPALIVE_STOP.wait(interval):
+        with _LOCK:
+            active = bool(_STATE.get("logged_in") or _STATE.get("restored"))
+        if not active:
+            continue
+        try:
+            session_health(force=True)
+        except Exception:  # noqa: BLE001 - 保活线程绝不向外抛
+            logger.debug("基元律动会话保活异常", exc_info=True)
+
+
+def _ensure_keepalive() -> None:
+    """幂等启动保活线程；间隔为 0 时不做任何事。"""
+    global _KEEPALIVE_THREAD
+    interval = _keepalive_interval_seconds()
+    if interval <= 0:
+        return
+    with _KEEPALIVE_LOCK:
+        if _KEEPALIVE_THREAD is not None and _KEEPALIVE_THREAD.is_alive():
+            return
+        thread = threading.Thread(
+            target=_keepalive_loop,
+            args=(interval,),
+            name="tr-session-keepalive",
+            daemon=True,
+        )
+        _KEEPALIVE_THREAD = thread
+        thread.start()
+
+
+def _stop_keepalive() -> None:
+    """唤醒并等待保活线程结束；供测试与进程收尾使用。"""
+    global _KEEPALIVE_THREAD
+    with _KEEPALIVE_LOCK:
+        thread = _KEEPALIVE_THREAD
+        _KEEPALIVE_THREAD = None
+    if thread is None:
+        return
+    _KEEPALIVE_STOP.set()
+    thread.join(timeout=2.0)
+    _KEEPALIVE_STOP.clear()
+
+
 def _get_client() -> httpx.Client:
     global _CLIENT
     with _LOCK:
@@ -208,12 +321,13 @@ def _get_client() -> httpx.Client:
             client = httpx.Client(timeout=_REQUEST_TIMEOUT)
             if _load_session(client):
                 _STATE["restored"] = True
+                _ensure_keepalive()
             _CLIENT = client
         return _CLIENT
 
 
 def _reset_state() -> None:
-    global _CLIENT
+    global _CLIENT, _COOKIE_DIGEST
     with _LOCK:
         client = _CLIENT
         _CLIENT = None
@@ -231,6 +345,7 @@ def _reset_state() -> None:
         )
     # 会话状态变了：健康检查缓存必须同步作废，否则旧结论会卡住新会话最多 60 秒
     _invalidate_health_cache()
+    _COOKIE_DIGEST = ""
     if client is not None:
         try:
             client.close()
@@ -363,6 +478,8 @@ def _request(
             server_message=server_message,
             status=status,
         )
+    # 成功响应可能带来轮换后的会话 cookie：立刻回写，保证重启后拿到最新快照。
+    _save_session_if_changed(_get_client())
     return payload
 
 
@@ -412,6 +529,7 @@ def password_login(account: str, password: str) -> dict:
         _STATE["challenge_id"] = None
         _STATE["challenge_phone"] = None
     _save_session(_get_client())
+    _ensure_keepalive()
     # 刚登录的会话必须立刻重新校验，不能拿登录前的旧健康结论挡住对话
     _invalidate_health_cache()
     return {"user": user, "ok": True}
@@ -533,6 +651,7 @@ def sms_login(phone: str, code: str, invite_code: str | None = None) -> dict:
         _STATE["challenge_id"] = None
         _STATE["challenge_phone"] = None
     _save_session(_get_client())
+    _ensure_keepalive()
     _invalidate_health_cache()
     return {"user": user, "ok": True}
 
