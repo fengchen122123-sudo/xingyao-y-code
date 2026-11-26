@@ -89,3 +89,25 @@ it('端到端：用户在 A，B 跑完出绿点，切到 B 点消失，回 A 后
   store.handleBridgeEvent(makeEvent('turn_finish', 'session-b'));
   expect('session-b' in store.sessionStatusDots).toBe(false);
 });
+
+it('报错后补发的 turn_finish 不覆盖红点，新回合开始才清掉', () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-a';
+
+  // 后端异常收尾：先 turn_error，再由 finish_once 补发 turn_finish
+  store.handleBridgeEvent({ type: 'turn_error', data: { session_name: 'session-b', message: '429' } } as any);
+  expect(store.sessionStatusDots['session-b']).toBe('red');
+
+  store.handleBridgeEvent(makeEvent('turn_finish', 'session-b'));
+  expect(store.sessionStatusDots['session-b']).toBe('red');
+
+  store.handleBridgeEvent(makeEvent('turn_idle', 'session-b'));
+  expect(store.sessionStatusDots['session-b']).toBe('red');
+
+  // 下一回合开始：上一轮红点作废，正常完成后打绿点
+  store.handleBridgeEvent(makeEvent('turn_start', 'session-b'));
+  expect('session-b' in store.sessionStatusDots).toBe(false);
+
+  store.handleBridgeEvent(makeEvent('turn_finish', 'session-b'));
+  expect(store.sessionStatusDots['session-b']).toBe('green');
+});

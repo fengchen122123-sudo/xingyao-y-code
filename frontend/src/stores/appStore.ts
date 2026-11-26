@@ -5693,6 +5693,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
         // 新回合已经开始：上一轮的停止请求必定已生效，兜底定时器不得再对该会话解锁
         this._clearStopFallbackTimer(turnSession);
+        // 上一轮的完成/待确认/报错提醒点作废，否则报错红点会一直留到用户切会话
+        if (turnSession) this._clearSessionStatusDot(turnSession);
         if (turnSession && !this.runningSessions.includes(turnSession)) {
           this.runningSessions.push(turnSession);
         }
@@ -6221,7 +6223,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // 对话结束后消息数已变化，刷新侧栏会话列表（否则计数停留在启动快照）
         this.refreshSessions();
         void this.refreshNavIndex(eventSession || undefined);
-        this._setSessionStatusDot(eventSession, 'green');
+        // 报错红点必须留到下一回合：后端 finish_once 在异常收尾时同样补发
+        // turn_finish（保证输入框解锁），无条件打绿会把「任务报错中断」覆盖成
+        // 「执行完成」。红点由 turn_start（新回合开始）或进入会话时清除。
+        if (this.sessionStatusDots[eventSession] !== 'red') {
+          this._setSessionStatusDot(eventSession, 'green');
+        }
       } else if (type === 'turn_cancelled') {
         if (eventSession) this.running = false;
         this.streamingSpeed = 0;
