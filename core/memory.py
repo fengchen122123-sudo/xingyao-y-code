@@ -2553,8 +2553,9 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
-    def ensure_session(self, session_name, workdir=None, source="GUI"):
+    def ensure_session(self, session_name, workdir=None, source="GUI", title_source="default"):
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
+        clean_title_source = str(title_source or "default").strip() or "default"
         with self._lock:
             cursor = self.conn.cursor()
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2564,8 +2565,8 @@ class MemoryManager:
                     return False
                 cursor.execute('''
                     INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source, title_source)
-                    VALUES (?, ?, ?, ?, ?, 'default')
-                ''', (session_name, wdir, now, now, source))
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (session_name, wdir, now, now, source, clean_title_source))
                 self.conn.commit()
                 return True
             except Exception:

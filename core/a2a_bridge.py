@@ -497,6 +497,28 @@ class A2ABridge:
             "is_current": bool(current_session and name == current_session),
         }
 
+    @staticmethod
+    def _ensure_mem_session(mem: Any, session_name: str, workdir: str) -> None:
+        ensure_fn = getattr(mem, "ensure_session", None)
+        if not callable(ensure_fn):
+            return
+        # 远程会话名由主控端显式约定/绑定，锁定 title_source='manual' 防止被对端 AI 命名改名失联
+        kwargs: dict[str, Any] = {
+            "workdir": workdir,
+            "source": "GUI",
+            "title_source": "manual",
+        }
+        try:
+            sig = inspect.signature(ensure_fn)
+            has_varkw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if not has_varkw:
+                kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        except (TypeError, ValueError):
+            pass
+        ensure_fn(session_name, **kwargs)
+
     def _ensure_session(self, session_name: str, workdir: str | None) -> None:
         bridge = self.bridge
         if bridge is None:
@@ -511,7 +533,7 @@ class A2ABridge:
             if created:
                 target_wdir = _normalize_workdir_value(workdir) if workdir else "GLOBAL"
                 if mem is not None and callable(getattr(mem, "ensure_session", None)):
-                    mem.ensure_session(clean_name, workdir=target_wdir, source="GUI")
+                    self._ensure_mem_session(mem, clean_name, target_wdir)
                 else:
                     create_session = getattr(bridge, "create_session", None)
                     if callable(create_session):
@@ -1130,7 +1152,7 @@ class A2ABridge:
                     mem.add_workspace(target_wdir)
                 except Exception:
                     pass
-            mem.ensure_session(clean_name, workdir=target_wdir, source="GUI")
+            self._ensure_mem_session(mem, clean_name, target_wdir)
         else:
             return {"ok": False, "msg": "bridge 不支持在不切换前台的情况下创建会话"}
 

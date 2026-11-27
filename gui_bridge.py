@@ -5035,6 +5035,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
     def _migrate_session_aux_state(
         self, old_name: str, final_name: str, *, holds_turn_start_lock: bool = False
     ) -> None:
+        if not old_name or not final_name or old_name == final_name:
+            return
         try:
             secretary.invalidate_secretary_cache(old_name)
             secretary.invalidate_secretary_cache(final_name)
@@ -5089,6 +5091,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             )
             if not success:
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
+            if final_name == old_name:
+                return {"ok": True, "name": final_name, "sessions": self.get_sessions()}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
             self._migrate_session_aux_state(old_name, final_name)
@@ -8417,7 +8421,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     self._emit_message_queue_snapshot(target_session)
                     return {"ok": True, "queued": True}
 
-                if workdir and re.match(r"^session_[a-f0-9]{6}$", target_session or ""):
+                if turn_source == "local" and workdir and re.match(r"^session_[a-f0-9]{6}$", target_session or ""):
                     # 标题派生前先净化 @{会话名} 标记：直接把标记原文截进名字会
                     # 产生「@{xxx」这类残缺标题，令该会话永远无法被 @ 引用命中
                     from core.input_parser import sanitize_session_title
@@ -10103,6 +10107,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             _phase_mark("模型流结束、撤销检查点已封闭")
             if cancelled:
                 self.emit_event("turn_cancelled", {"session_name": session_name})
+            elif turn_source in ("mcp", "lan"):
+                # 远程协作/外部投递回合保持主控端约定或选定的会话名，绝不异步 AI 改名导致失联重建
+                event_session_name = session_name
+                drain_session_name = session_name
             else:
                 event_session_name = self._maybe_auto_rename(session_name) or session_name
                 drain_session_name = event_session_name
@@ -11117,19 +11125,20 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 session_name, new_title, title_source=title_source
             )
         if success:
-            if self._current_session == session_name:
-                self._set_current_session(final_name)
-            self._migrate_session_aux_state(
-                session_name, final_name, holds_turn_start_lock=holds_turn_start_lock
-            )
-            self.emit_event("session_renamed", {
-                "old": session_name,
-                "new": final_name,
-                # 兼容旧字段名
-                "old_name": session_name,
-                "new_name": final_name,
-                "sessions": self.get_sessions(),
-            })
+            if final_name != session_name:
+                if self._current_session == session_name:
+                    self._set_current_session(final_name)
+                self._migrate_session_aux_state(
+                    session_name, final_name, holds_turn_start_lock=holds_turn_start_lock
+                )
+                self.emit_event("session_renamed", {
+                    "old": session_name,
+                    "new": final_name,
+                    # 兼容旧字段名
+                    "old_name": session_name,
+                    "new_name": final_name,
+                    "sessions": self.get_sessions(),
+                })
             return final_name
         return session_name
 

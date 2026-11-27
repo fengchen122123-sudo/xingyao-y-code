@@ -6251,8 +6251,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.currentSessionDisplayName = data.new;
         }
         // 运行中回合的会话名同步迁移：否则 runningSessions 残留旧名，
-        // 后续 turn_finish(新名) 无法正确移除，会导致 running 状态卡死
-        if (data.old && data.new) {
+        // 后续 turn_finish(新名) 无法正确移除，会导致 running 状态卡死。
+        // 注意：仅在 old !== new 时才迁移并 delete(old)，否则同名重命名会自删状态点！
+        if (data.old && data.new && data.old !== data.new) {
           this.runningSessions = this.runningSessions.map(s => (s === data.old ? data.new : s));
           this.queuedSessions = this.queuedSessions.map(s => (s === data.old ? data.new : s));
           // 停止兜底定时器同样跟名字走：首轮自动重命名常发生在停止附近，
@@ -6550,11 +6551,16 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (type === 'session_renamed' && data.old && data.new) {
           const oldKey = String(data.old);
           const newKey = String(data.new);
-          if (this.sessionRuntimeByName[oldKey]) {
-            this.sessionRuntimeByName[newKey] = this.sessionRuntimeByName[oldKey];
-            delete this.sessionRuntimeByName[oldKey];
+          // 关键守卫：oldKey === newKey 时（例如首轮 AI 命名结果/兜底截断名与当前会话名一致），
+          // 绝对不能 `delete sessionRuntimeByName[oldKey]`，否则会把当前会话刚捕获的 runtime 删空、
+          // 随后 _bindSessionRuntime 重建出 messages=[] 并闪回空白「新会话」欢迎页！
+          if (oldKey !== newKey) {
+            if (this.sessionRuntimeByName[oldKey]) {
+              this.sessionRuntimeByName[newKey] = this.sessionRuntimeByName[oldKey];
+              delete this.sessionRuntimeByName[oldKey];
+            }
+            if (this.currentSessionName === newKey) this._bindSessionRuntime(newKey);
           }
-          if (this.currentSessionName === newKey) this._bindSessionRuntime(newKey);
         } else if (switchedRuntime) {
           this._bindSessionRuntime(currentRuntimeKey, { skipLayout: true });
         }

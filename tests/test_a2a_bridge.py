@@ -432,6 +432,19 @@ def test_a2a_remote_management_endpoints_and_session_reuse(tmp_path, monkeypatch
         assert sel_data["ok"] is True
         assert sel_data["session"]["permission_mode"] == "full"
         assert sel_data["session"]["sandbox_bypass"] is True
+
+        # 7. 验证 A2A 创建或兜底建出的会话 title_source 均锁定为 manual，避免被 AI 自动重命名破坏复用
+        assert mem.get_session_title_source("nb-task-1") == "manual"
+        _, rpc_peer = _a2a_rpc(
+            srv,
+            "message/send",
+            {
+                "message": {"role": "user", "parts": [{"kind": "text", "text": "首次孤立会话"}]},
+                "metadata": {"session_name": "remote-pinned-2", "workdir": str(proj_dir), "wait_seconds": 0},
+            },
+        )
+        assert rpc_peer["result"]["metadata"]["session_name"] == "remote-pinned-2"
+        assert mem.get_session_title_source("remote-pinned-2") == "manual"
     finally:
         _clear_sandbox_state_for_tests()
         srv.stop()
