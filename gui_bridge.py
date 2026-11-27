@@ -7780,7 +7780,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 model_id=model_id,
             )
         self.post_notice(result.notice, session_name)
-        return {"ok": True, "slash": True}
+        return {"ok": True, "slash": True, "notice": result.notice}
 
     def _run_slash_action(self, action, session_name, workdir="", turn_source="local", model_id=""):
         if isinstance(action.get("action"), dict):

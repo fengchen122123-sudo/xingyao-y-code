@@ -54,6 +54,12 @@ export function buildMessageGroups(messages: ChatMessage[]): TurnGroupInfo[] {
   }
 
   for (const g of groups) {
+    // 无任何 assistant 回复的纯提示/报错回合（如 `/笔记本目录` 等直接走本地或 HTTP 的斜杠命令）：
+    // 不能留在 middle，否则 TurnGroup 因 hasAssistant=false 且 tail 为空会整段隐藏。
+    if (g.tail.length === 0 && g.middle.length > 0) {
+      g.tail.push(...g.middle);
+      g.middle.length = 0;
+    }
     const assistants = [...g.middle, ...g.tail].filter((m) => m.role === 'assistant');
     g.running = assistants.some((m) => m.execution_state === 'running');
     const states = assistants.map((m) => m.execution_state);

@@ -269,4 +269,20 @@ describe('collectFileChanges', () => {
     expect(c.name).toBe('tools.py');
     expect(c.added).toBe(1);
   });
+
+  it('无 assistant 回复的斜杠命令提示/报错组将其提升到 tail 确保可见', () => {
+    const gNotice = buildMessageGroups([
+      user('/笔记本目录'),
+      notice('工作目录列表...'),
+    ])[0];
+    expect(gNotice.middle).toHaveLength(0);
+    expect(gNotice.tail.map(m => m.role)).toEqual(['notice']);
+
+    const gError = buildMessageGroups([
+      user('/笔记本目录'),
+      error('对端星瑶暂不支持此接口（HTTP 404）'),
+    ])[0];
+    expect(gError.middle).toHaveLength(0);
+    expect(gError.tail.map(m => m.role)).toEqual(['error']);
+  });
 });

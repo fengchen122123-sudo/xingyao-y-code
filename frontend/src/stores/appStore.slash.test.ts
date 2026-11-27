@@ -50,4 +50,27 @@ describe('appStore.sendMessage slash handling', () => {
     expect(errors[0].content).toBe('未找到节点命令');
     vi.unstubAllGlobals();
   });
+
+  it('草稿会话或异步 notice 未先行到达时仍由 slash 返回值兜底落地且不重复', async () => {
+    const store = useAppStore();
+    store.currentSessionName = '';
+    store.pendingWorkdir = 'GLOBAL';
+    store._bindSessionRuntime('');
+
+    const send_user_message = vi.fn(async () => ({
+      ok: true,
+      slash: true,
+      notice: '节点【笔记本】工作目录（共 1 个）',
+    }));
+    vi.stubGlobal('pywebview', { api: { send_user_message } });
+
+    await store.sendMessage('/笔记本目录');
+    // 模拟异步 notice 事件随后重复到达
+    store.notifyChatLocal('节点【笔记本】工作目录（共 1 个）', 'notice');
+
+    const notices = store.messages.filter(m => m.role === 'notice');
+    expect(notices.length).toBe(1);
+    expect(notices[0].content).toBe('节点【笔记本】工作目录（共 1 个）');
+    vi.unstubAllGlobals();
+  });
 });

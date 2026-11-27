@@ -2393,7 +2393,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
         msgs = runtime.messages;
       }
       const last = msgs[msgs.length - 1];
-      if (kind === 'notice' && last && last.role === 'assistant' && last.execution_state === 'running') {
+      const insertAtTailRunning = Boolean(
+        kind === 'notice' && last && last.role === 'assistant' && last.execution_state === 'running',
+      );
+      const prevIdx = insertAtTailRunning ? msgs.length - 2 : msgs.length - 1;
+      const prevMsg = prevIdx >= 0 ? msgs[prevIdx] : undefined;
+      if (prevMsg && prevMsg.role === kind && prevMsg.content === msg) {
+        return;
+      }
+      if (insertAtTailRunning) {
         msgs.splice(msgs.length - 1, 0, { role: 'notice', content: msg });
       } else {
         msgs.push({ role: kind, content: msg });
@@ -5105,6 +5113,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
               msgs.splice(i, 1);
               break;
             }
+          }
+          if (res && res.ok && typeof (res as any).notice === 'string' && (res as any).notice.trim()) {
+            this.notifyChatLocal(String((res as any).notice).trim(), 'notice', sessionName);
+          } else if (res && !res.ok && typeof res.msg === 'string' && res.msg.trim()) {
+            this.notifyChatLocal(String(res.msg).trim(), 'error', sessionName);
           }
           if (this.currentSessionName === sessionName) {
             this._bindSessionRuntime(sessionName);

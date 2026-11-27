@@ -393,4 +393,33 @@ describe('TurnGroup', () => {
     expect(wrapper.find('.an-model').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it('仅有 user 与 error/notice（无 assistant）时直接渲染提示或报错卡片，不整段隐藏', () => {
+    const groupErr: TurnGroupInfo = {
+      userMsg: user('/笔记本目录'),
+      middle: [],
+      tail: [{ role: 'error', content: '对端星瑶暂不支持此接口（HTTP 404）' }],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const w1 = mount(TurnGroup, { props: { group: groupErr } });
+    expect(w1.text()).toContain('对端星瑶暂不支持此接口（HTTP 404）');
+    expect(w1.find('.assistant-name').exists()).toBe(false);
+    expect(w1.find('.fold-head').exists()).toBe(false);
+    w1.unmount();
+
+    const groupNotice: TurnGroupInfo = {
+      userMsg: user('/笔记本目录'),
+      middle: [],
+      tail: [{ role: 'notice', content: '节点【笔记本】工作目录（共 2 个）' }],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const w2 = mount(TurnGroup, { props: { group: groupNotice } });
+    expect(w2.text()).toContain('节点【笔记本】工作目录（共 2 个）');
+    expect(w2.find('.assistant-name').exists()).toBe(false);
+    w2.unmount();
+  });
 });
