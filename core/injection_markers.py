@@ -42,6 +42,8 @@ BG_SUMMARY_INJECTION_PREFIX = "请汇总所有后台子代理任务的结果并�
 
 BG_COMMAND_SUMMARY_INJECTION_PREFIX = "有一个后台命令任务执行完毕"
 
+LAN_PEER_SUMMARY_INJECTION_PREFIX = "远程节点任务已返回结果"
+
 SYSTEM_INJECTED_USER_PREFIXES: tuple[str, ...] = (
     "<task-notification>",
     "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何",
@@ -52,6 +54,7 @@ SYSTEM_INJECTED_USER_PREFIXES: tuple[str, ...] = (
     ORCHESTRATION_NUDGE_PREFIX,
     BG_SUMMARY_INJECTION_PREFIX,
     BG_COMMAND_SUMMARY_INJECTION_PREFIX,
+    LAN_PEER_SUMMARY_INJECTION_PREFIX,
 )
 
 _HOOK_CONTEXT_HEADER_RE = re.compile(r"^【\S+ hook 追加上下文】")

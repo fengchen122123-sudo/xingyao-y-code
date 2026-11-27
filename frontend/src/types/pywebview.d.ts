@@ -154,6 +154,37 @@ export interface FeishuSettingsSnapshot {
   };
 }
 
+export interface LanPeerInfo {
+  id: string;
+  name: string;
+  url: string;
+  protocol: string;
+  has_token: boolean;
+  token_plaintext: boolean;
+  default_session: string;
+  default_workdir: string;
+  description: string;
+  enabled: boolean;
+  last_status: string;
+  last_agent_name: string;
+  last_checked_at: string;
+  last_error: string;
+}
+
+export interface LanPeerLocalInfo {
+  ok: boolean;
+  running: boolean;
+  lan_ip?: string;
+  lan_port?: number;
+  a2a_port?: number;
+  a2a_url?: string;
+  agent_card_url?: string;
+  ws_url?: string;
+  token?: string;
+  import_json?: string;
+  msg?: string;
+}
+
 export interface DecisionSettingsSnapshot {
   version: number;
   enabled: boolean;
@@ -1809,6 +1840,28 @@ export interface PyWebViewAPI {
   // AI 生成内容目录：不可用路径显式拒绝（ok=false + msg），不做静默降级
   set_ai_output_dir(path: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  get_lan_peers(): Promise<{ ok: boolean; peers: LanPeerInfo[]; msg?: string }>;
+  save_lan_peer(payload: {
+    id?: string;
+    name: string;
+    url: string;
+    protocol?: string;
+    token?: string;
+    default_session?: string;
+    default_workdir?: string;
+    description?: string;
+    enabled?: boolean;
+  }): Promise<{ ok: boolean; peer?: LanPeerInfo; peers?: LanPeerInfo[]; msg?: string }>;
+  delete_lan_peer(peerId: string): Promise<{ ok: boolean; peers?: LanPeerInfo[]; msg?: string }>;
+  test_lan_peer(peerId: string): Promise<{
+    ok: boolean;
+    online: boolean;
+    protocol?: string;
+    agent_name?: string;
+    msg?: string;
+    peers?: LanPeerInfo[];
+  }>;
+  get_lan_peer_local_info(ensureStarted?: boolean): Promise<LanPeerLocalInfo>;
   // 子代理开关：关闭后不派发子代理，计划编排工具一并不可用
   set_subagent_enabled(value: boolean): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   get_feishu_settings(): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;

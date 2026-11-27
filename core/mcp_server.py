@@ -6,6 +6,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
+from core.a2a_bridge import A2ABridge
+
 logger = logging.getLogger(__name__)
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
@@ -86,6 +88,10 @@ class McpServer:
         self._lock = threading.Lock()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self.a2a = A2ABridge(bridge=bridge)
+
+    def on_event(self, event_type: str, data: Any) -> None:
+        self.a2a.on_event(event_type, data)
 
     def start(self) -> Dict[str, Any]:
         with self._lock:
@@ -280,9 +286,16 @@ class _McpRequestHandler(BaseHTTPRequestHandler):
     timeout = 30
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler 约定)
-        """``POST /mcp``：鉴权 → 解析 JSON → 交给 McpServer 分发."""
+        """``POST /mcp``、``/a2a`` 与 ``/api/a2a/*`` 路由分发."""
         parsed = urlparse(self.path)
-        if parsed.path != "/mcp":
+        path = parsed.path
+        is_a2a_route = (
+            path == "/a2a"
+            or path == "/api/a2a/send"
+            or path == "/api/a2a/permission"
+            or (path.startswith("/api/a2a/tasks/") and path.endswith("/cancel"))
+        )
+        if path != "/mcp" and not is_a2a_route:
             self._send_text(404, "not found")
             return
         mcp = self._mcp()
@@ -301,19 +314,103 @@ class _McpRequestHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self._send_json(400, _error(None, -32700, "parse error"))
             return
-        status, body = mcp.handle_message(payload)
-        if body is None:
-            self._send_empty(status)
-        else:
-            self._send_json(status, body)
+        if path == "/mcp":
+            status, body = mcp.handle_message(payload)
+            if body is None:
+                self._send_empty(status)
+            else:
+                self._send_json(status, body)
+            return
+        if path == "/a2a":
+            status, body = mcp.a2a.handle_jsonrpc(payload)
+            if body is None:
+                self._send_empty(status)
+            else:
+                self._send_json(status, body)
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"ok": False, "msg": "request body must be JSON object"})
+            return
+        if path == "/api/a2a/send":
+            res = mcp.a2a.send_message(
+                str(payload.get("text") or ""),
+                session_name=payload.get("session_name"),
+                workdir=payload.get("workdir"),
+                wait_seconds=payload.get("wait_seconds", 20),
+                context_id=payload.get("contextId") or payload.get("context_id"),
+                hop=payload.get("hop", 0),
+                caller=str(payload.get("caller") or ""),
+            )
+            self._send_json(200, res)
+            return
+        if path == "/api/a2a/permission":
+            res = mcp.a2a.respond_permission(
+                str(payload.get("request_id") or ""),
+                bool(payload.get("allow", False)),
+                bool(payload.get("always", False)),
+                task_id=payload.get("task_id"),
+                wait_seconds=payload.get("wait_seconds", 20),
+            )
+            self._send_json(200, res)
+            return
+        if path.startswith("/api/a2a/tasks/") and path.endswith("/cancel"):
+            task_id = path[len("/api/a2a/tasks/"):-len("/cancel")].strip("/")
+            task = mcp.a2a.cancel_task(task_id)
+            if task is None:
+                self._send_json(404, {"ok": False, "msg": "task not found"})
+            else:
+                self._send_json(200, task)
+            return
 
     def do_GET(self):  # noqa: N802
-        """``GET /health`` 探活；``GET /mcp`` 明确拒绝（不支持 SSE 长连接）."""
+        """``GET /health``、``/.well-known/agent.json`` 与 ``/api/a2a/*``."""
         parsed = urlparse(self.path)
-        if parsed.path == "/health":
+        path = parsed.path
+        if path == "/health":
             self._send_text(200, "ok")
             return
-        if parsed.path == "/mcp":
+        if path == "/.well-known/agent.json":
+            mcp = self._mcp()
+            host = self.headers.get("Host") or f"{mcp._dial_host()}:{mcp.port}"
+            base_url = f"http://{host}"
+            ws_url = ""
+            bridge = mcp.bridge
+            lan = getattr(bridge, "_lan_server", None) if bridge is not None else None
+            if lan is not None and getattr(lan, "port", 0):
+                lan_ip = getattr(lan, "lan_ip", "") or mcp._dial_host()
+                ws_url = f"ws://{lan_ip}:{lan.port}/"
+            self._send_json(200, mcp.a2a.build_agent_card(base_url, ws_url=ws_url))
+            return
+        if path == "/api/a2a/status":
+            mcp = self._mcp()
+            if not mcp.authorize(self.headers.get("Authorization"), parse_qs(parsed.query)):
+                self._send_json(
+                    401,
+                    _error(None, -32001, "unauthorized"),
+                    {"WWW-Authenticate": 'Bearer realm="mcp"'},
+                )
+                return
+            self._send_json(200, mcp.a2a.get_status())
+            return
+        if path.startswith("/api/a2a/tasks/"):
+            mcp = self._mcp()
+            if not mcp.authorize(self.headers.get("Authorization"), parse_qs(parsed.query)):
+                self._send_json(
+                    401,
+                    _error(None, -32001, "unauthorized"),
+                    {"WWW-Authenticate": 'Bearer realm="mcp"'},
+                )
+                return
+            task_id = path[len("/api/a2a/tasks/"):].strip("/")
+            query = parse_qs(parsed.query)
+            wait_raw = (query.get("wait_seconds") or ["0"])[0]
+            task = mcp.a2a.get_task(task_id, wait_seconds=wait_raw)
+            if task is None:
+                self._send_json(404, {"ok": False, "msg": "task not found"})
+            else:
+                self._send_json(200, task)
+            return
+        if path == "/mcp":
             self._send_json(
                 405,
                 _error(None, -32600, "method not allowed: use POST /mcp"),

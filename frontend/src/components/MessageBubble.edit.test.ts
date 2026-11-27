@@ -148,3 +148,42 @@ it('removing the only image submits even when the text is unchanged', async () =
   );
   wrapper.unmount();
 });
+
+it('submitting with unchanged text and images still regenerates', async () => {
+  const store = useAppStore();
+  const editSpy = vi.spyOn(store, 'editUserMessage').mockResolvedValue(true);
+  const wrapper = mount(MessageBubble, { props: { msg: userMessage({ _msg_id: 12 }) } });
+
+  await wrapper.get('[data-test="user-edit-btn"]').trigger('click');
+  await wrapper.get('[data-test="user-edit-submit"]').trigger('click');
+  await flushPromises();
+
+  expect(editSpy).toHaveBeenCalledWith(
+    expect.objectContaining({ _msg_id: 12 }), '原始提问', [],
+  );
+  wrapper.unmount();
+});
+
+it('clicking cancel button closes editing without touching the store', async () => {
+  const store = useAppStore();
+  const editSpy = vi.spyOn(store, 'editUserMessage').mockResolvedValue(true);
+  const wrapper = mount(MessageBubble, { props: { msg: userMessage({ _msg_id: 12 }) } });
+
+  await wrapper.get('[data-test="user-edit-btn"]').trigger('click');
+  await wrapper.get('[data-test="user-edit-cancel"]').trigger('click');
+  await flushPromises();
+
+  expect(editSpy).not.toHaveBeenCalled();
+  expect(wrapper.find('[data-test="user-edit-input"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('persisted image-only user message exposes edit button without copy button', () => {
+  const wrapper = mount(MessageBubble, {
+    props: { msg: { role: 'user', content: '', _msg_id: 12, images: ['data:image/png;base64,AAA'] } },
+  });
+
+  expect(wrapper.find('[data-test="user-edit-btn"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="user-copy-btn"]').exists()).toBe(false);
+  wrapper.unmount();
+});

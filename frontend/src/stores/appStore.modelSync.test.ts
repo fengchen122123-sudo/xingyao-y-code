@@ -58,3 +58,47 @@ it('model_changed 递增会话模型版本号，使在途 switchSession 旧快�
 
   expect(store._sessionModelVersion['会话一']).toBe(before + 1);
 });
+
+it('turn_start 固定本轮执行模型，回合中切换底部模型不影响本轮与后续轮次显示', () => {
+  const store = useAppStore();
+  store.currentSessionName = '会话一';
+  store.activeModelId = 'm-ds';
+  store.activeModelName = 'deepseek-v4.1-flash-1017';
+
+  store.handleBridgeEvent({
+    type: 'turn_start',
+    data: {
+      session_name: '会话一',
+      user_text: '请检查',
+      model_id: 'm-ds',
+      model_name: 'deepseek-v4.1-flash-1017',
+    },
+  });
+
+  // 回合执行中途用户在底部切换成另一个模型
+  store.activeModelId = 'm-glm';
+  store.activeModelName = 'glm-5.3-flash';
+
+  store.handleBridgeEvent({
+    type: 'token_delta',
+    data: { session_name: '会话一', text: '第一步' },
+  });
+  store.handleBridgeEvent({
+    type: 'round_started',
+    data: { session_name: '会话一' },
+  });
+  store.handleBridgeEvent({
+    type: 'message_final',
+    data: {
+      session_name: '会话一',
+      content: '最终回答',
+      model_id: 'm-ds',
+      model_name: 'deepseek-v4.1-flash-1017',
+    },
+  });
+
+  const assistants = store.messages.filter(m => m.role === 'assistant');
+  expect(assistants).toHaveLength(2);
+  expect(assistants[0].model_name).toBe('deepseek-v4.1-flash-1017');
+  expect(assistants[1].model_name).toBe('deepseek-v4.1-flash-1017');
+});

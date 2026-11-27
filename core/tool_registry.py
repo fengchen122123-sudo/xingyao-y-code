@@ -699,6 +699,52 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="读取历史会话详情",
             side_effect_scope="none",
         ),
+        ToolSpec(
+            name="lan_peer_list",
+            description=(
+                "列出已配置的局域网 / 跨机协作节点（其他电脑上的星瑶或兼容 A2A 的 Agent），"
+                "支持可选 probe=true 实时探测各节点在线状态与 Agent 能力信息。"
+            ),
+            input_schema=_schema({
+                "probe": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "是否实时发请求探测每个启用节点的连通性与在线状态",
+                },
+            }),
+            execute=_lan_peer_list_wrapper,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查看局域网协作节点",
+            side_effect_scope="network",
+        ),
+        ToolSpec(
+            name="lan_peer_poll",
+            description=(
+                "查询或长轮询等待远程节点任务（由 lan_peer_send 发起）的最新进度与结果。"
+                "当之前派发给另一台电脑的任务仍在执行中时，可调用本工具查看结果。"
+            ),
+            input_schema=_schema({
+                "task_id": {
+                    "type": "string",
+                    "description": "lan_peer_send 返回的 task_id（本地或远端任务编号）",
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "default": 25,
+                    "minimum": 0,
+                    "maximum": 60,
+                    "description": "最多等待结果的秒数（0~60，默认 25）",
+                },
+            }, ["task_id"]),
+            execute=_lan_peer_poll_wrapper,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询远程节点任务进度",
+            side_effect_scope="network",
+        ),
     ]
 
     mutating_specs = [
@@ -1590,6 +1636,89 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="管理长期个人记忆",
             side_effect_scope="system",
         ),
+        ToolSpec(
+            name="lan_peer_send",
+            description=(
+                "向另一台电脑上的星瑶（或兼容 A2A 协议的 Agent）下发自然语言任务并获取执行结果。"
+                "先短等待最多 wait_seconds 秒：若对端在窗口内完成则直接返回内容；若需要权限审批会返回"
+                "request_id 供用户确认；若超时仍在运行会自动转入后台监听，完成后自动把结果推回本会话。"
+            ),
+            input_schema=_schema({
+                "peer": {
+                    "type": "string",
+                    "description": "目标节点 ID 或名称（先通过 lan_peer_list 查看）",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "要交给对端 Agent 执行的自然语言任务或指令",
+                },
+                "session_name": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选，指定对端隔离会话名（留空默认按本机主机名隔离，不打扰对端前台）",
+                },
+                "workdir": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选，指定对端电脑上的工作目录路径",
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 0,
+                    "maximum": 60,
+                    "description": "初始同步等待秒数（0~60，默认 30；超时将转后台自动回传）",
+                },
+            }, ["peer", "text"]),
+            execute=_lan_peer_send_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="向远程节点派发任务",
+            side_effect_scope="network",
+        ),
+        ToolSpec(
+            name="lan_peer_approve",
+            description=(
+                "向远程节点提交权限确认决定（当 lan_peer_send / lan_peer_poll 或后台回调提示对端"
+                "等待权限确认时调用）。必须先取得用户明确同意，严禁擅自放行高危操作。"
+            ),
+            input_schema=_schema({
+                "peer": {
+                    "type": "string",
+                    "description": "目标节点 ID 或名称",
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "待确认的权限请求 request_id",
+                },
+                "allow": {
+                    "type": "boolean",
+                    "description": "是否允许执行（true=允许，false=拒绝）",
+                },
+                "always": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "是否记住本次放行选择（默认 false）",
+                },
+                "task_id": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选，关联的本地或远端 task_id，提交后继续等待任务完成",
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "default": 25,
+                    "minimum": 0,
+                    "maximum": 60,
+                    "description": "提交后继续等待结果秒数（0~60，默认 25）",
+                },
+            }, ["peer", "request_id", "allow"]),
+            execute=_lan_peer_approve_wrapper,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="响应远程节点权限请求",
+            side_effect_scope="network",
+        ),
     ]
 
     admin_specs = [
@@ -1677,6 +1806,56 @@ def _mcp_set_enabled_wrapper(name, enabled):
 def _mcp_list_servers_wrapper():
     from core.mcp_client import mcp_manager
     return ToolResult(content=mcp_manager.list_servers(), is_error=False)
+
+
+def _lan_peer_list_wrapper(probe: bool = False):
+    from core.lan_peers import tool_lan_peer_list
+    text = tool_lan_peer_list(probe=bool(probe))
+    return ToolResult(content=text, is_error=text.startswith("🚨"))
+
+
+def _lan_peer_send_wrapper(
+    peer: str,
+    text: str,
+    session_name: str = "",
+    workdir: str = "",
+    wait_seconds: int = 30,
+):
+    from core.lan_peers import tool_lan_peer_send
+    out = tool_lan_peer_send(
+        peer=peer,
+        text=text,
+        session_name=session_name,
+        workdir=workdir,
+        wait_seconds=wait_seconds,
+    )
+    return ToolResult(content=out, is_error=out.startswith("🚨"))
+
+
+def _lan_peer_poll_wrapper(task_id: str, wait_seconds: int = 25):
+    from core.lan_peers import tool_lan_peer_poll
+    out = tool_lan_peer_poll(task_id=task_id, wait_seconds=wait_seconds)
+    return ToolResult(content=out, is_error=out.startswith("🚨"))
+
+
+def _lan_peer_approve_wrapper(
+    peer: str,
+    request_id: str,
+    allow: bool,
+    always: bool = False,
+    task_id: str = "",
+    wait_seconds: int = 25,
+):
+    from core.lan_peers import tool_lan_peer_approve
+    out = tool_lan_peer_approve(
+        peer=peer,
+        request_id=request_id,
+        allow=allow,
+        always=always,
+        task_id=task_id,
+        wait_seconds=wait_seconds,
+    )
+    return ToolResult(content=out, is_error=out.startswith("🚨"))
 
 
 def _browser_set_viewport_wrapper(width, height):

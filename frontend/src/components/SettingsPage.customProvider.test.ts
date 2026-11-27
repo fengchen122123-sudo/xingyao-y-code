@@ -15,6 +15,7 @@ const stubs = {
   PersonaSettings: true,
   FeishuSettings: true,
   CloudRelaySettings: true,
+  LanPeersSettings: true,
   PluginsSettings: true,
   PluginSettingsPanel: true,
   HooksSettings: true,

@@ -91,6 +91,7 @@ _REPEAT_GUARD_EXEMPT_TOOLS = frozenset({
     # 收尾可能先失败（验证未过）后成功（修正后再收尾）：豁免重复抑制，
     # 避免第三次同参数 plan_finish 被拦截导致接管项无法收尾
     "plan_finish",
+    "lan_peer_poll",
 })
 
 
@@ -297,6 +298,7 @@ def _submit_on_pool(pool, function, *args, **kwargs):
 
     workdir = get_workdir()
     thread_session = app_context.get_thread_session()
+    thread_turn_source = app_context.get_thread_turn_source()
     thread_permission_mode = app_context.get_thread_permission_mode()
     from core.plan import get_plan_route, set_current_plan_session as _bind_plan_route
 
@@ -306,12 +308,15 @@ def _submit_on_pool(pool, function, *args, **kwargs):
         cur_thread = threading.current_thread()
         prev_thread_name = cur_thread.name
         prev_session = app_context.get_thread_session()
+        prev_turn_source = app_context.get_thread_turn_source()
         prev_plan_session, prev_plan_dir = get_plan_route()
         cur_thread.name = "ycode-tool-call"
         try:
             with workspace_scope(workdir):
                 if thread_session:
                     app_context.set_thread_session(thread_session)
+                if thread_turn_source:
+                    app_context.set_thread_turn_source(thread_turn_source)
                 if plan_session_id:
                     _bind_plan_route(plan_session_id, storage_dir=plan_storage_dir)
                 permission_scope = (
@@ -330,6 +335,10 @@ def _submit_on_pool(pool, function, *args, **kwargs):
             cur_thread.name = prev_thread_name
             try:
                 app_context.set_thread_session(prev_session)
+            except Exception:
+                pass
+            try:
+                app_context.set_thread_turn_source(prev_turn_source)
             except Exception:
                 pass
             try:

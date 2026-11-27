@@ -4,34 +4,20 @@
       <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-msg-sender">
         <b class="qq09-sender-name">木偶</b>
       </div>
-      <div class="bubble user-bubble" :class="{ 'is-editing': editing }">
+      <div v-if="editing" class="user-edit-card">
         <textarea
-          v-if="editing"
           ref="editInputRef"
           v-model="editText"
           class="user-edit-input"
           data-test="user-edit-input"
-          rows="3"
+          rows="2"
+          placeholder="修改消息内容…"
+          @input="autoResizeEditInput"
           @keydown="onEditKeydown"
           @paste="onEditPaste"
         ></textarea>
-        <div v-else-if="msg.content" class="user-text">{{ msg.content }}</div>
         <div
-          v-if="!editing && msg.images && msg.images.length"
-          class="img-grid"
-          :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
-        >
-          <img
-            v-for="(img, i) in msg.images"
-            :key="i"
-            :src="img"
-            class="msg-img"
-            alt="用户发送的图片"
-            @click="store.openLightbox(msg.images!, i)"
-          >
-        </div>
-        <div
-          v-if="editing && editImages.length"
+          v-if="editImages.length"
           class="edit-img-grid"
           data-test="user-edit-images"
         >
@@ -57,69 +43,111 @@
             class="attachment-note"
           >{{ note }}</div>
         </div>
+        <div class="user-edit-footer">
+          <input
+            ref="editImageInput"
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            multiple
+            class="edit-file-input"
+            data-test="user-edit-image-input"
+            @change="onEditImagesPicked"
+          >
+          <div class="user-edit-footer-left">
+            <button
+              type="button"
+              class="edit-icon-btn"
+              data-test="user-edit-image-add"
+              title="添加图片（也支持粘贴）"
+              aria-label="添加图片"
+              :disabled="editSubmitting"
+              @click="pickEditImages"
+            >
+              <AppIcon name="paperclip" :size="14" :stroke-width="1.85" />
+            </button>
+            <span class="user-edit-hint" :class="{ 'is-warning': store.running }">
+              <AppIcon :name="store.running ? 'triangle-alert' : 'info'" :size="12" />
+              <span>{{ editHint }}</span>
+            </span>
+          </div>
+          <div class="user-edit-footer-actions">
+            <button
+              type="button"
+              class="edit-btn edit-btn-cancel"
+              data-test="user-edit-cancel"
+              :disabled="editSubmitting"
+              @click="cancelEdit"
+            >
+              <span>取消</span>
+            </button>
+            <button
+              type="button"
+              class="edit-btn edit-btn-submit"
+              data-test="user-edit-submit"
+              :disabled="editSubmitting || (!editText.trim() && !editImages.length)"
+              @click="submitEdit"
+            >
+              <AppIcon v-if="editSubmitting" name="loader" :size="12.5" :stroke-width="2.2" class="edit-spin" />
+              <AppIcon v-else name="arrow-up" :size="13" :stroke-width="2.2" />
+              <span>{{ editSubmitting ? '处理中…' : '保存并重新生成' }}</span>
+            </button>
+          </div>
+        </div>
       </div>
-      <div v-if="editing" class="user-edit-bar">
-        <span class="user-edit-hint">{{ editHint }}</span>
-        <input
-          ref="editImageInput"
-          type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
-          multiple
-          class="edit-file-input"
-          data-test="user-edit-image-input"
-          @change="onEditImagesPicked"
-        >
-        <button
-          type="button"
-          class="msg-copy-btn"
-          data-test="user-edit-image-add"
-          :disabled="editSubmitting"
-          @click="pickEditImages"
-        >
-          <span>添加图片</span>
-        </button>
-        <button
-          type="button"
-          class="msg-copy-btn"
-          data-test="user-edit-cancel"
-          :disabled="editSubmitting"
-          @click="cancelEdit"
-        >
-          <span>取消</span>
-        </button>
-        <button
-          type="button"
-          class="msg-copy-btn user-edit-submit"
-          data-test="user-edit-submit"
-          :disabled="editSubmitting || (!editText.trim() && !editImages.length)"
-          @click="submitEdit"
-        >
-          <span>{{ editSubmitting ? '处理中…' : '保存并重新生成' }}</span>
-        </button>
-      </div>
-      <div v-else-if="msg.content" class="user-action-bar">
-        <button
-          v-if="canEdit"
-          type="button"
-          class="msg-copy-btn"
-          title="编辑并重新生成"
-          data-test="user-edit-btn"
-          @click="startEdit"
-        >
-          <AppIcon name="pencil" :size="13" :stroke-width="2" />
-          <span>编辑</span>
-        </button>
-        <button
-          class="msg-copy-btn"
-          :class="{ copied: userCopied }"
-          :title="userCopied ? '已复制' : '复制消息'"
-          data-test="user-copy-btn"
-          @click="copyUserMessage"
-        >
-          <AppIcon name="copy" :size="13" :stroke-width="2" />
-          <span>{{ userCopied ? '已复制' : '复制' }}</span>
-        </button>
-      </div>
+      <template v-else>
+        <div class="bubble user-bubble">
+          <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
+          <div
+            v-if="msg.images && msg.images.length"
+            class="img-grid"
+            :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
+          >
+            <img
+              v-for="(img, i) in msg.images"
+              :key="i"
+              :src="img"
+              class="msg-img"
+              alt="用户发送的图片"
+              @click="store.openLightbox(msg.images!, i)"
+            >
+          </div>
+          <div
+            v-if="msg.attachment_notes && msg.attachment_notes.length"
+            class="attachment-notes"
+          >
+            <div
+              v-for="(note, i) in msg.attachment_notes"
+              :key="i"
+              class="attachment-note"
+            >{{ note }}</div>
+          </div>
+        </div>
+        <div v-if="msg.content || canEdit" class="user-action-bar">
+          <button
+            v-if="canEdit"
+            type="button"
+            class="user-action-btn"
+            title="编辑并重新生成"
+            aria-label="编辑并重新生成"
+            data-test="user-edit-btn"
+            @click="startEdit"
+          >
+            <AppIcon name="pencil" :size="13.5" :stroke-width="1.85" />
+          </button>
+          <button
+            v-if="msg.content"
+            type="button"
+            class="user-action-btn"
+            :class="{ copied: userCopied }"
+            :title="userCopied ? '已复制' : '复制'"
+            :aria-label="userCopied ? '已复制' : '复制'"
+            data-test="user-copy-btn"
+            @click="copyUserMessage"
+          >
+            <AppIcon :name="userCopied ? 'check' : 'copy'" :size="13.5" :stroke-width="userCopied ? 2.2 : 1.85" />
+          </button>
+        </div>
+      </template>
     </template>
 
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
@@ -127,7 +155,7 @@
         <div v-if="showName || msg.cancelled" class="assistant-name">
           <template v-if="showName">
             <b class="an-agent">{{ store.agentName }}</b>
-            <span class="an-model">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+            <span v-if="msg.model_name" class="an-model">{{ msg.model_name }}</span>
           </template>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
@@ -876,12 +904,20 @@ const editHint = computed(() => (store.running
   ? '保存将中断当前回合，并删除该回合产生的记录'
   : '该回合的文件改动不会随编辑回滚'));
 
+function autoResizeEditInput() {
+  const el = editInputRef.value;
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(Math.max(el.scrollHeight, 44), 260)}px`;
+}
+
 async function startEdit() {
   if (!canEdit.value) return;
   editText.value = props.msg.content || '';
   editImages.value = [...(props.msg.images || [])];
   editing.value = true;
   await nextTick();
+  autoResizeEditInput();
   const el = editInputRef.value;
   if (el) {
     el.focus();
@@ -945,23 +981,10 @@ async function onEditPaste(e: ClipboardEvent) {
   await addEditImageFiles(files);
 }
 
-function sameImages(a: string[], b: string[]) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
-
 async function submitEdit() {
   if (editSubmitting.value) return;
   const text = editText.value.trim();
-  const imagesChanged = !sameImages(editImages.value, props.msg.images || []);
   if (!text && !editImages.value.length) return;
-  if (text === (props.msg.content || '').trim() && !imagesChanged) {
-    cancelEdit();
-    return;
-  }
   editSubmitting.value = true;
   try {
     const paths: string[] = [];
@@ -1073,105 +1096,232 @@ function onEditKeydown(e: KeyboardEvent) {
 .user-action-bar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
   margin-top: 4px;
+  padding-right: 2px;
   opacity: 0;
-  transition: opacity 0.15s;
+  transition: opacity 0.14s ease;
 }
-.msg-user:hover .user-action-bar {
+.msg-user:hover .user-action-bar,
+.msg-user:focus-within .user-action-bar,
+.user-action-bar:has(.copied) {
   opacity: 1;
 }
-.user-bubble.is-editing {
-  max-width: 80%;
+@media (hover: none) {
+  .user-action-bar {
+    opacity: 0.72;
+  }
+}
+.user-action-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--xy-text-3, var(--text-faint));
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease;
+}
+.user-action-btn:hover {
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text-bright));
+}
+.user-action-btn:active {
+  transform: scale(0.94);
+}
+.user-action-btn:focus-visible {
+  outline: 2px solid var(--xy-accent, var(--accent));
+  outline-offset: 1px;
+}
+.user-action-btn.copied {
+  color: var(--xy-green, var(--green));
+  background: var(--xy-green-soft, rgba(22, 163, 74, 0.1));
+}
+.user-edit-card {
+  width: min(100%, 660px);
+  background: var(--xy-card, var(--bg2));
+  border: 1px solid var(--xy-border-strong, var(--border));
+  border-radius: 16px;
+  padding: 12px 14px 10px;
+  box-shadow: var(--xy-shadow-composer, var(--xy-shadow-sm));
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+.user-edit-card:focus-within {
+  border-color: var(--xy-accent, var(--accent));
+  box-shadow: 0 0 0 3px var(--xy-accent-soft, var(--accent-soft)), var(--xy-shadow-composer, none);
 }
 .user-edit-input {
+  display: block;
   width: 100%;
-  min-width: 260px;
+  min-height: 44px;
+  max-height: 260px;
   padding: 0;
   border: 0;
   outline: none;
   background: transparent;
-  color: var(--text);
-  font: inherit;
-  line-height: 1.65;
-  resize: vertical;
+  color: var(--xy-text, var(--text));
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.625;
+  resize: none;
+  overflow-y: auto;
 }
-.user-edit-bar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+.user-edit-input::placeholder {
+  color: var(--xy-text-3, var(--text-faint));
 }
-.user-edit-hint {
-  font-size: 11px;
-  color: var(--text-faint);
-}
-.user-edit-submit {
-  color: var(--text-bright);
-  border-color: var(--accent);
-}
-.user-edit-bar .msg-copy-btn:disabled {
-  opacity: 0.55;
-  cursor: default;
-}
-/* 编辑态的图片网格：与只读缩略图分开，右上角带移除按钮 */
+/* 编辑态的图片网格：紧凑圆角缩略图，右上角带悬浮移除按钮 */
 .edit-img-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 .edit-img-cell {
   position: relative;
+  width: 64px;
+  height: 64px;
+  flex-shrink: 0;
 }
 .edit-img {
   width: 100%;
-  aspect-ratio: 1;
+  height: 100%;
   object-fit: cover;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: var(--bg3);
+  border-radius: 10px;
+  border: 1px solid var(--xy-border, var(--border));
+  background: var(--xy-surface, var(--bg3));
+  display: block;
 }
 .edit-img-remove {
   position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 20px;
-  height: 20px;
+  top: -5px;
+  right: -5px;
+  width: 18px;
+  height: 18px;
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: none;
+  border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 50%;
-  background: rgba(15, 15, 15, 0.66);
+  background: rgba(15, 15, 15, 0.72);
   color: #fff;
-  font-size: 14px;
+  font-size: 13px;
   line-height: 1;
   cursor: pointer;
+  backdrop-filter: blur(4px);
 }
-.edit-img-remove:hover {
-  background: rgba(15, 15, 15, 0.88);
+.edit-img-remove:hover:not(:disabled) {
+  background: rgba(15, 15, 15, 0.9);
+}
+.edit-img-remove:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .edit-file-input {
   display: none;
 }
-.msg-copy-btn {
+.user-edit-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--xy-border, var(--border));
+}
+.user-edit-footer-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.edit-icon-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--xy-text-2, var(--text-dim));
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.edit-icon-btn:hover:not(:disabled) {
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text-bright));
+}
+.user-edit-hint {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 8px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-faint);
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  cursor: pointer;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--xy-text-3, var(--text-faint));
 }
-.msg-copy-btn:hover {
-  color: var(--text-bright);
+.user-edit-hint.is-warning {
+  color: var(--xy-amber, var(--orange));
+}
+.user-edit-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.edit-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease, opacity 0.14s ease, filter 0.14s ease;
+}
+.edit-btn-cancel {
+  color: var(--xy-text-2, var(--text-dim));
+  background: transparent;
+  border: 1px solid var(--xy-border-strong, var(--border));
+}
+.edit-btn-cancel:hover:not(:disabled) {
+  background: var(--xy-hover, var(--bg3));
+  color: var(--xy-text, var(--text-bright));
+}
+.edit-btn-submit {
+  padding: 0 13px;
+  color: var(--xy-accent-fg, #ffffff);
+  background: var(--xy-accent, var(--accent));
+  border: 1px solid transparent;
+}
+.edit-btn-submit:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.edit-btn-submit:active:not(:disabled) {
+  filter: brightness(0.96);
+}
+.edit-btn:disabled,
+.edit-icon-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.edit-spin {
+  animation: spin 0.9s linear infinite;
 }
 
 .avatar-row {

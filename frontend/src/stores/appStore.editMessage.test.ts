@@ -183,3 +183,24 @@ it('turn_start backfills the database id onto the newest user bubble', () => {
 
   expect(store.messages[0]._msg_id).toBe(77);
 });
+
+it('clears lingering running state before resending edited message', async () => {
+  const store = useAppStore();
+  seedHistory(store);
+  store.runningSessions = ['s1'];
+  store.running = true;
+  api.edit_user_message.mockResolvedValue({ ok: true, removed: 2 });
+  let runningOnSend = true;
+  let inRunningSessionsOnSend = true;
+  const sendSpy = vi.spyOn(store, 'sendMessage').mockImplementation(async () => {
+    runningOnSend = store.running;
+    inRunningSessionsOnSend = store.runningSessions.includes('s1');
+  });
+
+  const ok = await store.editUserMessage(store.messages[2], '改过的第二条');
+
+  expect(ok).toBe(true);
+  expect(sendSpy).toHaveBeenCalledWith('改过的第二条', []);
+  expect(runningOnSend).toBe(false);
+  expect(inRunningSessionsOnSend).toBe(false);
+});

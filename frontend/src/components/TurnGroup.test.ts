@@ -1,6 +1,6 @@
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import TurnGroup from './TurnGroup.vue';
 import type { TurnGroupInfo } from '../utils/turnGroups';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
@@ -230,6 +230,167 @@ describe('TurnGroup', () => {
     expect(bar.text()).not.toContain('19s');
     expect(bar.attributes('title')).toContain('任务总时长: 25s');
     expect(bar.attributes('title')).toContain('模型耗时: 19s');
+    wrapper.unmount();
+  });
+
+  it('回合完成后在底部显示重新生成和复制按钮，运行中不显示', () => {
+    const doneGroup = finishedGroup();
+    doneGroup.userMsg!._msg_id = 88;
+    const doneWrapper = mount(TurnGroup, { props: { group: doneGroup } });
+
+    expect(doneWrapper.find('.xy-turn-footer [data-test="turn-regenerate-btn"]').exists()).toBe(true);
+    expect(doneWrapper.find('.xy-turn-footer [data-test="turn-copy-btn"]').exists()).toBe(true);
+    doneWrapper.unmount();
+
+    const runningGroup: TurnGroupInfo = {
+      userMsg: { role: 'user', content: '跑个任务', _msg_id: 89 },
+      middle: [assistant({ content: '中间过程', execution_state: 'completed' })],
+      tail: [assistant({ content: '正在输出', execution_state: 'running' })],
+      running: true,
+      state: 'completed',
+      turnId: '',
+    };
+    const runningWrapper = mount(TurnGroup, { props: { group: runningGroup } });
+    expect(runningWrapper.find('[data-test="turn-regenerate-btn"]').exists()).toBe(false);
+    expect(runningWrapper.find('[data-test="turn-copy-btn"]').exists()).toBe(false);
+    runningWrapper.unmount();
+  });
+
+  it('点击复制按钮只复制助手输出的正文，不含思考过程、工具过程或错误提示', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+
+    const group: TurnGroupInfo = {
+      userMsg: { role: 'user', content: '查一下配置', _msg_id: 90 },
+      middle: [
+        assistant({
+          content: '先读取文件检查',
+          reasoning_content: '中间思考过程',
+          tool_calls: [{ id: 't1' } as any],
+        }),
+      ],
+      tail: [
+        assistant({
+          content: '  最终输出的正文内容  ',
+          reasoning_content: '尾轮思考过程',
+          tool_calls: [{ id: 't2' } as any],
+        }),
+        { role: 'error', content: '附加错误提示' },
+      ],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    await wrapper.get('[data-test="turn-copy-btn"]').trigger('click');
+    await flushPromises();
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith('最终输出的正文内容');
+    wrapper.unmount();
+  });
+
+  it('点击重新生成按钮会调用 editUserMessage 重发本轮问题与图片', async () => {
+    const store = useAppStore();
+    const saveSpy = vi.spyOn(store, 'saveClipboardImage').mockResolvedValue('C:/tmp/regen-1.png');
+    const editSpy = vi.spyOn(store, 'editUserMessage').mockResolvedValue(true);
+
+    const userMsg: ChatMessage = {
+      role: 'user',
+      content: '  帮我看下这张图  ',
+      _msg_id: 91,
+      images: ['data:image/png;base64,AAA', 'C:/tmp/existing.png'],
+    };
+    const group: TurnGroupInfo = {
+      userMsg,
+      middle: [],
+      tail: [assistant({ content: '已查看图片' })],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    await wrapper.get('[data-test="turn-regenerate-btn"]').trigger('click');
+    await flushPromises();
+
+    expect(saveSpy).toHaveBeenCalledWith('data:image/png;base64,AAA');
+    expect(editSpy).toHaveBeenCalledWith(
+      userMsg,
+      '帮我看下这张图',
+      ['C:/tmp/regen-1.png', 'C:/tmp/existing.png'],
+    );
+    wrapper.unmount();
+  });
+
+  it('无输出正文时不显示复制按钮，无 _msg_id 时不显示重新生成按钮', () => {
+    const emptyOutputGroup: TurnGroupInfo = {
+      userMsg: { role: 'user', content: '提问', _msg_id: 92 },
+      middle: [assistant({ content: '中间工具调用', tool_calls: [{ id: 't1' } as any] })],
+      tail: [assistant({ content: '   ', reasoning_content: '只有思考' })],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const w1 = mount(TurnGroup, { props: { group: emptyOutputGroup } });
+    expect(w1.find('[data-test="turn-regenerate-btn"]').exists()).toBe(true);
+    expect(w1.find('[data-test="turn-copy-btn"]').exists()).toBe(false);
+    w1.unmount();
+
+    const unpersistedUserGroup: TurnGroupInfo = {
+      userMsg: { role: 'user', content: '未入库提问' },
+      middle: [],
+      tail: [assistant({ content: '有输出正文' })],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const w2 = mount(TurnGroup, { props: { group: unpersistedUserGroup } });
+    expect(w2.find('[data-test="turn-regenerate-btn"]').exists()).toBe(false);
+    expect(w2.find('[data-test="turn-copy-btn"]').exists()).toBe(true);
+    w2.unmount();
+  });
+
+  it('已固定模型名称的回合在底部切换模型后保持原模型显示不变', async () => {
+    const store = useAppStore();
+    store.activeModelName = 'deepseek-v4.1-flash-1017';
+    const group: TurnGroupInfo = {
+      userMsg: { role: 'user', content: '上一轮问题', _msg_id: 93 },
+      middle: [],
+      tail: [assistant({ content: '上一轮回答', model_name: 'deepseek-v4.1-flash-1017' })],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    expect(wrapper.get('.an-model').text()).toBe('deepseek-v4.1-flash-1017');
+    store.activeModelName = 'glm-5.3-flash';
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get('.an-model').text()).toBe('deepseek-v4.1-flash-1017');
+    wrapper.unmount();
+  });
+
+  it('缺少 model_name 的旧消息不跟随底部 activeModelName 变化', async () => {
+    const store = useAppStore();
+    store.activeModelName = 'deepseek-v4.1-flash-1017';
+    const group: TurnGroupInfo = {
+      userMsg: { role: 'user', content: '旧问题' },
+      middle: [],
+      tail: [assistant({ content: '旧回答' })],
+      running: false,
+      state: 'completed',
+      turnId: '',
+    };
+    const wrapper = mount(TurnGroup, { props: { group } });
+
+    expect(wrapper.find('.an-model').exists()).toBe(false);
+    store.activeModelName = 'glm-5.3-flash';
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find('.an-model').exists()).toBe(false);
     wrapper.unmount();
   });
 });

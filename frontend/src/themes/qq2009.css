@@ -833,13 +833,13 @@ html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .attachment-note
   border-top-color: #C6DBEF;
   color: var(--qq09-text-3);
 }
-html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-action-bar .msg-copy-btn {
-  border-color: #9FC2E2;
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-action-bar .user-action-btn {
+  border: 1px solid #9FC2E2;
   border-radius: 3px;
   background: linear-gradient(180deg, #fff, #E3F0FB);
   color: #2B5A7A;
 }
-html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-action-bar .msg-copy-btn:hover {
+html[data-gui-theme-id="builtin.qq2009"] #chat-scroll .msg-user .user-action-bar .user-action-btn:hover {
   border-color: var(--qq09-orange);
   background: linear-gradient(180deg, #FFF6E2, #FBD98F);
   color: #173F5F;

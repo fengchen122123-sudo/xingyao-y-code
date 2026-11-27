@@ -25,6 +25,7 @@ from core.agent_service import strip_context_suffix
 from core.injection_markers import (
     BG_COMMAND_SUMMARY_INJECTION_PREFIX,
     BG_SUMMARY_INJECTION_PREFIX,
+    LAN_PEER_SUMMARY_INJECTION_PREFIX,
     is_system_injected_user_text,
 )
 from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
@@ -398,6 +399,7 @@ _BG_COMMAND_SUMMARY_PROMPT = (
 _BG_SUMMARY_DISPLAY_TEXT = "📦 所有后台子代理任务已结束，正在自动汇总结果…"
 _BG_COMMAND_SUMMARY_DISPLAY_TEXT = "📦 后台任务已完成，正在总结结果…"
 _SECRETARY_DISPATCH_SUMMARY_DISPLAY_TEXT = "📋 派发任务已产生结果，秘书正在整理汇报…"
+_LAN_PEER_SUMMARY_DISPLAY_TEXT = "🌐 远程节点任务已返回结果，正在整理…"
 
 
 def _resolve_real_path(path: str) -> str:
@@ -1691,6 +1693,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         except Exception:
             logger.warning("注册后台命令任务完成回调失败", exc_info=True)
 
+        try:
+            from core.lan_peers import lan_peer_manager
+            lan_peer_manager.set_task_callback(self._on_lan_peer_task_update)
+        except Exception:
+            logger.warning("注册局域网节点后台回传回调失败", exc_info=True)
+
         from core.automation.engine import AutomationEngine
         from core.automation.storage import AutomationStorage
         self._automation_storage = AutomationStorage(self._memory)
@@ -2177,6 +2185,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 self._mcp_server.stop()
         except Exception:
             logger.exception("退出时停止局域网 MCP 服务失败")
+
+        try:
+            from core.lan_peers import lan_peer_manager
+            lan_peer_manager.shutdown()
+        except Exception:
+            logger.debug("退出时停止局域网节点监听失败", exc_info=True)
 
         try:
             if getattr(self, "_feishu_service", None) is not None:
@@ -3433,6 +3447,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
         relay = getattr(self, "_cloud_relay_service", None)
         if relay is not None:
             relay.on_event(event_type, data)
+        mcp_srv = getattr(self, "_mcp_server", None)
+        if mcp_srv is not None:
+            try:
+                mcp_srv.on_event(event_type, data)
+            except Exception:
+                pass
 
     def _queue_js_payload(self, payload: str) -> None:
         self._ensure_js_dispatcher()
@@ -3603,13 +3623,18 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             final_text = ""
             final_reasoning = ""
             final_media: list = []
+            final_model_name = ""
+            final_model_id = ""
             for msg in reversed(history):
                 if msg.get("role") == "assistant":
                     content = msg.get("content")
                     reasoning = msg.get("reasoning_content")
                     final_text = content if isinstance(content, str) else ""
                     final_reasoning = reasoning if isinstance(reasoning, str) else ""
-                    final_media = self._media_items_for_frontend(msg.get("_display"))
+                    disp = msg.get("_display") or {}
+                    final_media = self._media_items_for_frontend(disp)
+                    final_model_name = str(disp.get("model_name") or "").strip()
+                    final_model_id = str(disp.get("model_id") or "").strip()
                     break
             final_text = sanitize_protocol_text(final_text)
             if final_text or final_reasoning or final_media:
@@ -3620,6 +3645,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 }
                 if final_media:
                     payload["media"] = final_media
+                if final_model_name:
+                    payload["model_name"] = final_model_name
+                if final_model_id:
+                    payload["model_id"] = final_model_id
                 self.emit_event("message_final", payload)
         except Exception:
             logger.debug("补发 message_final 失败", exc_info=True)
@@ -7378,6 +7407,110 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             logger.exception("set_remote_token_ttl 失败")
             return {"ok": False, "msg": str(e)}
 
+    def get_lan_peers(self) -> Dict[str, Any]:
+        """返回已配置的局域网协作节点列表（绝不含令牌明文）。"""
+        try:
+            from core.lan_peers import list_peers
+            return {"ok": True, "peers": list_peers()}
+        except Exception as e:
+            logger.exception("get_lan_peers 失败")
+            return {"ok": False, "peers": [], "msg": str(e)}
+
+    def save_lan_peer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """新增或更新局域网协作节点（令牌加密落盘，返回脱敏列表）。"""
+        try:
+            from core.lan_peers import list_peers, save_peer
+            peer = save_peer(payload)
+            return {"ok": True, "peer": peer, "peers": list_peers()}
+        except ValueError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("save_lan_peer 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def delete_lan_peer(self, peer_id: str) -> Dict[str, Any]:
+        """删除指定的局域网协作节点。"""
+        try:
+            from core.lan_peers import delete_peer, list_peers
+            removed = delete_peer(peer_id)
+            if not removed:
+                return {"ok": False, "msg": f"未找到节点: {peer_id}", "peers": list_peers()}
+            return {"ok": True, "peers": list_peers()}
+        except Exception as e:
+            logger.exception("delete_lan_peer 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def test_lan_peer(self, peer_id: str) -> Dict[str, Any]:
+        """探测指定局域网协作节点的连通性与对端 Agent 信息。"""
+        try:
+            from core.lan_peers import list_peers, probe_peer
+            res = probe_peer(peer_id)
+            res["peers"] = list_peers()
+            return res
+        except Exception as e:
+            logger.exception("test_lan_peer 失败")
+            return {"ok": False, "online": False, "msg": str(e)}
+
+    def get_lan_peer_local_info(self, ensure_started: bool = False) -> Dict[str, Any]:
+        """返回本机可被局域网其他星瑶/A2A Agent 接入的连接信息。"""
+        try:
+            lan = self._ensure_lan_server() if ensure_started else getattr(self, "_lan_server", None)
+            mcp = self._ensure_mcp_server() if ensure_started else getattr(self, "_mcp_server", None)
+
+            lan_ip = getattr(lan, "lan_ip", "") if lan is not None else ""
+            if not lan_ip:
+                try:
+                    from core.lan_server import LanServer
+                    lan_ip = LanServer(bridge=None)._detect_lan_ip()
+                except Exception:
+                    lan_ip = "127.0.0.1"
+
+            lan_port = int(getattr(lan, "port", 0) or 0) if lan is not None else 0
+            a2a_port = int(getattr(mcp, "port", 0) or 0) if mcp is not None else 0
+
+            token = ""
+            if lan is not None:
+                raw_tok = getattr(lan, "_token", None)
+                if not raw_tok and ensure_started and callable(getattr(lan, "get_bind_info", None)):
+                    try:
+                        info = lan.get_bind_info()
+                        token = str(info.get("token") or "")
+                    except Exception:
+                        token = ""
+                elif isinstance(raw_tok, bytes):
+                    token = raw_tok.decode("utf-8", errors="ignore")
+                elif isinstance(raw_tok, str):
+                    token = raw_tok
+
+            a2a_url = f"http://{lan_ip}:{a2a_port}/a2a" if a2a_port else ""
+            agent_card_url = (
+                f"http://{lan_ip}:{a2a_port}/.well-known/agent.json"
+                if a2a_port
+                else (f"http://{lan_ip}:{lan_port}/.well-known/agent.json" if lan_port else "")
+            )
+            ws_url = f"ws://{lan_ip}:{lan_port}/" if lan_port else ""
+            import_payload = {
+                "name": f"星瑶 ({lan_ip})",
+                "url": a2a_url or ws_url,
+                "protocol": "a2a" if a2a_url else "lan_ws",
+                "token": token,
+            }
+            return {
+                "ok": True,
+                "running": bool(lan_port or a2a_port),
+                "lan_ip": lan_ip,
+                "lan_port": lan_port,
+                "a2a_port": a2a_port,
+                "a2a_url": a2a_url,
+                "agent_card_url": agent_card_url,
+                "ws_url": ws_url,
+                "token": token,
+                "import_json": json.dumps(import_payload, ensure_ascii=False, indent=2),
+            }
+        except Exception as e:
+            logger.exception("get_lan_peer_local_info 失败")
+            return {"ok": False, "msg": str(e)}
+
     def get_feishu_settings(self) -> Dict[str, Any]:
         """飞书集成设置快照。**不含 app_secret 明文**，只回 has_secret 布尔。"""
         try:
@@ -7536,6 +7669,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                     return {"ok": False, "msg": "目标消息不存在"}
                 if self._message_queues.pop(target_session, None):
                     self._emit_message_queue_snapshot(target_session)
+                try:
+                    from core.llm_dialects import mark_deepseek_generation_rotation
+                    mark_deepseek_generation_rotation(target_session)
+                except Exception:
+                    logger.debug("标记 DeepSeek 账本轮换代失败（不影响编辑）", exc_info=True)
             return {
                 "ok": True,
                 "removed": rewound.get("removed", 0),
@@ -9656,6 +9794,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
                 turn_start_data["display_text"] = (
                     display_text or _SECRETARY_DISPATCH_SUMMARY_DISPLAY_TEXT
                 )
+            elif internal_kind == "lan_peer_summary":
+                turn_start_data["display_text"] = (
+                    display_text or _LAN_PEER_SUMMARY_DISPLAY_TEXT
+                )
             else:
                 turn_start_data["display_text"] = _BG_SUMMARY_DISPLAY_TEXT
         with self._active_turn_lock:
@@ -9710,6 +9852,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             ctx_win = active_model.get("context_window", 128000)
             # 本回合实际发请求所用的模型 id（= 会话激活模型）。
             model_id = active_model.get("id")
+            turn_model_display = str(active_model.get("name") or model_name or "").strip()
+            turn_model_id = str(model_id or "").strip()
+            if turn_model_display:
+                turn_start_data["model_name"] = turn_model_display
+            if turn_model_id:
+                turn_start_data["model_id"] = turn_model_id
+            with self._active_turn_lock:
+                snap = self._active_turn_snapshots.get(session_name)
+                if snap is not None:
+                    if turn_model_display:
+                        snap["model_name"] = turn_model_display
+                    if turn_model_id:
+                        snap["model_id"] = turn_model_id
             # 首轮必须先创建会话再写模型绑定；后续模型未变化时不重复写库。
             session_workdir = pending_workdir or self._session_workdir(session_name)
             _ensure_session_model_binding(
@@ -9741,6 +9896,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             _workdir_scope.__enter__()
             self._memory.set_workdir(turn_workdir)
             app_context.set_thread_session(session_name)
+            app_context.set_thread_turn_source(turn_source)
             from core.plan import set_current_plan_session
             set_current_plan_session(session_name)
             # 权限档位进入鉴权路径：会话级档位此前只落在提示词文本与 DB 列，
@@ -9969,6 +10125,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             except Exception:
                 pass
             app_context.set_thread_session(None)
+            app_context.set_thread_turn_source(None)
             if _workdir_scope is not None:
                 _workdir_scope.__exit__(None, None, None)
             if _permission_scope is not None:
@@ -10348,6 +10505,108 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
             )
             self._active_turns[sec] = worker
             worker.start()
+
+    def _on_lan_peer_task_update(self, record: Dict[str, Any]) -> None:
+        if getattr(self, "_shutting_down", False) or not isinstance(record, dict):
+            return
+        try:
+            self.emit_event("lan_peer_task_updated", {
+                "local_task_id": str(record.get("local_task_id") or ""),
+                "peer_id": str(record.get("peer_id") or ""),
+                "peer_name": str(record.get("peer_name") or ""),
+                "status": str(record.get("status") or ""),
+                "origin_session": str(record.get("origin_session") or ""),
+                "remote_session": str(record.get("remote_session") or ""),
+                "reply_preview": str(record.get("reply") or "")[:200],
+                "error": str(record.get("error") or "")[:200],
+            })
+        except Exception:
+            logger.debug("推送远程节点任务更新事件失败", exc_info=True)
+
+        session = str(record.get("origin_session") or "").strip()
+        if not session or session in getattr(self, "_user_cancelled_sessions", ()):
+            return
+        if not hasattr(self, "_turn_start_lock") or getattr(self, "_active_turns", None) is None:
+            return
+        threading.Thread(
+            target=self._start_lan_peer_summary,
+            args=(session, dict(record)),
+            daemon=True,
+            name="gui-lan-peer-summary",
+        ).start()
+
+    def _start_lan_peer_summary(self, session: str, record: Dict[str, Any]) -> None:
+        try:
+            deadline = time.monotonic() + 120.0
+            while time.monotonic() < deadline:
+                if getattr(self, "_shutting_down", False):
+                    return
+                if session in getattr(self, "_user_cancelled_sessions", ()):
+                    return
+                with self._turn_start_lock:
+                    if self._is_turn_active(session):
+                        pass
+                    else:
+                        if getattr(self, "_shutting_down", False):
+                            return
+                        if session in getattr(self, "_user_cancelled_sessions", ()):
+                            return
+                        peer_id = str(record.get("peer_id") or "")
+                        peer_name = str(record.get("peer_name") or peer_id or "远程节点")
+                        task_id = str(record.get("local_task_id") or "")
+                        status = str(record.get("status") or "")
+                        prompt_preview = str(record.get("prompt_preview") or "")
+                        reply = str(record.get("reply") or "").strip()
+                        error = str(record.get("error") or "").strip()
+                        perm = record.get("permission") if isinstance(record.get("permission"), dict) else {}
+
+                        if status == "completed":
+                            body = (
+                                f"{LAN_PEER_SUMMARY_INJECTION_PREFIX}（状态：已完成）。\n"
+                                f"- 节点：{peer_name} (peer_id={peer_id})\n"
+                                f"- 任务编号：{task_id}\n"
+                                f"- 原任务摘要：{prompt_preview}\n"
+                                f"- 对端执行返回内容：\n{reply[:12000] or '（无文本输出）'}\n\n"
+                                "请把上述对端执行结果清晰准确地整理汇报给用户，或据此继续推进后续步骤。"
+                            )
+                        elif status == "input-required":
+                            req_id = str(perm.get("request_id") or "")
+                            tool_name = str(perm.get("tool_name") or "未知工具")
+                            desc = str(perm.get("description") or "对端请求确认高危操作")
+                            body = (
+                                f"{LAN_PEER_SUMMARY_INJECTION_PREFIX}（状态：等待权限确认）。\n"
+                                f"- 节点：{peer_name} (peer_id={peer_id})\n"
+                                f"- 任务编号：{task_id}\n"
+                                f"- request_id：{req_id}\n"
+                                f"- 请求工具：{tool_name}\n"
+                                f"- 操作说明：{desc}\n\n"
+                                "请向用户转述上述操作请求并询问是否同意；拿到用户明确同意后再调用 lan_peer_approve 提交。"
+                            )
+                        else:
+                            status_zh = "已取消" if status == "canceled" else "执行失败"
+                            body = (
+                                f"{LAN_PEER_SUMMARY_INJECTION_PREFIX}（状态：{status_zh}）。\n"
+                                f"- 节点：{peer_name} (peer_id={peer_id})\n"
+                                f"- 任务编号：{task_id}\n"
+                                f"- 原因：{error or status_zh}\n\n"
+                                "请如实向用户说明原因（若已被用户取消，切勿擅自重试）。"
+                            )
+
+                        cancel_event = threading.Event()
+                        self._cancel_events[session] = cancel_event
+                        disp = f"🌐 {peer_name} 已返回任务结果，正在整理…"
+                        worker = threading.Thread(
+                            target=self._run_turn_worker_serialized,
+                            args=(body, session, "lan_peer_summary", disp),
+                            daemon=True,
+                            name=f"gui-lan-peer-summary-{session}",
+                        )
+                        self._active_turns[session] = worker
+                        worker.start()
+                        return
+                time.sleep(1.0)
+        except Exception:
+            logger.debug("远程节点任务汇总回合触发失败", exc_info=True)
 
     @staticmethod
     def _format_subagent_live_detail(snap: Any) -> str:

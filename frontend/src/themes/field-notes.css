@@ -27,6 +27,7 @@ html[data-gui-theme-id="builtin.field-notes"] .icon-btn {
 }
 
 html[data-gui-theme-id="builtin.field-notes"] .msg-user .bubble,
+html[data-gui-theme-id="builtin.field-notes"] .msg-user .user-edit-card,
 html[data-gui-theme-id="builtin.field-notes"] .kimi-card {
   border-radius: 3px;
 }

@@ -445,6 +445,8 @@ class LanServer:
         "remove_mcp_server", "open_external_url", "get_remote_bind_qr",
         "delete_skill", "delete_plugin",
         "save_pdf_edits",
+        "get_lan_peers", "save_lan_peer", "delete_lan_peer",
+        "test_lan_peer", "get_lan_peer_local_info",
     })
 
     MESSAGE_ENTRY_METHODS = frozenset({"send_user_message"})
@@ -1007,6 +1009,8 @@ class LanServer:
                 ensure_ascii=False,
             )
             return self._http_response(200, body, "application/json; charset=utf-8")
+        if path == "/.well-known/agent.json":
+            return self._serve_agent_card()
         if path == "/metrics":
             return self._serve_metrics(request)
         if path.startswith("/computer-preview/"):
@@ -1072,6 +1076,27 @@ class LanServer:
     def _serve_theme(self) -> Response:
         return self._http_response(
             200, json.dumps({"ok": True, "theme": {}}), "application/json; charset=utf-8"
+        )
+
+    def _serve_agent_card(self) -> Response:
+        from core.a2a_bridge import A2ABridge
+
+        mcp_srv = getattr(self.bridge, "_mcp_server", None) if self.bridge is not None else None
+        a2a_port = getattr(mcp_srv, "port", 0) if mcp_srv is not None else 0
+        host_ip = self.lan_ip or "127.0.0.1"
+        base_url = f"http://{host_ip}:{a2a_port}" if a2a_port else ""
+        ws_url = f"ws://{host_ip}:{self.port}/" if self.port else ""
+        bridge_a2a = getattr(mcp_srv, "a2a", None) if mcp_srv is not None else None
+        card = (
+            bridge_a2a.build_agent_card(base_url, ws_url=ws_url)
+            if bridge_a2a is not None
+            else A2ABridge(bridge=self.bridge).build_agent_card(base_url, ws_url=ws_url)
+        )
+        return self._http_response(
+            200,
+            json.dumps(card, ensure_ascii=False),
+            "application/json; charset=utf-8",
+            cache_control="no-store",
         )
 
     def _serve_static(self, path: str) -> Response:

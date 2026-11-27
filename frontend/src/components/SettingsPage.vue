@@ -24,6 +24,7 @@
         <div class="nav-section">集成与数据</div>
         <button data-test="feishu-nav" class="nav-item" :class="{ active: activeSection === 'feishu' }" @click="activeSection = 'feishu'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>飞书集成</button>
         <button data-test="cloud-relay-nav" class="nav-item" :class="{ active: activeSection === 'cloud-relay' }" @click="activeSection = 'cloud-relay'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>云中转</button>
+        <button data-test="lan-peers-nav" class="nav-item" :class="{ active: activeSection === 'lan-peers' }" @click="activeSection = 'lan-peers'"><span class="nav-ico"><AppIcon name="layers" :size="14" /></span>局域网协作</button>
         <button data-test="session-archive-nav" class="nav-item" :class="{ active: activeSection === 'session-archive' }" @click="activeSection = 'session-archive'"><span class="nav-ico"><AppIcon name="box" :size="14" /></span>会话归档</button>
         <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
         <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
@@ -708,6 +709,7 @@
       <DecisionSettings v-else-if="activeSection === 'decision'" />
       <FeishuSettings v-else-if="activeSection === 'feishu'" />
       <CloudRelaySettings v-else-if="activeSection === 'cloud-relay'" />
+      <LanPeersSettings v-else-if="activeSection === 'lan-peers'" />
       <PetSettings v-else-if="activeSection === 'pet'" />
       <BackgroundConvert v-else-if="activeSection === 'bg-convert'" />
 
@@ -826,6 +828,7 @@ import GrowthSettings from './GrowthSettings.vue';
 import DecisionSettings from './DecisionSettings.vue';
 import FeishuSettings from './FeishuSettings.vue';
 import CloudRelaySettings from './CloudRelaySettings.vue';
+import LanPeersSettings from './LanPeersSettings.vue';
 import PetSettings from './PetSettings.vue';
 import PluginsSettings from './PluginsSettings.vue';
 import PluginSettingsPanel from './PluginSettingsPanel.vue';
@@ -841,7 +844,7 @@ import {
 import { parseModelTestError, type ParsedModelError } from '../utils/errorParser';
 
 const store = useAppStore();
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'lan-peers' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer' | `plugin:${string}`>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 
 const PLUGIN_SECTION_PREFIX = 'plugin:';

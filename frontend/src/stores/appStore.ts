@@ -853,7 +853,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       dirs: [] as Array<{ name: string; path: string }>,
       plainPick: null as null | ((path: string) => void),
     },
-    settingsSection: 'models' as 'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer',
+    settingsSection: 'models' as 'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'pet' | 'bg-convert' | 'system' | 'persona' | 'growth' | 'decision' | 'feishu' | 'cloud-relay' | 'lan-peers' | 'session-archive' | 'plugins' | 'about' | 'contact' | 'disclaimer',
     decisionEnabled: false,
     decisionUnread: 0,
     decisionEventTick: 0,
@@ -1348,6 +1348,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return (window.pywebview && window.pywebview.api) || null;
     },
 
+    _currentTurnModelMeta(this: any): { model_id: string; model_name: string } {
+      for (let i = this.messages.length - 1; i >= 0; i -= 1) {
+        const m = this.messages[i] as ChatMessage;
+        if (m.role === 'user') break;
+        if (m.role === 'assistant' && m.model_name) {
+          return {
+            model_id: String(m.model_id || ''),
+            model_name: String(m.model_name),
+          };
+        }
+      }
+      return {
+        model_id: String(this.activeModelId || ''),
+        model_name: String(this.activeModelName || ''),
+      };
+    },
+
     // 回合级事件（tool_start / tool_finish / diff_ready）必须落在当前助手消息上；
     // 缺失时：若当前会话处于运行态（如中途扫码接入），自愈补齐 running 占位卡片避免崩溃；
     // 若非运行态到达则严格抛出契约错误。
@@ -1364,6 +1381,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
             tool_calls: [],
             legacy_diffs: [],
             execution_state: 'running',
+            ...this._currentTurnModelMeta(),
           };
           this.messages.push(placeholder);
           last = placeholder;
@@ -1416,6 +1434,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
           }))
         : [];
 
+      const snapModelName = String(snap.model_name || '').trim() || runtime.modelName || this.activeModelName || '';
+      const snapModelId = String(snap.model_id || '').trim() || runtime.modelId || this.activeModelId || '';
+
       if (!runningMsg) {
         assistantMsg = {
           role: 'assistant',
@@ -1424,11 +1445,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
           tool_calls: toolCalls,
           legacy_diffs: [],
           execution_state: 'running',
+          model_id: snapModelId,
+          model_name: snapModelName,
         };
         msgs.push(assistantMsg);
       } else {
         assistantMsg = runningMsg;
         assistantMsg.execution_state = 'running';
+        if (snap.model_name || !assistantMsg.model_name) {
+          if (snapModelName) assistantMsg.model_name = snapModelName;
+        }
+        if (snap.model_id || !assistantMsg.model_id) {
+          if (snapModelId) assistantMsg.model_id = snapModelId;
+        }
         if (streamingText && (!assistantMsg.content || streamingText.length > assistantMsg.content.length)) {
           assistantMsg.content = streamingText;
         }
@@ -4037,6 +4066,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
               tool_calls: [],
               legacy_diffs: [],
               execution_state: 'running',
+              model_id: runtime.modelId || this.activeModelId || '',
+              model_name: runtime.modelName || this.activeModelName || '',
             });
           }
         }
@@ -5040,6 +5071,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
               tool_calls: [],
               legacy_diffs: [],
               execution_state: 'running',
+              model_id: this.activeModelId || '',
+              model_name: this.activeModelName || '',
             });
             if (this.currentSessionName === sessionName) {
               this._bindSessionRuntime(sessionName);
@@ -5151,6 +5184,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (this.currentSessionName !== sessionName) {
         this.broadcastChatNotice('会话已切换，编辑已保存但未重新生成', 'error', sessionName);
         return false;
+      }
+      if (this.runningSessions.includes(sessionName)
+          || (this.currentSessionName === sessionName && this.running)) {
+        this._setSessionRunning(sessionName, false);
       }
       // 编辑已落库（截断 + 新文本由本地历史承载），重发生成失败不能把它算成
       // 编辑失败：异常抛出去界面只会显示「编辑失败」，用户会以为改动丢了
@@ -5740,11 +5777,16 @@ navItems: [] as Array<{ id: number; preview: string }>,
             }
           }
         }
+        const turnModelName = String(data.model_name || '').trim() || this.activeModelName || '';
+        const turnModelId = String(data.model_id || '').trim() || this.activeModelId || '';
         const tail = this.messages[this.messages.length - 1];
         const tailIsRunningPlaceholder = tail && tail.role === 'assistant'
           && !tail.content && !tail.reasoning_content
           && (!tail.tool_calls || tail.tool_calls.length === 0);
-        if (!tailIsRunningPlaceholder) {
+        if (tailIsRunningPlaceholder) {
+          if (turnModelName) tail.model_name = turnModelName;
+          if (turnModelId) tail.model_id = turnModelId;
+        } else {
           this.messages.push({
             role: 'assistant',
             content: '',
@@ -5752,6 +5794,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
             tool_calls: [],
             legacy_diffs: [],
             execution_state: 'running',
+            model_id: turnModelId,
+            model_name: turnModelName,
           });
         }
         if (data.internal === 'bg_summary') {
@@ -5795,6 +5839,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
             tool_calls: [],
             legacy_diffs: [],
             execution_state: 'running',
+            model_id: last.model_id || this.activeModelId || '',
+            model_name: last.model_name || this.activeModelName || '',
           });
         }
       } else if (type === 'thinking_delta') {
@@ -5809,6 +5855,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
             tool_calls: [],
             legacy_diffs: [],
             execution_state: 'running',
+            ...this._currentTurnModelMeta(),
           };
           this.messages.push(placeholder);
           last = placeholder;
@@ -5827,6 +5874,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
             tool_calls: [],
             legacy_diffs: [],
             execution_state: 'running',
+            ...this._currentTurnModelMeta(),
           };
           this.messages.push(placeholder);
           last = placeholder;
@@ -5852,6 +5900,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const finalMedia = (data as { media?: MediaItem[] }).media;
           if (finalMedia && finalMedia.length) {
             last.media = finalMedia;
+          }
+          if (data.model_name) {
+            last.model_name = String(data.model_name);
+          }
+          if (data.model_id) {
+            last.model_id = String(data.model_id);
           }
         }
       } else if (type === 'step_metrics') {
@@ -6259,6 +6313,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
             legacy_diffs: [],
             execution_state: 'error',
             error_note: errorMsg,
+            ...this._currentTurnModelMeta(),
           };
           this.messages.push(placeholder);
           last = placeholder;

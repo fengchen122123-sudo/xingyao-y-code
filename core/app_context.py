@@ -308,6 +308,20 @@ def thread_session_scope(session_id: str | None):
         set_thread_session(previous)
 
 
+_thread_turn_source_tls = threading.local()
+
+
+def set_thread_turn_source(source: str | None) -> None:
+    """绑定/解绑当前线程的回合来源（如 local / lan / mcp）。"""
+    _thread_turn_source_tls.turn_source = (
+        str(source).strip().lower() if source else None
+    )
+
+
+def get_thread_turn_source() -> str | None:
+    return getattr(_thread_turn_source_tls, "turn_source", None)
+
+
 _thread_tool_call_tls = threading.local()
 
 

@@ -168,3 +168,16 @@ def test_edit_drops_queued_messages_of_the_session():
     assert result["ok"] is True
     assert bridge._message_queues.get("s1") in (None, [])
     assert ("message_queue", {"session": "s1"}) in events
+
+
+def test_edit_marks_deepseek_generation_rotation():
+    from core.llm_dialects import consume_deepseek_generation_rotation
+
+    bridge, _ = _make_bridge()
+    rows = _seed(bridge)
+    consume_deepseek_generation_rotation("s1")
+
+    result = bridge.edit_user_message("s1", rows[2]["_msg_id"], "改过的提问")
+
+    assert result["ok"] is True
+    assert consume_deepseek_generation_rotation("s1") is True

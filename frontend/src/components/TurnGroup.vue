@@ -4,7 +4,7 @@
   <div v-if="hasAssistant || group.tail.length" class="xy-turn-wrap">
     <div v-if="hasAssistant" class="assistant-name">
       <b class="an-agent">{{ store.agentName }}</b>
-      <span class="an-model">{{ turnModelName }}</span>
+      <span v-if="turnModelName" class="an-model">{{ turnModelName }}</span>
       <span v-if="turnCancelled" class="cancel-badge">已取消</span>
     </div>
 
@@ -103,12 +103,39 @@
       :turn-id="group.turnId"
     />
 
-    <div v-if="(!group.running && totalDurationText) || tailMetricsText || liveSpeedText" class="xy-turn-footer">
-      <span v-if="!group.running && totalDurationText" class="working-indicator done" data-test="turn-total-duration">
-        <AppIcon name="check" :size="13" :stroke-width="2.2" class="wi-check" />
-        <span class="wi-text">{{ store.agentName }}本轮工作 {{ totalDurationText }}</span>
-      </span>
-      <span v-else></span>
+    <div v-if="(!group.running && totalDurationText) || showTurnActions || tailMetricsText || liveSpeedText" class="xy-turn-footer">
+      <div class="xy-turn-footer-left">
+        <span v-if="!group.running && totalDurationText" class="working-indicator done" data-test="turn-total-duration">
+          <AppIcon name="check" :size="13" :stroke-width="2.2" class="wi-check" />
+          <span class="wi-text">{{ store.agentName }}本轮工作 {{ totalDurationText }}</span>
+        </span>
+        <div v-if="showTurnActions" class="turn-action-bar" data-test="turn-action-bar">
+          <button
+            v-if="canRegenerate"
+            type="button"
+            class="turn-action-btn"
+            title="重新生成"
+            aria-label="重新生成"
+            data-test="turn-regenerate-btn"
+            :disabled="regenerating"
+            @click="regenerateTurn"
+          >
+            <AppIcon name="refresh" :size="13" :stroke-width="1.85" :class="{ 'turn-action-spin': regenerating }" />
+          </button>
+          <button
+            v-if="canCopyOutput"
+            type="button"
+            class="turn-action-btn"
+            :class="{ copied: outputCopied }"
+            :title="outputCopied ? '已复制' : '复制正文'"
+            :aria-label="outputCopied ? '已复制' : '复制正文'"
+            data-test="turn-copy-btn"
+            @click="copyOutput"
+          >
+            <AppIcon :name="outputCopied ? 'check' : 'copy'" :size="13" :stroke-width="outputCopied ? 2.2 : 1.85" />
+          </button>
+        </div>
+      </div>
       <span
         v-if="liveSpeedText"
         class="msg-metrics-bar"
@@ -126,7 +153,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onUnmounted, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
 import ChangedFilesPanel from './ChangedFilesPanel.vue';
 import FoldCard from './FoldCard.vue';
@@ -168,7 +195,7 @@ const allAssistants = computed(() =>
 const hasAssistant = computed(() => allAssistants.value.length > 0);
 const turnModelName = computed(() => {
   const firstWithModel = allAssistants.value.find((m) => m.model_name);
-  return firstWithModel?.model_name || store.activeModelName || '模型';
+  return firstWithModel?.model_name || '';
 });
 const turnCancelled = computed(() => allAssistants.value.some((m) => m.cancelled));
 
@@ -304,6 +331,78 @@ const tailMetricsTooltip = computed(() => {
   if (m.token_speed) parts.push(`平均速度: ${m.token_speed} t/s`);
   return parts.join(' · ');
 });
+
+const outputBodyText = computed(() =>
+  props.group.tail
+    .filter((m) => m.role === 'assistant' && m.content && m.content.trim())
+    .map((m) => (m.content || '').trim())
+    .join('\n\n'),
+);
+
+const canCopyOutput = computed(() => !props.group.running && outputBodyText.value.length > 0);
+const canRegenerate = computed(() => {
+  if (props.group.running) return false;
+  const u = props.group.userMsg;
+  if (!u || !u._msg_id) return false;
+  return !!(u.content || '').trim() || !!(u.images && u.images.length);
+});
+const showTurnActions = computed(() =>
+  !props.group.running && hasAssistant.value && (canRegenerate.value || canCopyOutput.value),
+);
+
+const outputCopied = ref(false);
+let outputCopiedTimer: number | undefined;
+onUnmounted(() => {
+  if (outputCopiedTimer) window.clearTimeout(outputCopiedTimer);
+});
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+}
+
+async function copyOutput() {
+  const text = outputBodyText.value;
+  if (!text) return;
+  await copyTextToClipboard(text);
+  outputCopied.value = true;
+  if (outputCopiedTimer) window.clearTimeout(outputCopiedTimer);
+  outputCopiedTimer = window.setTimeout(() => { outputCopied.value = false; }, 1500);
+}
+
+const regenerating = ref(false);
+async function regenerateTurn() {
+  if (regenerating.value || !canRegenerate.value) return;
+  const u = props.group.userMsg;
+  if (!u) return;
+  const text = (u.content || '').trim();
+  regenerating.value = true;
+  try {
+    const paths: string[] = [];
+    for (const url of u.images || []) {
+      if (!url.startsWith('data:')) {
+        paths.push(url);
+        continue;
+      }
+      const saved = await store.saveClipboardImage(url);
+      if (!saved) return;
+      paths.push(saved);
+    }
+    await store.editUserMessage(u, text, paths);
+  } finally {
+    regenerating.value = false;
+  }
+}
 </script>
 
 <style scoped>
@@ -474,6 +573,53 @@ const tailMetricsTooltip = computed(() => {
   font-size: 12px;
   color: var(--xy-text-3, var(--text-faint));
   user-select: none;
+}
+.xy-turn-footer-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.turn-action-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.turn-action-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--xy-text-3, var(--text-faint));
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease;
+}
+.turn-action-btn:hover:not(:disabled) {
+  background: var(--xy-hover, var(--bg2));
+  color: var(--xy-text, var(--text-bright));
+}
+.turn-action-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+.turn-action-btn:focus-visible {
+  outline: 2px solid var(--xy-accent, var(--accent));
+  outline-offset: 1px;
+}
+.turn-action-btn.copied {
+  color: var(--xy-green, var(--green));
+  background: var(--xy-green-soft, rgba(22, 163, 74, 0.1));
+}
+.turn-action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.turn-action-spin {
+  animation: xy-spin 1s linear infinite;
 }
 .working-indicator.done {
   display: inline-flex;
