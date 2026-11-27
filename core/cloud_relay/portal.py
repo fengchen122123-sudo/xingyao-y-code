@@ -55,8 +55,22 @@ def device_token() -> str:
         return ""
 
 
-def request_ticket(base: str, device_id: str, token: str) -> dict | None:
-    """用设备令牌换取只读 remote JWT；失败返回 None。"""
+def _ttl_of(value: Any) -> int:
+    """把 ttl 归一成整数秒；None / 脏数据一律按 0（永久）处理。"""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def request_ticket(
+    base: str, device_id: str, token: str, ttl_seconds: int = 0
+) -> dict | None:
+    """用设备令牌换取只读 remote JWT；失败返回 None。
+
+    ``ttl_seconds`` 随请求发给网关（0 表示永久）。旧网关不认这个字段时会忽略它，
+    按自己的默认（约 23 小时）签发，客户端照实显示即可，不需要报错。
+    """
     if not base or not device_id or not token:
         return None
     try:
@@ -65,7 +79,11 @@ def request_ticket(base: str, device_id: str, token: str) -> dict | None:
         with httpx.Client(timeout=_TIMEOUT_SECONDS) as client:
             resp = client.post(
                 f"{base}/api/relay/device-token",
-                json={"device_id": device_id, "device_token": token},
+                json={
+                    "device_id": device_id,
+                    "device_token": token,
+                    "ttl_seconds": _ttl_of(ttl_seconds),
+                },
             )
     except Exception:
         logger.warning("云中转换票请求失败", exc_info=True)
@@ -121,6 +139,9 @@ def _persisted_ticket(device_id: str) -> dict | None:
         return None
     if int(data.get("expires_at") or 0) <= int(time.time()):
         return None
+    # ttl 缺失（老版本写下的缓存）按 0 处理：等价于「签票时没指定有效期」，
+    # 不能当成「与当前设置不同的另一种值」，否则升级后每次打开二维码都要换票。
+    data["ttl_seconds"] = _ttl_of(data.get("ttl_seconds"))
     return data
 
 
@@ -133,6 +154,9 @@ def _persist_ticket(device_id: str, payload: dict) -> None:
                 "device_id": device_id,
                 "token": str(payload.get("token") or ""),
                 "expires_at": int(payload.get("expires_at") or 0),
+                # 连 ttl 一起落盘：重启后若用户已改「过期时间」设置，要能认出
+                # 这张票是按旧设置签的，从而主动重签而不是继续沿用旧链接。
+                "ttl_seconds": _ttl_of(payload.get("ttl_seconds")),
             }
         )
         config.save_config_value(config.CLOUD_RELAY_REMOTE_TICKET_KEY, protect_secret(blob))
@@ -170,6 +194,7 @@ def build_pair_url(
             return fail("config", f"云中转缺少设备号或网关地址，{hint}")
         # 换票结果在本地缓存：二维码是「打开就生成」的高频动作，而网关对换票限流
         # （10 分钟 6 次），反复打开不能每次都去打网关。临近过期才重新换。
+        ttl = _ttl_of(ttl_seconds)
         payload = None
         refresh_notice = ""
         cached = _TICKET_CACHE.get(device_id)
@@ -182,14 +207,26 @@ def build_pair_url(
             cached is not None
             and int(cached.get("expires_at") or 0) - now > _CACHE_MARGIN_SECONDS
         )
+        # 缓存必须连同「当初签票用的 ttl」一起比较：票是网关按旧设置签好的，
+        # 用户改了「远程控制 token 过期时间」后只有重签一张才能让新设置生效，
+        # 否则缓存会把设置改动永远吞掉（面板上的有效期一动不动）。
+        # ttl=0 与不传都归一成 0，不会因为 None/0 之差反复换票。
+        cache_matches_ttl = cache_fresh and _ttl_of(cached.get("ttl_seconds")) == ttl
         # force_new 来自用户点「刷新」：必须真去网关换新票。缓存只服务
         # 「打开面板就出码」的高频路径，若它吞掉显式刷新，二维码和有效期
         # 就永远纹丝不动——用户看到的就是「刷新无效」。
-        if cache_fresh and not force_new:
+        if cache_matches_ttl and not force_new:
             payload = cached
         if payload is None:
-            payload = request_ticket(base, device_id, device_token())
+            try:
+                payload = request_ticket(base, device_id, device_token(), ttl_seconds=ttl)
+            except TypeError:
+                # 兼容只接受三参数的旧换票实现（测试桩 / 插件 monkeypatch）
+                payload = request_ticket(base, device_id, device_token())
             if payload is not None:
+                # 以用户设置为准记录 ttl：网关会回显被夹取后的实际值（ttl=0 会回显
+                # 十年），直接存回显值会让缓存与设置永远对不上，每次打开都换票。
+                payload["ttl_seconds"] = ttl
                 _TICKET_CACHE[device_id] = payload
                 _persist_ticket(device_id, payload)
                 if force_new:
@@ -210,9 +247,12 @@ def build_pair_url(
         else:
             page = f"/desktop/{device_id}"
         expires_at = int(payload.get("expires_at") or 0)
-        remaining = max(0, expires_at - int(time.time())) if expires_at else 0
-        if ttl_seconds and ttl_seconds > 0 and remaining > ttl_seconds:
-            remaining = int(ttl_seconds)
+        # 有效期按「这张票实际用的 ttl」决定：0 表示永久（前端 formatExpiry 把 0 渲染成
+        # 「永久有效」）；非 0 时服务端已按请求签发，直接用真实剩余秒数，不再二次截短。
+        if _ttl_of(payload.get("ttl_seconds")) == 0:
+            remaining = 0
+        else:
+            remaining = max(0, expires_at - int(time.time()))
         result = {
             "url": f"{base}{page}?token={jwt_token}",
             "token": jwt_token,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -46,7 +47,7 @@ def relay_config(monkeypatch):
     monkeypatch.setattr(
         portal,
         "request_ticket",
-        lambda base, device_id, token: {
+        lambda base, device_id, token, ttl_seconds=0: {
             "token": "remote-jwt",
             "expires_at": int(time.time()) + 3600,
         },
@@ -59,12 +60,30 @@ def test_pair_url_is_none_when_relay_is_offline(relay_config):
 
 
 def test_pair_url_prefers_mobile_page_when_deployed(relay_config, monkeypatch):
+    """部署了独立移动端时优先给移动页面，并按票的真实剩余秒数回填 expires_in。
+
+    ttl 显式传 86400：这正是 gui_bridge 上送 config.remote_token_ttl 的调用方式。
+    新语义下缺省 ttl=0 表示「永久」，expires_in 会返回 0，不再给出 3600 级数字。
+    """
     monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
-    result = portal.build_pair_url(_FakeBridge(_FakeService(True, "dev-1")), mobile=True)
+    result = portal.build_pair_url(
+        _FakeBridge(_FakeService(True, "dev-1")), mobile=True, ttl_seconds=86400
+    )
     assert result is not None
     assert result["url"] == "https://example.com/xy/bot/m/dev-1?token=remote-jwt"
     assert result["token"] == "remote-jwt"
     assert 3500 <= result["expires_in"] <= 3600
+
+
+def test_pair_url_reports_forever_when_ttl_is_zero(relay_config, monkeypatch):
+    """ttl_seconds=0 表示永久有效：expires_in 必须是 0（前端据此显示「永久有效」）。"""
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    result = portal.build_pair_url(
+        _FakeBridge(_FakeService(True, "dev-1")), mobile=True, ttl_seconds=0
+    )
+    assert result is not None
+    assert result["expires_in"] == 0
+    assert result["url"] == "https://example.com/xy/bot/m/dev-1?token=remote-jwt"
 
 
 def test_pair_url_falls_back_to_desktop_page(relay_config, monkeypatch):
@@ -231,3 +250,109 @@ def test_bind_qr_passes_force_new_to_relay(monkeypatch):
     result = bridge.get_remote_bind_qr(force_new=True, mobile=True)
     assert seen["force_new"] is True
     assert result["refresh_notice"] == "刷新过于频繁"
+
+
+# ---- 票据有效期可配置：客户端上送 ttl / 缓存比对 / 老缓存兼容 ----
+
+
+def _install_http_stub(monkeypatch, sent, payload=None):
+    """把 httpx.Client 换成内存桩，顺手抓下换票请求体。"""
+    import httpx
+
+    body = payload if payload is not None else {
+        "token": "remote-jwt",
+        "expires_at": int(time.time()) + 3600,
+    }
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return body
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def post(self, url, **kwargs):
+            sent.append({"url": url, "body": kwargs.get("json")})
+            return _Response()
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+
+@pytest.mark.parametrize("ttl", [0, 3600])
+def test_request_ticket_sends_ttl_seconds(monkeypatch, ttl):
+    """换票请求体必须带 ttl_seconds：网关据此签票（0=永久，正数=对应秒数）。"""
+    sent = []
+    _install_http_stub(monkeypatch, sent)
+    payload = portal.request_ticket(
+        "https://example.com/xy/bot", "dev-1", "plain-device-token", ttl_seconds=ttl
+    )
+    assert payload is not None
+    assert sent[0]["url"] == "https://example.com/xy/bot/api/relay/device-token"
+    assert sent[0]["body"] == {
+        "device_id": "dev-1",
+        "device_token": "plain-device-token",
+        "ttl_seconds": ttl,
+    }
+
+
+def test_build_pair_url_refetches_only_when_ttl_changes(relay_config, monkeypatch):
+    """缓存要连 ttl 一起比：设置没变就命中缓存不换票，改了有效期必须重签一张。"""
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    seen = []
+
+    def _ticket(base, device_id, token, ttl_seconds=0):
+        seen.append(ttl_seconds)
+        return {"token": f"jwt-{len(seen)}", "expires_at": int(time.time()) + 3600}
+
+    monkeypatch.setattr(portal, "request_ticket", _ticket)
+    bridge = _FakeBridge(_FakeService(True, "dev-1"))
+    first = portal.build_pair_url(bridge, mobile=True, ttl_seconds=3600)
+    cached = portal.build_pair_url(bridge, mobile=True, ttl_seconds=3600)
+    changed = portal.build_pair_url(bridge, mobile=True, ttl_seconds=0)
+    # 只有两次真实换票：3600 那次命中缓存，0 那次因 ttl 变了重签
+    assert seen == [3600, 0]
+    assert cached["token"] == first["token"]
+    assert 3500 <= cached["expires_in"] <= 3600
+    assert changed["token"] != first["token"]
+    assert changed["expires_in"] == 0
+
+
+def test_legacy_persisted_ticket_without_ttl_counts_as_zero(relay_config, monkeypatch):
+    """老版本落盘的缓存没有 ttl_seconds 字段：按 0（永久）读回，不报错也不白换票。"""
+    monkeypatch.setattr("core.credentials.unprotect_secret", lambda value: value)
+    monkeypatch.setattr("core.credentials.protect_secret", lambda value: value)
+    monkeypatch.setattr(portal, "mobile_page_available", lambda base, device_id: True)
+    legacy = json.dumps(
+        {
+            "device_id": "dev-1",
+            "token": "legacy-jwt",
+            "expires_at": int(time.time()) + 3600,
+        }
+    )
+    config.save_config_value(config.CLOUD_RELAY_REMOTE_TICKET_KEY, legacy)
+    assert portal._persisted_ticket("dev-1")["ttl_seconds"] == 0
+
+    calls = []
+
+    def _explode(*args, **kwargs):
+        calls.append(kwargs)
+        return {"token": "should-not-be-called", "expires_at": int(time.time()) + 3600}
+
+    monkeypatch.setattr(portal, "request_ticket", _explode)
+    result = portal.build_pair_url(
+        _FakeBridge(_FakeService(True, "dev-1")), mobile=True, ttl_seconds=0
+    )
+    assert result is not None
+    assert result["token"] == "legacy-jwt"
+    assert result["expires_in"] == 0
+    assert calls == []

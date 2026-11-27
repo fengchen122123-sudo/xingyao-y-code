@@ -159,11 +159,12 @@ def app_ws(client, device_id, jwt_token, last_seq=None, last_boot_id=None):
         yield ws
 
 
-def ticket(client, device_id, device_token):
-    return client.post(
-        "/api/relay/device-token",
-        json={"device_id": device_id, "device_token": device_token},
-    )
+def ticket(client, device_id, device_token, ttl_seconds=None):
+    body = {"device_id": device_id, "device_token": device_token}
+    if ttl_seconds is not None:
+        # 缺省不写这个字段：要能区分「旧客户端不传 ttl」与「显式传 0（永久）」
+        body["ttl_seconds"] = ttl_seconds
+    return client.post("/api/relay/device-token", json=body)
 
 
 def test_db_connect_row_factory_and_schema(tmp_path):
@@ -489,6 +490,59 @@ class TestTicketEndpoint:
         for _ in range(6):
             assert ticket(client, dev, token).status_code == 200
         assert ticket(client, dev, token).status_code == 429
+
+    def test_default_ttl_is_23_hours(self, client, device):
+        # 旧客户端不传 ttl_seconds：沿用 23 小时默认，新参数不改变原有行为
+        dev, token = device
+        body = ticket(client, dev, token).json()
+        assert body["ttl_seconds"] == 23 * 3600 == 82800
+        claims = pyjwt.decode(body["token"], SECRET, algorithms=["HS256"])
+        assert claims["exp"] - claims["iat"] == 82800
+
+    def test_explicit_ttl_seconds_is_signed(self, client, device):
+        dev, token = device
+        body = ticket(client, dev, token, ttl_seconds=3600).json()
+        assert body["ttl_seconds"] == 3600
+        claims = pyjwt.decode(body["token"], SECRET, algorithms=["HS256"])
+        assert claims["exp"] - claims["iat"] == 3600
+
+    def test_ttl_zero_means_forever(self, client, device):
+        # ttl=0 → 永久：用十年表达，且仍然带 exp（绝不签不带 exp 的票）
+        dev, token = device
+        body = ticket(client, dev, token, ttl_seconds=0).json()
+        assert body["ttl_seconds"] == 10 * 365 * 24 * 60 * 60 == 315360000
+        claims = pyjwt.decode(body["token"], SECRET, algorithms=["HS256"])
+        assert claims["exp"] - claims["iat"] == 315360000
+
+    def test_ttl_clamped_to_max_month(self, client, device):
+        dev, token = device
+        body = ticket(client, dev, token, ttl_seconds=999999999).json()
+        assert body["ttl_seconds"] == 30 * 24 * 60 * 60 == 2592000
+        claims = pyjwt.decode(body["token"], SECRET, algorithms=["HS256"])
+        assert claims["exp"] - claims["iat"] == 2592000
+
+    def test_negative_ttl_falls_back_to_default(self, client, device):
+        # 负数是脏数据：回落到 23 小时默认，不能签出已过期的废票
+        dev, token = device
+        body = ticket(client, dev, token, ttl_seconds=-5).json()
+        assert body["ttl_seconds"] == 82800
+        claims = pyjwt.decode(body["token"], SECRET, algorithms=["HS256"])
+        assert claims["exp"] - claims["iat"] == 82800
+
+    def test_ttl_param_does_not_bypass_token_check(self, client, device):
+        # 新参数不能成为绕过鉴权的通道：令牌无效时无论 ttl 是什么都 401
+        dev, _ = device
+        assert ticket(client, dev, "nope", ttl_seconds=0).status_code == 401
+        assert ticket(client, dev, "nope", ttl_seconds=2592000).status_code == 401
+
+    def test_ttl_refresh_still_invalidates_previous_token(self, client, conn, device):
+        # 指定 ttl 换票同样走「一设备只认最新一张票」：旧票在签发瞬间作废
+        dev, token = device
+        first = ticket(client, dev, token).json()
+        second = ticket(client, dev, token, ttl_seconds=3600).json()
+        assert first["token"] != second["token"]
+        assert read_remote_token(conn, first["token"], SECRET, dev) is None
+        assert read_remote_token(conn, second["token"], SECRET, dev) is not None
 
 
 class TestDeviceWS:

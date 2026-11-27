@@ -13,7 +13,12 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .auth import issue_device_token, issue_remote_token, read_remote_token
+from .auth import (
+    issue_device_token,
+    issue_remote_token,
+    read_remote_token,
+    resolve_remote_ttl,
+)
 from .db import connect
 from .mcp_bridge import mount_mcp_and_skill_routes
 from .registry import (
@@ -28,6 +33,8 @@ from .registry import (
 class DeviceTokenBody(BaseModel):
     device_id: str
     device_token: str
+    # 客户端可指定有效期（秒）：0 表示永久，缺省仍走服务端默认 23 小时，旧客户端无需改动
+    ttl_seconds: int | None = None
 
 
 class DeviceEnrollBody(BaseModel):
@@ -289,10 +296,14 @@ def create_app(
         # 限流只计已验证设备：无效令牌不占额度，防止伪造请求把合法设备的换票锁死。
         if not _ticket_allowed(body.device_id, time.time()):
             raise HTTPException(status_code=429, detail="换票过于频繁")
-        payload = issue_device_token(database, jwt_secret, body.device_id)
+        payload = issue_device_token(
+            database, jwt_secret, body.device_id, ttl_seconds=body.ttl_seconds
+        )
         # 签发新票即换代：旧链接（含泄露出去的那张）立刻作废，
         # 已连着的远端页面一并踢下线，并回收旧 jti 的 App 名额
         relay.kick_apps(body.device_id)
+        # 回显归一后的实际有效期，便于网关侧排障（客户端传的原值可能被夹取）
+        payload["ttl_seconds"] = resolve_remote_ttl(body.ttl_seconds)
         return payload
 
     @app.post("/api/relay/device-enroll")
