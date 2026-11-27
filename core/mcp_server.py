@@ -293,6 +293,9 @@ class _McpRequestHandler(BaseHTTPRequestHandler):
             path == "/a2a"
             or path == "/api/a2a/send"
             or path == "/api/a2a/permission"
+            or path == "/api/a2a/session/create"
+            or path == "/api/a2a/session/select"
+            or path == "/api/a2a/model/select"
             or (path.startswith("/api/a2a/tasks/") and path.endswith("/cancel"))
         )
         if path != "/mcp" and not is_a2a_route:
@@ -353,6 +356,31 @@ class _McpRequestHandler(BaseHTTPRequestHandler):
             )
             self._send_json(200, res)
             return
+        if path == "/api/a2a/session/create":
+            res = mcp.a2a.create_remote_session(
+                workdir=payload.get("workdir"),
+                session_name=payload.get("session_name"),
+                model_id=payload.get("model_id"),
+                permission_mode=str(payload.get("permission_mode") or "full"),
+                sandbox_bypass=bool(payload.get("sandbox_bypass", True)),
+            )
+            self._send_json(200, res)
+            return
+        if path == "/api/a2a/session/select":
+            res = mcp.a2a.select_remote_session(
+                str(payload.get("session_name") or ""),
+                permission_mode=str(payload.get("permission_mode") or "full"),
+                sandbox_bypass=bool(payload.get("sandbox_bypass", True)),
+            )
+            self._send_json(200, res)
+            return
+        if path == "/api/a2a/model/select":
+            res = mcp.a2a.select_remote_model(
+                str(payload.get("model") or payload.get("model_id") or ""),
+                session_name=payload.get("session_name"),
+            )
+            self._send_json(200, res)
+            return
         if path.startswith("/api/a2a/tasks/") and path.endswith("/cancel"):
             task_id = path[len("/api/a2a/tasks/"):-len("/cancel")].strip("/")
             task = mcp.a2a.cancel_task(task_id)
@@ -392,6 +420,44 @@ class _McpRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, mcp.a2a.get_status())
             return
+        if path in (
+            "/api/a2a/workspaces",
+            "/api/a2a/sessions",
+            "/api/a2a/providers",
+            "/api/a2a/models",
+        ):
+            mcp = self._mcp()
+            query = parse_qs(parsed.query)
+            if not mcp.authorize(self.headers.get("Authorization"), query):
+                self._send_json(
+                    401,
+                    _error(None, -32001, "unauthorized"),
+                    {"WWW-Authenticate": 'Bearer realm="mcp"'},
+                )
+                return
+            if path == "/api/a2a/workspaces":
+                self._send_json(200, mcp.a2a.list_workspaces())
+                return
+            if path == "/api/a2a/sessions":
+                workdir_q = (query.get("workdir") or [""])[0]
+                include_empty_raw = str((query.get("include_empty") or ["1"])[0]).strip().lower()
+                include_empty = include_empty_raw not in ("0", "false", "no")
+                self._send_json(
+                    200,
+                    mcp.a2a.list_sessions(workdir=workdir_q or None, include_empty=include_empty),
+                )
+                return
+            if path == "/api/a2a/providers":
+                self._send_json(200, mcp.a2a.list_providers())
+                return
+            if path == "/api/a2a/models":
+                prov_q = (query.get("provider") or [""])[0]
+                sess_q = (query.get("session_name") or [""])[0]
+                self._send_json(
+                    200,
+                    mcp.a2a.list_models(provider=prov_q or None, session_name=sess_q or None),
+                )
+                return
         if path.startswith("/api/a2a/tasks/"):
             mcp = self._mcp()
             if not mcp.authorize(self.headers.get("Authorization"), parse_qs(parsed.query)):

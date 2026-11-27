@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Callable, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import config
 from core import app_context, credentials
@@ -211,6 +211,29 @@ def delete_peer(peer_id: str) -> bool:
             return False
         _write_raw_peers_locked(kept)
         return True
+
+
+def update_peer_binding(
+    peer_id: str,
+    *,
+    default_session: Optional[str] = None,
+    default_workdir: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """原地更新节点绑定的默认会话 / 默认工作目录（绝不修改已保存令牌）。"""
+    target = str(peer_id or "").strip()
+    if not target:
+        return None
+    with _config_lock:
+        rows = _read_raw_peers_locked()
+        for row in rows:
+            if str(row.get("id") or "").strip() == target or str(row.get("name") or "").strip() == target:
+                if default_session is not None:
+                    row["default_session"] = str(default_session).strip()
+                if default_workdir is not None:
+                    row["default_workdir"] = str(default_workdir).strip()
+                _write_raw_peers_locked(rows)
+                return _sanitize_peer(row, include_secret=False)
+    return None
 
 
 def _update_peer_probe_status(
@@ -536,6 +559,171 @@ def _a2a_rpc_call(peer: dict[str, Any], method: str, params: dict[str, Any], tim
     if not isinstance(result, dict):
         raise RuntimeError("A2A 响应缺少 result")
     return result
+
+
+def _require_a2a_peer(peer_id: str) -> dict[str, Any]:
+    peer = get_peer(peer_id, include_secret=True)
+    if peer is None:
+        raise ValueError(f"未找到节点: {peer_id}")
+    if not peer.get("enabled", True):
+        raise ValueError(f"节点 {peer['name']} 已停用")
+    if _resolve_protocol(peer) != "a2a":
+        raise ValueError(f"节点 {peer['name']} 当前为 LAN WS 协议，远端目录/对话/模型管理请改用 A2A HTTP 地址（http://...:8765/a2a）")
+    return peer
+
+
+def _a2a_rest_call(
+    peer: dict[str, Any],
+    method: str,
+    path: str,
+    *,
+    query: Optional[dict[str, Any]] = None,
+    body: Optional[dict[str, Any]] = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    base_url, _ = _a2a_urls(str(peer.get("url") or ""))
+    token = str(peer.get("token") or "")
+    clean_path = "/" + path.lstrip("/")
+    url = f"{base_url}{clean_path}"
+    if query:
+        filtered = {k: str(v) for k, v in query.items() if v is not None and str(v) != ""}
+        if filtered:
+            url = f"{url}?{urlencode(filtered)}"
+    status_code, resp = _http_json(method, url, payload=body, token=token, timeout=timeout)
+    if status_code in (401, 403):
+        raise RuntimeError("节点鉴权失败，请检查令牌")
+    if status_code == 404:
+        raise RuntimeError("对端星瑶暂不支持此接口（HTTP 404），请将对端更新到最新版本")
+    if status_code >= 400:
+        raise RuntimeError(f"节点返回 HTTP {status_code}: {resp}")
+    if not isinstance(resp, dict):
+        raise RuntimeError("节点返回格式非法")
+    return resp
+
+
+def fetch_peer_status(peer_id: str) -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    res = _a2a_rest_call(peer, "GET", "/api/a2a/status")
+    res["peer"] = _sanitize_peer(peer, include_secret=False)
+    return res
+
+
+def fetch_peer_workspaces(peer_id: str) -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    res = _a2a_rest_call(peer, "GET", "/api/a2a/workspaces")
+    res["peer"] = _sanitize_peer(peer, include_secret=False)
+    return res
+
+
+def fetch_peer_sessions(peer_id: str, workdir: str = "") -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    res = _a2a_rest_call(
+        peer,
+        "GET",
+        "/api/a2a/sessions",
+        query={"workdir": workdir} if str(workdir or "").strip() else None,
+    )
+    res["peer"] = _sanitize_peer(peer, include_secret=False)
+    return res
+
+
+def fetch_peer_providers(peer_id: str) -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    res = _a2a_rest_call(peer, "GET", "/api/a2a/providers")
+    res["peer"] = _sanitize_peer(peer, include_secret=False)
+    return res
+
+
+def fetch_peer_models(peer_id: str, provider: str = "", session_name: str = "") -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    target_sess = str(session_name or "").strip() or str(peer.get("default_session") or "").strip()
+    query: dict[str, Any] = {}
+    if str(provider or "").strip():
+        query["provider"] = str(provider).strip()
+    if target_sess:
+        query["session_name"] = target_sess
+    res = _a2a_rest_call(peer, "GET", "/api/a2a/models", query=query or None)
+    res["peer"] = _sanitize_peer(peer, include_secret=False)
+    return res
+
+
+def create_peer_session(
+    peer_id: str,
+    *,
+    workdir: str = "",
+    session_name: str = "",
+    model_id: str = "",
+    permission_mode: str = "full",
+    sandbox_bypass: bool = True,
+) -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    payload: dict[str, Any] = {
+        "workdir": str(workdir or "").strip(),
+        "session_name": str(session_name or "").strip(),
+        "model_id": str(model_id or "").strip(),
+        "permission_mode": str(permission_mode or "full").strip() or "full",
+        "sandbox_bypass": bool(sandbox_bypass),
+    }
+    res = _a2a_rest_call(peer, "POST", "/api/a2a/session/create", body=payload)
+    if res.get("ok") and isinstance(res.get("session"), dict):
+        sess = res["session"]
+        updated_peer = update_peer_binding(
+            peer["id"],
+            default_session=str(sess.get("name") or ""),
+            default_workdir=str(sess.get("workdir") or ""),
+        )
+        if updated_peer is not None:
+            res["peer"] = updated_peer
+    return res
+
+
+def select_peer_session(
+    peer_id: str,
+    session_name: str,
+    *,
+    permission_mode: str = "full",
+    sandbox_bypass: bool = True,
+) -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    clean_session = str(session_name or "").strip()
+    if not clean_session:
+        return {"ok": False, "msg": "session_name 不能为空"}
+    payload: dict[str, Any] = {
+        "session_name": clean_session,
+        "permission_mode": str(permission_mode or "full").strip() or "full",
+        "sandbox_bypass": bool(sandbox_bypass),
+    }
+    res = _a2a_rest_call(peer, "POST", "/api/a2a/session/select", body=payload)
+    if res.get("ok") and isinstance(res.get("session"), dict):
+        sess = res["session"]
+        updated_peer = update_peer_binding(
+            peer["id"],
+            default_session=str(sess.get("name") or clean_session),
+            default_workdir=str(sess.get("workdir") or ""),
+        )
+        if updated_peer is not None:
+            res["peer"] = updated_peer
+    return res
+
+
+def select_peer_model(
+    peer_id: str,
+    model: str,
+    *,
+    session_name: str = "",
+) -> dict[str, Any]:
+    peer = _require_a2a_peer(peer_id)
+    clean_model = str(model or "").strip()
+    if not clean_model:
+        return {"ok": False, "msg": "model 不能为空"}
+    target_sess = str(session_name or "").strip() or str(peer.get("default_session") or "").strip()
+    payload: dict[str, Any] = {
+        "model": clean_model,
+        "session_name": target_sess,
+    }
+    res = _a2a_rest_call(peer, "POST", "/api/a2a/model/select", body=payload)
+    res["peer"] = _sanitize_peer(peer, include_secret=False)
+    return res
 
 
 def _a2a_send(
@@ -872,6 +1060,7 @@ class LanPeerTaskManager:
         self._tasks: dict[str, dict[str, Any]] = {}
         self._task_order: list[str] = []
         self._watching: set[str] = set()
+        self._manual_polling: dict[str, int] = {}
         self._shutdown_event = threading.Event()
         self._task_callback: Optional[Callable[[dict[str, Any]], None]] = None
 
@@ -888,6 +1077,7 @@ class LanPeerTaskManager:
             self._tasks.clear()
             self._task_order.clear()
             self._watching.clear()
+            self._manual_polling.clear()
             self._task_callback = None
 
     def _record_task(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -933,7 +1123,7 @@ class LanPeerTaskManager:
         try:
             while not self._shutdown_event.is_set() and time.monotonic() < deadline:
                 snap = self.get_local_task(local_task_id)
-                if snap is None:
+                if snap is None or snap.get("reported"):
                     return
                 if snap["status"] in _TERMINAL_STATES or snap["status"] == "input-required":
                     return
@@ -946,7 +1136,28 @@ class LanPeerTaskManager:
                     continue
                 status = str(updated.get("status") or "")
                 if status in _TERMINAL_STATES or status == "input-required":
-                    self._fire_callback(updated)
+                    # 若正在进行同步人工 poll（例如同回合 LLM 调 lan_peer_poll），
+                    # 稍作让步让人工 poll 先认领 reported，避免结果已在工具里返回后仍重复起汇总回合
+                    grace_deadline = time.monotonic() + 0.25
+                    while time.monotonic() < grace_deadline:
+                        with self._lock:
+                            manual_active = self._manual_polling.get(local_task_id, 0) > 0
+                            already_reported = bool(
+                                (self._tasks.get(local_task_id) or {}).get("reported")
+                            )
+                        if already_reported or not manual_active:
+                            break
+                        if self._shutdown_event.wait(0.01):
+                            return
+                    should_notify = False
+                    with self._lock:
+                        target = self._tasks.get(local_task_id)
+                        if target is not None and not target.get("reported"):
+                            target["reported"] = True
+                            should_notify = True
+                            updated = dict(target)
+                    if should_notify:
+                        self._fire_callback(updated)
                     return
                 if self._shutdown_event.wait(0.5):
                     return
@@ -1015,6 +1226,7 @@ class LanPeerTaskManager:
 
         local_task_id = f"ltask-{uuid.uuid4().hex[:10]}"
         now = time.time()
+        initial_status = str(res.get("status") or "working")
         record = {
             "local_task_id": local_task_id,
             "peer_id": peer["id"],
@@ -1024,12 +1236,13 @@ class LanPeerTaskManager:
             "origin_session": origin_session,
             "remote_session": str(res.get("remote_session") or target_session),
             "prompt_preview": clean_text[:120],
-            "status": str(res.get("status") or "working"),
+            "status": initial_status,
             "reply": str(res.get("reply") or ""),
             "error": str(res.get("error") or ""),
             "permission": res.get("permission"),
             "progress": res.get("progress"),
             "auto_report": bool(auto_report),
+            "reported": initial_status in _TERMINAL_STATES or initial_status == "input-required",
             "created_at": now,
             "updated_at": now,
         }
@@ -1074,25 +1287,42 @@ class LanPeerTaskManager:
             return {"ok": False, "status": "not_found", "msg": f"节点不存在: {snapshot['peer_id']}"}
 
         wait = _clamp_wait(wait_seconds, 25)
-        if snapshot["protocol"] == "a2a" and snapshot["remote_task_id"]:
-            res = _a2a_get_task(peer, snapshot["remote_task_id"], wait_seconds=wait)
-        else:
-            res = _ws_poll(peer, snapshot["remote_session"], wait_seconds=wait)
-
-        with self._lock:
-            target = self._tasks.get(snapshot["local_task_id"])
-            if target is not None:
-                target["status"] = str(res.get("status") or target["status"])
-                if res.get("reply"):
-                    target["reply"] = str(res["reply"])
-                if res.get("error"):
-                    target["error"] = str(res["error"])
-                target["permission"] = res.get("permission")
-                target["progress"] = res.get("progress")
-                target["updated_at"] = time.time()
-                updated = dict(target)
+        local_tid = snapshot["local_task_id"]
+        if not from_watcher:
+            with self._lock:
+                self._manual_polling[local_tid] = self._manual_polling.get(local_tid, 0) + 1
+        try:
+            if snapshot["protocol"] == "a2a" and snapshot["remote_task_id"]:
+                res = _a2a_get_task(peer, snapshot["remote_task_id"], wait_seconds=wait)
             else:
-                updated = snapshot
+                res = _ws_poll(peer, snapshot["remote_session"], wait_seconds=wait)
+
+            with self._lock:
+                target = self._tasks.get(local_tid)
+                if target is not None:
+                    target["status"] = str(res.get("status") or target["status"])
+                    if res.get("reply"):
+                        target["reply"] = str(res["reply"])
+                    if res.get("error"):
+                        target["error"] = str(res["error"])
+                    target["permission"] = res.get("permission")
+                    target["progress"] = res.get("progress")
+                    target["updated_at"] = time.time()
+                    if not from_watcher and (
+                        target["status"] in _TERMINAL_STATES or target["status"] == "input-required"
+                    ):
+                        target["reported"] = True
+                    updated = dict(target)
+                else:
+                    updated = snapshot
+        finally:
+            if not from_watcher:
+                with self._lock:
+                    left = self._manual_polling.get(local_tid, 0) - 1
+                    if left <= 0:
+                        self._manual_polling.pop(local_tid, None)
+                    else:
+                        self._manual_polling[local_tid] = left
         updated["ok"] = updated["status"] != "failed"
         if not from_watcher and updated["status"] == "working" and updated.get("auto_report") and updated.get("origin_session"):
             self._start_watcher_if_needed(updated["local_task_id"])
@@ -1268,3 +1498,147 @@ def tool_lan_peer_approve(
         wait_seconds=wait_seconds,
     )
     return _format_task_result(res)
+
+
+def tool_lan_peer_inspect(
+    peer: str,
+    target: str = "status",
+    workdir: str = "",
+    provider: str = "",
+    session_name: str = "",
+) -> str:
+    """通过 HTTP 直接查询对端星瑶的工作目录、对话、厂商、模型或当前状态（无需消耗对端 LLM 回合）。"""
+    kind = str(target or "status").strip().lower()
+    try:
+        if kind in ("workspaces", "workspace", "dirs", "dir", "目录"):
+            res = fetch_peer_workspaces(peer)
+            p = res.get("peer") or {}
+            items = res.get("workspaces") or []
+            bound_dir = str(p.get("default_workdir") or "")
+            lines = [f"[{p.get('name', peer)}] 工作目录列表（共 {len(items)} 个）："]
+            for idx, ws in enumerate(items, 1):
+                mark = " ← 当前绑定" if bound_dir and ws.get("path") == bound_dir else ""
+                lines.append(
+                    f"{idx}. {ws.get('path')}（{ws.get('label')} · {ws.get('session_count', 0)} 个对话）{mark}"
+                )
+            return "\n".join(lines)
+
+        if kind in ("sessions", "session", "chats", "对话", "会话"):
+            res = fetch_peer_sessions(peer, workdir=workdir)
+            p = res.get("peer") or {}
+            items = res.get("sessions") or []
+            bound_sess = str(p.get("default_session") or "")
+            lines = [f"[{p.get('name', peer)}] 对话列表（共 {len(items)} 个）："]
+            for idx, s in enumerate(items, 1):
+                mark = " ← 当前绑定" if bound_sess and s.get("name") == bound_sess else ""
+                lines.append(
+                    f"{idx}. {s.get('name')} | 目录={s.get('workdir')} | 消息={s.get('count', 0)} | "
+                    f"模型={s.get('model_name') or '-'} | 权限={s.get('permission_mode')}/沙盒"
+                    f"{'已解除' if s.get('sandbox_bypass') else '受限'}{mark}"
+                )
+            return "\n".join(lines)
+
+        if kind in ("providers", "provider", "厂商", "供应商"):
+            res = fetch_peer_providers(peer)
+            p = res.get("peer") or {}
+            items = res.get("providers") or []
+            lines = [f"[{p.get('name', peer)}] 模型厂商列表（共 {len(items)} 个）："]
+            for idx, prov in enumerate(items, 1):
+                preview = ", ".join(prov.get("models_preview") or [])
+                lines.append(
+                    f"{idx}. {prov.get('name')} (id={prov.get('id')}, models={prov.get('model_count', 0)}, "
+                    f"host={prov.get('base_url_host') or '-'})" + (f" | 示例: {preview}" if preview else "")
+                )
+            return "\n".join(lines)
+
+        if kind in ("models", "model", "模型"):
+            res = fetch_peer_models(peer, provider=provider, session_name=session_name)
+            p = res.get("peer") or {}
+            items = res.get("models") or []
+            active_id = str(res.get("active_model_id") or "")
+            sess_hint = str(res.get("session_name") or "").strip() or "对端全局默认"
+            lines = [f"[{p.get('name', peer)}] 模型列表（共 {len(items)} 个 · 目标={sess_hint}）："]
+            for idx, m in enumerate(items, 1):
+                mark = " ← 当前使用" if active_id and m.get("id") == active_id else ""
+                lines.append(
+                    f"{idx}. {m.get('name')} (id={m.get('id')}, provider={m.get('provider_name')}, "
+                    f"ctx={m.get('context_window', 0)}){mark}"
+                )
+            return "\n".join(lines)
+
+        res = fetch_peer_status(peer)
+        p = res.get("peer") or {}
+        return (
+            f"[{p.get('name', peer)}] 在线={res.get('online')} | 前台会话={res.get('current_session') or '-'} | "
+            f"当前绑定会话={p.get('default_session') or '未指定（按主机名隔离）'} | "
+            f"当前绑定目录={p.get('default_workdir') or '未指定'} | "
+            f"激活模型={res.get('active_model_name') or res.get('active_model_id') or '-'} | "
+            f"工作目录数={res.get('workspace_count', 0)} | 对话数={res.get('session_count', 0)}"
+        )
+    except Exception as exc:
+        return f"🚨 查询节点 [{peer}] 失败：{exc}"
+
+
+def tool_lan_peer_manage(
+    peer: str,
+    action: str,
+    session_name: str = "",
+    workdir: str = "",
+    model: str = "",
+    permission_mode: str = "full",
+    sandbox_bypass: bool = True,
+) -> str:
+    """管理对端星瑶会话与模型选择，并将结果持久绑定为该节点后续对话的默认目标。"""
+    act = str(action or "").strip().lower()
+    try:
+        if act in ("create_session", "new_session", "create", "新建", "新建对话"):
+            res = create_peer_session(
+                peer,
+                workdir=workdir,
+                session_name=session_name,
+                model_id=model,
+                permission_mode=permission_mode or "full",
+                sandbox_bypass=bool(sandbox_bypass),
+            )
+            if not res.get("ok"):
+                return f"🚨 [{peer}] 新建对话失败：{res.get('msg') or '未知错误'}"
+            sess = res.get("session") or {}
+            return (
+                f"✅ [{peer}] 已创建并绑定对话 `{sess.get('name')}`："
+                f"目录={sess.get('workdir')}，模型={sess.get('model_name') or '-'}，"
+                f"权限={sess.get('permission_mode')}，沙盒={'已解除' if sess.get('sandbox_bypass') else '开启'}。"
+                f"后续 lan_peer_send 将直接复用该对话。"
+            )
+
+        if act in ("select_session", "use_session", "选对话", "选择对话"):
+            res = select_peer_session(
+                peer,
+                session_name,
+                permission_mode=permission_mode or "full",
+                sandbox_bypass=bool(sandbox_bypass),
+            )
+            if not res.get("ok"):
+                return f"🚨 [{peer}] 选择对话失败：{res.get('msg') or '未知错误'}"
+            sess = res.get("session") or {}
+            return (
+                f"✅ [{peer}] 已绑定对话 `{sess.get('name')}`："
+                f"目录={sess.get('workdir')}，模型={sess.get('model_name') or '-'}，"
+                f"权限={sess.get('permission_mode')}，沙盒={'已解除' if sess.get('sandbox_bypass') else '开启'}。"
+            )
+
+        if act in ("select_model", "set_model", "选模型", "切换模型"):
+            res = select_peer_model(peer, model, session_name=session_name)
+            if not res.get("ok"):
+                return f"🚨 [{peer}] 切换模型失败：{res.get('msg') or '未知错误'}"
+            sess_label = res.get("session_name") or "对端全局默认"
+            return (
+                f"✅ [{peer}] 已将 `{sess_label}` 的模型切换为 "
+                f"{res.get('active_model_name')} (id={res.get('active_model_id')}, "
+                f"provider={res.get('provider_name')})。"
+            )
+
+        return (
+            f"🚨 不支持的 action={action}，请使用 create_session / select_session / select_model。"
+        )
+    except Exception as exc:
+        return f"🚨 管理节点 [{peer}] 失败：{exc}"

@@ -53,14 +53,14 @@
             :disabled="busy"
             @click="loadLocalInfo(true)"
           >
-            <AppIcon :name="localInfo.running ? 'refresh' : 'play'" :size="13" />
-            <span>{{ localInfo.running ? '刷新本机信息' : '启动并获取信息' }}</span>
+            <AppIcon :name="localInfo.running && localInfo.token ? 'refresh' : 'play'" :size="13" />
+            <span>{{ localActionLabel }}</span>
           </button>
           <button
             class="primary-button"
             type="button"
             data-test="lan-peers-copy-import"
-            :disabled="busy || !localInfo.import_json"
+            :disabled="busy || !localInfo.import_json || !localInfo.token"
             @click="copyText(localInfo.import_json, '已复制一键导入配置，可粘贴到另一台电脑')"
           >
             <AppIcon name="copy" :size="13" />
@@ -382,6 +382,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
+import { useAppStore } from '../stores/appStore';
 import type { LanPeerInfo, LanPeerLocalInfo } from '../types/pywebview';
 
 const peers = ref<LanPeerInfo[]>([]);
@@ -410,6 +411,20 @@ const localTokenDisplay = computed(() => {
   if (!localInfo.value.token) return '尚未签发（启动后生成）';
   return showLocalToken.value ? localInfo.value.token : '••••••••••••••••••••••••';
 });
+
+const localActionLabel = computed(() => {
+  if (!localInfo.value.running) return '启动并获取信息';
+  if (!localInfo.value.token) return '签发配对令牌';
+  return '刷新本机信息';
+});
+
+function refreshSlashCommands() {
+  try {
+    void useAppStore().loadSlashCommands();
+  } catch {
+    // 无 Pinia 上下文的独立组件单测跳过
+  }
+}
 
 function api() {
   return (window as any).pywebview?.api;
@@ -538,6 +553,7 @@ async function submitForm() {
     }
     if (Array.isArray(res.peers)) peers.value = res.peers;
     showForm.value = false;
+    refreshSlashCommands();
     setNotice('节点配置已保存。');
   } finally {
     busy.value = false;
@@ -569,6 +585,7 @@ async function togglePeerEnabled(peer: LanPeerInfo) {
     });
     if (res?.ok && Array.isArray(res.peers)) {
       peers.value = res.peers;
+      refreshSlashCommands();
       setNotice(`已${!peer.enabled ? '启用' : '停用'}节点 ${peer.name}。`);
     } else if (res?.msg) {
       setNotice(res.msg, true);
@@ -585,6 +602,7 @@ async function removePeer(peerId: string) {
     if (res?.ok && Array.isArray(res.peers)) {
       peers.value = res.peers;
       if (editingId.value === peerId) showForm.value = false;
+      refreshSlashCommands();
       setNotice(`已删除节点 ${peerId}。`);
     } else if (res?.msg) {
       setNotice(res.msg, true);

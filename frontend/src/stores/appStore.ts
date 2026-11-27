@@ -5087,11 +5087,36 @@ navItems: [] as Array<{ id: number; preview: string }>,
           pendingDir ? (this.draftModelId || undefined) : (this.activeModelId || undefined),
           this._getSessionRuntime(sessionName).permMode || undefined,
         );
+        const isSlashReply = Boolean(res && (res as any).slash);
+        if (isSlashReply && !willQueue) {
+          this._setSessionRunning(sessionName, false);
+          const targetRt = this._getSessionRuntime(sessionName);
+          const msgs = targetRt.messages;
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (
+              m
+              && m.role === 'assistant'
+              && m.execution_state === 'running'
+              && !m.content
+              && !m.reasoning_content
+              && !(m.tool_calls && m.tool_calls.length)
+            ) {
+              msgs.splice(i, 1);
+              break;
+            }
+          }
+          if (this.currentSessionName === sessionName) {
+            this._bindSessionRuntime(sessionName);
+          }
+        }
         if (res && res.ok) {
           this.draftModelId = '';
           if (/^\/goal(\s|$)/i.test(text.trim())) void this.loadGoalState();
-          if (pendingDir) {
-          this.refreshSessions();
+          if (isSlashReply && pendingDir && !(res as any).session) {
+            revertGhostSession();
+          } else if (pendingDir) {
+            this.refreshSessions();
           }
         }
         if (!res || !res.ok) {
@@ -5113,9 +5138,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
             // 先回退幽灵会话再广播：runtime 已迁回草稿 key，
             // notice 事件回环插入才能落到草稿视图（否则目标会话 runtime 为空被丢弃）
             revertGhostSession();
-            this.broadcastChatNotice('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'error');
+            if (!isSlashReply) {
+              this.broadcastChatNotice('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'error');
+            }
           } else {
-            this.broadcastChatNotice('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'error', sessionName);
+            if (!isSlashReply) {
+              this.broadcastChatNotice('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'error', sessionName);
+            }
             if (this.currentSessionName === sessionName) {
               this._bindSessionRuntime(sessionName);
             }

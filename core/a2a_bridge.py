@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import re
 import threading
 import time
@@ -9,6 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,53 @@ def _sanitize_permission_payload(perm: Any) -> dict[str, Any] | None:
     if isinstance(perm.get("options"), list):
         out["options"] = list(perm["options"])
     return out
+
+
+def _normalize_workdir_value(raw: Any) -> str:
+    val = str(raw or "").strip()
+    if not val or val.upper() == "GLOBAL" or val == "全局":
+        return "GLOBAL"
+    try:
+        return os.path.normpath(os.path.realpath(os.path.abspath(os.path.expanduser(val))))
+    except Exception:
+        return os.path.normpath(val)
+
+
+def _workdir_eq(left: Any, right: Any) -> bool:
+    nl = _normalize_workdir_value(left)
+    nr = _normalize_workdir_value(right)
+    if nl == "GLOBAL" or nr == "GLOBAL":
+        return nl == nr
+    return os.path.normcase(nl) == os.path.normcase(nr)
+
+
+def _url_host_label(raw_url: Any) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+    except Exception:
+        return ""
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    port_part = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port_part}"
+
+
+def _format_session_display_name(raw_name: str, source: str = "GUI") -> str:
+    name = str(raw_name or "")
+    if str(source or "").upper() == "SECRETARY":
+        try:
+            from core import secretary
+            sec_name = secretary.get_secretary_name(name)
+            if sec_name:
+                return str(sec_name)
+        except Exception:
+            pass
+    if re.match(r"^session_[a-f0-9]{6}$", name):
+        return f"新会话 ({name})"
+    return name
 
 
 @dataclass
@@ -242,21 +291,255 @@ class A2ABridge:
         except Exception:
             logger.debug("A2ABridge.on_event 处理异常（已忽略）", exc_info=True)
 
+    def _emit_sessions_refresh(self) -> None:
+        bridge = self.bridge
+        if bridge is None:
+            return
+        emit_fn = getattr(bridge, "emit_event", None)
+        get_sessions = getattr(bridge, "get_sessions", None)
+        if callable(emit_fn) and callable(get_sessions):
+            try:
+                emit_fn("sessions", get_sessions())
+            except Exception:
+                logger.debug("A2A 推送 sessions 刷新事件失败", exc_info=True)
+
+    def _all_sessions_flat(self) -> list[dict[str, Any]]:
+        bridge = self.bridge
+        if bridge is None:
+            return []
+        mem = getattr(bridge, "_memory", None)
+        if mem is not None and callable(getattr(mem, "get_all_sessions", None)):
+            try:
+                rows = mem.get_all_sessions(workdir=None, include_empty=True) or []
+                return [dict(r) for r in rows if isinstance(r, dict)]
+            except Exception:
+                logger.debug("读取 MemoryManager 会话列表失败", exc_info=True)
+        get_sessions = getattr(bridge, "get_sessions", None)
+        if callable(get_sessions):
+            try:
+                raw = get_sessions() or []
+            except Exception:
+                return []
+            flat: list[dict[str, Any]] = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                if isinstance(item.get("sessions"), list):
+                    folder_path = str(item.get("folder_path") or "")
+                    for child in item["sessions"]:
+                        if isinstance(child, dict):
+                            entry = dict(child)
+                            if not entry.get("workdir") and folder_path:
+                                entry["workdir"] = folder_path
+                            flat.append(entry)
+                elif item.get("name"):
+                    flat.append(dict(item))
+            return flat
+        return []
+
+    def _apply_remote_session_access(
+        self,
+        session_name: str,
+        *,
+        permission_mode: str = "full",
+        sandbox_bypass: bool = True,
+        only_if_unset: bool = False,
+    ) -> tuple[str, bool]:
+        from core import app_context
+
+        target = str(session_name or "").strip()
+        canonical_mode = (
+            app_context.normalize_permission_mode(permission_mode)
+            if app_context.is_known_permission_mode(permission_mode)
+            else "full"
+        )
+        effective_mode = canonical_mode
+        bridge = self.bridge
+        mem = getattr(bridge, "_memory", None) if bridge is not None else None
+        if target and mem is not None:
+            getter = getattr(mem, "get_session_permission_mode", None)
+            setter = getattr(mem, "set_session_permission_mode", None)
+            existing_mode = None
+            if callable(getter):
+                try:
+                    existing_mode = getter(target)
+                except Exception:
+                    existing_mode = None
+            if existing_mode and only_if_unset:
+                effective_mode = str(existing_mode)
+            elif callable(setter):
+                try:
+                    setter(target, canonical_mode)
+                    effective_mode = canonical_mode
+                except Exception:
+                    logger.debug("绑定远程会话权限档位失败", exc_info=True)
+
+        effective_sandbox = bool(sandbox_bypass)
+        if target:
+            try:
+                from core.tools import (
+                    is_session_sandbox_bypass_enabled,
+                    set_session_sandbox_bypass,
+                )
+
+                if only_if_unset:
+                    already = bool(is_session_sandbox_bypass_enabled(target))
+                    if already:
+                        effective_sandbox = True
+                    elif effective_mode == "full" and sandbox_bypass:
+                        set_session_sandbox_bypass(True, session_name=target)
+                        effective_sandbox = True
+                    else:
+                        effective_sandbox = already
+                else:
+                    set_session_sandbox_bypass(bool(sandbox_bypass), session_name=target)
+                    effective_sandbox = bool(sandbox_bypass)
+            except Exception:
+                logger.debug("设置远程会话沙盒状态失败", exc_info=True)
+        return effective_mode, effective_sandbox
+
+    def _load_model_config(self) -> dict[str, Any]:
+        bridge = self.bridge
+        if bridge is not None:
+            loader = getattr(bridge, "_load_config", None) or getattr(bridge, "load_config", None)
+            if callable(loader):
+                try:
+                    data = loader()
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+        try:
+            from core.model_manager import load_config
+            data = load_config()
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _resolve_active_model_for_session(
+        self,
+        session_name: str | None = None,
+        cfg: Optional[dict[str, Any]] = None,
+    ) -> tuple[str, str]:
+        config_data = cfg if isinstance(cfg, dict) else self._load_model_config()
+        model_index: dict[str, str] = {}
+        for p in config_data.get("providers", []) or []:
+            if not isinstance(p, dict):
+                continue
+            for m in p.get("models", []) or []:
+                if isinstance(m, dict) and m.get("id"):
+                    model_index[str(m["id"])] = str(m.get("name") or m.get("litellm_model") or m["id"])
+
+        bridge = self.bridge
+        target = str(session_name or "").strip()
+        if target and bridge is not None:
+            mem = getattr(bridge, "_memory", None)
+            getter = getattr(mem, "get_session_model_id", None) if mem is not None else None
+            if callable(getter):
+                try:
+                    bound = str(getter(target) or "").strip()
+                    if bound:
+                        return bound, model_index.get(bound, bound)
+                except Exception:
+                    pass
+        try:
+            from core.model_manager import get_active_model
+            active = get_active_model(target or None)
+            if isinstance(active, dict) and active.get("id"):
+                aid = str(active["id"])
+                return aid, str(active.get("name") or model_index.get(aid, aid))
+        except Exception:
+            pass
+        global_id = str(config_data.get("active_model_id") or "").strip()
+        if global_id:
+            return global_id, model_index.get(global_id, global_id)
+        return "", ""
+
+    def _build_session_item(self, raw: dict[str, Any], cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        bridge = self.bridge
+        mem = getattr(bridge, "_memory", None) if bridge is not None else None
+        name = str(raw.get("name") or "")
+        source = str(raw.get("source") or "GUI")
+        wdir_raw = raw.get("workdir") or "GLOBAL"
+        norm_wdir = _normalize_workdir_value(wdir_raw)
+        perm_mode = ""
+        if mem is not None and callable(getattr(mem, "get_session_permission_mode", None)):
+            try:
+                perm_mode = str(mem.get_session_permission_mode(name) or "")
+            except Exception:
+                perm_mode = ""
+        if not perm_mode and bridge is not None and callable(getattr(bridge, "_effective_permission_mode", None)):
+            try:
+                perm_mode = str(bridge._effective_permission_mode(name) or "")
+            except Exception:
+                perm_mode = ""
+        sb_bypass = False
+        try:
+            from core.tools import is_session_sandbox_bypass_enabled
+            sb_bypass = bool(is_session_sandbox_bypass_enabled(name))
+        except Exception:
+            sb_bypass = False
+        model_id, model_name = self._resolve_active_model_for_session(name, cfg=cfg)
+        current_session = str(getattr(bridge, "_current_session", "") or "") if bridge is not None else ""
+        return {
+            "name": name,
+            "display_name": _format_session_display_name(name, source=source),
+            "workdir": norm_wdir,
+            "is_global": norm_wdir == "GLOBAL",
+            "count": int(raw.get("count") or 0),
+            "updated_at": str(raw.get("updated_at") or ""),
+            "created_at": str(raw.get("created_at") or ""),
+            "source": source,
+            "model_id": model_id,
+            "model_name": model_name,
+            "permission_mode": perm_mode or "confirm",
+            "sandbox_bypass": sb_bypass,
+            "is_current": bool(current_session and name == current_session),
+        }
+
     def _ensure_session(self, session_name: str, workdir: str | None) -> None:
         bridge = self.bridge
         if bridge is None:
             return
         try:
-            get_sessions = getattr(bridge, "get_sessions", None)
-            create_session = getattr(bridge, "create_session", None)
-            if callable(get_sessions) and callable(create_session):
-                existing = get_sessions() or []
-                known = {str(s.get("name") or "") for s in existing if isinstance(s, dict)}
-                if session_name not in known:
-                    kwargs: dict[str, Any] = {"title": session_name}
-                    if workdir:
-                        kwargs["workdir"] = workdir
-                    create_session(**kwargs)
+            clean_name = str(session_name or "").strip()
+            if not clean_name:
+                return
+            known = {str(s.get("name") or "") for s in self._all_sessions_flat()}
+            created = clean_name not in known
+            mem = getattr(bridge, "_memory", None)
+            if created:
+                target_wdir = _normalize_workdir_value(workdir) if workdir else "GLOBAL"
+                if mem is not None and callable(getattr(mem, "ensure_session", None)):
+                    mem.ensure_session(clean_name, workdir=target_wdir, source="GUI")
+                else:
+                    create_session = getattr(bridge, "create_session", None)
+                    if callable(create_session):
+                        kwargs: dict[str, Any] = {"title": clean_name}
+                        if workdir:
+                            kwargs["workdir"] = workdir
+                        create_session(**kwargs)
+            elif workdir and mem is not None and callable(getattr(mem, "update_session_workdir", None)):
+                # 如果调用方明确传入 workdir，且该会话原本在 GLOBAL 下且暂无明确项目绑定，不强行覆盖已有项目目录；
+                # 只有原本为 GLOBAL 且传入具体目录时才归入目标目录。
+                current_wdir = ""
+                if callable(getattr(mem, "get_session_workdir", None)):
+                    try:
+                        current_wdir = str(mem.get_session_workdir(clean_name) or "").strip()
+                    except Exception:
+                        current_wdir = ""
+                desired = _normalize_workdir_value(workdir)
+                if desired != "GLOBAL" and (not current_wdir or current_wdir == "GLOBAL"):
+                    mem.update_session_workdir(clean_name, desired)
+
+            self._apply_remote_session_access(
+                clean_name,
+                permission_mode="full",
+                sandbox_bypass=True,
+                only_if_unset=not created,
+            )
+            if created:
+                self._emit_sessions_refresh()
         except Exception:
             logger.debug("A2A 预建隔离会话失败（将直接投递消息）", exc_info=True)
 
@@ -270,10 +553,20 @@ class A2ABridge:
         fn = getattr(bridge, "send_user_message", None)
         if not callable(fn):
             raise RuntimeError("bridge 不支持 send_user_message")
+        mem = getattr(bridge, "_memory", None) if bridge is not None else None
+        perm_mode = "full"
+        if mem is not None and callable(getattr(mem, "get_session_permission_mode", None)):
+            try:
+                bound_perm = str(mem.get_session_permission_mode(session_name) or "").strip()
+                if bound_perm:
+                    perm_mode = bound_perm
+            except Exception:
+                pass
         kwargs: dict[str, Any] = {
             "text": text,
             "session_name": session_name,
             "turn_source": "mcp",
+            "permission_mode": perm_mode,
         }
         if workdir:
             kwargs["workdir"] = workdir
@@ -659,13 +952,353 @@ class A2ABridge:
             active_tasks = sum(
                 1 for t in self._tasks.values() if t.status not in _TERMINAL_STATES
             )
+        active_model_id, active_model_name = self._resolve_active_model_for_session(current_session)
+        perm_mode = ""
+        if bridge is not None and callable(getattr(bridge, "_effective_permission_mode", None)):
+            try:
+                perm_mode = str(bridge._effective_permission_mode(current_session) or "")
+            except Exception:
+                perm_mode = ""
+        if not perm_mode:
+            perm_mode = "confirm"
+        sb_bypass = False
+        if current_session:
+            try:
+                from core.tools import is_session_sandbox_bypass_enabled
+                sb_bypass = bool(is_session_sandbox_bypass_enabled(current_session))
+            except Exception:
+                sb_bypass = False
+        ws_res = self.list_workspaces()
+        sess_flat = self._all_sessions_flat()
         return {
             "ok": True,
             "online": bridge is not None,
             "agent": "星瑶 (Y-code)",
             "current_session": current_session,
+            "active_model_id": active_model_id,
+            "active_model_name": active_model_name,
+            "permission_mode": perm_mode,
+            "sandbox_bypass": sb_bypass,
+            "workspace_count": len(ws_res.get("workspaces") or []),
+            "session_count": len(sess_flat),
             "active_tasks": active_tasks,
             "active_permission": active_permission,
+        }
+
+    def list_workspaces(self) -> dict[str, Any]:
+        bridge = self.bridge
+        mem = getattr(bridge, "_memory", None) if bridge is not None else None
+        raw_sessions = self._all_sessions_flat()
+        counts: dict[str, int] = {"GLOBAL": 0}
+        ordered_paths: list[str] = ["GLOBAL"]
+        seen_norms: dict[str, str] = {"GLOBAL": "GLOBAL"}
+
+        def _register_dir(raw_path: Any, increment: int = 0) -> None:
+            norm = _normalize_workdir_value(raw_path)
+            key = "GLOBAL" if norm == "GLOBAL" else os.path.normcase(norm)
+            if key not in seen_norms:
+                seen_norms[key] = norm
+                ordered_paths.append(norm)
+                counts[norm] = 0
+            canon = seen_norms[key]
+            counts[canon] = counts.get(canon, 0) + increment
+
+        if mem is not None and callable(getattr(mem, "get_all_workspaces", None)):
+            try:
+                for ws in mem.get_all_workspaces() or []:
+                    _register_dir(ws, 0)
+            except Exception:
+                logger.debug("读取 workspaces 表失败", exc_info=True)
+        for sess in raw_sessions:
+            _register_dir(sess.get("workdir") or "GLOBAL", 1)
+
+        items: list[dict[str, Any]] = []
+        for path in ordered_paths:
+            is_global = path == "GLOBAL"
+            items.append({
+                "path": path,
+                "label": "自由对话 (GLOBAL)" if is_global else (os.path.basename(path) or path),
+                "is_global": is_global,
+                "session_count": counts.get(path, 0),
+            })
+        items.sort(key=lambda it: (0 if it["is_global"] else 1, -int(it["session_count"]), it["path"].lower()))
+        return {"ok": True, "workspaces": items}
+
+    def list_sessions(
+        self,
+        workdir: str | None = None,
+        include_empty: bool = True,
+    ) -> dict[str, Any]:
+        cfg = self._load_model_config()
+        target_dir = str(workdir or "").strip()
+        raw_sessions = self._all_sessions_flat()
+        items: list[dict[str, Any]] = []
+        for raw in raw_sessions:
+            if not include_empty and int(raw.get("count") or 0) <= 0:
+                continue
+            item = self._build_session_item(raw, cfg=cfg)
+            if target_dir and not _workdir_eq(item["workdir"], target_dir):
+                continue
+            items.append(item)
+        items.sort(key=lambda it: (str(it.get("updated_at") or ""), str(it.get("name") or "")), reverse=True)
+        return {"ok": True, "sessions": items}
+
+    def list_providers(self) -> dict[str, Any]:
+        cfg = self._load_model_config()
+        providers_out: list[dict[str, Any]] = []
+        for p in cfg.get("providers", []) or []:
+            if not isinstance(p, dict):
+                continue
+            models = [m for m in (p.get("models") or []) if isinstance(m, dict)]
+            preview = [str(m.get("name") or m.get("id") or "") for m in models[:5] if (m.get("name") or m.get("id"))]
+            providers_out.append({
+                "id": str(p.get("id") or ""),
+                "name": str(p.get("name") or p.get("id") or ""),
+                "protocol": str(p.get("protocol") or "openai"),
+                "base_url_host": _url_host_label(p.get("base_url")),
+                "model_count": len(models),
+                "models_preview": preview,
+            })
+        return {"ok": True, "providers": providers_out}
+
+    def list_models(
+        self,
+        provider: str | None = None,
+        session_name: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self._load_model_config()
+        target_session = str(session_name or "").strip()
+        active_id, active_name = self._resolve_active_model_for_session(target_session or None, cfg=cfg)
+        prov_filter = str(provider or "").strip().lower()
+        models_out: list[dict[str, Any]] = []
+        for p in cfg.get("providers", []) or []:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("id") or "")
+            pname = str(p.get("name") or pid)
+            if prov_filter and prov_filter not in (pid.lower(), pname.lower()) and prov_filter not in pname.lower():
+                continue
+            for m in p.get("models", []) or []:
+                if not isinstance(m, dict):
+                    continue
+                mid = str(m.get("id") or "")
+                mname = str(m.get("name") or mid)
+                models_out.append({
+                    "id": mid,
+                    "name": mname,
+                    "provider_id": pid,
+                    "provider_name": pname,
+                    "litellm_model": str(m.get("litellm_model") or ""),
+                    "context_window": int(m.get("context_window") or 0),
+                    "is_active": bool(active_id and mid == active_id),
+                })
+        return {
+            "ok": True,
+            "session_name": target_session,
+            "active_model_id": active_id,
+            "active_model_name": active_name,
+            "models": models_out,
+        }
+
+    def create_remote_session(
+        self,
+        *,
+        workdir: str | None = None,
+        session_name: str | None = None,
+        model_id: str | None = None,
+        permission_mode: str = "full",
+        sandbox_bypass: bool = True,
+    ) -> dict[str, Any]:
+        bridge = self.bridge
+        if bridge is None:
+            return {"ok": False, "msg": "bridge 未初始化"}
+        target_wdir = _normalize_workdir_value(workdir)
+        if target_wdir != "GLOBAL" and not os.path.isdir(target_wdir):
+            return {"ok": False, "msg": f"工作目录不存在: {workdir}"}
+
+        clean_name = str(session_name or "").strip()
+        if not clean_name:
+            clean_name = f"remote-{uuid.uuid4().hex[:6]}"
+        existing_names = {str(s.get("name") or "") for s in self._all_sessions_flat()}
+        if clean_name in existing_names:
+            return {"ok": False, "msg": f"会话已存在: {clean_name}"}
+
+        mem = getattr(bridge, "_memory", None)
+        if mem is not None and callable(getattr(mem, "ensure_session", None)):
+            if target_wdir != "GLOBAL" and callable(getattr(mem, "add_workspace", None)):
+                try:
+                    mem.add_workspace(target_wdir)
+                except Exception:
+                    pass
+            mem.ensure_session(clean_name, workdir=target_wdir, source="GUI")
+        else:
+            return {"ok": False, "msg": "bridge 不支持在不切换前台的情况下创建会话"}
+
+        self._apply_remote_session_access(
+            clean_name,
+            permission_mode=permission_mode or "full",
+            sandbox_bypass=bool(sandbox_bypass),
+            only_if_unset=False,
+        )
+
+        clean_model = str(model_id or "").strip()
+        if clean_model:
+            model_res = self.select_remote_model(clean_model, session_name=clean_name)
+            if not model_res.get("ok"):
+                return {
+                    "ok": False,
+                    "msg": f"会话已创建但设置模型失败: {model_res.get('msg')}",
+                }
+
+        self._emit_sessions_refresh()
+        cfg = self._load_model_config()
+        created_row = next(
+            (r for r in self._all_sessions_flat() if str(r.get("name") or "") == clean_name),
+            {"name": clean_name, "workdir": target_wdir, "count": 0, "source": "GUI"},
+        )
+        return {"ok": True, "session": self._build_session_item(created_row, cfg=cfg)}
+
+    def select_remote_session(
+        self,
+        session_name: str,
+        *,
+        permission_mode: str = "full",
+        sandbox_bypass: bool = True,
+    ) -> dict[str, Any]:
+        query = str(session_name or "").strip()
+        if not query:
+            return {"ok": False, "msg": "session_name 不能为空"}
+        raw_sessions = self._all_sessions_flat()
+        exact = [s for s in raw_sessions if str(s.get("name") or "") == query]
+        matched: Optional[dict[str, Any]] = None
+        if exact:
+            matched = exact[0]
+        else:
+            disp_matches = [
+                s
+                for s in raw_sessions
+                if _format_session_display_name(
+                    str(s.get("name") or ""), str(s.get("source") or "GUI")
+                ).lower()
+                == query.lower()
+            ]
+            if len(disp_matches) == 1:
+                matched = disp_matches[0]
+            elif len(disp_matches) > 1:
+                names = ", ".join(str(s.get("name") or "") for s in disp_matches[:5])
+                return {"ok": False, "msg": f"命中多个对话，请指定更精确的会话名: {names}"}
+            else:
+                q_low = query.lower()
+                partial = [
+                    s
+                    for s in raw_sessions
+                    if q_low in str(s.get("name") or "").lower()
+                    or q_low
+                    in _format_session_display_name(
+                        str(s.get("name") or ""), str(s.get("source") or "GUI")
+                    ).lower()
+                ]
+                if len(partial) == 1:
+                    matched = partial[0]
+                elif len(partial) > 1:
+                    names = ", ".join(str(s.get("name") or "") for s in partial[:5])
+                    return {"ok": False, "msg": f"命中多个候选对话，请使用更精确的名称: {names}"}
+
+        if matched is None:
+            return {"ok": False, "msg": f"未找到对话: {query}"}
+
+        target_name = str(matched.get("name") or "")
+        self._apply_remote_session_access(
+            target_name,
+            permission_mode=permission_mode or "full",
+            sandbox_bypass=bool(sandbox_bypass),
+            only_if_unset=False,
+        )
+        cfg = self._load_model_config()
+        return {"ok": True, "session": self._build_session_item(matched, cfg=cfg)}
+
+    def select_remote_model(
+        self,
+        model: str,
+        *,
+        session_name: str | None = None,
+    ) -> dict[str, Any]:
+        query = str(model or "").strip()
+        if not query:
+            return {"ok": False, "msg": "model 不能为空"}
+        cfg = self._load_model_config()
+        candidates: list[dict[str, str]] = []
+        for p in cfg.get("providers", []) or []:
+            if not isinstance(p, dict):
+                continue
+            pname = str(p.get("name") or p.get("id") or "")
+            pid = str(p.get("id") or "")
+            for m in p.get("models", []) or []:
+                if not isinstance(m, dict) or not m.get("id"):
+                    continue
+                candidates.append({
+                    "id": str(m.get("id") or ""),
+                    "name": str(m.get("name") or m.get("id") or ""),
+                    "litellm_model": str(m.get("litellm_model") or ""),
+                    "provider_id": pid,
+                    "provider_name": pname,
+                })
+
+        q_low = query.lower()
+        chosen: Optional[dict[str, str]] = None
+        for key in ("id",):
+            hits = [c for c in candidates if c[key] == query]
+            if hits:
+                chosen = hits[0]
+                break
+        if chosen is None:
+            hits = [c for c in candidates if c["name"].lower() == q_low or c["litellm_model"].lower() == q_low]
+            if len(hits) == 1:
+                chosen = hits[0]
+            elif len(hits) > 1:
+                opts = ", ".join(f"{h['name']}({h['provider_name']}:{h['id']})" for h in hits[:5])
+                return {"ok": False, "msg": f"命中多个同名模型，请改用模型 ID 指定: {opts}"}
+        if chosen is None:
+            hits = [
+                c
+                for c in candidates
+                if q_low in c["name"].lower()
+                or q_low in c["id"].lower()
+                or q_low in c["litellm_model"].lower()
+            ]
+            if len(hits) == 1:
+                chosen = hits[0]
+            elif len(hits) > 1:
+                opts = ", ".join(f"{h['name']}({h['id']})" for h in hits[:5])
+                return {"ok": False, "msg": f"命中多个候选模型，请进一步指定: {opts}"}
+
+        if chosen is None:
+            return {"ok": False, "msg": f"未找到模型: {query}"}
+
+        target_session = str(session_name or "").strip()
+        bridge = self.bridge
+        if bridge is not None and callable(getattr(bridge, "set_model", None)):
+            res = bridge.set_model(chosen["id"], session_name=target_session or None)
+            if isinstance(res, dict) and not res.get("ok"):
+                return {"ok": False, "msg": str(res.get("msg") or "切换模型失败")}
+        else:
+            mem = getattr(bridge, "_memory", None) if bridge is not None else None
+            if target_session and mem is not None and callable(getattr(mem, "set_session_model_id", None)):
+                mem.set_session_model_id(target_session, chosen["id"])
+            else:
+                try:
+                    from core.model_manager import set_active_model
+                    set_active_model(chosen["id"])
+                except Exception as exc:
+                    return {"ok": False, "msg": f"切换模型失败: {exc}"}
+
+        return {
+            "ok": True,
+            "session_name": target_session,
+            "active_model_id": chosen["id"],
+            "active_model_name": chosen["name"],
+            "provider_id": chosen["provider_id"],
+            "provider_name": chosen["provider_name"],
         }
 
     def build_agent_card(self, base_url: str, ws_url: str = "") -> dict[str, Any]:
@@ -784,6 +1417,61 @@ class A2ABridge:
                 bool(params.get("always", False)),
                 task_id=params.get("task_id"),
                 wait_seconds=params.get("wait_seconds", DEFAULT_WAIT_SECONDS),
+            )
+            return 200, {"jsonrpc": "2.0", "id": msg_id, "result": res}
+
+        if method == "xingyao/status":
+            return 200, {"jsonrpc": "2.0", "id": msg_id, "result": self.get_status()}
+
+        if method == "xingyao/workspaces":
+            return 200, {"jsonrpc": "2.0", "id": msg_id, "result": self.list_workspaces()}
+
+        if method == "xingyao/sessions":
+            include_empty = bool(params.get("include_empty", True))
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": self.list_sessions(
+                    workdir=params.get("workdir"),
+                    include_empty=include_empty,
+                ),
+            }
+
+        if method == "xingyao/providers":
+            return 200, {"jsonrpc": "2.0", "id": msg_id, "result": self.list_providers()}
+
+        if method == "xingyao/models":
+            return 200, {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": self.list_models(
+                    provider=params.get("provider"),
+                    session_name=params.get("session_name"),
+                ),
+            }
+
+        if method == "xingyao/session_create":
+            res = self.create_remote_session(
+                workdir=params.get("workdir"),
+                session_name=params.get("session_name"),
+                model_id=params.get("model_id"),
+                permission_mode=str(params.get("permission_mode") or "full"),
+                sandbox_bypass=bool(params.get("sandbox_bypass", True)),
+            )
+            return 200, {"jsonrpc": "2.0", "id": msg_id, "result": res}
+
+        if method == "xingyao/session_select":
+            res = self.select_remote_session(
+                str(params.get("session_name") or ""),
+                permission_mode=str(params.get("permission_mode") or "full"),
+                sandbox_bypass=bool(params.get("sandbox_bypass", True)),
+            )
+            return 200, {"jsonrpc": "2.0", "id": msg_id, "result": res}
+
+        if method == "xingyao/model_select":
+            res = self.select_remote_model(
+                str(params.get("model") or params.get("model_id") or ""),
+                session_name=params.get("session_name"),
             )
             return 200, {"jsonrpc": "2.0", "id": msg_id, "result": res}
 

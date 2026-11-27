@@ -896,4 +896,31 @@ describe('useSuggest', () => {
     vi.unstubAllGlobals();
     errSpy.mockRestore();
   });
+
+  it('斜杠命令：输入节点前缀如 /笔记本 时放宽上限展示全部节点子命令', () => {
+    const store = useAppStore();
+    store.skills = [];
+    store.mcps = [];
+    store.slashCommands = [
+      { name: '/笔记本目录', usage: '/笔记本目录', summary: '[笔记本] 查看工作目录', kind: 'action' },
+      { name: '/笔记本对话', usage: '/笔记本对话', summary: '[笔记本] 查看对话列表', kind: 'action' },
+      { name: '/笔记本厂商', usage: '/笔记本厂商', summary: '[笔记本] 查看模型厂商', kind: 'action' },
+      { name: '/笔记本模型', usage: '/笔记本模型', summary: '[笔记本] 查看模型列表', kind: 'action' },
+      { name: '/笔记本选对话', usage: '/笔记本选对话 <序号>', summary: '[笔记本] 绑定对端对话', kind: 'action' },
+      { name: '/笔记本新建', usage: '/笔记本新建 [目录]', summary: '[笔记本] 新建并绑定对话', kind: 'action' },
+      { name: '/笔记本选模型', usage: '/笔记本选模型 <序号>', summary: '[笔记本] 切换模型', kind: 'action' },
+      { name: '/笔记本状态', usage: '/笔记本状态', summary: '[笔记本] 查看在线状态', kind: 'action' },
+      { name: '/笔记本帮助', usage: '/笔记本帮助', summary: '[笔记本] 帮助', kind: 'action' },
+    ];
+
+    const inputVal = ref('/笔记本');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('/笔记本', 4);
+    detectToken();
+
+    expect(suggestItems.value.length).toBe(9);
+    expect(suggestItems.value.map(it => it.label)).toContain('/笔记本选模型');
+  });
 });

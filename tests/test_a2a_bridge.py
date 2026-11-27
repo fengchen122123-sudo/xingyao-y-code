@@ -265,3 +265,174 @@ def test_a2a_rest_status_and_send(make_server):
     task = json.loads(raw2.decode("utf-8"))
     assert task["status"]["state"] == "completed"
     assert task["artifacts"][0]["parts"][0]["text"] == "REST OK"
+
+
+def test_a2a_remote_management_endpoints_and_session_reuse(tmp_path, monkeypatch):
+    from core.memory import MemoryManager
+    from core.tools import _clear_sandbox_state_for_tests, is_session_sandbox_bypass_enabled
+
+    _clear_sandbox_state_for_tests()
+    proj_dir = tmp_path / "demo_project"
+    proj_dir.mkdir()
+    mem = MemoryManager(db_path=str(tmp_path / "test_a2a.db"))
+    mem.set_workdir(str(proj_dir))
+    mem.add_workspace(str(proj_dir))
+    mem.ensure_session("existing-chat", workdir=str(proj_dir), source="GUI")
+
+    fake_cfg = {
+        "active_model_id": "ds-chat",
+        "providers": [
+            {
+                "id": "prov-ds",
+                "name": "DeepSeek",
+                "base_url": "https://user:secret@api.deepseek.com/v1",
+                "api_key": "sk-TOP-SECRET-KEY",
+                "protocol": "openai",
+                "models": [
+                    {
+                        "id": "ds-chat",
+                        "name": "deepseek-chat",
+                        "litellm_model": "openai/deepseek-chat",
+                        "context_window": 128000,
+                    },
+                    {
+                        "id": "ds-reasoner",
+                        "name": "deepseek-reasoner",
+                        "litellm_model": "openai/deepseek-reasoner",
+                        "context_window": 128000,
+                    },
+                ],
+            }
+        ],
+    }
+
+    class RichBridge:
+        def __init__(self):
+            self._memory = mem
+            self._current_session = "local-foreground"
+            self.set_model_calls = []
+            self.sent_calls = []
+            self.events = []
+            self.mcp_server = None
+
+        def _load_config(self):
+            return fake_cfg
+
+        def get_sessions(self):
+            # 返回真实 GUI 的分组格式（非扁平会话），验证 _ensure_session 不会误判重复创建
+            return [{"folder_path": str(proj_dir), "sessions": [{"name": "existing-chat"}]}]
+
+        def create_session(self, **_kw):
+            raise AssertionError("A2A 不应调用抢占前台的 bridge.create_session")
+
+        def set_model(self, model_id, session_name=None):
+            self.set_model_calls.append((model_id, session_name))
+            if session_name:
+                mem.set_session_model_id(session_name, model_id)
+            return {"ok": True}
+
+        def emit_event(self, etype, data):
+            self.events.append((etype, data))
+
+        def send_user_message(self, text, session_name=None, permission_mode=None, workdir=None, turn_source="local"):
+            self.sent_calls.append({
+                "text": text,
+                "session_name": session_name,
+                "permission_mode": permission_mode,
+                "workdir": workdir,
+                "turn_source": turn_source,
+            })
+            return {"ok": True}
+
+    bridge = RichBridge()
+    srv = McpServer(bridge=bridge, port=0, host="127.0.0.1", token_provider=lambda: TOKEN)
+    bridge.mcp_server = srv
+    assert srv.start()["ok"]
+    try:
+        # 1. 未认证必须拒绝
+        unauth_status, _, _ = _http(srv, "GET", "/api/a2a/workspaces")
+        assert unauth_status == 401
+
+        auth_h = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+        # 2. 查询目录、会话、厂商、模型（绝不能泄露 api_key 或 URL 凭据）
+        s_ws, _, b_ws = _http(srv, "GET", "/api/a2a/workspaces", headers=auth_h)
+        assert s_ws == 200
+        ws_paths = [w["path"] for w in json.loads(b_ws.decode("utf-8"))["workspaces"]]
+        assert "GLOBAL" in ws_paths and any("demo_project" in p for p in ws_paths)
+
+        s_prov, _, b_prov = _http(srv, "GET", "/api/a2a/providers", headers=auth_h)
+        raw_prov_text = b_prov.decode("utf-8")
+        assert s_prov == 200
+        assert "sk-TOP-SECRET-KEY" not in raw_prov_text
+        assert "user:secret" not in raw_prov_text
+        prov_list = json.loads(raw_prov_text)["providers"]
+        assert prov_list[0]["base_url_host"] == "https://api.deepseek.com"
+        assert prov_list[0]["model_count"] == 2
+
+        s_mod, _, b_mod = _http(srv, "GET", "/api/a2a/models?provider=DeepSeek", headers=auth_h)
+        assert s_mod == 200
+        assert len(json.loads(b_mod.decode("utf-8"))["models"]) == 2
+
+        # 3. 在指定目录新建对话：默认 full + 沙盒解除，且绝不切换 _current_session
+        s_cr, _, b_cr = _http(
+            srv,
+            "POST",
+            "/api/a2a/session/create",
+            body=json.dumps({"workdir": str(proj_dir), "session_name": "nb-task-1"}).encode("utf-8"),
+            headers=auth_h,
+        )
+        assert s_cr == 200
+        cr_data = json.loads(b_cr.decode("utf-8"))
+        assert cr_data["ok"] is True
+        assert cr_data["session"]["name"] == "nb-task-1"
+        assert cr_data["session"]["permission_mode"] == "full"
+        assert cr_data["session"]["sandbox_bypass"] is True
+        assert bridge._current_session == "local-foreground"
+        assert mem.get_session_permission_mode("nb-task-1") == "full"
+        assert is_session_sandbox_bypass_enabled("nb-task-1") is True
+
+        # 4. 切换新会话的模型
+        s_sm, _, b_sm = _http(
+            srv,
+            "POST",
+            "/api/a2a/model/select",
+            body=json.dumps({"model": "deepseek-reasoner", "session_name": "nb-task-1"}).encode("utf-8"),
+            headers=auth_h,
+        )
+        assert s_sm == 200
+        sm_data = json.loads(b_sm.decode("utf-8"))
+        assert sm_data["ok"] is True
+        assert sm_data["active_model_id"] == "ds-reasoner"
+        assert mem.get_session_model_id("nb-task-1") == "ds-reasoner"
+
+        # 5. 发送消息复用已有对话：不能新建会话，且携带 permission_mode=full
+        _, rpc_send = _a2a_rpc(
+            srv,
+            "message/send",
+            {
+                "message": {"role": "user", "parts": [{"kind": "text", "text": "继续检查"}]},
+                "metadata": {"session_name": "nb-task-1", "wait_seconds": 0},
+            },
+        )
+        assert rpc_send["result"]["metadata"]["session_name"] == "nb-task-1"
+        assert bridge.sent_calls[-1]["session_name"] == "nb-task-1"
+        assert bridge.sent_calls[-1]["permission_mode"] == "full"
+
+        # 6. 选择已有对话同样默认授予 full + 沙盒解除
+        s_sel, _, b_sel = _http(
+            srv,
+            "POST",
+            "/api/a2a/session/select",
+            body=json.dumps({"session_name": "existing-chat"}).encode("utf-8"),
+            headers=auth_h,
+        )
+        assert s_sel == 200
+        sel_data = json.loads(b_sel.decode("utf-8"))
+        assert sel_data["ok"] is True
+        assert sel_data["session"]["permission_mode"] == "full"
+        assert sel_data["session"]["sandbox_bypass"] is True
+    finally:
+        _clear_sandbox_state_for_tests()
+        srv.stop()
+        mem.close()

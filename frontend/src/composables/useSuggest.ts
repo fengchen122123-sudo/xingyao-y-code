@@ -39,8 +39,9 @@ export function useSuggest(
     const q = query.toLowerCase();
     const items: SuggestItem[] = [];
     // 命令候选排最前：内置命令是产品自带能力，命中时优先级高于用户技能与 MCP。
-    // 最多占 4 个名额，避免命令一多就把技能候选整体挤出面板（与 @ 面板给会话
-    // 留 4 个名额同理）。label 直接用 name（含前导斜杠），desc 用一句话说明。
+    // 空前缀时最多占 4 个名额以免挤走技能/MCP；带明确前缀过滤（如 `/笔记本`）时
+    // 放宽到 10 个，确保动态节点命令（目录/对话/厂商/模型/选对话/新建/选模型）完整可见。
+    const cmdLimit = q ? 10 : 4;
     for (const c of store.slashCommands) {
       if (!c.name || !c.name.toLowerCase().startsWith('/' + q)) continue;
       items.push({
@@ -50,7 +51,7 @@ export function useSuggest(
         desc: c.summary || c.usage,
         apply: c.name + ' ',
       });
-      if (items.length >= 4) break;
+      if (items.length >= cmdLimit) break;
     }
     for (const s of store.skills) {
       if (!s.enabled || !s.short_id) continue;
@@ -83,7 +84,7 @@ export function useSuggest(
       seen.add(it.label);
       merged.push(it);
     }
-    suggestItems.value = merged.slice(0, 8);
+    suggestItems.value = merged.slice(0, q ? 10 : 8);
     suggestIndex.value = 0;
   }
 

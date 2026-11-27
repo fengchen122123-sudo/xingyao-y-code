@@ -7685,20 +7685,26 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin, PetBridgeMi
 
     def list_slash_commands(self) -> Dict[str, Any]:
         try:
+            from core.slash_commands.peer_commands import build_peer_slash_specs
             from core.slash_commands.specs import register_builtin_commands
             from core.slash_commands.registry import all_specs
             register_builtin_commands()
+            commands = [
+                {
+                    "name": spec.name,
+                    "usage": spec.usage,
+                    "summary": spec.summary,
+                    "kind": spec.kind,
+                }
+                for spec in all_specs()
+            ]
+            existing_names = {str(c.get("name") or "").lower() for c in commands}
+            for peer_spec in build_peer_slash_specs():
+                if str(peer_spec.get("name") or "").lower() not in existing_names:
+                    commands.append(peer_spec)
             return {
                 "ok": True,
-                "commands": [
-                    {
-                        "name": spec.name,
-                        "usage": spec.usage,
-                        "summary": spec.summary,
-                        "kind": spec.kind,
-                    }
-                    for spec in all_specs()
-                ],
+                "commands": commands,
             }
         except Exception as exc:
             # 与桥内其他方法保持一致：异常不穿透，交给前端按 ok=False 降级

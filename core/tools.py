@@ -13,7 +13,7 @@ import warnings
 import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -322,9 +322,9 @@ def _sandbox_session_id():
         return "__default__"
 
 
-def set_session_sandbox_bypass(enabled):
+def set_session_sandbox_bypass(enabled, session_name: Optional[str] = None):
     global _session_sandbox_bypass
-    sid = _sandbox_session_id()
+    sid = str(session_name or "").strip() or _sandbox_session_id()
     with _session_sandbox_lock:
         if sid:
             _session_sandbox_bypass_by_session[sid] = bool(enabled)
@@ -355,9 +355,9 @@ def rename_session_sandbox_bypass(old_task_id: str, new_task_id: str) -> None:
             _session_sandbox_bypass_by_session[new_key] = enabled
 
 
-def is_session_sandbox_bypass_enabled():
+def is_session_sandbox_bypass_enabled(session_name: Optional[str] = None):
     """读取任务级沙盒放行标志（供 core.llm 权限决策使用）。"""
-    sid = _sandbox_session_id()
+    sid = str(session_name or "").strip() or _sandbox_session_id()
     with _session_sandbox_lock:
         if sid:
             return _session_sandbox_bypass_by_session.get(sid, False)

@@ -27,6 +27,11 @@ def _known_names() -> tuple:
 def dispatch_command(text, ctx=None) -> DispatchResult:
     parsed = parse_slash_command(text, _known_names())
     if parsed is None:
+        from core.slash_commands.peer_commands import try_dispatch_peer_command
+
+        peer_result = try_dispatch_peer_command(text)
+        if peer_result is not None:
+            return peer_result
         return DispatchResult(handled=False)
 
     spec = get(parsed.name)

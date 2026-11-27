@@ -745,6 +745,46 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             activity_description="查询远程节点任务进度",
             side_effect_scope="network",
         ),
+        ToolSpec(
+            name="lan_peer_inspect",
+            description=(
+                "通过 HTTP 直接查询远程星瑶节点的工作目录（workspaces）、历史对话（sessions）、"
+                "模型厂商（providers）、可用模型（models）或运行状态（status），无需对端运行 LLM 回合。"
+            ),
+            input_schema=_schema({
+                "peer": {
+                    "type": "string",
+                    "description": "目标节点 ID 或名称（如 笔记本）",
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["status", "workspaces", "sessions", "providers", "models"],
+                    "default": "status",
+                    "description": "查询对象：status / workspaces / sessions / providers / models",
+                },
+                "workdir": {
+                    "type": "string",
+                    "default": "",
+                    "description": "当 target=sessions 时可选按工作目录过滤",
+                },
+                "provider": {
+                    "type": "string",
+                    "default": "",
+                    "description": "当 target=models 时可选按厂商 ID 或名称过滤",
+                },
+                "session_name": {
+                    "type": "string",
+                    "default": "",
+                    "description": "当 target=models 时可选指定查看哪个对话当前激活的模型",
+                },
+            }, ["peer"]),
+            execute=_lan_peer_inspect_wrapper,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询远程节点目录/对话/模型",
+            side_effect_scope="network",
+        ),
     ]
 
     mutating_specs = [
@@ -1640,6 +1680,8 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             name="lan_peer_send",
             description=(
                 "向另一台电脑上的星瑶（或兼容 A2A 协议的 Agent）下发自然语言任务并获取执行结果。"
+                "默认会持续复用该节点当前绑定的对端对话（或主机名隔离会话），不会每次新建随机对话；"
+                "若需要在指定工作目录新建对话、切换到已有对话或切换对端模型，请先调用 lan_peer_manage。"
                 "先短等待最多 wait_seconds 秒：若对端在窗口内完成则直接返回内容；若需要权限审批会返回"
                 "request_id 供用户确认；若超时仍在运行会自动转入后台监听，完成后自动把结果推回本会话。"
             ),
@@ -1717,6 +1759,54 @@ def build_default_registry(profile: str | None = None) -> ToolRegistry:
             requires_permission=False,
             parallel_safe=False,
             activity_description="响应远程节点权限请求",
+            side_effect_scope="network",
+        ),
+        ToolSpec(
+            name="lan_peer_manage",
+            description=(
+                "在远程星瑶节点上指定目录新建对话、选择已有对话（绑定为后续 lan_peer_send 默认对话），"
+                "或切换远程对话的模型。新建或选择对话时默认开启完全访问权限并解除沙盒限制。"
+            ),
+            input_schema=_schema({
+                "peer": {
+                    "type": "string",
+                    "description": "目标节点 ID 或名称（如 笔记本）",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["create_session", "select_session", "select_model"],
+                    "description": "操作类型：create_session / select_session / select_model",
+                },
+                "session_name": {
+                    "type": "string",
+                    "default": "",
+                    "description": "会话名（select_session 必填；create_session 留空自动命名；select_model 留空则作用于节点当前绑定对话）",
+                },
+                "workdir": {
+                    "type": "string",
+                    "default": "",
+                    "description": "create_session 时的目标工作目录（留空或 GLOBAL 表示自由对话）",
+                },
+                "model": {
+                    "type": "string",
+                    "default": "",
+                    "description": "模型 ID 或名称（select_model 必填；create_session 可选绑定初始模型）",
+                },
+                "permission_mode": {
+                    "type": "string",
+                    "default": "full",
+                    "description": "远端会话默认权限模式（默认 full 完全访问）",
+                },
+                "sandbox_bypass": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否默认解除该远端会话的沙盒限制（默认 true）",
+                },
+            }, ["peer", "action"]),
+            execute=_lan_peer_manage_wrapper,
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="配置远程节点对话与模型",
             side_effect_scope="network",
         ),
     ]
@@ -1854,6 +1944,46 @@ def _lan_peer_approve_wrapper(
         always=always,
         task_id=task_id,
         wait_seconds=wait_seconds,
+    )
+    return ToolResult(content=out, is_error=out.startswith("🚨"))
+
+
+def _lan_peer_inspect_wrapper(
+    peer: str,
+    target: str = "status",
+    workdir: str = "",
+    provider: str = "",
+    session_name: str = "",
+):
+    from core.lan_peers import tool_lan_peer_inspect
+    out = tool_lan_peer_inspect(
+        peer=peer,
+        target=target,
+        workdir=workdir,
+        provider=provider,
+        session_name=session_name,
+    )
+    return ToolResult(content=out, is_error=out.startswith("🚨"))
+
+
+def _lan_peer_manage_wrapper(
+    peer: str,
+    action: str,
+    session_name: str = "",
+    workdir: str = "",
+    model: str = "",
+    permission_mode: str = "full",
+    sandbox_bypass: bool = True,
+):
+    from core.lan_peers import tool_lan_peer_manage
+    out = tool_lan_peer_manage(
+        peer=peer,
+        action=action,
+        session_name=session_name,
+        workdir=workdir,
+        model=model,
+        permission_mode=permission_mode,
+        sandbox_bypass=sandbox_bypass,
     )
     return ToolResult(content=out, is_error=out.startswith("🚨"))
 

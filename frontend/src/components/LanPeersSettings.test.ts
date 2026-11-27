@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { mount } from '@vue/test-utils';
+import { createPinia, setActivePinia } from 'pinia';
 import LanPeersSettings from './LanPeersSettings.vue';
 
 function flush() {
@@ -134,6 +135,52 @@ describe('LanPeersSettings', () => {
     await flush();
     expect(delete_lan_peer).toHaveBeenCalledWith('peer-b');
     expect(wrapper.find('[data-test="lan-peers-empty"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it('服务监听中但令牌未签发时按钮显示签发配对令牌并禁用一键导入，保存节点后刷新斜杠命令', async () => {
+    setActivePinia(createPinia());
+    const get_lan_peers = vi.fn(async () => ({ ok: true, peers: [] }));
+    const get_lan_peer_local_info = vi.fn(async () => ({
+      ok: true,
+      running: true,
+      lan_ip: '192.168.1.13',
+      a2a_port: 8765,
+      a2a_url: 'http://192.168.1.13:8765/a2a',
+      token: '',
+      import_json: '{}',
+    }));
+    const save_lan_peer = vi.fn(async (payload) => ({
+      ok: true,
+      peer: { id: 'nb', name: payload.name, url: payload.url, protocol: 'a2a', has_token: true, enabled: true },
+      peers: [{ id: 'nb', name: payload.name, url: payload.url, protocol: 'a2a', has_token: true, enabled: true }],
+    }));
+    const list_slash_commands = vi.fn(async () => ({
+      ok: true,
+      commands: [{ name: '/笔记本目录', usage: '/笔记本目录', summary: '目录', kind: 'action' }],
+    }));
+    (window as any).pywebview = {
+      api: {
+        get_lan_peers,
+        get_lan_peer_local_info,
+        save_lan_peer,
+        list_slash_commands,
+      },
+    };
+
+    const wrapper = mount(LanPeersSettings, { global: { stubs: { AppIcon: true } } });
+    await flush();
+
+    expect(wrapper.find('[data-test="lan-peers-start-local"]').text()).toContain('签发配对令牌');
+    expect((wrapper.find('[data-test="lan-peers-copy-import"]').element as HTMLButtonElement).disabled).toBe(true);
+
+    await wrapper.find('[data-test="lan-peers-add-btn"]').trigger('click');
+    await wrapper.find('[data-test="lan-peer-form-name"]').setValue('笔记本');
+    await wrapper.find('[data-test="lan-peer-form-url"]').setValue('http://192.168.1.22:8765/a2a');
+    await wrapper.find('[data-test="lan-peer-form-save"]').trigger('click');
+    await flush();
+
+    expect(list_slash_commands).toHaveBeenCalled();
     wrapper.unmount();
   });
 });
